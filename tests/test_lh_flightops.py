@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from blueprints import lh_flightops as fo
+from blueprints.crew_live_state import duty_from_roster_day
 
 
 def test_pkce_s256_correct():
@@ -157,11 +158,13 @@ def test_duty_events_to_ics_deadhead_and_locations():
     assert 'DH LH 1623: KRK-MUC' in ics
     assert 'LOCATION:KRK - MUC' in ics
     assert 'LH 2068: MUC-HAM' in ics
-    # Hotel ohne Zeiten → Datums-Event über die Nacht (Tag..Tag+2, DTEND
-    # exklusiv) mit IATA-LOCATION — Quelle für ical_layover_ort.
+    # Hotel ohne Zeiten mit IATA-LOCATION — Quelle für ical_layover_ort.
     assert 'Layover [BRE]' in ics
     assert 'LOCATION:BRE' in ics
-    assert 'DTEND;VALUE=DATE:20260727' in ics
+    # Hotel-Station BRE passt zu KEINEM Leg (die Legs landen HAM) → Spanne
+    # nicht ableitbar → Fallback aufs alte Datums-Verhalten für den ganzen
+    # Lauf (erster Tag … letzter Tag+2), damit der Layover-Morgen seinen
+    # Marker behält (Tim/KRK 25.07.).
     # OFFDUTY/FREE → myTime-Prosa.
     assert 'Off Day (FREE)' in ics
     # ABSENCE/U1 (Urlaub) → 'Absence (U1)' — iOS mappt ABSENCE auf Urlaub;
@@ -946,3 +949,365 @@ def test_store_own_pk_idempotent(monkeypatch):
     assert len(saved) == n
     fo._store_own_pk('AT-U', '')       # leer → no-op
     assert len(saved) == n
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION 2026-07-26 — echte Prod-Payloads (COMMON_DUTY_EVENTS, live gezogen)
+#
+# (1) Tibor „Tag 2/2 in Athen": Hotel-Events kommen OHNE Zeiten und EINES PRO
+#     NACHT. Der alte Datums-Event Tag..Tag+2 pro Hotel-Event machte N konstant
+#     2, stapelte bei Mehr-Nacht-Layovern „(Tag 2/2) · (Tag 1/2)" auf EINEN Tag
+#     und erfand einen Layover-Tag hinter der letzten Nacht.
+# (2) „B4 löst einen freien Tag aus": Bürodienst kommt als
+#     eventCategory=GROUNDDUTY mit dem NACKTEN Hauscode in eventDetails.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Echter Payload eines verbundenen FlightOps-Users (anonymisiert): 3 Nächte KIX,
+# Hotel-Event an DREI aufeinanderfolgenden rosterDays, ein Tag OHNE Events
+# mittendrin, Weiterflug erst am 29.07.
+DUTY_KIX_MULTINIGHT = {
+    "rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            {"eventType": "BRIEFING", "eventCategory": "briefing",
+             "eventDetails": "Briefing", "wholeDay": False,
+             "startTime": "2026-07-25T08:40:00Z", "startLocation": "MUC",
+             "endTime": None, "endLocation": None},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH742", "wholeDay": False,
+             "startTime": "2026-07-25T10:39:00Z", "startLocation": "MUC",
+             "endTime": "2026-07-25T22:20:00Z", "endLocation": "KIX"},
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False, "startTime": None,
+             "startLocation": "KIX", "endTime": None, "endLocation": None}]},
+        {"day": "2026-07-26Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False, "startTime": None,
+             "startLocation": "KIX", "endTime": None, "endLocation": None}]},
+        {"day": "2026-07-27Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False, "startTime": None,
+             "startLocation": "KIX", "endTime": None, "endLocation": None}]},
+        {"day": "2026-07-28Z", "events": []},
+        {"day": "2026-07-29Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH743", "wholeDay": False,
+             "startTime": "2026-07-29T00:30:00Z", "startLocation": "KIX",
+             "endTime": "2026-07-29T14:40:00Z", "endLocation": "MUC"}]},
+    ]
+}
+
+# Tibors echter Athen-Umlauf (26.–28.07.2026): EINE Nacht, Hotel am Ankunftstag.
+DUTY_TIBOR_ATH = {
+    "rosterDays": [
+        {"day": "2026-07-26Z", "events": [
+            {"eventType": "BRIEFING", "eventCategory": "briefing",
+             "eventDetails": "Briefing", "wholeDay": False,
+             "startTime": "2026-07-26T14:35:00Z", "startLocation": "FRA"},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH690", "wholeDay": False,
+             "startTime": "2026-07-26T16:35:00Z", "startLocation": "FRA",
+             "endTime": "2026-07-26T20:15:00Z", "endLocation": "TLV"}]},
+        {"day": "2026-07-27Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH691", "wholeDay": False,
+             "startTime": "2026-07-26T22:10:00Z", "startLocation": "TLV",
+             "endTime": "2026-07-27T00:20:00Z", "endLocation": "ATH"},
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False, "startTime": None,
+             "startLocation": "ATH", "endTime": None, "endLocation": None}]},
+        {"day": "2026-07-28Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH691", "wholeDay": False,
+             "startTime": "2026-07-28T01:10:00Z", "startLocation": "ATH",
+             "endTime": "2026-07-28T04:15:00Z", "endLocation": "FRA"}]},
+    ]
+}
+
+
+def _briefings(payload):
+    import app as backend
+    ics = fo.duty_events_to_ics(payload)
+    assert ics is not None
+    return backend._ics_events_to_briefings(backend._parse_ics_to_events(ics))[0]
+
+
+def test_multinight_layover_emits_one_vevent_with_real_span():
+    """3 Hotel-Events derselben Nachtfolge → GENAU EIN Layover-VEVENT über die
+    echte Spanne Ankunft…Weiterflug (nicht 3× Tag..Tag+2)."""
+    ics = fo.duty_events_to_ics(DUTY_KIX_MULTINIGHT)
+    assert ics.count('SUMMARY:Layover [KIX]') == 1
+    assert 'DTSTART:20260725T222000Z' in ics      # Ankunft LH742
+    assert 'DTEND:20260729T003000Z' in ics        # Abflug LH743
+    # kein Datums-Event mehr für das Hotel
+    assert 'DTSTART;VALUE=DATE:20260726' not in ics
+
+
+def test_multinight_layover_day_labels_are_honest():
+    """N ist die ECHTE Nächtezahl (früher immer 2) und kein Tag trägt zwei
+    widersprüchliche Layover-Segmente."""
+    b = _briefings(DUTY_KIX_MULTINIGHT)
+    assert 'Layover [KIX] (Tag 1/4)' in (b['2026-07-26'].get('ical_summary') or '')
+    assert 'Layover [KIX] (Tag 2/4)' in (b['2026-07-27'].get('ical_summary') or '')
+    assert 'Layover [KIX] (Tag 3/4)' in (b['2026-07-28'].get('ical_summary') or '')
+    assert 'Layover [KIX] (Tag 4/4)' in (b['2026-07-29'].get('ical_summary') or '')
+    for d in ('2026-07-26', '2026-07-27', '2026-07-28', '2026-07-29'):
+        s = b[d].get('ical_summary') or ''
+        assert s.count('Layover [KIX]') == 1, (d, s)
+    # Der Layover-Ort steht jetzt an JEDEM echten Hotel-Tag (vorher nur Tag 1
+    # je Hotel-Event, weil ohne Zeiten der except-Zweig griff) — der Heimkehr-
+    # Morgen (Abflug 02:30 Ortszeit Berlin) zählt korrekt NICHT mit.
+    assert b['2026-07-26'].get('ical_layover_ort') == 'KIX'
+    assert b['2026-07-27'].get('ical_layover_ort') == 'KIX'
+    assert b['2026-07-28'].get('ical_layover_ort') == 'KIX'
+    assert b['2026-07-29'].get('ical_layover_ort') != 'KIX'
+
+
+def test_tibor_athen_single_night_labels():
+    """Tibors Athen-Tour: Tag 1/2 am Ankunftstag, Tag 2/2 am Rückflugtag —
+    und KEIN Layover-Segment an einem Tag vor Tour-Start."""
+    b = _briefings(DUTY_TIBOR_ATH)
+    assert 'Layover [ATH]' not in (b['2026-07-26'].get('ical_summary') or '')
+    assert 'Layover [ATH] (Tag 1/2)' in (b['2026-07-27'].get('ical_summary') or '')
+    assert 'Layover [ATH] (Tag 2/2)' in (b['2026-07-28'].get('ical_summary') or '')
+    assert '2026-07-29' not in b          # kein erfundener Tag hinter der Tour
+    assert b['2026-07-27'].get('ical_layover_ort') == 'ATH'
+
+
+def _f(det, s, sl, e, el):
+    return {"eventType": "FLIGHT", "eventCategory": "flight",
+            "eventDetails": det, "wholeDay": False, "startTime": s,
+            "startLocation": sl, "endTime": e, "endLocation": el}
+
+
+def _hotel(station):
+    return {"eventType": "HOTEL", "eventCategory": "hotel",
+            "eventDetails": "Hotel", "wholeDay": False, "startTime": None,
+            "startLocation": station, "endTime": None, "endLocation": None}
+
+
+def test_hotel_without_derivable_next_leg_falls_back_to_dates():
+    """Layover am Rand des Import-Fensters (Weiterflug noch nicht im Import):
+    Spanne nicht bestimmbar → EIN Datums-Event fuer den ganzen Lauf. Altes
+    Verhalten, aber garantiert nur EINMAL — kein Stapeln."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            _f("LH742", "2026-07-25T10:39:00Z", "MUC",
+               "2026-07-25T22:20:00Z", "KIX"), _hotel("KIX")]},
+    ]}
+    ics = fo.duty_events_to_ics(payload)
+    assert ics.count('SUMMARY:Layover [KIX]') == 1
+    assert 'DTSTART;VALUE=DATE:20260725' in ics
+    assert 'DTEND;VALUE=DATE:20260727' in ics
+
+
+def test_layover_span_stops_when_crew_leaves_otherwise():
+    """ADVERSARIAL (Review 26.07.): kommt die Crew ohne Flug-Leg heim (Bahn),
+    darf die Suche NICHT bis zum naechsten Abflug ab dieser Station
+    weiterlaufen — sonst entsteht ein Wochen-Layover, das freie Tage als
+    Layover stempelt (reproduziert: 21 Tage, 18 freie Tage betroffen)."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            _f("LH100", "2026-07-25T10:00:00Z", "FRA",
+               "2026-07-25T11:00:00Z", "CGN"), _hotel("CGN")]},
+        {"day": "2026-07-26Z", "events": [
+            _f("LH200", "2026-07-26T09:00:00Z", "FRA",
+               "2026-07-26T10:00:00Z", "MUC")]},
+        {"day": "2026-08-14Z", "events": [
+            _f("LH300", "2026-08-14T08:00:00Z", "CGN",
+               "2026-08-14T09:00:00Z", "FRA")]},
+    ]}
+    b = _briefings(payload)
+    lay = [d for d in b if (b[d].get('ical_layover_ort') or '') == 'CGN']
+    assert len(lay) <= 2, lay
+    assert '2026-08-01' not in b
+
+
+def test_same_station_twice_in_one_day_keeps_the_real_night():
+    """ADVERSARIAL: FRA-MUC-FRA morgens + FRA-MUC abends + Hotel MUC. Wird der
+    ABFLUG am Hotel-Tag verankert, gewinnt der Morgen-Rueckflug → 1-h-Spanne,
+    die 6-h-Regel verwirft sie, und die echte Nacht verschwindet komplett."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            _f("LH1", "2026-07-25T04:00:00Z", "FRA", "2026-07-25T05:00:00Z", "MUC"),
+            _f("LH2", "2026-07-25T06:00:00Z", "MUC", "2026-07-25T07:00:00Z", "FRA"),
+            _f("LH3", "2026-07-25T18:00:00Z", "FRA", "2026-07-25T19:00:00Z", "MUC"),
+            _hotel("MUC")]},
+        {"day": "2026-07-26Z", "events": [
+            _f("LH4", "2026-07-26T07:00:00Z", "MUC", "2026-07-26T08:00:00Z", "FRA")]},
+    ]}
+    ics = fo.duty_events_to_ics(payload)
+    assert 'DTSTART:20260725T190000Z' in ics       # der ABEND-Flug
+    assert 'DTEND:20260726T070000Z' in ics
+    b = _briefings(payload)
+    assert b['2026-07-25'].get('ical_layover_ort') == 'MUC'
+
+
+def test_turnaround_out_of_the_layover_station_keeps_every_night():
+    """ADVERSARIAL: JFK-Nacht, JFK-YYZ-JFK-Turnaround, JFK-Nacht, Heimflug.
+    Der Turnaround darf den Aufenthalt nicht zerschneiden."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            _f("LH400", "2026-07-25T12:00:00Z", "FRA",
+               "2026-07-25T19:00:00Z", "JFK"), _hotel("JFK")]},
+        {"day": "2026-07-26Z", "events": [
+            _f("LH8000", "2026-07-26T10:00:00Z", "JFK",
+               "2026-07-26T11:30:00Z", "YYZ"),
+            _f("LH8001", "2026-07-26T14:00:00Z", "YYZ",
+               "2026-07-26T15:30:00Z", "JFK"), _hotel("JFK")]},
+        {"day": "2026-07-28Z", "events": [
+            _f("LH401", "2026-07-28T01:00:00Z", "JFK",
+               "2026-07-28T09:00:00Z", "FRA")]},
+    ]}
+    ics = fo.duty_events_to_ics(payload)
+    assert ics.count('SUMMARY:Layover [JFK]') == 1
+    assert 'DTSTART:20260725T190000Z' in ics       # ERSTE Ankunft
+    assert 'DTEND:20260728T010000Z' in ics         # LETZTER Abflug
+    b = _briefings(payload)
+    assert b['2026-07-27'].get('ical_layover_ort') == 'JFK'
+
+
+def test_leg_timestamps_with_unexpected_shape_degrade_safely():
+    """Nur 'YYYY-MM-DDTHH:MM:SSZ' ist lexikografisch sicher vergleichbar.
+    Offsets/Millisekunden duerfen nie eine falsche Spanne erzeugen."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            _f("LH1", "2026-07-25T10:00:00+02:00", "FRA",
+               "2026-07-25T11:00:00.500Z", "KIX"), _hotel("KIX")]},
+    ]}
+    ics = fo.duty_events_to_ics(payload)
+    assert 'DTSTART;VALUE=DATE:20260725' in ics    # Fallback, keine Zeit-Spanne
+    assert 'SUMMARY:Layover [KIX]' in ics
+
+
+def test_short_turnaround_hotel_does_not_set_layover_ort():
+    """Die 6-h-Mindestbodenzeit-Regel lief für FlightOps NIE (Datums-Events
+    haben keine start_iso → der except-Zweig griff immer). Mit echter Spanne
+    greift sie wieder: <6 h Boden ⇒ kein Layover-Ort."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-26Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH999", "wholeDay": False,
+             "startTime": "2026-07-26T18:00:00Z", "startLocation": "FRA",
+             "endTime": "2026-07-26T21:15:00Z", "endLocation": "TLV"},
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False, "startTime": None,
+             "startLocation": "TLV", "endTime": None, "endLocation": None},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH998", "wholeDay": False,
+             "startTime": "2026-07-26T23:10:00Z", "startLocation": "TLV",
+             "endTime": "2026-07-27T02:30:00Z", "endLocation": "FRA"}]},
+    ]}
+    b = _briefings(payload)
+    for d in b:
+        assert b[d].get('ical_layover_ort') != 'TLV', (d, b[d])
+
+
+# ── BUG 4 · B4 = Bürodienst ─────────────────────────────────────────────────
+DUTY_OFFICE_B4 = {
+    "rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            {"eventType": "GROUNDEVENT", "eventCategory": "GROUNDDUTY",
+             "eventDetails": "B4", "wholeDay": False,
+             "startTime": "2026-07-25T06:30:00Z", "startLocation": "MUC",
+             "endTime": "2026-07-25T15:00:00Z", "endLocation": "MUC"}]},
+        {"day": "2026-07-26Z", "events": [
+            {"eventType": "GROUNDEVENT", "eventCategory": "GROUNDDUTY",
+             "eventDetails": "EMCRM", "wholeDay": False,
+             "startTime": "2026-07-26T06:30:00Z", "startLocation": "MUC",
+             "endTime": "2026-07-26T15:00:00Z", "endLocation": "MUC"}]},
+    ]
+}
+
+
+def test_groundduty_office_code_gets_mytime_prose():
+    """FlightOps schickt den nackten Hauscode; myTime schreibt für DENSELBEN
+    Tag „Office Day (B4)". Wir minten die myTime-Prosa — dadurch greift die
+    bestehende Dienst-Erkennung ohne Sonderweg. Andere GROUNDDUTY-Details
+    (Training) bleiben unverändert roh."""
+    ics = fo.duty_events_to_ics(DUTY_OFFICE_B4)
+    assert 'SUMMARY:Office Day (B4)' in ics
+    assert 'SUMMARY:EMCRM' in ics
+    b = _briefings(DUTY_OFFICE_B4)
+    assert b['2026-07-25'].get('ical_summary') == 'Office Day (B4)'
+    # Zeiten des Bürodienstes bleiben erhalten (Dienst-Fenster 06:30–15:00Z).
+    assert (b['2026-07-25'].get('ical_start_iso') or '').startswith('2026-07-25T06:30')
+    assert (b['2026-07-25'].get('ical_end_iso') or '').startswith('2026-07-25T15:00')
+
+
+def test_office_codes_are_the_agreed_marker_contract():
+    """MARKER-VERTRAG mit iOS (Models/RosterEventClassifier.swift),
+    Owner-Entscheid 26.07.2026: Buerodienst = Token `B` + GENAU EINE Ziffer
+    2-9. Divergiert das, klassifizieren App und Backend denselben Tag
+    verschieden — genau die Bug-Klasse, die hier gefixt wird."""
+    for n in range(2, 10):
+        assert fo.is_office_day_code('B%d' % n)
+    # AUSNAHMEN aus dem CRS-Handbuch: nacktes B = Betriebsunfall (Abwesenheit),
+    # B1 = Teilzeit-Vertragsart (kein Tagessymbol).
+    assert not fo.is_office_day_code('B')
+    assert not fo.is_office_day_code('B1')
+    assert not fo.is_office_day_code('B0')
+    # Token-Grenzen: kein Praefix-Match.
+    for bad in ('B45', 'B455', 'B4A', 'AB4', 'B 4', ''):
+        assert not fo.is_office_day_code(bad), bad
+
+
+def test_office_codes_count_as_ground_duty_evidence():
+    import app as backend
+    for n in range(2, 10):
+        code = 'B%d' % n
+        assert backend._summary_has_ground_duty(code), code
+        assert backend._summary_has_ground_duty('OFFICE DAY (%s)' % code)
+    # Praefix darf NICHT zuenden.
+    assert not backend._summary_has_ground_duty('B455')
+    assert not backend._summary_has_ground_duty('B45')
+    # CRS-Ausnahmen: nacktes B (Betriebsunfall) und B1 (Vertragsart).
+    assert not backend._summary_has_ground_duty('B')
+    assert not backend._summary_has_ground_duty('B1')
+    assert not backend._summary_has_ground_duty('ABSENCE (B)')
+    # echte freie Tage bleiben frei
+    assert not backend._summary_has_ground_duty('OFF DAY')
+    assert not backend._summary_has_ground_duty('OFF DAY (OF)')
+    assert not backend._summary_has_ground_duty('OFF DAY (ORTSTAG)')
+
+
+def test_merged_off_plus_office_day_is_not_free():
+    """DER eigentliche Bug: myTime legt am selben Tag zwei VEVENTs an, der
+    Import merged sie zu „Off Day (OF) - B4" — das Off-Segment stempelte den
+    Tag frei, obwohl daneben ein Buerodienst steht. Muss in BEIDEN Backend-
+    Pfaden greifen (Kalender-klass UND Crew-/Family-Marker)."""
+    import app as backend
+    up = 'OFF DAY (OF) · B4'
+    assert backend._summary_has_ground_duty(up)
+    assert backend._summary_has_ground_duty('OFF DAY (OF) · B7')
+    klass = ('OFF' if ('OFF DAY' in up
+                       and not backend._summary_has_ground_duty(up)) else None)
+    assert klass is None
+    assert duty_from_roster_day(None, 'Off Day (OF) · B4') != 'free'
+    assert duty_from_roster_day(None, 'Off Day (B4)') != 'free'
+    # Der reine freie Tag bleibt frei — sonst waere der Guard zu breit.
+    assert duty_from_roster_day(None, 'Off Day (OF)') == 'free'
+    assert duty_from_roster_day(None, 'Off Day (FREE) · Off Day (==)') == 'free'
+
+
+def test_office_day_klass_is_not_off():
+    import app as backend
+    up = 'OFFICE DAY (B4)'
+    klass = ('OFF' if ('OFF DAY' in up
+                       and not backend._summary_has_ground_duty(up)) else None)
+    assert klass is None
+    assert duty_from_roster_day(None, 'Office Day (B4)') != 'free'
+
+
+def test_groundduty_prose_only_for_an_exact_code():
+    """„MED B4 MUC" ist kein Buerotag — der Code darf das Event nicht
+    umetikettieren (er bleibt aber Boden-Dienst-Beweis)."""
+    import app as backend
+    payload = {"rosterDays": [{"day": "2026-07-26Z", "events": [
+        {"eventType": "GROUNDEVENT", "eventCategory": "GROUNDDUTY",
+         "eventDetails": "MED B4 MUC", "wholeDay": False,
+         "startTime": "2026-07-26T06:30:00Z", "startLocation": "MUC",
+         "endTime": "2026-07-26T15:00:00Z", "endLocation": "MUC"}]}]}
+    ics = fo.duty_events_to_ics(payload)
+    assert 'SUMMARY:MED B4 MUC' in ics
+    assert 'Office Day' not in ics
+    assert backend._summary_has_ground_duty('MED B4 MUC')

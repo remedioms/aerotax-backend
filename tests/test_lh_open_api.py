@@ -105,7 +105,7 @@ def test_leg_to_facts_departed_with_delay():
 
 def test_flight_facts_picks_matching_leg(monkeypatch):
     monkeypatch.setattr(lh, "_KEY", "k"); monkeypatch.setattr(lh, "_SECRET", "s")
-    monkeypatch.setattr(lh, "_get", lambda path: FS_4Y136)
+    monkeypatch.setattr(lh, "_get", lambda path, caller=None: FS_4Y136)
     # dep/arr wählt das RICHTIGE Leg (FRA-MBA, nicht MBA-JRO)
     f = lh.lh_flight_facts("4Y136", "2026-07-21", "FRA", "MBA")
     assert f["dep_iata"] == "FRA" and f["arr_iata"] == "MBA"
@@ -122,7 +122,8 @@ def test_flight_facts_noop_for_non_group(monkeypatch):
     monkeypatch.setattr(lh, "_KEY", "k"); monkeypatch.setattr(lh, "_SECRET", "s")
     # kein Netz-Call für Nicht-Group-Flug
     called = {"n": 0}
-    monkeypatch.setattr(lh, "_get", lambda p: called.__setitem__("n", called["n"] + 1) or {})
+    monkeypatch.setattr(lh, "_get",
+                        lambda p, caller=None: called.__setitem__("n", called["n"] + 1) or {})
     assert lh.lh_flight_facts("AB123", "2026-07-21", "X", "Y") == {}
     assert called["n"] == 0
 
@@ -175,8 +176,9 @@ def test_cached_only_never_blocks_and_warms(monkeypatch):
     monkeypatch.setattr(lh, '_KEY', 'k')
     monkeypatch.setattr(lh, '_SECRET', 's')
     warms = []
-    monkeypatch.setattr(lh, '_warm_async', lambda *a: warms.append(a))
-    monkeypatch.setattr(lh, '_get', lambda p: (_ for _ in ()).throw(
+    monkeypatch.setattr(lh, '_warm_async',
+                        lambda *a, **k: warms.append(a))
+    monkeypatch.setattr(lh, '_get', lambda p, caller=None: (_ for _ in ()).throw(
         AssertionError('cached_only darf nie HTTP machen')))
     lh._facts_memo.clear()
     assert lh.lh_flight_facts('LH400', '2026-07-22', cached_only=True) == {}
@@ -187,3 +189,131 @@ def test_cached_only_never_blocks_and_warms(monkeypatch):
     assert lh.lh_flight_facts('LH400', '2026-07-22',
                               cached_only=True) == {'gate': 'C16'}
     assert len(warms) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LH-QUOTA-SICHTBARKEIT (2026-07-26) — der prozess-übergreifende Zähler.
+# `_HOUR_BUDGET`/`_hour_count` zählen PRO PROZESS (3 Backend-Worker + Poll-
+# Worker, kein gemeinsames Volume) — die LH-Quota gilt aber PRO KEY. Deshalb
+# ax_api_budget als gemeinsame Wahrheit, aufgeschlüsselt nach Aufrufer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_budget_inc_buffers_and_flushes_hour_and_caller_key(monkeypatch):
+    import time as _t
+    from blueprints import aerox_data_blueprint as adb
+    seen = []
+    monkeypatch.setattr(adb, '_budget_key_inc',
+                        lambda key, units=1: seen.append((key, units)))
+    lh._budget_buf.clear()
+    lh.budget_inc('lhopen', 'mqtt_event')
+    lh.budget_inc('lhopen', 'mqtt_event')
+    # GEPUFFERT: im Hot-Path wird NICHT geschrieben (kein Supabase-Roundtrip,
+    # kein 120-s-postgrest-Timeout im LH-/MQTT-/Cron-Thread) — erst der
+    # Flusher-Thread schreibt, und dann aggregiert.
+    assert seen == []
+    lh.budget_flush()
+    h = _t.strftime('%Y%m%d%H', _t.gmtime())
+    # STUNDE VOR AUFRUFER — sonst ist die Abfrage kein index-nutzbares Praefix.
+    assert (f'lhopen:{h}', 2) in seen
+    assert (f'lhopen:{h}:mqtt_event', 2) in seen
+    assert lh._budget_buf == {}
+
+
+def test_budget_flush_puts_units_back_when_write_fails(monkeypatch):
+    from blueprints import aerox_data_blueprint as adb
+
+    def _boom(key, units=1):
+        raise RuntimeError('sb down')
+    monkeypatch.setattr(adb, '_budget_key_inc', _boom)
+    lh._budget_buf.clear()
+    lh.budget_inc('lhfo', None)          # darf NICHT werfen
+    assert lh.budget_flush() == 0        # auch der Flush nicht
+    # Nicht geschriebene Einheiten bleiben erhalten (kein Verlust beim ersten
+    # Netzruckler) und werden beim naechsten Versuch erneut geschrieben.
+    assert lh._budget_buf
+    lh._budget_buf.clear()
+
+
+def test_budget_caller_label_is_sanitised(monkeypatch):
+    from blueprints import aerox_data_blueprint as adb
+    seen = []
+    monkeypatch.setattr(adb, '_budget_key_inc',
+                        lambda key, units=1: seen.append(key))
+    lh._budget_buf.clear()
+    lh.budget_inc('lhfo', 'COMMON_DUTY:EVENTS/../x')
+    lh.budget_flush()
+    # Kein ':' im Label — sonst zerfaellt das Key-Parsing in lh_quota_snapshot.
+    labels = [k for k in seen if k.count(':') == 2]
+    assert labels and all(':' not in k.split(':')[2] for k in labels)
+    lh._budget_buf.clear()
+
+
+def test_denied_calls_are_counted_too(monkeypatch):
+    """Der eigene Prozess-Throttle deckelt bei _HOUR_BUDGET — ein reiner
+    „gesendet"-Zaehler koennte darum NIE ueber 220xProzesse steigen und waere
+    fuer die Frage „warum ueberm Limit?" blind. Abgewiesene mitzaehlen."""
+    calls = []
+    monkeypatch.setattr(lh, '_token', lambda: 'tok')
+    monkeypatch.setattr(lh, '_budget_ok', lambda: False)
+    monkeypatch.setattr(lh, 'budget_inc',
+                        lambda prefix, caller=None, units=1:
+                        calls.append((prefix, caller)))
+    assert lh._get('/x', caller='unit') is None
+    assert calls and calls[0][0] == 'lhopen_denied'
+
+
+def test_budget_writes_are_blocked_inside_pytest():
+    # Schutz gegen „lokaler Testlauf verfaelscht die Prod-Zaehler".
+    assert lh._budget_writes_allowed() is False
+
+
+def test_get_books_a_call_in_the_shared_counter(monkeypatch):
+    """Jeder LH-Call, der einen Slot bekommt, muss gezählt werden — auch wenn
+    LH danach 404/403 liefert (der Call ist verbraucht)."""
+    calls = []
+    monkeypatch.setattr(lh, '_token', lambda: 'tok')
+    monkeypatch.setattr(lh, '_budget_ok', lambda: True)
+    monkeypatch.setattr(lh, 'budget_inc',
+                        lambda prefix, caller=None, units=1:
+                        calls.append((prefix, caller)))
+
+    def _boom(*a, **k):
+        raise OSError('net')
+    monkeypatch.setattr(lh.urllib.request, 'urlopen', _boom)
+    assert lh._get('/x', caller='unit') is None
+    assert calls == [('lhopen', 'unit')]
+
+
+def test_get_books_blocked_calls_as_denied_not_as_sent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(lh, '_token', lambda: 'tok')
+    monkeypatch.setattr(lh, '_budget_ok', lambda: False)
+    monkeypatch.setattr(lh, 'budget_inc',
+                        lambda prefix, caller=None, units=1:
+                        calls.append((prefix, caller)))
+    assert lh._get('/x', caller='unit') is None
+    # Nicht als gesendet buchen (der Call ging nie raus) — aber als ABGEWIESEN,
+    # sonst ist der Bedarf unsichtbar.
+    assert [c for c in calls if c[0] == 'lhopen'] == []
+    assert calls == [('lhopen_denied', 'hour_budget')]
+
+
+def test_facts_memo_alias_defragments_cache(monkeypatch):
+    """MQTT ruft ohne dep/arr, die Roster-Pfade IMMER mit — derselbe Flug belegte
+    zwei Memo-Einträge und der teure Push-Call wärmte den falschen Key."""
+    lh._facts_memo.clear()
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_get', lambda path, caller=None: {'x': 1})
+    monkeypatch.setattr(lh, '_leg_to_facts',
+                        lambda leg: {'reg': 'D-AIKP', 'dep_iata': 'FRA',
+                                     'arr_iata': 'JFK'})
+    monkeypatch.setattr(lh, '_budget_ok', lambda: True)
+
+    def _fake_legs(path, caller=None):
+        return {'FlightStatusResource': {'Flights': {'Flight': [{'Departure': {}, 'Arrival': {}}]}}}
+    monkeypatch.setattr(lh, '_get', _fake_legs)
+    out = lh.lh_flight_facts('LH400', '2026-07-26', force=True, caller='mqtt')
+    assert out.get('reg') == 'D-AIKP'
+    assert ('LH400', '2026-07-26', None, None) in lh._facts_memo
+    assert ('LH400', '2026-07-26', 'FRA', 'JFK') in lh._facts_memo
+    lh._facts_memo.clear()

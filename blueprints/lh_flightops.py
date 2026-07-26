@@ -37,6 +37,44 @@ from flask import Blueprint, jsonify, request, redirect
 log = logging.getLogger('aerotax')
 lh_flightops_bp = Blueprint('lh_flightops_bp', __name__)
 
+# ── LH-Bürodienst-Hauscodes (Owner 2026-07-26: „B4 = Office") ───────────────
+# Im CRS-Handbuch stehen diese Codes NICHT (dort ist Bürodienst DS_F/DS_M/DS_S)
+# — sie sind hausintern.
+#
+# MARKER-VERTRAG mit iOS (`Models/RosterEventClassifier.swift`) — beide Seiten
+# MÜSSEN identisch klassifizieren. Owner-Entscheid 26.07.2026 (LH-Kabinencrew):
+#   · Bürodienst = Token `B` + GENAU EINE Ziffer 2–9, also B2…B9,
+#   · als EIGENSTÄNDIGES Token nach Split des „·"-Segments an Nicht-Alpha-
+#     numerik — `B45` und `B455` zünden NICHT, kein Präfix-Match,
+#   · ein Segment mit einem solchen Token ist BODEN-DIENST-BEWEIS → der Tag ist
+#     NIE frei,
+#   · Klassifikation = Office: Dienst ohne Sektoren, erhöht keinen Freitage-
+#     Zähler und erzeugt keine Blockstunden.
+#
+# ZWEI AUSNAHMEN, aus dem CRS-Handbuch belegt — dürfen NICHT eingesammelt
+# werden (deshalb `[2-9]`, nicht `\d`):
+#   · nacktes `B`  = Betriebsunfall → Abwesenheit (2,9 LSW/Tag, reduziert den
+#     Freitage-Anspruch). Kein Bürodienst.
+#   · `B1`         = Teilzeit-VERTRAGSART („Mini Flex", 26,29 %), ausdrücklich
+#     kein Tagessymbol. Taucht es doch als Tages-Token auf → loggen (s.u.).
+LH_OFFICE_DAY_CODE_RE = re.compile(r'^B[2-9]$')
+
+# Ein Segment in seine alphanumerischen Tokens zerlegen. IDENTISCH in
+# app.py:_summary_has_ground_duty — divergierende Trenner hiessen divergierende
+# Klassifikation.
+_TOKEN_SPLIT = r'[^A-Z0-9ÄÖÜ]+'
+
+
+def is_office_day_code(token):
+    """True für die Bürodienst-Hauscodes B2…B9 (ganzes Token, GROSS)."""
+    return bool(LH_OFFICE_DAY_CODE_RE.match((token or '').strip().upper()))
+
+
+def segment_has_office_code(segment_upper):
+    """True wenn ein '·'-Segment ein eigenständiges B2…B9-Token trägt."""
+    return any(is_office_day_code(t)
+               for t in re.split(_TOKEN_SPLIT, segment_upper or ''))
+
 # DREI UMGEBUNGEN (Owner-Doku 2026-07-22) — alles env-gesteuert, also nur ein
 # Config-Flip, KEIN Umbau:
 #   1) MOCK (Default): statische Testdaten. base .../crew_services/mock,
@@ -201,6 +239,10 @@ def _refresh(refresh_token):
     explizit NICHT nötig — nur Basic-Header + diese zwei Body-Params."""
     body = urllib.parse.urlencode({
         'grant_type': 'refresh_token', 'refresh_token': refresh_token}).encode()
+    # MIT ZÄHLEN (2026-07-26): der Refresh ist ein echter HTTP-Call gegen LH
+    # und lief im `refresh-all`-Cron bis zu 1× pro User und Lauf — er war im
+    # Zähler unsichtbar und hätte das FlightOps-Volumen fast verdoppelt.
+    _flightops_budget_inc('/oauth_refresh')
     return _token_request(body)
 
 
@@ -437,10 +479,25 @@ def flightops_connected(user_token):
 
 
 # ── Mock-API-Call ────────────────────────────────────────────────────────────
+def _flightops_budget_inc(path):
+    """LH-FlightOps-Call im PROZESS-ÜBERGREIFENDEN Stundenzähler buchen.
+    (Sichtbarkeit statt Schätzen — Owner 2026-07-26: „erst messen".) Der
+    FlightOps-Key ist ein EIGENER LH-Key, darum eigener Schlüssel-Präfix
+    `lhfo:`; zweiter Schlüssel je Service für die Verbraucher-Aufschlüsselung.
+    Wirft nie und darf den API-Pfad niemals blockieren."""
+    try:
+        from blueprints.lh_open_api import budget_inc
+        svc = re.sub(r'[^A-Za-z_]', '', (path or '').lstrip('/'))[:40] or 'unknown'
+        budget_inc('lhfo', svc)
+    except Exception:
+        pass
+
+
 def _api_get(user_token, path, params=None):
     access = _valid_access(user_token)
     if not access:
         return None
+    _flightops_budget_inc(path)
     url = _BASE + path
     if params:
         url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
@@ -664,7 +721,21 @@ def check_in_times(user_token, flight, date, dep, arr,
     Report). Doku-bestätigte Parameter (Owner 2026-07-22): flightDesignator,
     flightDate, departureAirport, arrivalAirport, dutyType (OD/DH),
     crewCategory (COC=Cockpit / CAB=Cabin). Das war die 409-Ursache (vorher
-    fälschlich Datumsfenster)."""
+    fälschlich Datumsfenster).
+
+    NICHT die Hotel-Pickup-Zeit (live gemessen 2026-07-26, Owner-Frage
+    „Pickup-Zeiten verschwunden seit FlightOps-Login"): `crewBusDeparture` ist
+    der APRON-Bus vom Briefing zum Flieger, NICHT der Hotelbus. Belege aus zwei
+    echten Responses —
+      MUC (Homebase)  briefingBegin 08:30Z → security 08:57Z →
+                      crewBusDeparture 09:02Z → boarding 09:40Z → STD 10:20Z
+      BOM (Layover)   briefingBegin 18:35Z → security 19:05Z →
+                      crewBusDeparture 19:12Z → paxOnBoard 19:37Z → STD 20:15Z
+    Der Hotel-Pickup liegt real ~2:10–2:30 h VOR Abflug (myTime-Bestand:
+    'Layover [PEK] … 10:55 LT Pickup PEK', 'Layover [EWR] … 18:40 LT Pickup
+    EWR'), also klar VOR briefingBegin. Kein Feld dieser Response trägt ihn.
+    → Aus FlightOps ist die Pickup-Zeit NICHT ableitbar; es wird deshalb auch
+    KEIN Pickup-VEVENT synthetisiert (Grundregel: nie raten)."""
     params = {
         'flightDesignator': (flight or '').upper().replace(' ', ''),
         'flightDate': _date_z(date), 'departureAirport': (dep or '').upper(),
@@ -715,6 +786,159 @@ def duty_events_to_ics(resp):
     lines = ['BEGIN:VCALENDAR', 'VERSION:2.0',
              'PRODID:-//AeroX LH FlightOps//DE']
     n = 0
+
+    # ── Flug-Zeitachse → ECHTE Layover-Spanne (Tibor „Tag 2/2 in Athen",
+    # 2026-07-26) ────────────────────────────────────────────────────────────
+    # FlightOps liefert Hotel-Events OHNE Zeiten und EINES PRO NACHT. Der alte
+    # Weg (Datums-Event Tag..Tag+2 je Hotel-Event) hatte drei bewiesene Fehler:
+    #   1. N war IMMER 2 — ein 3-Nächte-Layover las live „(Tag 2/2) · (Tag 1/2)"
+    #      am selben Tag (KIX 25.–29.07., Prod-Payload) statt „Tag 2/5".
+    #   2. Der erfundene Tag+1 nach der letzten Hotel-Nacht trug „(Tag 2/2)",
+    #      auch wenn die Crew längst weg war.
+    #   3. Ein Datums-Event hat KEINE start_iso/end_iso → in
+    #      _ics_events_to_briefings (app.py) warf `datetime.fromisoformat('')`
+    #      immer → die 6-h-Mindestbodenzeit-Regel (Turnaround ≠ Layover) lief
+    #      für FlightOps NIE, und `ical_layover_ort` landete nur auf Tag 1.
+    # Die echte Spanne IST ableitbar — aber NUR mit drei Sicherungen, die ein
+    # adversarialer Review am 26.07. erzwungen hat (jede davon hat eine naive
+    # Fassung an echten Roster-Formen zerlegt):
+    #   (a) ANKUNFT ZUERST, dann Abflug. Verankert man den Abflug am Hotel-Tag
+    #       („erster Abflug ab Station ab 00:00Z"), gewinnt bei FRA-MUC-FRA
+    #       (morgens) + FRA-MUC (abends) + Hotel MUC der MORGEN-Rückflug → eine
+    #       1-h-„Layover"-Spanne, die die 6-h-Regel verwirft: die echte Nacht
+    #       verschwindet komplett.
+    #   (b) Der Abflug muss das ERSTE Leg NACH der Ankunft sein UND ab dieser
+    #       Station starten. Sonst läuft die Suche über Wochen weiter, wenn die
+    #       Crew anders heimkommt (Bahn/Bus/Leg ohne endTime) — gesehen: ein
+    #       21-Tage-„Layover", der 18 freie Tage als Layover stempelte.
+    #   (c) Mehrere Hotel-Nächte werden als LAUF zusammengefasst und ergeben EIN
+    #       Event; die Spanne wird gegen die Lauflänge plausibilisiert
+    #       (max. Nächte+2 Kalendertage).
+    # Ist die Spanne nicht bestimmbar, fällt der ganze Lauf auf EIN Datums-Event
+    # erster Tag…letzter Tag+2 zurück — also das alte Verhalten, aber pro LAUF
+    # statt pro Nacht (das Stapeln „(Tag 2/2) · (Tag 1/2)" ist damit auch dort
+    # weg) und mit erhaltenem Layover-Morgen-Marker (Tim/KRK 25.07.).
+    _ISO_Z = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+    _legs = []
+    _hotel_seq = []          # (day8, station) in Roster-Reihenfolge
+    for _d0 in days:
+        if not isinstance(_d0, dict):
+            continue
+        _day0 = (_d0.get('day') or '')[:10].replace('-', '')
+        for _e0 in _as_list(_d0.get('events')):
+            if not isinstance(_e0, dict):
+                continue
+            _c0 = re.sub(r'[_\s]', '', (_e0.get('eventCategory') or '').lower())
+            _t0 = re.sub(r'[_\s]', '', (_e0.get('eventType') or '').lower())
+            _f0 = (_e0.get('startLocation') or '').upper().strip()
+            _o0 = (_e0.get('endLocation') or '').upper().strip()
+            if _t0 == 'hotel' or _c0 == 'hotel':
+                _st0 = (_o0 or _f0)
+                if len(_day0) == 8 and len(_st0) == 3:
+                    _hotel_seq.append((_day0, _st0))
+                continue
+            if not (_t0 == 'flight' or _c0 in _FLIGHT_CATS):
+                continue
+            _s0 = (_e0.get('startTime') or '').strip()
+            _x0 = (_e0.get('endTime') or '').strip()
+            # STRIKTE Form: nur 'YYYY-MM-DDTHH:MM:SSZ'. Nur dann ist der
+            # lexikografische Vergleich unten beweisbar korrekt; alles andere
+            # (Offset statt Z, Millisekunden) würde falsch sortieren, also
+            # lieber sauber degradieren als still falsch rechnen.
+            if not (_ISO_Z.match(_s0) and len(_f0) == 3):
+                continue
+            # endTime/endLocation sind für die ABFLUG-Seite nicht nötig — ein
+            # Leg ohne endTime darf den Lauf trotzdem beenden.
+            if not (_ISO_Z.match(_x0) and len(_o0) == 3):
+                _x0, _o0 = '', ''
+            _legs.append((_s0, _x0, _f0, _o0))
+    _legs.sort(key=lambda x: x[0])
+
+    def _shift(day8, delta):
+        from datetime import datetime as _d, timedelta as _td
+        try:
+            return (_d.strptime(day8, '%Y%m%d') + _td(days=delta)).strftime('%Y%m%d')
+        except Exception:
+            return day8
+
+    def _iso_day(day8, suffix='T00:00:00Z'):
+        return f'{day8[:4]}-{day8[4:6]}-{day8[6:]}{suffix}'
+
+    # Läufe aufeinanderfolgender Hotel-Nächte derselben Station bilden.
+    _runs = {}               # (day8, station) → (first_day8, last_day8)
+    _seen_hd = set()
+    _ordered = [hd for hd in _hotel_seq
+                if not (hd in _seen_hd or _seen_hd.add(hd))]
+    _i = 0
+    while _i < len(_ordered):
+        _d1, _stn = _ordered[_i]
+        _j = _i
+        while (_j + 1 < len(_ordered) and _ordered[_j + 1][1] == _stn
+               and _ordered[_j + 1][0] == _shift(_ordered[_j][0], 1)):
+            _j += 1
+        for _k in range(_i, _j + 1):
+            _runs[_ordered[_k]] = (_d1, _ordered[_j][0])
+        _i = _j + 1
+
+    def _night_span(station, day8):
+        """Spanne EINER Hotel-Nacht: (ankunft_iso, abflug_iso) oder (None, None)."""
+        # (a) ANKUNFT ZUERST: das späteste Leg, das an der Station landet und
+        # noch an diesem Hotel-Tag endet (Rückblick 3 Tage für Langstrecke /
+        # rosterDay-Drift). Verankert man stattdessen den ABFLUG am Tag, gewinnt
+        # bei FRA-MUC-FRA (morgens) + FRA-MUC (abends) + Hotel MUC der Morgen-
+        # Rückflug → 1-h-„Layover", und die echte Nacht verschwindet.
+        lo = _iso_day(_shift(day8, -3))
+        hi = _iso_day(_shift(day8, 1))
+        arr_iso = None
+        for _s, _x, _f, _o in _legs:
+            if _o == station and _x and lo <= _x < hi:
+                arr_iso = _x                     # sortiert → am Ende der späteste
+        if not arr_iso:
+            return None, None
+        # (b) ABFLUG: das ERSTE Leg NACH der Ankunft — und es MUSS an dieser
+        # Station starten. Startet es woanders, ist die Crew längst anders
+        # heimgekommen (Bahn/Bus/Leg ohne Zeiten); dann lieber nichts ableiten
+        # als über Wochen weiterzusuchen (gesehen: 21-Tage-Phantom-Layover).
+        for _s, _x, _f, _o in _legs:
+            if _s > arr_iso:
+                return (arr_iso, _s) if _f == station else (None, None)
+        return None, None
+
+    def _run_span(station, first_day, last_day):
+        """Spanne des GANZEN Hotel-Laufs = früheste Ankunft … spätester Abflug
+        seiner Nächte. Ein Turnaround AUS dem Layover-Ort heraus (JFK-YYZ-JFK
+        mitten im Aufenthalt) zerlegt den Aufenthalt sonst in zwei Hälften und
+        die erste Nacht ginge verloren."""
+        arrs, deps = [], []
+        d8 = first_day
+        for _ in range(64):
+            a, b = _night_span(station, d8)
+            if a and b:
+                arrs.append(a)
+                deps.append(b)
+            if d8 == last_day:
+                break
+            d8 = _shift(d8, 1)
+        if not arrs:
+            return None, None
+        arr_iso, dep_iso = min(arrs), max(deps)
+        if dep_iso <= arr_iso:
+            return None, None
+        # (c) Plausibilität gegen die Lauflänge — harte Obergrenze gegen jede
+        # noch unbekannte Roster-Form: Nächte + 3 Kalendertage.
+        try:
+            from datetime import datetime as _d
+            nights = ((_d.strptime(last_day, '%Y%m%d')
+                       - _d.strptime(first_day, '%Y%m%d')).days + 1)
+            span = (_d.strptime(dep_iso[:10], '%Y-%m-%d')
+                    - _d.strptime(arr_iso[:10], '%Y-%m-%d')).days + 1
+            if span > nights + 3:
+                return None, None
+        except Exception:
+            return None, None
+        return arr_iso, dep_iso
+
+    _hotel_emitted = set()
 
     def _dt(v):
         # 'YYYY-MM-DDTHH:MM:SSZ' → 'YYYYMMDDTHHMMSSZ'
@@ -820,6 +1044,32 @@ def duty_events_to_ics(resp):
                     loc_line = f'LOCATION:{_hiata}'
             elif cat in ('sim',):
                 summary = 'Simulator'
+            elif cat == 'groundduty':
+                # BÜRODIENST (Owner 2026-07-26 „B4 löst einen freien Tag aus"):
+                # FlightOps schickt Office-Tage als eventCategory=GROUNDDUTY mit
+                # dem NACKTEN Hauscode in eventDetails ('B4', live verifiziert:
+                # GROUNDDUTY/B4/06:30–15:00Z MUC). Der fiel bisher in den Roh-
+                # Zweig und reiste als „B4" mit — ohne jede Dienst-Evidenz.
+                # myTime schreibt für DENSELBEN Tag „Office Day (B4)"; genau
+                # diese Prosa minten wir jetzt (myTime-Paritaet), damit die
+                # bestehende Klassifikation (_summary_has_ground_duty → 'OFFICE',
+                # iOS RosterEventClassifier → .office) ohne Sonderweg greift.
+                # Nur wenn das Detail EXAKT einer der Codes ist — ein „MED B4
+                # MUC" darf nicht als Bürotag umetikettiert werden (der Code
+                # bleibt im Roh-Summary und wird trotzdem als Boden-Dienst
+                # erkannt). Andere GROUNDDUTY-Details (EMCRM, TK, MED, D4,
+                # WBT_GR …) reisen unverändert roh weiter — kein Bürodienst.
+                if det.strip().upper() == 'B1':
+                    # CRS-Handbuch: B1 ist eine Teilzeit-Vertragsart, KEIN
+                    # Tagessymbol. Wenn LH es doch als Tages-Code schickt, will
+                    # der Owner das wissen (Entscheid 26.07.) — nur loggen,
+                    # nicht klassifizieren.
+                    log.info('[lh_flightops] GROUNDDUTY-Detail "B1" gesehen — '
+                             'laut CRS eine Vertragsart, nicht als Office '
+                             'klassifiziert')
+                summary = (f'Office Day ({det})'
+                           if is_office_day_code(det)
+                           else (det or cat.upper() or 'Duty'))
             elif cat in ('abs', 'lic', 'duty') or etype in ('briefing', 'groundevent'):
                 summary = det or cat.upper() or 'Duty'
             else:
@@ -829,7 +1079,35 @@ def duty_events_to_ics(resp):
                 loc_line = f'LOCATION:{frm}'
             day = (d.get('day') or '')[:10].replace('-', '')
             is_hotel = (etype == 'hotel' or cat == 'hotel')
-            if ev.get('wholeDay') and day:
+            _run = _runs.get((day, (to or frm))) if is_hotel else None
+            if _run:
+                # EIN Event pro Hotel-LAUF (nicht pro Nacht) — sonst stapeln
+                # sich „(Tag 2/2) · (Tag 1/2)"-Segmente auf einem Tag.
+                _first, _last = _run
+                if ((to or frm), _first, _last) in _hotel_emitted:
+                    continue
+                _hotel_emitted.add(((to or frm), _first, _last))
+                _h_arr, _h_dep = _run_span((to or frm), _first, _last)
+                if _h_arr and _h_dep:
+                    # Echte Spanne Ankunft…Weiterflug → zeitbehaftetes VEVENT
+                    # (wie im myTime-Feed). Erst damit greift die 6-h-Regel und
+                    # „(Tag i/N)" zählt die echten Nächte.
+                    lines += ['BEGIN:VEVENT', f'UID:{uid}',
+                              f'DTSTART:{_dt(_h_arr)}', f'DTEND:{_dt(_h_dep)}',
+                              f'SUMMARY:{summary}'] \
+                        + ([loc_line] if loc_line else []) + ['END:VEVENT']
+                else:
+                    # Nicht ableitbar (Layover am Fensterrand, Heimreise ohne
+                    # Flug-Leg, Stations-Code passt zu keinem Leg): altes
+                    # Datums-Verhalten für den GANZEN Lauf — erster Tag bis
+                    # letzter Tag+2 (DTEND exklusiv), damit der Layover-Morgen
+                    # seinen Marker behält.
+                    lines += ['BEGIN:VEVENT', f'UID:{uid}',
+                              f'DTSTART;VALUE=DATE:{_first}',
+                              f'DTEND;VALUE=DATE:{_shift(_last, 2)}',
+                              f'SUMMARY:{summary}'] \
+                        + ([loc_line] if loc_line else []) + ['END:VEVENT']
+            elif ev.get('wholeDay') and day:
                 nd = _next_day(day)
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART;VALUE=DATE:{day}', f'DTEND;VALUE=DATE:{nd}',
@@ -844,13 +1122,9 @@ def duty_events_to_ics(resp):
                           f'SUMMARY:{summary}'] \
                     + ([loc_line] if loc_line else []) + ['END:VEVENT']
             elif day:
-                # Hotel-Events (Nacht am Layover-Ort) spannen wie im myTime-Feed
-                # über die Nacht in den Folgetag — so bekommt der Folge-Morgen
-                # sein 'Layover [XXX] (Tag 2/2)'-Segment und der Import kann den
-                # Nightstop dem richtigen Tag zuordnen. FlightOps liefert für
-                # Hotel-Events keine Zeiten (startTime/endTime null, wholeDay
-                # false) → Datums-Event Tag..Tag+2 (DTEND exklusiv).
-                nd = _next_day(_next_day(day)) if is_hotel else _next_day(day)
+                # Zeitloses Nicht-Hotel-Event → EIN Datums-Tag. (Hotels laufen
+                # oben über den Lauf-Zweig und kommen hier nie an.)
+                nd = _next_day(day)
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART;VALUE=DATE:{day}', f'DTEND;VALUE=DATE:{nd}',
                           f'SUMMARY:{summary}'] \

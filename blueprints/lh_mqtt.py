@@ -288,7 +288,8 @@ def _cached_leg_reg(flight_disp, date, dep, arr):
         hit = _reg_memo.get(key)
         if hit and now < hit[0]:
             return hit[1]
-    reg = (lh_flight_facts(flight_disp, date, dep, arr) or {}).get('reg')
+    reg = (lh_flight_facts(flight_disp, date, dep, arr,
+                           caller='mqtt_leg_reg') or {}).get('reg')
     with _reg_lock:
         _reg_memo[key] = (now + (_REG_TTL_S if reg else _REG_NEG_TTL_S), reg)
         if len(_reg_memo) > 3000:
@@ -551,7 +552,8 @@ def _push_inbound(kind, event_flight, topic_date, facts=None):
     Zubringer-Start, ab 15 min). Guard gegen die Früh-Rotation derselben
     Maschine: der Event-Flug muss der BESTE (letzte) Board-Inbound vor dem
     Leg sein; ohne Board-Daten (Outstation) zählt der Maschinen-Match."""
-    facts = facts or lh_flight_facts(event_flight, topic_date, force=True) or {}
+    facts = facts or lh_flight_facts(event_flight, topic_date, force=True,
+                                     caller='mqtt_inbound') or {}
     if kind == 'est_dep':
         d = facts.get('dep_delay_min')
         if not isinstance(d, int) or d < 15 or not facts.get('est_dep'):
@@ -700,7 +702,7 @@ def lh_mqtt_event():
         facts = lh_flight_facts(flight_disp, topic_date,
                                 (s0.get('from') or '').strip().upper() or None,
                                 (s0.get('to') or '').strip().upper() or None,
-                                force=True) or {}
+                                force=True, caller='mqtt_event') or {}
         for tok, sector in affected:
             built = _build_push(kind, flight_disp, topic_date, facts, sector)
             if not built:

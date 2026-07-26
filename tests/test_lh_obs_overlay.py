@@ -114,7 +114,7 @@ def test_gate_skips_far_and_historic_dates(monkeypatch):
 
 def test_fill_uses_cached_only(monkeypatch):
     seen = {}
-    def fake(fn, d, dep, arr, force=False, cached_only=False):
+    def fake(fn, d, dep, arr, force=False, cached_only=False, caller=None):
         seen['cached_only'] = cached_only
         return dict(LH)
     monkeypatch.setattr(lh_open_api, 'lh_flight_facts', fake)

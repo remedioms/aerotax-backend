@@ -13119,10 +13119,24 @@ def _summary_has_ground_duty(summary_upper):
              'MEDICAL', 'SEMINAR', 'COURSE', 'CHECK', 'PICKUP', 'PICK UP',
              'STANDBY', 'STBY', 'RISERVA', 'OFFICE', 'BÜRO', 'BUERO', 'GROUND')
     _duty_codes = {'EM', 'SIM', 'OPC', 'LPC', 'CBT', 'TRG', 'GST', 'SEP'}
+    # LH-Bürodienst-Hauscodes B2…B9 (Owner 2026-07-26, Marker-Vertrag mit iOS;
+    # nacktes „B" = Betriebsunfall und „B1" = Teilzeit-Vertragsart sind
+    # ausgenommen). Sie werden VOR dem _offish-`continue` geprüft, weil genau
+    # die GEMERGTE Form der Bug war: myTime legt am selben Tag ZWEI VEVENTs an
+    # und der Import merged sie zu „Off Day (OF) · B4" — das Off-Segment
+    # stempelte den Tag frei, obwohl daneben ein Bürodienst steht. Ganzes
+    # Token („B45"/„B455" zünden nicht). Quelle: blueprints/lh_flightops.py.
+    try:
+        from blueprints.lh_flightops import segment_has_office_code as _has_office
+    except Exception:
+        def _has_office(_s):
+            return False
     for seg in (summary_upper or '').split('·'):
         s = seg.strip()
         if not s or s in ('OFF', 'FREI', 'OF', 'X', 'FR', 'FREE', 'REC'):
             continue
+        if _has_office(s):
+            return True
         if any(t in s for t in _offish):
             continue
         if any(t in s for t in _duty):
@@ -33351,7 +33365,8 @@ def _lh_fill_obs_merged(rec, fn, date_q, dep, arr):
             return rec
         # cached_only: NIE blockieren — Miss wärmt im Hintergrund, der nächste
         # Read innerhalb der TTL bekommt die Fakten.
-        lh = lh_flight_facts(fn, d, dep, arr, cached_only=True)
+        lh = lh_flight_facts(fn, d, dep, arr, cached_only=True,
+                             caller='obs_overlay')
     except Exception:
         return rec
     out = _lh_apply_obs_fill(rec, lh)
@@ -34968,7 +34983,7 @@ def _leg_tail(flight_no, date=None, dep_iata=None, arr_iata=None):
         from blueprints.lh_open_api import (lh_flight_facts as _lh_facts,
                                             is_lh_group as _lh_is_group)
         if _lh_is_group(op_fn):
-            _lhf = _lh_facts(op_fn, d, frm, to)
+            _lhf = _lh_facts(op_fn, d, frm, to, caller='leg_tail')
             _lhreg = _lhf.get('reg') if isinstance(_lhf, dict) else None
             if _lhreg:
                 return _lhreg

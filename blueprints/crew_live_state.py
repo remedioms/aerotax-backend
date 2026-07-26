@@ -1700,6 +1700,18 @@ def duty_from_roster_day(klass=None, marker=None):
     if klass_up in ('VISUM', 'VISA') or 'VISUM' in marker_up or 'VISA' in marker_up:
         return 'visa'
     if klass_up in ('FREI', 'OFF', 'X', 'REST') or 'OFF DAY' in marker_up:
+        # BÜRODIENST SCHLÄGT FREI (Owner 2026-07-26 „B4 löst einen freien Tag
+        # aus"): myTime legt am selben Tag zwei VEVENTs an, der Import merged
+        # sie zu „Off Day (OF) · B4" — der Off-Teil stempelte den Tag hier als
+        # frei, obwohl daneben ein Bürodienst steht. Gleiche Prüfung wie im
+        # Kalender-Pfad (app.py:_summary_has_ground_duty), damit Crew-Feed,
+        # Family-Watch und Kalender denselben Tag nicht verschieden lesen.
+        try:
+            import app as _app
+            if _app._summary_has_ground_duty(marker_up):
+                return None
+        except Exception:
+            pass
         return 'free'
     return None
 

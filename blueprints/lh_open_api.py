@@ -21,6 +21,7 @@ Code/Log. Rückgabe von `lh_flight_facts` ist byte-shape-kompatibel mit
 `_obs_rows_to_facts` (aerox_data_blueprint), damit der Merge trivial bleibt.
 """
 import os
+import re
 import time
 import json
 import threading
@@ -173,13 +174,111 @@ def _budget_ok():
     return True
 
 
-def _get(path):
+# ── Prozess-übergreifender LH-Zähler (Owner 2026-07-26: „erst messen") ──────
+# WARUM: `_HOUR_BUDGET`/`_hour_count` oben zählen PRO PROZESS — produktiv laufen
+# 3 Backend-Worker (:8080) + 1 Poll-Worker (:8081) + der Pfad des MQTT-Daemons,
+# und ein datei-basierter Zähler ginge nicht (die Container teilen KEIN Volume).
+# Die LH-Quota gilt aber PRO KEY. Gemeinsame Wahrheit = ax_api_budget.
+#
+# SCHLÜSSEL-LAYOUT — Stunde VOR dem Aufrufer:
+#     lhopen:<YYYYMMDDHH>            lhopen:<YYYYMMDDHH>:<caller>
+# Damit ist die Stunden-Abfrage ein PRÄFIX (`lhopen:2026072621%`) und kann den
+# Primärschlüssel-Index nutzen; mit dem Aufrufer vorn wäre nur ein
+# `%:<stunde>`-Suffix-Match möglich → Seq-Scan über eine ewig wachsende Tabelle.
+_budget_buf_lock = threading.Lock()
+_budget_buf = {}
+_BUDGET_FLUSH_S = 30.0
+_budget_thread = None
+
+
+def _budget_writes_allowed():
+    """Kein Zähler-Schreiben aus der Test-Suite — sonst verfälscht ein lokaler
+    pytest-Lauf (mit echten Supabase-Creds in der Env) genau die Zahlen, die
+    dieser Zähler beweisen soll."""
+    return not os.environ.get('PYTEST_CURRENT_TEST')
+
+
+def budget_flush():
+    """Gepufferte Zähler nach Supabase schreiben. Wirft nie.
+
+    NUR aus dem eigenen Flusher-Thread aufrufen (oder aus Tests). Der
+    Supabase-Client hat 120 s postgrest-Timeout und der Retry-Transport kann
+    das auf ein Vielfaches strecken — im Request-/MQTT-/Cron-Thread wäre das
+    ein Aufhänger in einem MESS-Pfad. Fehlgeschlagene Einheiten wandern zurück
+    in den Puffer, gehen also nicht schon beim ersten Netzruckler verloren."""
+    with _budget_buf_lock:
+        if not _budget_buf:
+            return 0
+        pending = dict(_budget_buf)
+        _budget_buf.clear()
+    done = 0
+    try:
+        from blueprints.aerox_data_blueprint import _budget_key_inc
+        for k, u in list(pending.items()):
+            _budget_key_inc(k, u)
+            pending.pop(k, None)
+            done += 1
+    except Exception:
+        pass
+    if pending:                       # Rest zurücklegen statt verwerfen
+        with _budget_buf_lock:
+            for k, u in pending.items():
+                _budget_buf[k] = _budget_buf.get(k, 0) + u
+    return done
+
+
+def _budget_thread_start():
+    """Einen (1) Daemon-Thread pro Prozess, der den Puffer wegschreibt.
+    Bewusst EIN langlebiger Thread: `supabase_threadlocal` hält pro Thread
+    einen eigenen httpx-Client und schließt ihn beim Thread-Ende NICHT — ein
+    Flush aus kurzlebigen `lh-warm`-Threads würde also Sockets lecken."""
+    global _budget_thread
+    if _budget_thread is not None or not _budget_writes_allowed():
+        return
+
+    def _run():
+        while True:
+            time.sleep(_BUDGET_FLUSH_S)
+            try:
+                budget_flush()
+            except Exception:
+                pass
+
+    _budget_thread = threading.Thread(target=_run, daemon=True,
+                                      name='lh-budget-flush')
+    _budget_thread.start()
+
+
+def budget_inc(key_prefix, caller=None, units=1):
+    """Einen LH-Call buchen — reine In-Memory-Addition, KEIN Netz.
+    Der Flusher-Thread schreibt höchstens alle 30 s. Wirft nie."""
+    try:
+        h = time.strftime('%Y%m%d%H', time.gmtime())
+        lbl = re.sub(r'[^a-z0-9_]', '', str(caller or 'unknown').lower())[:32]
+        with _budget_buf_lock:
+            for k in (f'{key_prefix}:{h}', f'{key_prefix}:{h}:{lbl or "unknown"}'):
+                _budget_buf[k] = _budget_buf.get(k, 0) + max(1, int(units))
+        _budget_thread_start()
+    except Exception:
+        pass
+
+
+def _get(path, caller=None):
     """Authentifizierter GET → dict oder None. Wirft nie."""
+    global _rate_penalty_until
     tok = _token()
     if not tok:
         return None
     if not _budget_ok():
+        # ABGEWIESEN mitzählen (sonst ist der Zähler blind für genau die Frage
+        # des Owners): `_budget_ok` deckelt bei _HOUR_BUDGET pro Prozess, ein
+        # reiner Gesendet-Zähler könnte also NIE über 220×Prozesse steigen.
+        # Erst „gewollt = gesendet + abgewiesen" zeigt den echten Bedarf.
+        budget_inc('lhopen_denied',
+                   'rate_penalty' if time.time() < _rate_penalty_until
+                   else 'hour_budget')
         return None
+    budget_inc('lhopen', caller)
     req = urllib.request.Request(
         _BASE + path,
         headers={'Authorization': 'Bearer ' + tok,
@@ -191,7 +290,6 @@ def _get(path):
         if e.code == 403:
             # „Developer Over Rate": kurzer Voll-Stopp statt 403-Salve —
             # jeder weitere Call verbrennt nur Budget gegen dieselbe Wand.
-            global _rate_penalty_until
             _rate_penalty_until = time.time() + _RATE_PENALTY_SEC
         if e.code not in (404,):     # 404 = Flug an dem Tag nicht geflogen (normal)
             log.warning('[lh_open] GET %s -> HTTP %s', path.split('?')[0], e.code)
@@ -331,7 +429,7 @@ _warm_inflight = set()
 _WARM_MAX_INFLIGHT = 8
 
 
-def _warm_async(fn, d, dep, arr):
+def _warm_async(fn, d, dep, arr, caller=None):
     key = (fn, d, dep, arr)
     with _warm_lock:
         if key in _warm_inflight or len(_warm_inflight) >= _WARM_MAX_INFLIGHT:
@@ -340,7 +438,8 @@ def _warm_async(fn, d, dep, arr):
 
     def _run():
         try:
-            lh_flight_facts(fn, d, dep, arr)
+            lh_flight_facts(fn, d, dep, arr,
+                            caller=f'warm_{caller}' if caller else 'warm')
         except Exception:
             pass
         finally:
@@ -351,7 +450,7 @@ def _warm_async(fn, d, dep, arr):
 
 
 def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
-                    cached_only=False):
+                    cached_only=False, caller=None):
     """Autoritative LH-Group-Flug-Fakten (Shape wie _obs_rows_to_facts) oder {}.
     Gecacht pro (flight,date,dep,arr). No-op wenn nicht konfiguriert / kein
     LH-Group-Flug. Wirft nie. force=True überspringt den Memo-READ (schreibt
@@ -375,10 +474,11 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
             if hit and now < hit[0]:
                 return dict(hit[1])
     if cached_only:
-        _warm_async(fn, d, dep, arr)
+        _warm_async(fn, d, dep, arr, caller)
         return {}
 
-    data = _get(f'/operations/flightstatus/{urllib.parse.quote(fn)}/{d}')
+    data = _get(f'/operations/flightstatus/{urllib.parse.quote(fn)}/{d}',
+                caller=caller)
     facts = {}
     try:
         legs = (((data or {}).get('FlightStatusResource') or {})
@@ -415,8 +515,21 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
     # ~40 min vor Abflug ändern), sonst lang (Plan/Historie stabil).
     today = time.strftime('%Y-%m-%d', time.gmtime())
     ttl = 120 if d == today else 6 * 3600
+    # CACHE-FRAGMENTIERUNG (2026-07-26): der MQTT-Push-Pfad ruft ohne dep/arr
+    # (Key (fn,date,None,None)), die Roster-/Detail-Pfade IMMER mit
+    # (fn,date,dep,arr). Derselbe Flug belegte dadurch zwei Einträge und der
+    # frisch bezahlte Push-Call wärmte den Key nicht, den die App danach liest.
+    # Der Alias-Write kostet nichts und macht jeden Call doppelt nutzbar.
+    _alias = None
+    if (dep is None or arr is None) and isinstance(facts, dict):
+        _fd = (facts.get('dep_iata') or '').upper().strip() or None
+        _fa = (facts.get('arr_iata') or '').upper().strip() or None
+        if _fd and _fa and (_fd, _fa) != (dep, arr):
+            _alias = (fn, d, _fd, _fa)
     with _facts_lock:
         _facts_memo[key] = (now + ttl, dict(facts))
+        if _alias is not None:
+            _facts_memo[_alias] = (now + ttl, dict(facts))
         if len(_facts_memo) > _FACTS_MAX:
             items = sorted(_facts_memo.items(), key=lambda kv: kv[1][0])
             for k, _v in items[:len(items) // 4 or 1]:
@@ -436,5 +549,5 @@ def lh_flight_debug(flight, date):
         'configured': lh_open_configured(),
         'is_lh_group': is_lh_group(flight),
         'flight': flight, 'date': date,
-        'facts': lh_flight_facts(flight, date, dep, arr),
+        'facts': lh_flight_facts(flight, date, dep, arr, caller='debug'),
     })

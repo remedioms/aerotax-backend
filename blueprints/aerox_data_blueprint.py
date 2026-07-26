@@ -1329,6 +1329,100 @@ def _budget_key_inc(key, units=1):
         pass
 
 
+def lh_quota_snapshot(hours=6):
+    """Prozess-ÜBERGREIFENDER LH-Quota-Stand der letzten `hours` Stunden.
+
+    WARUM ES DAS BRAUCHT (Owner 2026-07-26 „LH-Key ständig überm Limit — erst
+    messen"): `lh_open_api._HOUR_BUDGET`/`_hour_count` zählen PRO PROZESS, und
+    produktiv laufen 3 Backend-Worker (:8080) + 1 Poll-Worker (:8081) + der
+    Pfad des MQTT-Daemons — die Container teilen KEIN Volume, ein datei-
+    basierter Zähler kann das also nicht sehen. Die LH-Quota gilt aber PRO KEY
+    (1.000/h + 5/s). Die Zähler stehen daher in `ax_api_budget` (atomarer RPC).
+
+    Schlüssel-Schema (Spalte heißt historisch `month`, hält beliebige Keys) —
+    die STUNDE steht vor dem Aufrufer, damit die Abfrage ein index-nutzbares
+    PRÄFIX ist (mit dem Aufrufer vorn bliebe nur ein `%:<stunde>`-Suffix-Match
+    = Seq-Scan über eine ewig wachsende Tabelle):
+      lhopen:<YYYYMMDDHH>[:<caller>]         LH Open API (gesendet)
+      lhopen_denied:<YYYYMMDDHH>[:<grund>]   vom eigenen Throttle ABGEWIESEN
+      lhfo:<YYYYMMDDHH>[:<service>]          LH FlightOps (EIGENER LH-Key!)
+    Wirft nie. Liest NUR (der Puffer-Flush läuft im eigenen Daemon-Thread —
+    ein Force-Flush hier würde einen Request-Thread an Supabase hängen), die
+    Zahlen können also bis zu 30 s nachlaufen."""
+    import time as _t
+    hours = max(1, min(48, int(hours or 6)))
+    now = _t.time()
+    stamps = [_t.strftime('%Y%m%d%H', _t.gmtime(now - i * 3600))
+              for i in range(hours)]
+    out = {'quota_per_key_per_hour': 1000, 'hours': [], 'note': (
+        'lhopen = LH Open API Key, lhfo = LH FlightOps Key (getrennte Keys, '
+        'getrenntes Kontingent). lhopen_denied = Calls, die der EIGENE '
+        'Prozess-Throttle abgewiesen hat (gewollt = lhopen + lhopen_denied). '
+        'Zaehler prozessuebergreifend via ax_api_budget, bis zu 30 s Nachlauf.')}
+    sb = _sb()
+    rows = []
+    if sb is not None:
+        for st in stamps:
+            for fam in ('lhopen', 'lhopen_denied', 'lhfo'):
+                try:
+                    r = (sb.table('ax_api_budget').select('month,n')
+                         .like('month', f'{fam}:{st}%')
+                         .order('month').limit(200).execute())
+                    rows += (getattr(r, 'data', None) or [])
+                except Exception:
+                    pass
+    by_stamp = {}
+    for row in rows:
+        k = str(row.get('month') or '')
+        n = int(row.get('n') or 0)
+        parts = k.split(':')
+        if len(parts) < 2:
+            continue
+        fam, st = parts[0], parts[1]
+        by_stamp.setdefault(st, {}).setdefault(fam, {'total': 0, 'callers': {}})
+        if len(parts) == 2:
+            by_stamp[st][fam]['total'] = n
+        else:
+            by_stamp[st][fam]['callers'][':'.join(parts[2:])] = n
+    for st in stamps:
+        fams = by_stamp.get(st, {})
+        for fam in fams.values():
+            fam['callers'] = dict(sorted(fam['callers'].items(),
+                                         key=lambda kv: -kv[1])[:12])
+        out['hours'].append({'hour_utc': st, 'keys': fams})
+    return out
+
+
+@aerox_data_bp.route('/api/ax/lh-quota', methods=['GET'])
+def ax_lh_quota():
+    """Owner-only: was hat der LH-Key diese Stunde wirklich gesehen — und wer
+    hat es verbraucht. Auth wie die uebrigen Owner-Routen (X-Admin-Token ==
+    RECOVERY_SECRET, hmac-vergleich; alternativ das interne X-Poll-Secret,
+    damit der Report-Cron dieselbe Wahrheit ziehen kann)."""
+    import hmac as _hmac
+    import os as _os
+    from flask import request as _rq
+    ok = False
+    try:
+        import app as _app
+        exp = _app._recovery_pepper()
+        got = _rq.headers.get('X-Admin-Token', '')
+        ok = bool(exp and got and _hmac.compare_digest(got, exp))
+    except Exception:
+        ok = False
+    if not ok:
+        sec = (_os.environ.get('ADSB_POLL_SECRET') or '').strip()
+        got = (_rq.headers.get('X-Poll-Secret') or '').strip()
+        ok = bool(sec and got and _hmac.compare_digest(got, sec))
+    if not ok:
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    try:
+        hours = int(_rq.args.get('hours') or 6)
+    except Exception:
+        hours = 6
+    return jsonify({'ok': True, **lh_quota_snapshot(hours)})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  FR24 OFFICIAL API (bezahlt) — LETZTER Fallback hinter Warehouse/Boards/gRPC.
 #  Owner-Direktive 2026-07-09: freies Scraping bleibt Hauptquelle; die bezahlte
@@ -4307,7 +4401,8 @@ def _flight_facts_from_obs(flight_no, date, dep_iata=None, arr_iata=None,
             # gedrosseltem LH-HTTP-Roundtrip im Request-Thread. Das 30-s-Memo
             # unten kann dadurch kurz board-only sein — gleiche bewusst
             # akzeptierte Übergangslage wie im _FLIGHT_MERGE_CACHE.
-            _lh = lh_flight_facts(fn, d, dep, arr, cached_only=lh_cached_only)
+            _lh = lh_flight_facts(fn, d, dep, arr, cached_only=lh_cached_only,
+                                  caller='obs_merge')
             if _lh:
                 facts = _merge_lh_into_facts(facts, _lh)
     except Exception:

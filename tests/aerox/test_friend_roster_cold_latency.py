@@ -255,7 +255,8 @@ def test_facts_wrapper_passes_lh_cached_only(monkeypatch):
     import blueprints.lh_open_api as LH
     seen = []
 
-    def _fake_lh(fn, d, dep=None, arr=None, force=False, cached_only=False):
+    def _fake_lh(fn, d, dep=None, arr=None, force=False, cached_only=False,
+                 caller=None):
         seen.append(cached_only)
         return {}
 
