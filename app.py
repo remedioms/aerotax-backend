@@ -40896,7 +40896,12 @@ def ax_crew_punctuality(token):
         year, month = now.year, now.month
     month_str = f'{year:04d}-{month:02d}'
     refresh = (request.args.get('refresh') or '').strip().lower() in ('1', 'true', 'yes')
-    min_sample = 3
+    # Mindest-Stichprobe 5 (Owner 2026-07-26, Tibor „11/11 · 33% bei 3 Flügen"):
+    # 3 gewertete Flüge sind zu wenig für einen fairen Rang — ein einzelner
+    # verspäteter Flug kippt auf 33% und stempelt „oft verspätet". Ab 5
+    # gewerteten Flügen wird gerankt; darunter „noch nicht genug Daten"
+    # (insufficient_sample). 15 (airport-Tafel) bleibt für Crew zu hoch.
+    min_sample = 5
 
     # Self-Cache (metadata.punctuality) laden — für Lazy-Gate + SB-down-Fallback.
     cached_p = None
