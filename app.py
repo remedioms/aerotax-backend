@@ -19472,30 +19472,49 @@ _MK_ALERT_LAST_SENT = {}     # (kind, build) -> unix ts
 _MK_ALERT_TTL_SEC = 3600
 
 
-def _mk_top_frames(call_stack, limit=5):
+def _mk_top_frames(call_stack, limit=8):
     """Zieht die obersten Frames aus einem MetricKit-callStackTree-JSON.
 
     Struktur: {"callStacks": [{"callStackRootFrames": [{"binaryName": …,
-    "offsetIntoBinaryTextSegment": …, "subFrames": […]}]}]} — wir laufen die
-    erste Root-Kette entlang. Bei truncated Stacks (String statt Objekt) → [].
+    "offsetIntoBinaryTextSegment": …, "sampleCount": …, "subFrames": […]}]}]}.
+
+    Triage 2026-07-26 (Owner-Mails zeigten nur "dyld/main/SwiftUI"-Scaffolding
+    bzw. "—"): der alte Walker lief stur node_list[0] von der Wurzel und nur
+    über stacks[0]. Drei Fixes:
+      1. threadAttributed-Stack bevorzugen, sonst ersten nehmen (viele
+         Hang-Reports haben KEINEN attributed Thread → Mail zeigte "—",
+         obwohl ein 64-Sample-Stack im Payload lag).
+      2. HOT-PATH statt erster Kette: an jeder Verzweigung das Kind mit dem
+         höchsten sampleCount (bei Hangs = wo die Zeit wirklich steckt).
+      3. ORIENTIERUNG: Crash-Trees nesten Leaf→Root, Hang-Trees Root→Leaf
+         (empirisch, ax_crash_reports b202/221/231). Erkennbar am
+         dyld-`start`-Scaffolding: steht `dyld` am Pfad-ANFANG, ist das der
+         Stack-BODEN → umdrehen. Ausgegeben wird immer die Leaf-Seite
+         (Top-of-Stack), dort steht der Täter (z.B. libicucore unter
+         NewsAirportRelevance.isAbout).
     """
-    frames = []
     try:
         if not isinstance(call_stack, dict):
-            return frames
+            return []
         stacks = call_stack.get('callStacks') or []
         if not stacks:
-            return frames
-        node_list = stacks[0].get('callStackRootFrames') or []
-        while node_list and len(frames) < limit:
-            node = node_list[0]
+            return []
+        stack = next((s for s in stacks if s.get('threadAttributed')), stacks[0])
+        path = []
+        node_list = stack.get('callStackRootFrames') or []
+        while node_list and len(path) < 300:
+            node = max(node_list, key=lambda n: n.get('sampleCount') or 0)
             binary = node.get('binaryName') or '?'
             offset = node.get('offsetIntoBinaryTextSegment')
-            frames.append(f'{binary} +{offset}' if offset is not None else binary)
+            path.append(f'{binary} +{offset}' if offset is not None else binary)
             node_list = node.get('subFrames') or []
+        if not path:
+            return []
+        if any('dyld' in f for f in path[:2]):
+            path.reverse()
+        return path[:limit]
     except Exception:
-        pass
-    return frames
+        return []
 
 
 def _mk_send_alert_email(row, top_frames):
