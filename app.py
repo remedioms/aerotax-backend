@@ -13119,9 +13119,9 @@ def _summary_has_ground_duty(summary_upper):
              'MEDICAL', 'SEMINAR', 'COURSE', 'CHECK', 'PICKUP', 'PICK UP',
              'STANDBY', 'STBY', 'RISERVA', 'OFFICE', 'BÜRO', 'BUERO', 'GROUND')
     _duty_codes = {'EM', 'SIM', 'OPC', 'LPC', 'CBT', 'TRG', 'GST', 'SEP'}
-    # LH-Bürodienst-Hauscodes B2…B9 (Owner 2026-07-26, Marker-Vertrag mit iOS;
-    # nacktes „B" = Betriebsunfall und „B1" = Teilzeit-Vertragsart sind
-    # ausgenommen). Sie werden VOR dem _offish-`continue` geprüft, weil genau
+    # LH-Bürodienst-Hauscodes B1…B9 (Marker-Vertrag mit iOS; nur das nackte
+    # „B" ist ausgenommen — das ist Betriebsunfall/Abwesenheit). Sie werden
+    # VOR dem _offish-`continue` geprüft, weil genau
     # die GEMERGTE Form der Bug war: myTime legt am selben Tag ZWEI VEVENTs an
     # und der Import merged sie zu „Off Day (OF) · B4" — das Off-Segment
     # stempelte den Tag frei, obwohl daneben ein Bürodienst steht. Ganzes

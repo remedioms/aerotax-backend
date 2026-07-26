@@ -43,7 +43,7 @@ lh_flightops_bp = Blueprint('lh_flightops_bp', __name__)
 #
 # MARKER-VERTRAG mit iOS (`Models/RosterEventClassifier.swift`) — beide Seiten
 # MÜSSEN identisch klassifizieren. Owner-Entscheid 26.07.2026 (LH-Kabinencrew):
-#   · Bürodienst = Token `B` + GENAU EINE Ziffer 2–9, also B2…B9,
+#   · Bürodienst = Token `B` + GENAU EINE Ziffer 1–9, also B1…B9,
 #   · als EIGENSTÄNDIGES Token nach Split des „·"-Segments an Nicht-Alpha-
 #     numerik — `B45` und `B455` zünden NICHT, kein Präfix-Match,
 #   · ein Segment mit einem solchen Token ist BODEN-DIENST-BEWEIS → der Tag ist
@@ -51,13 +51,16 @@ lh_flightops_bp = Blueprint('lh_flightops_bp', __name__)
 #   · Klassifikation = Office: Dienst ohne Sektoren, erhöht keinen Freitage-
 #     Zähler und erzeugt keine Blockstunden.
 #
-# ZWEI AUSNAHMEN, aus dem CRS-Handbuch belegt — dürfen NICHT eingesammelt
-# werden (deshalb `[2-9]`, nicht `\d`):
-#   · nacktes `B`  = Betriebsunfall → Abwesenheit (2,9 LSW/Tag, reduziert den
+# EINE AUSNAHME, aus dem CRS-Handbuch belegt — darf NICHT eingesammelt werden
+# (deshalb `[1-9]`, nicht `\d`):
+#   · nacktes `B` = Betriebsunfall → Abwesenheit (2,9 LSW/Tag, reduziert den
 #     Freitage-Anspruch). Kein Bürodienst.
-#   · `B1`         = Teilzeit-VERTRAGSART („Mini Flex", 26,29 %), ausdrücklich
-#     kein Tagessymbol. Taucht es doch als Tages-Token auf → loggen (s.u.).
-LH_OFFICE_DAY_CODE_RE = re.compile(r'^B[2-9]$')
+#
+# `B1` IST Bürodienst (Owner-Entscheid 27.07.2026). Das CRS-Handbuch führt B1
+# als Teilzeit-VERTRAGSART („Mini Flex", 26,29 %) — der Prod-Bestand ist aber
+# eindeutiger: 74 von 84 B1-Tagen tragen LHs EIGENES Label „Office Day (B1)".
+# B1 ist offenbar beides; im Tages-Kontext gilt Bürodienst.
+LH_OFFICE_DAY_CODE_RE = re.compile(r'^B[1-9]$')
 
 # Ein Segment in seine alphanumerischen Tokens zerlegen. IDENTISCH in
 # app.py:_summary_has_ground_duty — divergierende Trenner hiessen divergierende
@@ -66,12 +69,12 @@ _TOKEN_SPLIT = r'[^A-Z0-9ÄÖÜ]+'
 
 
 def is_office_day_code(token):
-    """True für die Bürodienst-Hauscodes B2…B9 (ganzes Token, GROSS)."""
+    """True für die Bürodienst-Hauscodes B1…B9 (ganzes Token, GROSS)."""
     return bool(LH_OFFICE_DAY_CODE_RE.match((token or '').strip().upper()))
 
 
 def segment_has_office_code(segment_upper):
-    """True wenn ein '·'-Segment ein eigenständiges B2…B9-Token trägt."""
+    """True wenn ein '·'-Segment ein eigenständiges B1…B9-Token trägt."""
     return any(is_office_day_code(t)
                for t in re.split(_TOKEN_SPLIT, segment_upper or ''))
 
@@ -1059,14 +1062,6 @@ def duty_events_to_ics(resp):
                 # bleibt im Roh-Summary und wird trotzdem als Boden-Dienst
                 # erkannt). Andere GROUNDDUTY-Details (EMCRM, TK, MED, D4,
                 # WBT_GR …) reisen unverändert roh weiter — kein Bürodienst.
-                if det.strip().upper() == 'B1':
-                    # CRS-Handbuch: B1 ist eine Teilzeit-Vertragsart, KEIN
-                    # Tagessymbol. Wenn LH es doch als Tages-Code schickt, will
-                    # der Owner das wissen (Entscheid 26.07.) — nur loggen,
-                    # nicht klassifizieren.
-                    log.info('[lh_flightops] GROUNDDUTY-Detail "B1" gesehen — '
-                             'laut CRS eine Vertragsart, nicht als Office '
-                             'klassifiziert')
                 summary = (f'Office Day ({det})'
                            if is_office_day_code(det)
                            else (det or cat.upper() or 'Duty'))

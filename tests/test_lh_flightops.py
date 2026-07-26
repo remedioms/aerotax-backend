@@ -1239,13 +1239,16 @@ def test_office_codes_are_the_agreed_marker_contract():
     Owner-Entscheid 26.07.2026: Buerodienst = Token `B` + GENAU EINE Ziffer
     2-9. Divergiert das, klassifizieren App und Backend denselben Tag
     verschieden — genau die Bug-Klasse, die hier gefixt wird."""
-    for n in range(2, 10):
+    for n in range(1, 10):
         assert fo.is_office_day_code('B%d' % n)
-    # AUSNAHMEN aus dem CRS-Handbuch: nacktes B = Betriebsunfall (Abwesenheit),
-    # B1 = Teilzeit-Vertragsart (kein Tagessymbol).
+    # AUSNAHME aus dem CRS-Handbuch: nacktes B = Betriebsunfall (Abwesenheit,
+    # reduziert den Freitage-Anspruch) — KEIN Buerodienst.
     assert not fo.is_office_day_code('B')
-    assert not fo.is_office_day_code('B1')
     assert not fo.is_office_day_code('B0')
+    # B1 IST Buerodienst (Owner-Entscheid 27.07.2026): 74 von 84 echten
+    # B1-Tagen tragen LHs eigenes Label „Office Day (B1)". Das CRS fuehrt B1
+    # zusaetzlich als Teilzeit-Vertragsart — im Tages-Kontext gilt Dienst.
+    assert fo.is_office_day_code('B1')
     # Token-Grenzen: kein Praefix-Match.
     for bad in ('B45', 'B455', 'B4A', 'AB4', 'B 4', ''):
         assert not fo.is_office_day_code(bad), bad
@@ -1253,17 +1256,17 @@ def test_office_codes_are_the_agreed_marker_contract():
 
 def test_office_codes_count_as_ground_duty_evidence():
     import app as backend
-    for n in range(2, 10):
+    for n in range(1, 10):
         code = 'B%d' % n
         assert backend._summary_has_ground_duty(code), code
         assert backend._summary_has_ground_duty('OFFICE DAY (%s)' % code)
     # Praefix darf NICHT zuenden.
     assert not backend._summary_has_ground_duty('B455')
     assert not backend._summary_has_ground_duty('B45')
-    # CRS-Ausnahmen: nacktes B (Betriebsunfall) und B1 (Vertragsart).
+    # CRS-Ausnahme: nacktes B = Betriebsunfall/Abwesenheit, kein Buerodienst.
     assert not backend._summary_has_ground_duty('B')
-    assert not backend._summary_has_ground_duty('B1')
     assert not backend._summary_has_ground_duty('ABSENCE (B)')
+    assert not backend._summary_has_ground_duty('B0')
     # echte freie Tage bleiben frei
     assert not backend._summary_has_ground_duty('OFF DAY')
     assert not backend._summary_has_ground_duty('OFF DAY (OF)')
@@ -1283,7 +1286,10 @@ def test_merged_off_plus_office_day_is_not_free():
                        and not backend._summary_has_ground_duty(up)) else None)
     assert klass is None
     assert duty_from_roster_day(None, 'Off Day (OF) · B4') != 'free'
+    assert duty_from_roster_day(None, 'Off Day (OF) · B1') != 'free'
     assert duty_from_roster_day(None, 'Off Day (B4)') != 'free'
+    # nacktes B bleibt Abwesenheit, kein Dienst-Beweis
+    assert duty_from_roster_day(None, 'Off Day (OF) · B') == 'free'
     # Der reine freie Tag bleibt frei — sonst waere der Guard zu breit.
     assert duty_from_roster_day(None, 'Off Day (OF)') == 'free'
     assert duty_from_roster_day(None, 'Off Day (FREE) · Off Day (==)') == 'free'
