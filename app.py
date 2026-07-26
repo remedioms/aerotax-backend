@@ -12608,7 +12608,8 @@ def _hangout_notify_nearby(creator_token, lat, lon, iata, title, pin_id,
         short_title = (title or 'Treffpunkt').strip()[:60]
         body = f'Neuer Treffpunkt in {place}: {short_title}'
         data = {'type': 'hangout_nearby', 'pin_id': pin_id,
-                'iata': iata, 'deep_link': f'aerox://hangout/{pin_id}'}
+                'iata': iata, 'title': short_title,
+                'deep_link': f'aerox://hangout/{pin_id}'}
 
         if not result['enabled']:
             app.logger.info(
