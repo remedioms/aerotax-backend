@@ -1029,6 +1029,57 @@ def _match_aerox_profiles(members):
             except Exception:
                 continue
 
+        # UNSCHARFER FALLBACK (Owner 2026-07-26, „sieht man wirklich wer auf
+        # AeroX ist?" — Live-Check: 1/76 gematcht). LH-Crew-Listen führen
+        # ABGEKÜRZTE Namen („Markus K."), AeroX-Profile den vollen Namen
+        # („Markus Krause") → der exakte ilike-Match oben traf fast nie.
+        # Regel (Owner-Entscheid „nur eindeutige Treffer"): letztes Token =
+        # Nachname-Initial (1 Buchstabe, ggf. mit Punkt) → Vorname + Initial +
+        # Airline Lufthansa; NUR übernehmen, wenn GENAU EIN Profil passt (kein
+        # Falsch-Treffer-Risiko bei zwei „Markus K." an derselben Base).
+        def _abbrev_parts(name):
+            toks = [t for t in str(name or '').split() if t]
+            if len(toks) < 2:
+                return None
+            last = toks[-1].rstrip('.')
+            if len(last) != 1 or not last.isalpha():
+                return None          # kein abgekürzter Nachname → nicht fuzzy
+            return toks[0], last.upper()   # (Vorname, Initial)
+
+        fuzzy_need = [m for m in need
+                      if m['name'].strip().lower() not in by_name]
+        for m in fuzzy_need[:12]:
+            parts = _abbrev_parts(m.get('name'))
+            if not parts:
+                continue
+            first, initial = parts
+            if len(first) < 2:
+                continue             # zu kurzer Vorname → zu unspezifisch
+            try:
+                # Vorname als Präfix (deckt Zweit-Vornamen im Profil mit ab).
+                r = (_app.sb.table('user_profiles').select(sel)
+                     .ilike('name', first + ' %').limit(8).execute())
+            except Exception:
+                continue
+            cand = []
+            for row in (r.data or []):
+                if 'lufthansa' not in str(row.get('airline') or '').lower():
+                    continue
+                ntoks = [t for t in str(row.get('name') or '').split() if t]
+                if len(ntoks) < 2:
+                    continue
+                # Vorname exakt + Nachname beginnt mit dem Initial.
+                if ntoks[0].lower() != first.lower():
+                    continue
+                if not ntoks[-1][:1].upper() == initial:
+                    continue
+                cand.append(row)
+            # Eindeutigkeit über den Token (dieselbe Person kann mehrfach
+            # zurückkommen ist hier ausgeschlossen, aber sicher ist sicher).
+            uniq_tokens = {row.get('token') for row in cand if row.get('token')}
+            if len(uniq_tokens) == 1:
+                by_name[m['name'].strip().lower()] = cand[0]
+
         def _pub(row):
             md = row.get('metadata') or {}
             if str(md.get('account_type') or '').strip().lower() == 'family':
