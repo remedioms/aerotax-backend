@@ -8490,7 +8490,24 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     # HOCHGEZOGEN (Owner 2026-07-13): der merged-Record des Zubringers ist jetzt
     # AUCH die Board-Quelle für die FlightState-Engine (Phase/Landung/Monotonie),
     # deshalb vor dem Live-Gate berechnet.
-    merged_in = (merged_fn(inbound_fn, dep_iata=inbound_origin, arr_iata=dep,
+    # TAGES-ANKER (Owner 2026-07-26, LH853 „Gelandet obwohl in der Luft"):
+    # date=None heißt „heute am Flughafen" — wird die Kette am VORABEND für
+    # den MORGIGEN Leg gebaut (Feed zeigt den nächsten Dienst schon abends),
+    # lieferte der Merge die GESTRIGE Instanz der täglichen Zubringer-Nummer
+    # (est_arr von gestern 08:11 = längst vorbei → iOS stempelte „Gelandet",
+    # und der eingefrorene Karten-Snapshot trug das bis in den Flugtag).
+    # Bei date ≠ heute-am-Abflughafen deshalb explizit DIESEN Tag anfragen —
+    # Obs existieren dann meist noch nicht ⇒ ehrliche nulls statt Falsch-Tag.
+    _merged_date = None
+    try:
+        _now_fn = _life_app('_airport_local_now')
+        _today_dep = _now_fn(dep).strftime('%Y-%m-%d') if _now_fn else None
+    except Exception:
+        _today_dep = None
+    if date and _today_dep and str(date)[:10] != _today_dep:
+        _merged_date = str(date)[:10]
+    merged_in = (merged_fn(inbound_fn, date=_merged_date,
+                           dep_iata=inbound_origin, arr_iata=dep,
                            free_only=True)
                  if (merged_fn and inbound_fn) else None)
 
