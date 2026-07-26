@@ -1476,7 +1476,7 @@ def flightops_hotel(token):
 # Hintergrund-Thread: Token-Grant warmhalten + import→diff→push-Kette auch
 # bei geschlossener App. Auth wie poll-boards (X-Poll-Secret / localhost).
 _refresh_all_lock = threading.Lock()
-_refresh_all_state = {'running': False, 'last': None}
+_refresh_all_state = {'running': False, 'last': None, 'drain': False}
 
 
 def _internal_secret_ok():
@@ -1518,6 +1518,20 @@ def _refresh_all_work(tokens):
     try:
         import app as _app
         for tok in tokens:
+            # DEPLOY-DRAIN (Grant-Burn #3, 2026-07-26): dieser Daemon-Thread
+            # wurde beim Container-Recreate HART gekillt — traf der Kill das
+            # Fenster zwischen LH-Rotation und _tokens_save, war der neue
+            # Refresh-Token weg und der naechste Versuch verbrannte per
+            # Reuse-Detection die ganze Familie (29/126 Grants, Cluster exakt
+            # an den Deploy-Zeitpunkten). deploy-hetzner.sh setzt vor dem
+            # Recreate das drain-Flag und wartet bis running=False — hier
+            # deshalb VOR jedem Grant pruefen und sauber abbrechen (der
+            # aktuelle Grant persistiert fertig, kein neuer LH-Call startet).
+            if _refresh_all_state.get('drain'):
+                log.info('[flightops-refresh-all] drain angefordert — '
+                         'Abbruch nach %d/%d Grants', ok + fail + skipped,
+                         len(tokens))
+                break
             try:
                 if not flightops_connected(tok):
                     skipped += 1     # needs_relogin / Tokens weg
@@ -1546,6 +1560,19 @@ def _refresh_all_work(tokens):
                  len(tokens), ok, fail, skipped)
 
 
+@lh_flightops_bp.route('/api/internal/flightops/refresh-drain', methods=['POST'])
+def flightops_refresh_drain():
+    """Deploy-Vorbereitung: laufenden refresh-all-Lauf sauber auslaufen
+    lassen (kein neuer LH-Call startet, der aktuelle Grant persistiert
+    fertig). Der Deploy pollt bis running=False. Idempotent."""
+    if not _internal_secret_ok():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    with _refresh_all_lock:
+        _refresh_all_state['drain'] = True
+        running = bool(_refresh_all_state['running'])
+    return jsonify({'ok': True, 'running': running})
+
+
 @lh_flightops_bp.route('/api/internal/flightops/refresh-all', methods=['POST'])
 def flightops_refresh_all():
     if not _internal_secret_ok():
@@ -1557,6 +1584,7 @@ def flightops_refresh_all():
             return jsonify({'ok': True, 'already_running': True,
                             'last': _refresh_all_state['last']})
         _refresh_all_state['running'] = True
+        _refresh_all_state['drain'] = False
     tokens = _connected_tokens()
     if not tokens:
         with _refresh_all_lock:
