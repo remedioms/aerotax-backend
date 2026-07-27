@@ -44934,14 +44934,50 @@ _CREWACCESS_LEG_RE = re.compile(
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\b')
 _CREWACCESS_SBY_RE = re.compile(
     r'^(SBY[A-Z0-9]*)\s+([A-Z]{3})\s+(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\b')
+# Übernacht-Split-Zeile (Released Roster, Alex/LHX 2026-07-27): CrewAccess
+# rendert einen Leg, der LOKAL nach Mitternacht ankommt, auf ZWEI Zeilen —
+# Opener trägt nur From+Start („JC 852 FRA 19:10 32N"), der Closer auf der
+# FOLGE-Tageszeile nur To+End („JC 852 HEL 21:40 32N 11:45"). Beide Zeiten
+# sind UTC; die Tageszeile des Closers ist die LOKALE Ankunftstags-Anzeige
+# (Anzeige-Eigenheit) und darf NICHT als UTC-Datum gelesen werden.
+_CREWACCESS_SPLIT_RE = re.compile(
+    r'^(?:[A-Z][A-Z0-9_]*\s+)*?(\d{1,4}[A-Z]?)\s+([A-Z]{3})\s+(\d{1,2}:\d{2})\b')
+# Layover-Spalte: Dauer-Token (H:MM…HHH:MM) HINTER dem Leg-Match (nach A/C,
+# vor Trip ID). Trip IDs sind reine Ziffern ohne Doppelpunkt → kollisionsfrei.
+_CREWACCESS_LAYCOL_RE = re.compile(r'\b(\d{1,3}):([0-5]\d)\b')
 
 
 def _crewaccess_text_to_ics(text, carrier='VL'):
-    """CrewAccess-„Roster Preview"-Text → synthetisches ICS. Pure/testbar.
-    Returns (ics_string, None) oder (None, error_code). Deterministisch,
-    NICHTS wird erfunden: unbekannte Tages-Marker reisen als Roh-Summary mit."""
+    """CrewAccess-Roster-Text („Roster Preview" / „Published Roster" /
+    „Released Roster" — LHX-Jeppesen-Export seit 2026-07) → synthetisches ICS.
+    Pure/testbar. Returns (ics_string, None) oder (None, error_code).
+    Deterministisch, NICHTS wird erfunden: unbekannte Tages-Marker reisen als
+    Roh-Summary mit; unschließbare Übernacht-Opener werden verworfen.
+
+    Full-Effort-Überarbeitung (Alex/Vanessa LHX 2026-07-27):
+      • Report (UTC) wird NICHT mehr weggeworfen, sondern als Briefing-Token
+        „HH:MM LT Briefing {STN} · {Leg}" in das erste Leg des Dienstes
+        eingebettet (UTC → Stations-Wanduhr; exakt das Discover-/ITA-Format,
+        das iOS `briefingTimeFromSummary()` und `_corrected_briefing_start_iso`
+        verstehen). Vorher zeigte die App den 45-min-Default statt der echten
+        80-min-Briefingzeit.
+      • Übernacht-Split-Legs (Opener „JC 852 FRA 19:10" / Closer auf der
+        Folge-Tageszeile „JC 852 HEL 21:40 … 11:45") werden über die
+        Flugnummer gepaart. Zeiten sind UTC; das Datum der Closer-Zeile ist
+        die LOKALE Ankunftstags-Anzeige und wird für die Zeitrechnung
+        ignoriert (Ende ≤ Start ⇒ +1 Tag). Vorher fiel der Leg still weg und
+        die 2-Tages-Tour zerbrach in zwei Tagesumläufe.
+      • Layover-Spalte (Dauer hinter dem letzten Leg vor dem Nightstop, z.B.
+        „11:45") ⇒ synthetisches LAYOVER-Event (SUMMARY:LAYOVER,
+        LOCATION=Ankunftsstation, Spanne Ankunft→Ankunft+Dauer) — dasselbe
+        Vokabular wie LH-Feeds/SWISS-F5, damit die Tour zusammenhängt. Nur
+        <24 h: ganztägige Layover haben schon die „Layover: XXX"-Tageszeile.
+      • Report-Zeit auch auf UNDATIERTEN Zeilen (zweiter Dienst am selben
+        Kalendertag nach Nightstop-Rückkehr: „09:50 JC 849 HEL FRA …") —
+        vorher matchte die Leg-Regex nicht und der Leg fiel still weg."""
     _head_ok = ('Roster Preview' in (text or '')
-                or 'Published Roster' in (text or ''))
+                or 'Published Roster' in (text or '')
+                or 'Released Roster' in (text or ''))
     if not _head_ok or 'Planning period' not in (text or ''):
         return None, 'unsupported_pdf_format'
     mp = re.search(r'Planning period:\s*([A-Za-z]+)\s+(\d{4})', text)
@@ -44950,7 +44986,8 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
         return None, 'no_planning_period'
     year = int(mp.group(2))
 
-    from datetime import date as _date, timedelta as _td
+    from datetime import date as _date, timedelta as _td, timezone as _tzu
+    from zoneinfo import ZoneInfo as _ZI
 
     def day_date(dom):
         try:
@@ -44958,17 +44995,47 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
         except ValueError:
             return None
 
-    events = []   # (uid_suffix, dtstart, dtend, summary, all_day)
+    events = []   # (uid_suffix, dtstart, dtend, summary, all_day[, tzid, loc])
 
-    def add_leg(d, num, frm, to, t1, t2):
+    def _wall_briefing(rep_hhmm, rep_day, stn):
+        # Report (UTC) → Wanduhr-Zeit an der Abflug-Station (der „LT"-
+        # Designator des Briefing-Tokens). Unbekannte Station ⇒ None
+        # (Token weglassen statt eine falsche Zeit zu erfinden).
+        tzname = airport_tz(stn)
+        if not tzname:
+            return None
+        try:
+            h, m = (int(x) for x in rep_hhmm.split(':'))
+            rep = datetime(rep_day.year, rep_day.month, rep_day.day, h, m,
+                           tzinfo=_tzu.utc)
+            return rep.astimezone(_ZI(tzname)).strftime('%H:%M')
+        except Exception:
+            return None
+
+    def add_leg(d, num, frm, to, t1, t2, briefing=None, layover=None):
         h1, m1 = (int(x) for x in t1.split(':'))
         h2, m2 = (int(x) for x in t2.split(':'))
         start = datetime(d.year, d.month, d.day, h1, m1)
         end = datetime(d.year, d.month, d.day, h2, m2)
         if end <= start:
             end += _td(days=1)   # Red-Eye über Mitternacht (Zeiten sind UTC)
-        summary = f'{carrier}{num} {frm} - {to}'
+        base = f'{carrier}{num} {frm} - {to}'
+        wall = None
+        if briefing:
+            wall = _wall_briefing(briefing[0], briefing[1], frm)
+        summary = f'{wall} LT Briefing {frm} · {base}' if wall else base
         events.append((f'leg-{len(events)}', start, end, summary, False))
+        if layover:
+            try:
+                lh, lmin = (int(x) for x in layover.split(':'))
+            except Exception:
+                lh, lmin = 0, 0
+            if 0 < lh < 24:
+                # Nightstop-Signal aus der Layover-Spalte: LH-Form-LAYOVER
+                # (SUMMARY:LAYOVER + LOCATION) über die echte Bodenzeit.
+                events.append((f'lay-{len(events)}', end,
+                               end + _td(hours=lh, minutes=lmin),
+                               'LAYOVER', False, None, to))
 
     def add_all_day(d, summary):
         events.append((f'day-{len(events)}', d, d + _td(days=1), summary, True))
@@ -44984,6 +45051,8 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
 
     in_table = False
     cur_day = None
+    cur_report = None   # (HH:MM UTC, date) — noch nicht verbrauchte Report-Zeit
+    pending = None      # offener Übernacht-Opener: (num, frm, t1, dep_day, report)
     for raw in (text or '').splitlines():
         line = raw.strip()
         if not line:
@@ -45001,6 +45070,7 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
         if dm:
             cur_day = day_date(dm.group(1))
             rest = (dm.group(2) or '').strip()
+            cur_report = None
             if cur_day is None:
                 continue
             if not rest:
@@ -45030,16 +45100,41 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
             if ml:
                 add_all_day(cur_day, f'Layover {ml.group(1)}')
                 continue
-            # Report-Zeit vor dem ersten Leg abstreifen („05:15 FO 2460 …").
-            mr = re.match(r'^(\d{1,2}:\d{2})\s+(.*)$', rest)
-            if mr:
-                rest = mr.group(2)
         if cur_day is None:
             continue
+        # Report-Zeit (Spalte „Report (UTC)") — auf Datumszeilen („05:15 FO
+        # 2460 …") UND auf undatierten Zeilen (zweiter Dienst desselben
+        # Kalendertags nach einem Nightstop-Closer: „09:50 JC 849 HEL FRA …").
+        mr = re.match(r'^(\d{1,2}:\d{2})\s+(.*)$', rest)
+        if mr:
+            cur_report = (mr.group(1), cur_day)
+            rest = mr.group(2)
         lm = _CREWACCESS_LEG_RE.match(rest)
         if lm:
+            lay = _CREWACCESS_LAYCOL_RE.search(rest[lm.end():])
             add_leg(cur_day, lm.group(1), lm.group(2), lm.group(3),
-                    lm.group(4), lm.group(5))
+                    lm.group(4), lm.group(5), briefing=cur_report,
+                    layover=(lay.group(0) if lay else None))
+            cur_report = None
+            continue
+        sm = _CREWACCESS_SPLIT_RE.match(rest)
+        if sm:
+            num, stn, t = sm.group(1), sm.group(2), sm.group(3)
+            if pending and pending[0] == num:
+                # Closer (To+End): Zeitrechnung IMMER vom Opener-Tag aus —
+                # die Tageszeile des Closers ist CrewAccess' LOKALE
+                # Ankunftstags-Anzeige, kein UTC-Datum (FRA→HEL 19:10→21:40
+                # UTC landet lokal 00:40 und steht deshalb unterm Folgetag).
+                p_num, p_frm, p_t1, p_day, p_rep = pending
+                lay = _CREWACCESS_LAYCOL_RE.search(rest[sm.end():])
+                add_leg(p_day, p_num, p_frm, stn, p_t1, t, briefing=p_rep,
+                        layover=(lay.group(0) if lay else None))
+                pending = None
+            else:
+                # Übernacht-Opener (From+Start): Report-Zeit mitnehmen, der
+                # gepaarte Leg trägt später das Briefing-Token.
+                pending = (num, stn, t, cur_day, cur_report)
+                cur_report = None
 
     if not events:
         return None, 'no_roster_days'
@@ -45058,11 +45153,15 @@ def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
     Das erlaubt `_ics_parse_dt` den richtigen Tages-Bucket (Abflug-Station-
     Lokal-Datum) zu ermitteln, statt auf Europe/Berlin zu fallen und dabei
     bei späten UTC-Zeiten auf den Folgetag zu rollen.
+
+    Optionales 7. Element `location`: IATA-Code für eine LOCATION-Zeile
+    (synthetisierte LAYOVER-Events aus der CrewAccess-Layover-Spalte).
     """
     lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', f'PRODID:-//{prodid}//DE']
     for ev_tuple in events:
         uid, start, end, summary, all_day = ev_tuple[:5]
         dep_tzid = ev_tuple[5] if len(ev_tuple) > 5 else None
+        location = ev_tuple[6] if len(ev_tuple) > 6 else None
         lines.append('BEGIN:VEVENT')
         lines.append(f'UID:pdf-{year}{month:02d}-{uid}@aerox-roster')
         if all_day:
@@ -45077,6 +45176,10 @@ def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
             lines.append(f'DTSTART:{start.strftime("%Y%m%dT%H%M%S")}Z')
             lines.append(f'DTEND:{end.strftime("%Y%m%dT%H%M%S")}Z')
         lines.append(f'SUMMARY:{summary}')
+        if location:
+            # LAYOVER-Events tragen die Station als LOCATION (LH-Feed-Form) —
+            # ical_layover_ort/Nightstop-Ableitung lesen genau dieses Feld.
+            lines.append(f'LOCATION:{location}')
         lines.append('END:VEVENT')
     lines.append('END:VCALENDAR')
     return '\r\n'.join(lines)
