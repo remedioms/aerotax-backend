@@ -11519,6 +11519,119 @@ _PUSH_TYPE_TO_PREF = {
     'inbound_delay': 'roster_change',
 }
 
+# ── Per-Freund-Push-Steuerung (2026-07-27) ──────────────────────────
+# „Von welchen Freunden bekomme ich Pushes — und welche Arten?"
+# Persistiert als registry['friend_prefs'] (metadata-jsonb, kein DDL):
+#   {'<freund-token>': {'level': 'all'|'important'|'custom'|'none',
+#                       'types': ['dm', 'community', …]}}
+# Gelesen im EMPFÄNGER-Registry, geschlüsselt auf den AUSLÖSER (actor_token).
+#
+# ARCHITEKTUR-REGEL: die per-Freund-Stufe ist ein FILTER AUF dem globalen
+# Kategorie-Kanal, niemals eine Freischaltung. Reihenfolge in
+# _send_push_notification: (1) globale Kategorie (_PUSH_TYPE_TO_PREF) —
+# aus ist aus; (2) per-Freund-Gate. „Keine" heißt keine: auch DMs dieses
+# Freundes werden unterdrückt (der globale dm-Kanal bleibt für alle
+# ANDEREN Freunde unberührt).
+#
+# FAIL-OPEN an jeder Stelle: kein Eintrag / unbekannter Typ / kaputte
+# Struktur ⇒ senden. Ein Bug hier darf nie still Pushes fressen.
+_PUSH_FRIEND_LEVELS = ('all', 'important', 'custom', 'none')
+
+# Per-Freund wählbare „Arten" → die realen data['type']-Strings dahinter.
+# NUR Typen, die ein anderer AeroX-User tatsächlich auslösen kann
+# (roster_change/flight_update/inbound_* haben keinen Auslöser → nie hier).
+_PUSH_FRIEND_ART_TO_TYPES = {
+    'dm': ('dm',),
+    'group_message': ('group_message', 'group_added'),
+    'friend_request': ('friend_request', 'buddy_request', 'friend_accept',
+                       'friend_accepted', 'buddy_accepted'),
+    'community': ('wall_comment', 'wall_comment_reply', 'forum_reply',
+                  'forum_mention', 'friend_remind', 'trade_interest',
+                  'trade_closed'),
+    'hangout': ('hangout_nearby',),
+}
+_PUSH_FRIEND_ART_KEYS = tuple(_PUSH_FRIEND_ART_TO_TYPES.keys())
+_PUSH_TYPE_TO_FRIEND_ART = {
+    t: art for art, types in _PUSH_FRIEND_ART_TO_TYPES.items() for t in types
+}
+
+# „Wichtige" = nur direkte, an MICH persönlich gerichtete Interaktionen.
+# Ambient-Rauschen (Gruppen-Geplauder, Community/Forum, Treffpunkte in der
+# Nähe) fällt weg.
+_PUSH_FRIEND_IMPORTANT_ARTS = ('dm', 'friend_request')
+
+# Deckel gegen Blob-Wachstum in der metadata-jsonb-Column.
+_PUSH_FRIEND_PREFS_MAX = 500
+
+
+def _push_friend_pref_normalize(value):
+    """Roh-Wert aus dem Client → kanonisches {'level':…, 'types':[…]} oder None.
+
+    Akzeptiert die Kurzform als String ('none') genauso wie das volle Dict.
+    None bedeutet „Default" (= 'all') und wird vom Aufrufer als LÖSCHEN des
+    Eintrags interpretiert — so bleibt der gespeicherte Blob klein.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = {'level': value}
+    if not isinstance(value, dict):
+        return None
+    level = str(value.get('level') or 'all').strip().lower()
+    if level not in _PUSH_FRIEND_LEVELS:
+        return None
+    raw_types = value.get('types')
+    types = []
+    if isinstance(raw_types, (list, tuple)):
+        for t in raw_types:
+            k = str(t or '').strip().lower()
+            if k in _PUSH_FRIEND_ART_TO_TYPES and k not in types:
+                types.append(k)
+    if level == 'custom':
+        # 'custom' ohne Auswahl ist bedeutungslos → auf die klaren Endpunkte
+        # normalisieren, damit die Gate-Logik nie raten muss.
+        if not types:
+            return {'level': 'none', 'types': []}
+        if len(types) == len(_PUSH_FRIEND_ART_KEYS):
+            return None
+        return {'level': 'custom', 'types': types}
+    if level == 'all':
+        return None
+    return {'level': level, 'types': []}
+
+
+def _push_friend_prefs_allow(friend_prefs, actor_token, push_type):
+    """Darf ein von `actor_token` ausgelöster Push vom Typ `push_type` raus?
+
+    Fail-open: alles Unbekannte/Fehlende ⇒ True.
+    """
+    if not actor_token or not isinstance(friend_prefs, dict):
+        return True
+    entry = friend_prefs.get(actor_token)
+    if isinstance(entry, str):
+        entry = {'level': entry}
+    if not isinstance(entry, dict):
+        return True
+    level = str(entry.get('level') or 'all').strip().lower()
+    if level in ('', 'all'):
+        return True
+    if level == 'none':
+        # „Keine" ist absolut — auch für (noch) unbekannte Push-Typen.
+        return False
+    art = _PUSH_TYPE_TO_FRIEND_ART.get(push_type)
+    if art is None:
+        # Typ ist nicht per-Freund steuerbar (z.B. ein künftiger Typ) →
+        # nur 'none' blockt ihn, sonst durchlassen.
+        return True
+    if level == 'important':
+        return art in _PUSH_FRIEND_IMPORTANT_ARTS
+    if level == 'custom':
+        types = entry.get('types')
+        if not isinstance(types, (list, tuple)):
+            return True
+        return art in {str(t or '').strip().lower() for t in types}
+    return True
+
 
 def _push_load_from_supabase(token):
     """Returns dict in legacy-shape ({token, push_token, apns_token, …}) oder
@@ -12992,7 +13105,8 @@ def _hangout_notify_nearby(creator_token, lat, lon, iata, title, pin_id,
                 _push_outbox_enqueue(
                     u['token'], 'AeroX Treffpunkt', body, data=data,
                     thread_id=f'hangout__{pin_id}', category='community',
-                    idempotency_key=f'hangout-geo:{pin_id}:{_push_token_ref(u["token"])}')
+                    idempotency_key=f'hangout-geo:{pin_id}:{_push_token_ref(u["token"])}',
+                    actor_token=creator_token)
                 sent += 1
             except Exception:
                 continue
@@ -13235,7 +13349,8 @@ def add_member_to_group(token, group_id):
                 data={'type': 'group_added', 'group_id': group_id,
                       'group_name': group_name},
                 thread_id=f'group__{group_id}',
-                idempotency_key=f'group-added:{group_id}:{_push_token_ref(target)}')
+                idempotency_key=f'group-added:{group_id}:{_push_token_ref(target)}',
+                actor_token=token)
         except Exception:
             pass
 
@@ -22982,7 +23097,8 @@ def add_comment(token, post_id):
                                f'{commenter_name} hat kommentiert',
                                (text or '')[:120],
                                data={'type': 'wall_comment', 'post_id': post_id},
-                               idempotency_key=f'wall-comment:{c.get("id")}:{post_author}')
+                               idempotency_key=f'wall-comment:{c.get("id")}:{post_author}',
+                               actor_token=token)
         # ANTWORT AUF EINEN KOMMENTAR (Florian 2026-07-24, gleiches Loch wie im
         # Forum): der Autor des parent-Kommentars bekam von Antworten auf SEINEN
         # Kommentar keinen Push — nur der Post-Autor. Der `comments`-Stream ist
@@ -22998,7 +23114,8 @@ def add_comment(token, post_id):
                                    f'{commenter_name} hat auf deinen Kommentar geantwortet',
                                    (text or '')[:120],
                                    data={'type': 'wall_comment', 'post_id': post_id},
-                                   idempotency_key=f'wall-comment-parent:{c.get("id")}:{parent_author}')
+                                   idempotency_key=f'wall-comment-parent:{c.get("id")}:{parent_author}',
+                                   actor_token=token)
     except Exception:
         pass
     return jsonify({'ok': True, 'comment': response_c})
@@ -24302,7 +24419,8 @@ def forum_create_reply(token, thread_id):
                                (text or '')[:120],
                                data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
                                idempotency_key=(
-                                   f'forum-reply:{reply.get("id")}:{thread_author_token}'))
+                                   f'forum-reply:{reply.get("id")}:{thread_author_token}'),
+                               actor_token=token)
         # Mentioned-User extra benachrichtigen (nicht doppelt wenn = thread-author)
         if mentioned_token and mentioned_token != token and mentioned_token != thread_author_token:
             _push_notify_async(mentioned_token,
@@ -24310,7 +24428,8 @@ def forum_create_reply(token, thread_id):
                                (text or '')[:120],
                                data={'type': 'forum_mention', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
                                idempotency_key=(
-                                   f'forum-mention:{reply.get("id")}:{mentioned_token}'))
+                                   f'forum-mention:{reply.get("id")}:{mentioned_token}'),
+                               actor_token=token)
         # ANTWORT AUF EINEN KOMMENTAR (Florian 2026-07-24: „Auf meinen weiteren
         # Kommentar hast Du nicht geantwortet … [keine] Benachrichtigung"):
         # bisher wurde NUR der Thread-Autor gepusht — der Autor des parent-Reply
@@ -24331,7 +24450,8 @@ def forum_create_reply(token, thread_id):
                                    (text or '')[:120],
                                    data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
                                    idempotency_key=(
-                                       f'forum-reply-parent:{reply.get("id")}:{parent_author}'))
+                                       f'forum-reply-parent:{reply.get("id")}:{parent_author}'),
+                                   actor_token=token)
     except Exception:
         pass
     return jsonify({'ok': True, 'reply': response_reply})
@@ -25830,7 +25950,8 @@ def layover_rec_add_comment(token, rec_id):
                                    (text or '')[:120],
                                    data={'type': 'wall_comment_reply', 'post_id': str(rec_id), 'comment_id': str(comment.get('id') or ''), 'parent_comment_id': str(parent_comment_id or '')},
                                    idempotency_key=(
-                                       f'layover-comment:{comment.get("id")}:{parent_token}'))
+                                       f'layover-comment:{comment.get("id")}:{parent_token}'),
+                                   actor_token=token)
     except Exception:
         pass
     return jsonify({'ok': True, 'comment': response_c})
@@ -27970,11 +28091,23 @@ def set_push_prefs():
     roster_change, community (_PUSH_PREF_KEYS) — unbekannte Keys werden
     ignoriert, Werte zu bool gecoerct. _send_push_notification unterdrückt
     Kategorien mit pref==False; fehlende prefs/keys → normal senden (fail-open).
+
+    ADDITIV (2026-07-27): optionales `friend_prefs`
+    `{freund_token: 'none' | {'level': 'all'|'important'|'custom'|'none',
+                              'types': ['dm','community',…]}}`.
+    Steuert PRO FREUND, welche von ihm ausgelösten Pushes ankommen.
+    Abwärtskompatibel: alte Clients schicken das Feld nicht → nichts ändert
+    sich. `friend_prefs: {}` löscht NICHTS (Merge-Semantik); um einen Freund
+    auf den Default zurückzusetzen, `null` bzw. `{'level':'all'}` schicken.
     """
     body = request.get_json(silent=True) or {}
     user_token = (body.get('token') or '').strip()
     prefs_in = body.get('prefs')
-    if not user_token or not isinstance(prefs_in, dict):
+    friend_prefs_in = body.get('friend_prefs')
+    has_friend_prefs = isinstance(friend_prefs_in, dict)
+    # `prefs` bleibt Pflicht, solange kein friend_prefs mitkommt (alter
+    # Contract). Ein reiner Freundes-Sync darf `prefs` weglassen.
+    if not user_token or not (isinstance(prefs_in, dict) or has_friend_prefs):
         return jsonify({'ok': False, 'error': 'missing token or prefs'}), 400
     # SECURITY (IDOR): wie register-apns — Body-Token umgeht das Pfad-Binding-
     # Gate → expliziter Bearer-Match. Sonst könnte ein Angreifer fremde
@@ -27984,16 +28117,57 @@ def set_push_prefs():
     existing = _push_load(user_token) or {}
     old_prefs = existing.get('prefs')
     merged_prefs = dict(old_prefs) if isinstance(old_prefs, dict) else {}
-    for k, v in prefs_in.items():
-        if k in _PUSH_PREF_KEYS:
-            merged_prefs[k] = bool(v)
+    if isinstance(prefs_in, dict):
+        for k, v in prefs_in.items():
+            if k in _PUSH_PREF_KEYS:
+                merged_prefs[k] = bool(v)
+    old_friend = existing.get('friend_prefs')
+    merged_friend = dict(old_friend) if isinstance(old_friend, dict) else {}
+    if has_friend_prefs:
+        for friend_token, value in friend_prefs_in.items():
+            key = str(friend_token or '').strip()
+            if not key or len(key) > 128:
+                continue
+            norm = _push_friend_pref_normalize(value)
+            if norm is None:
+                # Default („Alle") wird NICHT gespeichert, sondern entfernt —
+                # hält den metadata-Blob klein und macht fail-open zur Regel.
+                merged_friend.pop(key, None)
+            elif (key in merged_friend
+                  or len(merged_friend) < _PUSH_FRIEND_PREFS_MAX):
+                merged_friend[key] = norm
     # WICHTIG: bestehende Registry-Felder (apns_token, push_token, bundle_id, …)
     # mitnehmen — _push_save persistiert das GANZE dict inkl. metadata-jsonb
     # (Metadata-Clobber-Gotcha, siehe Avatar-Persist-Bug).
-    merged = {**existing, 'token': user_token, 'prefs': merged_prefs}
+    merged = {**existing, 'token': user_token, 'prefs': merged_prefs,
+              'friend_prefs': merged_friend}
     if _push_save(user_token, merged):
-        return jsonify({'ok': True, 'prefs': merged_prefs})
+        return jsonify({'ok': True, 'prefs': merged_prefs,
+                        'friend_prefs': merged_friend})
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+
+
+@app.route('/api/push/prefs/<token>', methods=['GET'])
+def get_push_prefs(token):
+    """Aktuelle Push-Preferences lesen (Zweitgerät/Neuinstallation).
+
+    Ohne diesen Read kennt ein frisch installiertes Gerät die Pro-Freund-
+    Auswahl nicht und würde sie beim ersten Sync mit lokalen Defaults
+    überschreiben.
+    """
+    user_token = (token or '').strip()
+    if not user_token:
+        return jsonify({'ok': False, 'error': 'missing_token'}), 400
+    if not _request_bearer_matches(user_token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
+    reg = _push_load(user_token) or {}
+    prefs = reg.get('prefs')
+    friend_prefs = reg.get('friend_prefs')
+    return jsonify({
+        'ok': True,
+        'prefs': prefs if isinstance(prefs, dict) else {},
+        'friend_prefs': (friend_prefs if isinstance(friend_prefs, dict) else {}),
+    })
 
 
 # ── APNs HTTP/2 Sender ───────────────────────────────────────────────────
@@ -28164,12 +28338,17 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
 
 def _send_push_notification(token, title, body, data=None,
                             thread_id=None, badge=None, category=None,
-                            _return_detail=False):
+                            actor_token=None, _return_detail=False):
     """Fan out to every active installation, with one legacy Expo fallback.
 
     The public/legacy return value remains bool. The durable outbox asks for a
     small detailed result so preference/no-installation outcomes complete
     terminally while transport failures retry.
+
+    `actor_token` = der AUSLÖSER des Pushes (der Freund, der geschrieben/
+    kommentiert/eingeladen hat). Nur gesetzt an Call-Sites, wo ein anderer
+    AeroX-User den Push verursacht — er wird NIE Teil des APNs-Payloads,
+    sondern nur für das Pro-Freund-Gate benutzt.
     """
     import os
 
@@ -28191,6 +28370,16 @@ def _send_push_notification(token, title, body, data=None,
             print(f"[PUSH] suppressed user_ref={_push_token_ref(token)} "
                   f"type={push_type} pref={pref_key}")
             return _result(True, True, 'suppressed_by_preference')
+
+    # Pro-Freund-Gate (2026-07-27) — NACH dem globalen Kategorie-Filter: die
+    # Freundes-Stufe kann nur zusätzlich einschränken, nie freischalten.
+    if actor_token:
+        friend_prefs = (legacy or {}).get('friend_prefs')
+        if not _push_friend_prefs_allow(friend_prefs, actor_token, push_type):
+            print(f"[PUSH] suppressed user_ref={_push_token_ref(token)} "
+                  f"type={push_type} actor_ref={_push_token_ref(actor_token)} "
+                  f"by=friend_pref")
+            return _result(True, True, 'suppressed_by_friend_preference')
 
     apns_configured = bool(os.environ.get('APNS_AUTH_KEY', '').strip())
     delivered = 0
@@ -28365,7 +28554,8 @@ def _push_outbox_key(token, title, body, data, thread_id, badge, category,
 
 
 def _push_outbox_enqueue(token, title, body, data=None, thread_id=None,
-                         badge=None, category=None, idempotency_key=None):
+                         badge=None, category=None, idempotency_key=None,
+                         actor_token=None):
     if not (SB_AVAILABLE and sb is not None and token):
         return None
     payload = {
@@ -28376,6 +28566,12 @@ def _push_outbox_enqueue(token, title, body, data=None, thread_id=None,
         'badge': badge,
         'category': str(category)[:64] if category else None,
     }
+    # Auslöser NUR im Outbox-Payload (server-seitig), NICHT in `data` — `data`
+    # landet 1:1 im APNs-Payload auf dem Gerät des Empfängers.
+    if actor_token:
+        payload['actor_token'] = str(actor_token)[:128]
+    # Der Idempotenz-Hash bleibt bewusst OHNE actor_token: derselbe Event
+    # bekommt sonst nach dem Deploy einen neuen Key und würde doppelt zugestellt.
     key = _push_outbox_key(token, title, body, data, thread_id, badge,
                            category, idempotency_key=idempotency_key)
     try:
@@ -28504,6 +28700,7 @@ def _push_outbox_drain(max_batches=4):
                             thread_id=payload.get('thread_id'),
                             badge=payload.get('badge'),
                             category=payload.get('category'),
+                            actor_token=payload.get('actor_token'),
                             _return_detail=True)
                 except Exception as e:
                     delivery = {'ok': False, 'terminal': False,
@@ -28549,15 +28746,20 @@ def _push_executor():
 
 
 def _push_notify_async(token, title, body, data=None, thread_id=None,
-                       badge=None, category=None, idempotency_key=None):
+                       badge=None, category=None, idempotency_key=None,
+                       actor_token=None):
     """Durably enqueue, then schedule non-blocking delivery.
 
     If the additive schema/store is unavailable, preserve old clients via the
     previous direct executor send. That path is metered and never called durable.
+
+    `actor_token`: siehe _send_push_notification — der auslösende Freund, für
+    das Pro-Freund-Gate. Reist nur im Outbox-Payload, nie im APNs-Payload.
     """
     outbox_id = _push_outbox_enqueue(
         token, title, body, data=data, thread_id=thread_id, badge=badge,
-        category=category, idempotency_key=idempotency_key)
+        category=category, idempotency_key=idempotency_key,
+        actor_token=actor_token)
     if outbox_id:
         _ensure_push_outbox_worker()
         return outbox_id
@@ -28568,7 +28770,8 @@ def _push_notify_async(token, title, body, data=None, thread_id=None,
             try:
                 _send_push_notification(token, title, body, data=data,
                                         thread_id=thread_id, badge=badge,
-                                        category=category)
+                                        category=category,
+                                        actor_token=actor_token)
             except Exception as e:
                 print(f"[PUSH] fallback send failed user_ref={_push_token_ref(token)}: "
                       f"{type(e).__name__}: {str(e)[:200]}")
@@ -28737,6 +28940,9 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
                         'badge': 1,
                         'idempotency_key': (f'chat:{message_id}:{rcpt}'
                                             if message_id else None),
+                        # Pro-Freund-Gate: der Empfänger kann Pushes DIESES
+                        # Absenders auf „Wichtige"/„Keine" gestellt haben.
+                        'actor_token': author_token,
                     }
                     if _from_outbox:
                         child_id = _push_outbox_enqueue(
@@ -42322,7 +42528,8 @@ def _send_friend_request_core(token, target, notify=True):
             _push_notify_async(target, 'Neue Folge-Anfrage',
                                f'{who} möchte dir folgen.',
                                data={'type': 'friend_request', 'from': token},
-                               idempotency_key=f'friend-request:{token}:{target}')
+                               idempotency_key=f'friend-request:{token}:{target}',
+                               actor_token=token)
         except Exception:
             pass
     return jsonify({'ok': True})
@@ -42453,7 +42660,8 @@ def redeem_friend_invite(token):
         _push_notify_async(issuer, 'Neue Crew-Verbindung',
                            f'{who} ist jetzt mit dir verbunden.',
                            data={'type': 'friend_accept', 'from': token},
-                           idempotency_key=f'friend-connect:{token}:{issuer}')
+                           idempotency_key=f'friend-connect:{token}:{issuer}',
+                           actor_token=token)
     except Exception:
         pass
     return jsonify({'ok': True, 'connected': True})
@@ -42509,7 +42717,8 @@ def accept_friend_request(token):
         _push_notify_async(from_token, 'Neue Crew-Verbindung',
                            f'{who} hat deine Anfrage angenommen.',
                            data={'type': 'friend_accept', 'from': token},
-                           idempotency_key=f'friend-accept:{token}:{from_token}')
+                           idempotency_key=f'friend-accept:{token}:{from_token}',
+                           actor_token=token)
     except Exception:
         pass
     return jsonify({'ok': True})
@@ -42586,7 +42795,8 @@ def friend_remind(token):
                            'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.',
                            # Audit 2026-07-12: ohne data.type war der Push
                            # unfilterbar (verstiess gegen die eigene Checkliste).
-                           data={'type': 'friend_remind'})
+                           data={'type': 'friend_remind'},
+                           actor_token=token)
     except Exception:
         pass
     return jsonify({'ok': True})

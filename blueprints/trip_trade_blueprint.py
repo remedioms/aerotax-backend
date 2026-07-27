@@ -124,8 +124,13 @@ def _rate_limited(token, endpoint, limit, window_sec):
 
 # ─── Push-Notification Helper (best effort) ───────────────────────────
 
-def _push(token, title, body, data=None):
-    """Best-Effort Push an `token`. Stillschweigend OK wenn nicht verfügbar."""
+def _push(token, title, body, data=None, actor_token=None):
+    """Best-Effort Push an `token`. Stillschweigend OK wenn nicht verfügbar.
+
+    `actor_token` = der auslösende AeroX-User (Pro-Freund-Push-Gate im
+    app-Modul). Ältere app-Module ohne den Parameter fallen sauber auf den
+    alten Aufruf zurück.
+    """
     m = _get_app_module()
     if m is None:
         return False
@@ -135,6 +140,14 @@ def _push(token, title, body, data=None):
         or getattr(m, '_send_push_notification', None)
     if not callable(fn):
         return False
+    if actor_token:
+        try:
+            fn(token, title, body, data=data, actor_token=actor_token)
+            return True
+        except TypeError:
+            pass
+        except Exception:
+            return False
     try:
         fn(token, title, body, data)
         return True
@@ -965,7 +978,7 @@ def express_interest(token, post_id):
             'type': 'trade_interest',
             'post_id': post_id,
             'interest_id': interest_id,
-        })
+        }, actor_token=token)
     except Exception:
         pass
 
@@ -1062,7 +1075,8 @@ def close_trade_post(token, post_id):
             try:
                 _push(it, 'Trade-Post geschlossen',
                       'Ein Post auf den du Interesse hattest wurde geschlossen.',
-                      data={'type': 'trade_closed', 'post_id': post_id})
+                      data={'type': 'trade_closed', 'post_id': post_id},
+                      actor_token=token)
             except Exception:
                 pass
     except Exception:
