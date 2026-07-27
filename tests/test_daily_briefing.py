@@ -1007,6 +1007,7 @@ class _FakeSB:
     def __init__(self, select_rows):
         self.select_rows = select_rows      # list[dict] für JEDEN Select (FIFO)
         self.ops = []
+        self.reads = []                     # Filter JEDES Selects (Reihenfolge)
 
     def table(self, name):
         fake = self
@@ -1045,6 +1046,7 @@ class _FakeSB:
             def execute(self):
                 import types
                 if self.op[0] == 'select':
+                    fake.reads.append(list(self.filters))
                     rows = fake.select_rows.pop(0) if fake.select_rows else []
                     return types.SimpleNamespace(data=rows)
                 fake.ops.append((name, self.op[0], self.payload, list(self.filters)))
@@ -1510,21 +1512,39 @@ def test_degeneric_reunites_a_glued_generic_word():
     """Der konkrete BUD-Fall: das Verzeichnis kennt 'Intercity Budapest' (mit
     35 min Fahrtzeit, am 18.07. stillgelegt), LH bucht 'IntercityHotel
     Budapest' — dasselbe Haus."""
-    assert db._same_house('IntercityHotel Budapest', 'Intercity Budapest')
-    assert db._same_house('Parkhotel Bremen', 'Park Hotel Bremen')
+    assert db._same_house_loose('IntercityHotel Budapest', 'Intercity Budapest')
+    assert db._same_house_loose('Parkhotel Bremen', 'Park Hotel Bremen')
+
+
+def test_loose_matching_never_touches_the_display_path(sync_env):
+    """BLOCKER-Regression (adversarialer Review 27.07.): die lockere Sicht
+    gehört AUSSCHLIESSLICH in den Wechsel-Pfad. Eine Station darf zwei
+    Crowd-Schreibweisen desselben Hauses tragen — unter der lockeren Sicht
+    würden daraus zwei Treffer, aus 'exact' würde 'ambiguous_multi_hotel',
+    und eine korrekte Fahrtzeit verschwände als N/A."""
+    d = [{'iata': 'BRE', 'hotel': 'Parkhotel Bremen', 'transfer_min': 25,
+          'votes': 1},
+         {'iata': 'BRE', 'hotel': 'Park Hotel Bremen', 'transfer_min': 25,
+          'votes': 1}]
+    m = db.transfer_match('BRE', 'Parkhotel Bremen', d)
+    assert m['reason'] == 'exact' and m['transfer_min'] == 25
+    assert db.official_name_action('Parkhotel Bremen', m) == (None, False)
 
 
 def test_degeneric_does_not_merge_different_houses():
     """Gegenprobe zu den teuren Altfehlern: der Suffix-Strip darf keine zwei
     Häuser verschmelzen."""
-    assert not db._same_house('Hilton Frankfurt Airport',
-                              'Hilton Garden Inn Frankfurt Airport')
-    assert not db._same_house('Mercure Hotel Frankfurt (Airport)',
-                              'Mercure Hotel Frankfurt (City)')
-    assert not db._same_house('IntercityHotel Budapest',
-                              'Hilton Garden Inn Budapest City Centre')
-    # Kein Präfix-Strip und kein Kahlschlag bei kurzen Wurzeln.
-    assert db._hotel_tokens('Hotelissimo Rom') == {'hotelissimo', 'rom'}
+    for a, b in (('Hilton Frankfurt Airport', 'Hilton Garden Inn Frankfurt Airport'),
+                 ('Mercure Hotel Frankfurt (Airport)', 'Mercure Hotel Frankfurt (City)'),
+                 ('IntercityHotel Budapest', 'Hilton Garden Inn Budapest City Centre')):
+        assert not db._same_house(a, b)
+        assert not db._same_house_loose(a, b)
+    # Kein Präfix-Strip und kein Kahlschlag bei kurzen/generischen Wurzeln:
+    # 'thehotel' -> 'the' waere generisch und fiele danach ganz weg, das Haus
+    # traefe jedes andere mit demselben Ortsnamen.
+    assert db._hotel_tokens('Hotelissimo Rom', degeneric=True) == {'hotelissimo', 'rom'}
+    assert 'brussels' in db._hotel_tokens('TheHotel Brussels', degeneric=True)
+    assert db._hotel_tokens('TheHotel Brussels', degeneric=True) != {'brussels'}
 
 
 def test_change_decision_needs_three_nights_over_a_week():
@@ -1598,6 +1618,31 @@ def test_supersede_plan_is_idempotent_and_refuses_ambiguity():
            {'id': 'c', 'hotel': 'Hotel Z', 'status': 'approved', 'active': True}]
     assert db.hotel_supersede_plan(dup, 'Hotel A')['reason'] == 'ambiguous_same_house'
     assert db.hotel_supersede_plan(dup, 'Hotel A')['deactivate'] == []
+
+
+def test_supersede_plan_never_promotes_a_single_persons_suggestion():
+    """Eine `suggested`-Zeile traegt die frei eingegebene Fahrtzeit EINER
+    Person. /api/ax/crew-hotels/suggest verlangt an einer belegten Station
+    bewusst zwei Stimmen — der Wechsel-Pfad darf das nicht umgehen
+    (adversarialer Review 27.07.)."""
+    rows = [{'id': 'sug', 'hotel': 'Hotel A', 'transfer_min': 600,
+             'status': 'suggested', 'active': True},
+            {'id': 'cur', 'hotel': 'Hotel Z', 'transfer_min': 30,
+             'status': 'approved', 'active': True}]
+    plan = db.hotel_supersede_plan(rows, 'Hotel A')
+    assert plan == {'resurrect': None, 'insert': False, 'deactivate': [],
+                    'reason': 'pending_human_vote'}
+
+
+def test_supersede_plan_ignores_official_name_when_matching():
+    """Eine vergiftete Zeile (offizieller Name des EINEN Hauses auf der Zeile
+    eines anderen — live vorgekommen, s. transfer_match-Docstring) darf nie
+    samt ihrer fremden Fahrtzeit reaktiviert werden."""
+    rows = [{'id': 'poison', 'hotel': 'Hilton Garden Inn Budapest City Centre',
+             'official_name': 'IntercityHotel Budapest', 'transfer_min': 40,
+             'status': 'approved', 'active': False}]
+    plan = db.hotel_supersede_plan(rows, 'IntercityHotel Budapest')
+    assert plan['resurrect'] is None and plan['insert'] is True
 
 
 def test_supersede_plan_ignores_the_evidence_rows_themselves():
@@ -1686,3 +1731,41 @@ def test_hotel_block_reports_the_night_it_is_about():
     assert hb['night_of'] == '2026-07-28'
     # Und die Fahrtzeit bleibt ehrlich leer (BUD-Eintrag hat transfer_min=0).
     assert hb['transfer_min'] is None and 'N/A' in hb['line']
+
+
+def test_retired_evidence_never_overrules_the_owner_again(sync_env):
+    """BLOCKER-Regression (adversarialer Review 27.07.): nach einem Wechsel
+    bleibt die Evidenz-Zeile als Protokoll stehen, aber STILLGELEGT. Nimmt der
+    Owner den Wechsel zurueck, darf der naechste einzelne Payload die alte,
+    laengst erreichte Schwelle nicht wiederfinden — sonst waere die
+    dokumentierte Ruecknahme 120 Tage lang wirkungslos."""
+    fake = sync_env([[]])            # der Read findet nichts (active=False)
+    out = db._sync_official_name('AT-U', 'BUD', 'IntercityHotel Budapest',
+                                 DIRECTORY, night='2026-07-28')
+    assert out == 'evidence_recorded'          # faengt bei EINER Nacht an
+    assert ('eq', 'active', True) in fake.reads[0]
+    assert ('eq', 'status', db._LH_CONTEST_STATUS) in fake.reads[0]
+
+
+def test_duplicate_evidence_rows_are_merged_not_abandoned(sync_env):
+    """Zwei gunicorn-Worker koennen dieselbe Nacht gleichzeitig einfuegen
+    (keine Unique-Constraint, `_dir_sync_memo` ist prozesslokal). Wuerde der
+    Reader bei >1 Zeile aufgeben, waere das Feature ab dem ersten Rennen
+    dauerhaft tot und die Tabelle wuechse pro Nacht weiter."""
+    fake = sync_env([
+        [{'id': 'ev1', 'votes': 1, 'official_name_source': 'lh_evidence:2026-07-01'},
+         {'id': 'ev2', 'votes': 1, 'official_name_source': 'lh_evidence:2026-07-12'}],
+        [{'id': 'cur', 'hotel': 'Hilton Garden Inn Budapest City Centre',
+          'transfer_min': 0, 'votes': 1, 'status': 'approved', 'active': True}],
+    ])
+    out = db._sync_official_name('AT-U', 'BUD', 'IntercityHotel Budapest',
+                                 DIRECTORY, night='2026-07-28')
+    # Beide Naechte zaehlen -> mit der dritten steht die Schwelle.
+    assert out == 'hotel_changed'
+    merged = [p for _t, op, p, _f in fake.ops
+              if op == 'update' and 'official_name_source' in (p or {})]
+    assert merged and merged[0]['official_name_source'] == \
+        'lh_evidence:2026-07-01,2026-07-12,2026-07-28'
+    # Das Duplikat wird eingesammelt, nicht liegengelassen.
+    assert any(('eq', 'id', 'ev2') in f and (p or {}).get('active') is False
+               for _t, op, p, f in fake.ops if op == 'update')

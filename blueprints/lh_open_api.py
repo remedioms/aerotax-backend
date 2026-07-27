@@ -582,26 +582,30 @@ def _facts_dt(val):
 def _facts_ttl(date_str, facts, now=None):
     """Wie lange die Fakten eines Flugs gültig bleiben (Sekunden). Pure.
 
-    Vertrag — im Zweifel IMMER die alte, kurze TTL:
-      • anderer Tag als heute        → 6 h   (wie bisher)
-      • heute, keine/zeitlose Fakten → 120 s (wie bisher)
-      • heute, > 2 h vor dem Abflug  → bis zu 20 min, aber NIE über den Beginn
-        des Betriebsfensters hinaus (Abflug − 2 h) — der erste Read danach
-        holt garantiert frische Gate-/Ist-Daten
-      • heute, > 2 h nach der Ankunft→ 30 min
-      • alles dazwischen             → 120 s (wie bisher)
-    """
+    Sobald Zeiten bekannt sind, entscheidet die UHR — nicht der Kalendertag:
+      • vor dem Betriebsfenster (> 2 h vor Abflug) → bis zu 20 min (heute) bzw.
+        6 h (anderer Tag), aber NIE über den Beginn des Fensters hinaus; der
+        erste Read danach holt garantiert frische Gate-/Ist-Daten
+      • nach dem Betriebsfenster (> 2 h nach Abflug UND Ankunft) → 30 min
+        (heute) bzw. 6 h (anderer Tag)
+      • im Fenster → 120 s (unverändert)
+    Ohne Zeiten bleibt es beim alten, rein datumsbasierten Verhalten.
+
+    Dass der Kalendertag NICHT mehr allein entscheidet, schliesst nebenbei das
+    Mitternachts-Loch: ein Red-Eye mit Servicetag „gestern", der um 01:00 UTC
+    in der Luft ist, bekam vorher 6 h TTL — jetzt die 120 s des Fensters.
+    Und ein Flug, dessen SOLL-Ankunft vorbei ist, dessen Abflug sich aber
+    verspätet hat, gilt erst als fertig, wenn AUCH der Abflug lange vorbei ist
+    (adversarialer Review 27.07.: sonst hätte ein verspäteter Flug 30 min lang
+    ein veraltetes Gate gezeigt)."""
     now = time.time() if now is None else now
-    if (date_str or '') != time.strftime('%Y-%m-%d', time.gmtime(now)):
-        return _TTL_OTHER_DAY
+    other_day = (date_str or '') != time.strftime('%Y-%m-%d', time.gmtime(now))
     if not isinstance(facts, dict) or not facts:
-        return _TTL_OPS
+        return _TTL_OTHER_DAY if other_day else _TTL_OPS
     dep = _facts_dt(facts.get('est_dep') or facts.get('sched_dep'))
     arr = _facts_dt(facts.get('est_arr') or facts.get('sched_arr'))
     if dep is None and arr is None:
-        return _TTL_OPS
-    if arr is not None and now > arr.timestamp() + _OPS_TAIL_S:
-        return _TTL_DONE
+        return _TTL_OTHER_DAY if other_day else _TTL_OPS
     if dep is not None:
         lead = dep.timestamp() - _OPS_LEAD_S - now
         # `max(_TTL_OPS, …)`: kurz VOR dem Betriebsfenster ist der Rest-Abstand
@@ -609,7 +613,17 @@ def _facts_ttl(date_str, facts, now=None):
         # MEHR Calls als vorher. Die Überschreitung ins Fenster hinein ist
         # höchstens so gross wie die Fenster-TTL selbst.
         if lead > 0:
-            return max(_TTL_OPS, int(min(_TTL_PLAN, lead)))
+            cap = _TTL_OTHER_DAY if other_day else _TTL_PLAN
+            return max(_TTL_OPS, int(min(cap, lead)))
+    # „Fertig" heisst: der SPÄTESTE bekannte Zeitpunkt liegt lange zurück —
+    # und der Abflug auch. Beides ist nötig: nur die Ankunft zu prüfen fror
+    # verspätete Flüge ein (Soll-Ankunft vorbei, Abflug noch in der Zukunft),
+    # nur den Abflug zu prüfen hätte einen Langstreckenflug schon zwei Stunden
+    # nach dem Start für fertig erklärt.
+    ref_end = arr or dep
+    if (ref_end is not None and now > ref_end.timestamp() + _OPS_TAIL_S
+            and (dep is None or now > dep.timestamp() + _OPS_TAIL_S)):
+        return _TTL_OTHER_DAY if other_day else _TTL_DONE
     return _TTL_OPS
 
 
@@ -668,6 +682,9 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
     fn = (flight_no or '').replace(' ', '').upper().strip()
     d = ((date or '').strip()[:10])
     if not fn or not d or not lh_open_configured() or not is_lh_group(fn):
+        # Auch das ist eine Aussage über DIESEN Aufruf — sonst liest der
+        # Aufrufer danach den Zustand eines fremden, früheren GETs.
+        _note_answer(False)
         return {}
     dep = (dep_iata or '').upper().strip() or None
     arr = (arr_iata or '').upper().strip() or None
@@ -677,11 +694,16 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
         with _facts_lock:
             hit = _facts_memo.get(key)
             if hit and now < hit[0]:
-                # Ein Memo-Treffer IST eine Antwort. Ohne diese Zeile läse ein
-                # Aufrufer wie `_fetch_leg_reg` nach einem Cache-Hit den
-                # answered/denied-Zustand eines völlig anderen, längst
-                # vergangenen GETs desselben Threads.
-                _note_answer(True)
+                # Ein Memo-Treffer trägt seine EIGENE Antwort-Eigenschaft mit
+                # (3. Tupel-Element). Ohne die läse ein Aufrufer wie
+                # `_fetch_leg_reg` den Zustand eines völlig anderen, längst
+                # vergangenen GETs desselben Threads — und ein pauschales
+                # `True` wäre noch schlimmer: ein aus einer LÜCKE (503,
+                # Throttle-Abweisung) gecachtes `{}` würde damit zur
+                # autoritativen Aussage „dieser Flug hat keine Reg" und landete
+                # über `_legs_regs` sogar im GETEILTEN Cache
+                # (adversarialer Review 27.07.).
+                _note_answer(hit[2] if len(hit) > 2 else bool(hit[1]))
                 return dict(hit[1])
     if cached_only:
         _warm_async(fn, d, dep, arr, caller)
@@ -724,7 +746,11 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
 
     # TTL nach Abflugnähe (s. `_facts_ttl`): im Betriebsfenster kurz
     # (Gate-Wechsel/Ist-Zeiten), weit davor bzw. lange danach länger.
-    ttl = _facts_ttl(d, facts, now)
+    # LEER OHNE ANTWORT ist eine LÜCKE, kein Fakt (Throttle-Abweisung, 503) —
+    # die darf NIE mit einer langen TTL zementiert werden, sonst gilt der
+    # Ausfall stundenlang weiter (adversarialer Review 27.07.).
+    answered = last_call_answered()
+    ttl = _facts_ttl(d, facts, now) if (facts or answered) else _TTL_OPS
     # CACHE-FRAGMENTIERUNG (2026-07-26): der MQTT-Push-Pfad ruft ohne dep/arr
     # (Key (fn,date,None,None)), die Roster-/Detail-Pfade IMMER mit
     # (fn,date,dep,arr). Derselbe Flug belegte dadurch zwei Einträge und der
@@ -737,9 +763,9 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
         if _fd and _fa and (_fd, _fa) != (dep, arr):
             _alias = (fn, d, _fd, _fa)
     with _facts_lock:
-        _facts_memo[key] = (now + ttl, dict(facts))
+        _facts_memo[key] = (now + ttl, dict(facts), answered)
         if _alias is not None:
-            _facts_memo[_alias] = (now + ttl, dict(facts))
+            _facts_memo[_alias] = (now + ttl, dict(facts), answered)
         if len(_facts_memo) > _FACTS_MAX:
             items = sorted(_facts_memo.items(), key=lambda kv: kv[1][0])
             for k, _v in items[:len(items) // 4 or 1]:

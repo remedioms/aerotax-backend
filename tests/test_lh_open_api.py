@@ -497,3 +497,73 @@ def test_memo_hit_counts_as_an_answer(monkeypatch):
     assert lh.last_call_answered() is True
     assert lh.last_call_denied() is False
     lh._facts_memo.clear()
+
+
+def test_gap_is_never_memoized_as_a_fact(monkeypatch):
+    """BLOCKER-Regression (adversarialer Review 27.07.): ein leeres Ergebnis
+    OHNE Antwort (Throttle-Abweisung, LH-503) ist eine Lücke. Es darf weder
+    mit einer langen TTL zementiert werden noch beim nächsten Memo-Treffer als
+    „answered" gelten — sonst wird aus der Lücke die autoritative Aussage
+    „dieser Flug hat keine Reg", und `lh_mqtt._legs_regs` schreibt sie sogar in
+    den GETEILTEN Cache."""
+    monkeypatch.setattr(lh, '_KEY', 'k')
+    monkeypatch.setattr(lh, '_SECRET', 's')
+    monkeypatch.setattr(lh, '_get', lambda *a, **k: None)   # setzt answered=False
+    lh._facts_memo.clear()
+    lh._call_state.answered = False
+    lh._call_state.denied = True
+    # Bewusst ein Flug am FOLGETAG — dort hätte `_facts_ttl` 6 h geliefert.
+    import time as _t
+    tomorrow = _t.strftime('%Y-%m-%d', _t.gmtime(_t.time() + 86400))
+    assert lh.lh_flight_facts('LH400', tomorrow, 'FRA', 'JFK',
+                              caller='unit') == {}
+    exp, facts, answered = lh._facts_memo[('LH400', tomorrow, 'FRA', 'JFK')]
+    assert facts == {} and answered is False
+    assert exp - _t.time() <= lh._TTL_OPS + 1          # kurz, nicht 6 h
+    # Und der Memo-Treffer meldet ehrlich „keine Antwort".
+    lh._call_state.answered = True
+    assert lh.lh_flight_facts('LH400', tomorrow, 'FRA', 'JFK',
+                              caller='unit') == {}
+    assert lh.last_call_answered() is False
+    lh._facts_memo.clear()
+
+
+def test_real_empty_answer_keeps_its_long_ttl(monkeypatch):
+    """Gegenprobe: ein ECHTES 404 („den Flug gab es an dem Tag nicht") ist eine
+    Antwort und darf sehr wohl lange gecacht werden."""
+    monkeypatch.setattr(lh, '_KEY', 'k')
+    monkeypatch.setattr(lh, '_SECRET', 's')
+
+    def _answered_none(*a, **k):
+        lh._note_answer(True)
+        return None
+    monkeypatch.setattr(lh, '_get', _answered_none)
+    lh._facts_memo.clear()
+    import time as _t
+    tomorrow = _t.strftime('%Y-%m-%d', _t.gmtime(_t.time() + 86400))
+    assert lh.lh_flight_facts('LH400', tomorrow, 'FRA', 'JFK',
+                              caller='unit') == {}
+    exp, _f, answered = lh._facts_memo[('LH400', tomorrow, 'FRA', 'JFK')]
+    assert answered is True and exp - _t.time() > 3600
+    lh._facts_memo.clear()
+
+
+def test_facts_ttl_delayed_flight_is_not_frozen_as_done():
+    """Verspäteter Flug: die SOLL-Ankunft ist vorbei, der Abflug liegt aber
+    noch in der Zukunft. Der darf nicht 30 min als „fertig" gelten — genau
+    dort steht das veraltete Gate (adversarialer Review 27.07.)."""
+    late = {'sched_arr': '2026-07-27T08:00:00+00:00',
+            'est_dep': '2026-07-27T12:00:00+00:00'}
+    assert _ttl('2026-07-27', late, at='2026-07-27T11:45:00') == 120
+    assert _ttl('2026-07-27', late, at='2026-07-27T13:00:00') == 120
+
+
+def test_facts_ttl_closes_the_midnight_hole_for_red_eyes():
+    """Ein Red-Eye mit Servicetag „gestern", der um 01:00 UTC in der Luft ist,
+    bekam über die reine Datumsprüfung 6 h TTL. Sobald Zeiten bekannt sind,
+    entscheidet die Uhr."""
+    red = {'sched_dep': '2026-07-26T22:30:00+00:00',
+           'sched_arr': '2026-07-27T06:30:00+00:00'}
+    assert _ttl('2026-07-26', red, at='2026-07-27T01:00:00') == 120
+    # Weit nach der Ankunft bleibt der Vortag lang gecacht.
+    assert _ttl('2026-07-26', red, at='2026-07-27T12:00:00') == 6 * 3600

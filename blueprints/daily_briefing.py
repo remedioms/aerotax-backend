@@ -545,27 +545,39 @@ def _fold(s):
 
 def _degeneric(tok):
     """'intercityhotel' → 'intercity'. Ein ANGEKLEBTES generisches Wort am
-    ENDE eines Tokens wird abgetrennt, damit die Zusammenschreibung nicht zwei
-    Häuser aus einem macht.
+    ENDE eines Tokens wird abgetrennt.
 
     Der konkrete Fall (BUD, 27.07.): das Verzeichnis kennt 'Intercity
     Budapest', LH bucht 'IntercityHotel Budapest' — dasselbe Haus, aber die
-    Token-Mengen {intercity, budapest} und {intercityhotel, budapest} waren
-    ungleich. Bewusst NUR als Suffix und nur für die Wort-Wurzeln 'hotel(s)':
-    ein Präfix-Strip ('Hotelissimo' → 'issimo') oder eine breitere Wortliste
-    wäre genau die Fuzzy-Magie, die hier schon zweimal zwei Häuser
-    verschmolzen hat. Der Rest muss ≥ 3 Zeichen behalten."""
+    Token-Mengen {intercity, budapest} und {intercityhotel, budapest} sind
+    ungleich. Bewusst NUR als Suffix und nur für die Wurzeln 'hotel(s)': ein
+    Präfix-Strip ('Hotelissimo' → 'issimo') oder eine breitere Wortliste wäre
+    genau die Fuzzy-Magie, die hier schon zweimal zwei Häuser verschmolzen hat.
+    Der Rest muss ≥ 3 Zeichen behalten UND darf nicht selbst generisch sein
+    ('thehotel' → 'the' wäre danach leer und träfe jedes Haus)."""
     for g in ('hotels', 'hotel'):
         if tok.endswith(g) and len(tok) - len(g) >= 3:
-            return tok[:-len(g)]
+            rest = tok[:-len(g)]
+            return tok if rest in _GENERIC_HOTEL_TOKENS else rest
     return tok
 
 
-def _hotel_tokens(name):
+def _hotel_tokens(name, degeneric=False):
     """Hotelname → signifikante Token-Menge (Klammern raus, Akzente gefaltet).
-    Deterministisch — keine Fuzzy-Magie."""
+    Deterministisch — keine Fuzzy-Magie.
+
+    `degeneric` löst zusätzlich angeklebte 'hotel'-Suffixe auf und ist damit
+    LOCKERER. Das bleibt bewusst dem Wechsel-Pfad vorbehalten
+    (`hotel_supersede_plan`) und wirkt NIE auf `transfer_match`: an einer
+    Station mit zwei Crowd-Schreibweisen desselben Hauses ('Parkhotel Bremen'
+    und 'Park Hotel Bremen', beide erlaubt) würde die lockere Sicht aus einem
+    eindeutigen Treffer zwei machen — und aus einer korrekten Fahrtzeit ein
+    N/A (adversarialer Review 27.07.). Der Wechsel-Pfad verträgt das: dort
+    heisst „mehrdeutig" schlicht „nichts anfassen"."""
     s = re.sub(r'\([^)]*\)', ' ', str(name or ''))
-    toks = {_degeneric(t) for t in re.split(r'[^a-z0-9]+', _fold(s)) if t}
+    toks = {t for t in re.split(r'[^a-z0-9]+', _fold(s)) if t}
+    if degeneric:
+        toks = {_degeneric(t) for t in toks}
     return toks - _GENERIC_HOTEL_TOKENS
 
 
@@ -577,6 +589,19 @@ def _paren_tokens(name):
     for m in re.findall(r'\(([^)]*)\)', str(name or '')):
         toks |= {t for t in re.split(r'[^a-z0-9]+', _fold(m)) if t}
     return toks - _GENERIC_HOTEL_TOKENS
+
+
+def _same_house_loose(lh_name, dir_name):
+    """Wie `_same_house`, löst zusätzlich angeklebte 'hotel'-Suffixe auf
+    ('IntercityHotel Budapest' == 'Intercity Budapest'). NUR für den
+    Hotelwechsel-Pfad — s. `_hotel_tokens`."""
+    lt = _hotel_tokens(lh_name, degeneric=True)
+    if not lt or lt != _hotel_tokens(dir_name, degeneric=True):
+        return False
+    pl, pd = _paren_tokens(lh_name), _paren_tokens(dir_name)
+    if pl and pd and pl != pd:
+        return False
+    return True
 
 
 def _same_house(lh_name, dir_name):
@@ -924,18 +949,29 @@ def hotel_supersede_plan(rows, lh_name):
       • Stillgelegt wird nur, wenn die Station bisher GENAU EIN aktives Hotel
         hatte. Bei mehreren aktiven Häusern sind das bewusste Optionen
         (`/api/admin/crew-hotels/approve` kollabiert sie auch nicht) — dort
-        kommt LHs Haus dazu, statt die anderen zu löschen."""
+        kommt LHs Haus dazu, statt die anderen zu löschen.
+
+    Zwei Riegel aus dem adversarialen Review 27.07.:
+      • Verglichen wird NUR gegen die Spalte `hotel`. Über `official_name` zu
+        matchen hätte eine (früher live vorgekommene) vergiftete Zeile
+        — offizieller Name des einen Hauses auf der Zeile eines anderen —
+        samt deren fremder Fahrtzeit wieder aktiviert.
+      • Reaktiviert wird nur eine `approved`-Zeile. Eine `suggested`-Zeile
+        trägt die frei eingegebene Zeit EINER Person; sie über den
+        Wechsel-Pfad hochzuheben umginge die Zwei-Stimmen-Regel von
+        /api/ax/crew-hotels/suggest. In dem Fall: nichts tun, der Mensch
+        entscheidet."""
     rows = [r for r in (rows or [])
             if str(r.get('status') or '') != _LH_CONTEST_STATUS]
-    same = [r for r in rows
-            if _same_house(lh_name, r.get('hotel'))
-            or (r.get('official_name')
-                and _same_house(lh_name, r.get('official_name')))]
+    same = [r for r in rows if _same_house_loose(lh_name, r.get('hotel'))]
     if len(same) > 1:
         # Nicht eindeutig adressierbar → NICHTS anfassen (dieselbe Linie wie
         # der 'enrich'-Pfad). Ein Mensch entscheidet.
         return {'resurrect': None, 'insert': False, 'deactivate': [],
                 'reason': 'ambiguous_same_house'}
+    if same and str(same[0].get('status') or '') != 'approved':
+        return {'resurrect': None, 'insert': False, 'deactivate': [],
+                'reason': 'pending_human_vote'}
     same_ids = {r.get('id') for r in same}
     active = [r for r in rows
               if str(r.get('status') or '') == 'approved' and r.get('active')
@@ -1105,17 +1141,30 @@ def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso):
     Nächte, `official_name_source` = 'lh_evidence:<datum>,<datum>,…'.
     Wirft nie."""
     try:
+        # `active=True` ist Pflicht, nicht Kosmetik: nach einem vollzogenen
+        # Wechsel wird die Evidenz-Zeile stillgelegt, bleibt aber als Protokoll
+        # stehen. Ohne den Filter fände der nächste Payload sie wieder — mit
+        # bereits erreichter Schwelle — und würde eine vom Owner
+        # zurückgenommene Entscheidung sofort wieder überstimmen
+        # (adversarialer Review 27.07.).
         rows = (sbc.table(_DIR_TABLE)
                 .select('id,official_name_source,votes')
                 .eq('airline', airline).eq('iata', station)
-                .eq('status', _LH_CONTEST_STATUS)
-                .ilike('hotel', clean).limit(2).execute().data) or []
+                .eq('status', _LH_CONTEST_STATUS).eq('active', True)
+                .ilike('hotel', clean).limit(5).execute().data) or []
     except Exception as e:
         log.warning('[daily_briefing] hotel-evidence read: %s', type(e).__name__)
         return 'reported'
-    row = rows[0] if len(rows) == 1 else None
-    nights = set(_parse_nights((row or {}).get('official_name_source')))
-    if night in nights and row is not None:
+    # DUPLIKATE ZUSAMMENFÜHREN statt aufgeben: es gibt keine Unique-Constraint
+    # und `_dir_sync_memo` ist prozesslokal — zwei gunicorn-Worker können
+    # dieselbe Nacht gleichzeitig einfügen. Würde man bei >1 Zeile aufgeben,
+    # wäre das Feature ab dem ersten Rennen dauerhaft tot und die Tabelle
+    # wüchse pro Nacht weiter (adversarialer Review 27.07.).
+    row = rows[0] if rows else None
+    nights = set()
+    for r in rows:
+        nights |= set(_parse_nights(r.get('official_name_source')))
+    if night in nights and row is not None and len(rows) == 1:
         return 'evidence_known'          # diese Nacht zählt genau einmal
     nights.add(night)
     flip, kept, reason = hotel_change_decision(nights)
@@ -1132,6 +1181,10 @@ def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso):
             })).execute()
         else:
             sbc.table(_DIR_TABLE).update(payload).eq('id', row['id']).execute()
+            for dupe in rows[1:]:        # Rennen-Duplikate einsammeln
+                sbc.table(_DIR_TABLE).update(
+                    {'active': False, 'updated_at': now_iso}
+                ).eq('id', dupe['id']).execute()
     except Exception as e:
         log.warning('[daily_briefing] hotel-evidence write: %s', type(e).__name__)
         return 'reported'
