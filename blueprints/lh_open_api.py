@@ -552,7 +552,15 @@ def _leg_to_facts(leg):
 # hätte.
 # Drei Stufen statt einer, alles rein deterministisch aus den Fakten:
 _TTL_OPS = 120                 # Betriebsfenster: unverändert frisch
-_TTL_PLAN = 20 * 60            # heute, aber noch weit vor Abflug (nur Plan)
+# 45 min ist KEINE runde Zahl, sondern eine Antwort auf den Takt des
+# Roster-Warmers (`aerox_data_blueprint`, poll-tick alle 30 min, bis zu 500
+# Flüge pro Lauf): eine TTL UNTER diesem Takt heißt, dass jeder Lauf jeden
+# Flug erneut kauft — genau das machte die obs_*-Familie zum grössten
+# Verbraucher, nachdem der Reg-Pfad entlastet war (gemessen 10 UTC:
+# warm_obs_overlay 321 Calls in 20 min). Gefährlich lang wird das nie: die
+# TTL ist unten hart auf den Beginn des Betriebsfensters gedeckelt, ein Flug
+# kurz vor seinem Fenster bekommt also weiterhin nur die Rest-Sekunden.
+_TTL_PLAN = 45 * 60            # heute, aber noch weit vor Abflug (nur Plan)
 _TTL_DONE = 30 * 60            # heute, aber lange gelandet (Ist-Zeiten final)
 _TTL_OTHER_DAY = 6 * 3600      # anderer Tag als heute (unverändert)
 _OPS_LEAD_S = 2 * 3600         # ab hier zählt ein Flug als „operativ"

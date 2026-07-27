@@ -464,7 +464,10 @@ def test_facts_ttl_far_before_departure_never_outlives_the_window_start():
     Betriebsfensters (Abflug − 2 h) hinaus, damit der erste Read danach
     garantiert frische Gate-/Ist-Daten holt."""
     far = {'sched_dep': '2026-07-27T17:00:00+00:00'}     # +8 h
-    assert _ttl('2026-07-27', far) == 20 * 60
+    assert _ttl('2026-07-27', far) == 45 * 60
+    # Muss den 30-min-Takt des Roster-Warmers ueberdauern, sonst kauft jeder
+    # Lauf jeden Flug erneut.
+    assert lh._TTL_PLAN > 30 * 60
     near = {'sched_dep': '2026-07-27T11:10:00+00:00'}    # +2 h 10 min
     assert _ttl('2026-07-27', near) == 10 * 60           # exakt bis 09:10 +2h
     # Kurz VOR dem Fenster darf die TTL nie UNTER die Fenster-TTL rutschen —
