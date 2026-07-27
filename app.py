@@ -17464,7 +17464,13 @@ def _maybe_refresh_flightops(token):
 # (aus den Sektoren bzw. LH-Fakten) + manuelles Overlay (Landungen Tag/Nacht,
 # PF/PM, Nachtflugzeit, Bemerkung) + Summen pro Muster. „Der Dienstplan füllt
 # das Flugbuch vor" — Aggregation vorhandener Daten, nichts wird erfunden.
-_LOGBOOK_ENRICH_CAP = 60   # max LH-Fakten-Anreicherungen (Reg/Typ) pro Request
+_LOGBOOK_ENRICH_CAP = 60   # max LH-Fakten-Anreicherungen (Reg/Typ) pro Lauf
+# Reg/Typ eines abgeflogenen Legs ändern sich nicht mehr → lange TTL. Das
+# 30-s-Memo in _flight_facts_from_obs taugt dafür nicht (es deckt einen
+# Aggregat-Fan-out ab, nicht ein Flugbuch über 16 Jahre).
+_LOGBOOK_FACTS_TTL_S = 30 * 24 * 3600
+_LOGBOOK_ENRICH_RUNNING = set()          # Token mit laufendem Hintergrund-Lauf
+_LOGBOOK_ENRICH_LOCK = _req_threading.Lock()
 
 
 def _logbook_leg_key(date, flight, frm, to):
@@ -17520,6 +17526,105 @@ def _logbook_overlay_save(token, overlay):
     except Exception:
         pass
     return ok
+
+
+def _logbook_facts_path(token):
+    import os
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    return os.path.join(_USER_HISTORY_DIR,
+                        f'logbook_facts_{safe}.json') if safe else None
+
+
+def _logbook_facts_load(token):
+    """Angereicherte Reg/Typ pro Leg-Key: {key: {reg, type, at}}.
+
+    Zweck (2026-07-27): die LH-/Board-Anreicherung aus dem REQUEST-PFAD
+    nehmen. Vorher rief `get_logbook` bis zu 60x `_flight_facts_from_obs`
+    synchron auf — bei einem Roster mit vielen Legs ohne Reg/Typ waren das
+    kalt bis zu 67 s (Florian Zäpernick, 117 Legs ohne Muster), und der Edge
+    bricht bei ~20 s mit einer 404-Seite ab. Jetzt liest der Request nur noch
+    diesen Cache; gefüllt wird er vom Hintergrund-Worker."""
+    import os
+    try:
+        pth = _logbook_facts_path(token)
+        if pth and os.path.exists(pth):
+            with open(pth) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _logbook_facts_save(token, facts):
+    try:
+        pth = _logbook_facts_path(token)
+        if pth:
+            _atomic_write_json(pth, facts)
+            return True
+    except Exception as e:
+        app.logger.warning(f'[logbook] facts_save_fail: {type(e).__name__}')
+    return False
+
+
+def _logbook_enrich_async(token, wanted):
+    """Fehlende Reg/Typ IM HINTERGRUND nachziehen und persistieren.
+
+    `wanted`: Liste (key, flight, date, from, to). Pro Token läuft höchstens
+    EIN Worker (sonst feuern parallele App-Aufrufe dieselben LH-Calls, und
+    der LH-Throttle serialisiert global — genau die Incident-Lehre aus
+    _flight_obs_merged). Der nächste Request sieht die Ergebnisse; der
+    aktuelle antwortet sofort."""
+    if not wanted:
+        return
+    with _LOGBOOK_ENRICH_LOCK:
+        if token in _LOGBOOK_ENRICH_RUNNING:
+            return
+        _LOGBOOK_ENRICH_RUNNING.add(token)
+
+    def _do():
+        import time as _t
+        found = 0
+        try:
+            from blueprints.aerox_data_blueprint import _flight_facts_from_obs
+        except Exception:
+            with _LOGBOOK_ENRICH_LOCK:
+                _LOGBOOK_ENRICH_RUNNING.discard(token)
+            return
+        try:
+            facts = _logbook_facts_load(token)
+            for key, flight, date, frm, to in wanted[:_LOGBOOK_ENRICH_CAP]:
+                try:
+                    f = _flight_facts_from_obs(flight, date, frm, to) or {}
+                except Exception:
+                    f = {}
+                reg, actype = f.get('reg'), f.get('type')
+                # Auch das leere Ergebnis festhalten (mit Zeitstempel): sonst
+                # fragt jeder Folge-Request dieselben unauflösbaren Legs neu
+                # an — das war der eigentliche Dauerbrenner.
+                facts[key] = {'reg': reg or None, 'type': actype or None,
+                              'at': int(_t.time())}
+                if reg or actype:
+                    found += 1
+            _logbook_facts_save(token, facts)
+            app.logger.info(
+                f'[logbook] enrich-bg tok={token[:8]} '
+                f'{len(wanted[:_LOGBOOK_ENRICH_CAP])} Legs geprüft, '
+                f'{found} mit Reg/Typ, {max(0, len(wanted) - _LOGBOOK_ENRICH_CAP)} '
+                f'bleiben für den nächsten Aufruf')
+        except Exception as e:
+            app.logger.warning(f'[logbook] enrich-bg fail tok={token[:8]} '
+                               f'{type(e).__name__}: {str(e)[:120]}')
+        finally:
+            with _LOGBOOK_ENRICH_LOCK:
+                _LOGBOOK_ENRICH_RUNNING.discard(token)
+
+    try:
+        _req_threading.Thread(target=_do, daemon=True).start()
+    except Exception:
+        with _LOGBOOK_ENRICH_LOCK:
+            _LOGBOOK_ENRICH_RUNNING.discard(token)
 
 
 def _logbook_block_min(dep_iso, arr_iso):
@@ -17638,9 +17743,15 @@ def get_logbook(token):
             imp_by_key[_logbook_leg_key(L.get('date'), L.get('flight'),
                                         L.get('from'), L.get('to'))] = L
 
+    # Angereicherte Reg/Typ kommen aus dem persistenten Cache, NICHT aus einem
+    # LH-Call im Request-Thread (siehe _logbook_facts_load). Was fehlt, wird
+    # gesammelt und nach der Schleife an den Hintergrund-Worker übergeben.
+    facts_cache = _logbook_facts_load(token)
+    import time as _lb_t
+    _now_ts = _lb_t.time()
+    enrich_wanted = []
+
     entries = []
-    enrich_used = 0
-    enrich_capped = False
     for date in sorted(sectors_by_day.keys()):
         for s in (sectors_by_day[date] or []):
             if not isinstance(s, dict):
@@ -17657,16 +17768,16 @@ def get_logbook(token):
             reg = s.get('reg') or s.get('tail') or iv.get('reg')
             actype = s.get('type') or iv.get('type')
             if (not reg or not actype) and _flight_facts_from_obs:
-                if enrich_used < _LOGBOOK_ENRICH_CAP:
-                    try:
-                        f = _flight_facts_from_obs(flight, date, frm, to) or {}
-                        reg = reg or f.get('reg')
-                        actype = actype or f.get('type')
-                    except Exception:
-                        pass
-                    enrich_used += 1
+                cached = facts_cache.get(key)
+                if isinstance(cached, dict) and \
+                        (_now_ts - (cached.get('at') or 0)) < _LOGBOOK_FACTS_TTL_S:
+                    reg = reg or cached.get('reg')
+                    actype = actype or cached.get('type')
                 else:
-                    enrich_capped = True
+                    # Nichts (Frisches) im Cache → Hintergrund-Worker fragen.
+                    # Der Request wartet NICHT; dieses Leg bleibt diesmal ohne
+                    # Reg/Typ und ist beim nächsten Aufruf gefüllt.
+                    enrich_wanted.append((key, flight, date, frm, to))
             ov = overlay.get(key) or {}
             entries.append({
                 'key': key, 'date': date, 'flight': flight,
@@ -17682,9 +17793,12 @@ def get_logbook(token):
                 'night_min': ov.get('night_min', iv.get('night_min')),
                 'remarks': ov.get('remarks', iv.get('remarks')),
             })
-    if enrich_capped:
-        app.logger.info(f'[logbook] enrich-cap {_LOGBOOK_ENRICH_CAP} tok={token[:8]} '
-                        f'— restliche Legs ohne LH-Reg/Typ (bereits gespeicherte bleiben)')
+    # Anreicherung asynchron anstoßen (Owner-Auftrag 2026-07-27). Der Request
+    # ist damit unabhängig davon, wie viele Legs noch Reg/Typ brauchen — vorher
+    # skalierte genau das mit der Antwortzeit und riss die ~20-s-Edge-Grenze.
+    enrich_capped = len(enrich_wanted) > _LOGBOOK_ENRICH_CAP
+    if enrich_wanted:
+        _logbook_enrich_async(token, enrich_wanted)
 
     # Eingespieltes Alt-Flugbuch unter die Roster-Legs mergen. Roster gewinnt
     # bei gleichem Leg-Key (live angereichert); das manuelle Overlay gewinnt
@@ -17795,6 +17909,9 @@ def get_logbook(token):
         'sim_total_min': sim_total,
         'carryover_min': carryover_min,
         'enrich_capped': enrich_capped,
+        # Wie viele Legs noch auf Reg/Typ warten. 0 = fertig angereichert.
+        # Additiv — ältere iOS-Builds ignorieren das Feld.
+        'enrich_pending': len(enrich_wanted),
     })
 
 

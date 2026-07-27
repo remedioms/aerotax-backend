@@ -30,9 +30,12 @@ DAYS = {
 
 def _seed():
     backend._manual_briefings_save(TOKEN, DAYS)
-    # Overlay + Import-Cache sauber starten (Disk-Dateien + Profil-Mirror)
+    # Overlay + Import- + Anreicherungs-Cache sauber starten (Disk-Dateien +
+    # Profil-Mirror). Der facts-Cache ist seit 2026-07-27 die Quelle für
+    # nachgezogene Reg/Typ — ein Rest aus einem Vorlauf würde hier einstreuen.
     for p in (backend._logbook_overlay_path(TOKEN),
-              backend._logbook_import_path(TOKEN)):
+              backend._logbook_import_path(TOKEN),
+              backend._logbook_facts_path(TOKEN)):
         try:
             if p and os.path.exists(p):
                 os.remove(p)
@@ -250,3 +253,96 @@ def test_by_year_aggregation_includes_import():
     # Platzhalter-Leg 2014 ohne Blockzeit zählt als Leg, nicht als Stunden
     assert by['2014'] == {'year': '2014', 'legs': 1, 'block_min': 0,
                           'landings': 0}
+
+
+# ── Anreicherung asynchron (2026-07-27) ─────────────────────────────────────
+# Vorher lief die LH-/Board-Anreicherung SYNCHRON im Request (bis 60 Calls).
+# Bei einem Roster mit vielen Legs ohne Reg/Typ waren das kalt bis zu 67 s,
+# und der Edge bricht bei ~20 s mit einer 404-Seite ab. Diese Tests halten
+# fest, dass der Request nicht mehr auf die Anreicherung wartet.
+
+def test_enrichment_does_not_block_request(monkeypatch):
+    """Kein einziger _flight_facts_from_obs-Aufruf im Request-Thread."""
+    _seed()
+    import blueprints.aerox_data_blueprint as bp
+    calls = []
+
+    def _boom(flight_no, date, dep_iata=None, arr_iata=None, **kw):
+        calls.append(flight_no)
+        raise AssertionError('Anreicherung darf den Request nicht blockieren')
+
+    monkeypatch.setattr(bp, '_flight_facts_from_obs', _boom)
+    started = []
+    monkeypatch.setattr(backend, '_logbook_enrich_async',
+                        lambda tok, wanted: started.append(list(wanted)))
+
+    r = _get()
+    assert r['ok'] is True
+    assert calls == []
+    # LH222 hat im Seed keine Reg → genau dieses Leg gehört in die Warteschlange
+    assert len(started) == 1
+    assert [w[1] for w in started[0]] == ['LH222']
+    assert r['enrich_pending'] == 1
+    assert r['enrich_capped'] is False
+
+
+def test_enrichment_uses_persisted_facts_cache(monkeypatch):
+    """Was der Hintergrund-Worker geschrieben hat, füllt den nächsten Request —
+    ohne erneuten externen Call."""
+    _seed()
+    import time as _t
+    # Leg-Key trägt den ROSTER-Tag (03.05.), nicht das Abflugdatum (04.05.)
+    key = backend._logbook_leg_key('2026-05-03', 'LH222', 'FRA', 'MUC')
+    backend._logbook_facts_save(TOKEN, {
+        key: {'reg': 'D-AINA', 'type': 'A20N', 'at': int(_t.time())}})
+    monkeypatch.setattr(backend, '_logbook_enrich_async',
+                        lambda tok, wanted: None)
+    try:
+        r = _get()
+        e = {x['flight']: x for x in r['entries']}
+        assert e['LH222']['reg'] == 'D-AINA'      # Lücke aus dem Cache gefüllt
+        # …aber der Sektor bleibt Herr über das, was er selbst weiß:
+        # der Cache sagt A20N, der Roster 32N → Roster gewinnt.
+        assert e['LH222']['type'] == '32N'
+        assert r['enrich_pending'] == 0
+    finally:
+        p = backend._logbook_facts_path(TOKEN)
+        if p and os.path.exists(p):
+            os.remove(p)
+
+
+def test_enrichment_cache_expires(monkeypatch):
+    """Uralter Cache-Eintrag zählt nicht mehr — Leg geht zurück in die Queue."""
+    _seed()
+    # Leg-Key trägt den ROSTER-Tag (03.05.), nicht das Abflugdatum (04.05.)
+    key = backend._logbook_leg_key('2026-05-03', 'LH222', 'FRA', 'MUC')
+    backend._logbook_facts_save(TOKEN, {
+        key: {'reg': 'D-ALT', 'type': 'OLD', 'at': 1}})   # 1970
+    wanted = []
+    monkeypatch.setattr(backend, '_logbook_enrich_async',
+                        lambda tok, w: wanted.extend(w))
+    try:
+        r = _get()
+        e = {x['flight']: x for x in r['entries']}
+        assert e['LH222']['reg'] is None
+        assert [w[1] for w in wanted] == ['LH222']
+    finally:
+        p = backend._logbook_facts_path(TOKEN)
+        if p and os.path.exists(p):
+            os.remove(p)
+
+
+def test_enrich_worker_runs_once_per_token(monkeypatch):
+    """Parallele Aufrufe desselben Tokens starten nur EINEN Worker — sonst
+    feuern sie dieselben LH-Calls, und der Throttle serialisiert global."""
+    import blueprints.aerox_data_blueprint as bp
+    seen = []
+    monkeypatch.setattr(bp, '_flight_facts_from_obs',
+                        lambda fn, d, a=None, b=None, **kw: seen.append(fn) or {})
+    backend._LOGBOOK_ENRICH_RUNNING.add('AT-BUSY')
+    try:
+        backend._logbook_enrich_async('AT-BUSY',
+                                      [('k', 'LH1', '2026-05-01', 'FRA', 'MUC')])
+        assert seen == []
+    finally:
+        backend._LOGBOOK_ENRICH_RUNNING.discard('AT-BUSY')
