@@ -197,7 +197,7 @@ def _flow_rm(state):
 def _tokens_load(user_token, fresh=False):
     """FlightOps-Tokens {access, refresh, expires_at, scope} für einen AeroX-User.
 
-    `fresh=True` für die absichtlichen Zweit-Lesungen in `_valid_access`: dort
+    `fresh=True` für die absichtlichen Zweit-Lesungen des Refreshers: dort
     ist der ganze Zweck, den Stand zu sehen, den ein ANDERER Prozess gerade
     geschrieben hat (Token-Rotation). Ein Request-Memo darf da nicht
     dazwischen — sonst stirbt der Grant-Race-Schutz still und der Verlierer
@@ -207,22 +207,229 @@ def _tokens_load(user_token, fresh=False):
         prof = ((_app._profile_load(user_token, fresh=fresh) or {})
                 .get('profile') or {})
         t = prof.get('flightops_tokens')
+        t = dict(t) if isinstance(t, dict) else {}
+        # Rotations-Notfallspeicher: hängt der Mirror noch am konsumierten
+        # RT (Save nach Rotation war fehlgeschlagen), ist die Prozess-Kopie
+        # die Wahrheit — sonst würde der stale Mirror-RT beim nächsten
+        # Refresh die Familie per Reuse-Detection verbrennen.
+        pend = _rotated_pending_take(user_token, t)
+        return pend if pend is not None else t
+    except Exception:
+        return {}
+
+
+def _tokens_mirror_raw(user_token):
+    """Durabler Mirror-Stand OHNE Pending-Overlay — für Supersede-Checks
+    (»hängt der Mirror noch am konsumierten RT oder hat inzwischen ein
+    Re-Login/anderer Stand gewonnen?«). Immer fresh, nie Memo."""
+    try:
+        import app as _app
+        prof = ((_app._profile_load(user_token, fresh=True) or {})
+                .get('profile') or {})
+        t = prof.get('flightops_tokens')
         return dict(t) if isinstance(t, dict) else {}
     except Exception:
         return {}
 
 
-def _tokens_save(user_token, tokens):
+def _tokens_disk_mirror(user_token, tokens):
+    """Best-effort-Disk-Kopie NACH bestätigtem SB-Write (der atomare Merge
+    berührt die Disk nicht). Nur Lese-Cache für degradierte SB-Phasen —
+    rotiert wird bei SB-Ausfall ohnehin nie (fail-closed)."""
     try:
         import app as _app
-        pf = _app._profile_load(user_token) or {}
-        prof = (pf.get('profile') or {})
+        full = dict(_app._profile_load_from_disk(user_token) or {})
+        prof = dict(full.get('profile') or {})
         prof['flightops_tokens'] = tokens
-        _app._profile_save(user_token, prof)
-        return True
+        full.update({'token': user_token, 'profile': prof})
+        p = _app._user_profile_path(user_token)
+        if p:
+            _app._atomic_write_json(p, full)
+    except Exception:
+        pass
+
+
+def _tokens_save(user_token, tokens):
+    """Token-Stand DB-BESTÄTIGT persistieren. True NUR bei bestätigtem Write.
+
+    ASYMMETRIE-VERTRAG (Grant-Burn #4, 26.07.2026): ein verpasster oder
+    vertagter Refresh kostet Minuten Datenfrische — ein Refresh-Token-Reuse
+    kostet die ganze Token-Familie und zwingt den User zum Neu-Login. Deshalb
+    zählt hier ausschließlich ein von Supabase bestätigter Write als Erfolg;
+    die Disk ist reiner Lese-Cache (der 26.07.-Massen-Burn entstand u.a.,
+    weil ein Disk-only-»Erfolg« als Persistenz durchging und der Rückgabewert
+    ignoriert wurde).
+
+    Primärpfad: atomarer Top-Level-Merge NUR des Keys `flightops_tokens`
+    (RPC profile_metadata_merge) — nie der ganze Profil-Blob. Gegenstück:
+    app._profile_save_to_supabase strippt den Key aus JEDEM generischen
+    Profil-Save (Writer-Flag), damit Crew-Cache/Location/pk-Writes nie eine
+    stale Token-Kopie über eine frische Rotation mergen können.
+    Ohne SB (Dev/Tests) gilt die Disk via _profile_save als Wahrheit."""
+    try:
+        import app as _app
+        writer = getattr(_app, '_FLIGHTOPS_TOKEN_WRITER', None)
+        if writer is not None:
+            writer.active = True
+        try:
+            if getattr(_app, 'SB_AVAILABLE', False):
+                if _app._profile_metadata_merge_sb(
+                        user_token, {'flightops_tokens': tokens}):
+                    _tokens_disk_mirror(user_token, tokens)
+                    return True
+                # Merge traf keine Row (Erstverbindung/Row fehlt) oder war
+                # transient: voller Profil-Save, danach Readback als
+                # Bestätigung — Rotationen laufen praktisch immer über den
+                # Merge, dieser Pfad ist der seltene Anlage-Fall.
+                pf = _app._profile_load(user_token) or {}
+                prof = dict(pf.get('profile') or {})
+                prof['flightops_tokens'] = tokens
+                if not _app._profile_save(user_token, prof):
+                    return False
+                cur = _tokens_mirror_raw(user_token)
+                return ((cur.get('refresh') or '')
+                        == (tokens.get('refresh') or ''))
+            # Dev/Tests ohne SB: single-process, Disk ist die Wahrheit.
+            pf = _app._profile_load(user_token) or {}
+            prof = dict(pf.get('profile') or {})
+            prof['flightops_tokens'] = tokens
+            return bool(_app._profile_save(user_token, prof))
+        finally:
+            if writer is not None:
+                writer.active = False
     except Exception as e:
         log.warning('[lh_flightops] token_save_fail: %s', type(e).__name__)
         return False
+
+
+# ── Rotations-Notfallspeicher (Grant-Burn #4, Massen-Burn 26.07.2026) ────────
+# LH rotiert den Refresh-Token bei JEDEM Refresh und revoziert bei Reuse die
+# ganze Familie. Schlägt der Profil-Save NACH einer erfolgreichen Rotation fehl
+# (SB-Latenz/-Ausfall — genau das passierte fleet-weit am 26.07. unter dem
+# Supabase-Client-Registry-Leak), ist der neue RT das EINZIGE lebende Exemplar
+# der Familie: der Mirror zeigt weiter den KONSUMIERTEN RT, und der nächste
+# Refresh verbrennt den Grant deterministisch. Der Save nach Rotation ist darum
+# der wertvollste Write des Systems: hart retryen, und wenn ALLES scheitert,
+# den Stand im Prozess parken — _tokens_load serviert ihn weiter und versucht
+# bei jeder Gelegenheit erneut zu persistieren.
+_rotated_pending = {}            # user_token → {'tokens', 'consumed_rt', 'ts'}
+_rotated_pending_lock = threading.Lock()
+_ROTATED_SAVE_RETRIES = 4
+_ROTATED_SAVE_BACKOFF_S = 0.5
+_ROTATED_PENDING_MAX_AGE_S = 24 * 3600
+
+
+def _rotated_pending_take(user_token, mirror_tokens):
+    """Geparkten Rotations-Stand gegen den Mirror abgleichen. Gibt die
+    Prozess-Wahrheit zurück (dict) wenn der Mirror stale ist (zeigt noch den
+    konsumierten RT bzw. ist leer), sonst None; verwirft die Kopie, sobald
+    ein FREMDER (neuerer) Stand im Mirror steht. Versucht en passant erneut
+    zu persistieren."""
+    with _rotated_pending_lock:
+        pend = _rotated_pending.get(user_token)
+    if not pend:
+        return None
+    if time.time() - (pend.get('ts') or 0) > _ROTATED_PENDING_MAX_AGE_S:
+        with _rotated_pending_lock:
+            _rotated_pending.pop(user_token, None)
+        return None
+    mirror_rt = (mirror_tokens or {}).get('refresh') or ''
+    ours = (pend.get('tokens') or {}).get('refresh') or ''
+    if mirror_rt and mirror_rt not in (pend.get('consumed_rt') or '', ours):
+        # Jemand anders hat inzwischen erfolgreich rotiert UND persistiert —
+        # dessen Stand ist neuer, unsere Kopie ist Geschichte.
+        with _rotated_pending_lock:
+            _rotated_pending.pop(user_token, None)
+        return None
+    # Mirror hängt noch am konsumierten RT → unsere Kopie ist die Wahrheit.
+    if _tokens_save(user_token, pend['tokens']):
+        log.info('[lh_flightops] rotation-nachsave gelungen token=%s',
+                 (user_token or '')[:8])
+        with _rotated_pending_lock:
+            _rotated_pending.pop(user_token, None)
+    return dict(pend['tokens'])
+
+
+def _save_rotated_cas(user_token, consumed_rt, tokens):
+    """Atomarer Compare-and-Swap-Save nach Rotation (RPC flightops_save_rotated,
+    Migration 20260727): schreibt server-seitig NUR, wenn der durable Stand
+    noch am konsumierten RT hängt → 'saved'. Hängt er an einem FREMDEN
+    (Re-Login währenddessen / anderer Prozess) → 'superseded' — dann nichts
+    überschreiben. None = RPC nicht verfügbar (Migration fehlt / SB-Hiccup):
+    Caller nutzt den Merge-Fallback mit Supersede-Readback."""
+    try:
+        import app as _app
+        ok, data = _app._social_rpc_call('flightops_save_rotated', {
+            'p_token': user_token, 'p_consumed': consumed_rt or '',
+            'p_tokens': tokens})
+        if not ok:
+            return None
+        if isinstance(data, list) and data:
+            data = (next(iter(data[0].values()), None)
+                    if isinstance(data[0], dict) else data[0])
+        return data if data in ('saved', 'superseded', 'no_row') else None
+    except Exception:
+        return None
+
+
+def _tokens_save_rotated(user_token, consumed_rt, tokens):
+    """Persist NACH erfolgreicher LH-Rotation — der wertvollste Write des
+    Systems, darf nie still scheitern. Primär CAS-RPC (atomar, DB-bestätigt,
+    überschreibt nie einen fremden neueren Stand), Fallback bestätigter Merge
+    mit Supersede-Readback; Retry mit Backoff; scheitert alles, wird der
+    Stand geparkt (_rotated_pending) statt verloren zu gehen. True = Stand
+    durabel gesichert ODER bewusst verworfen (fremder neuerer Stand);
+    False = nur noch im Prozess geparkt."""
+    delay = _ROTATED_SAVE_BACKOFF_S
+    for attempt in range(_ROTATED_SAVE_RETRIES):
+        cas = _save_rotated_cas(user_token, consumed_rt, tokens)
+        if cas == 'saved':
+            if attempt:
+                log.warning('[lh_flightops] rotation-save nach %d Versuchen '
+                            'gelungen token=%s', attempt + 1,
+                            (user_token or '')[:8])
+            _tokens_disk_mirror(user_token, tokens)
+            with _rotated_pending_lock:
+                _rotated_pending.pop(user_token, None)
+            return True
+        if cas == 'superseded':
+            log.warning('[lh_flightops] rotation-save superseded (Re-Login/'
+                        'fremder neuerer Stand) — Kopie verworfen token=%s',
+                        (user_token or '')[:8])
+            with _rotated_pending_lock:
+                _rotated_pending.pop(user_token, None)
+            return True
+        if cas in (None, 'no_row'):
+            # RPC (noch) nicht da: Supersede von Hand prüfen, dann
+            # bestätigter Merge-Save (schafft im no_row-Fall auch die Row).
+            cur_rt = (_tokens_mirror_raw(user_token) or {}).get('refresh') or ''
+            if cur_rt and cur_rt not in (consumed_rt or '',
+                                         tokens.get('refresh') or ''):
+                log.warning('[lh_flightops] rotation-save superseded (readback)'
+                            ' — Kopie verworfen token=%s', (user_token or '')[:8])
+                with _rotated_pending_lock:
+                    _rotated_pending.pop(user_token, None)
+                return True
+            if _tokens_save(user_token, tokens):
+                if attempt:
+                    log.warning('[lh_flightops] rotation-save nach %d Versuchen'
+                                ' gelungen token=%s', attempt + 1,
+                                (user_token or '')[:8])
+                with _rotated_pending_lock:
+                    _rotated_pending.pop(user_token, None)
+                return True
+        time.sleep(delay)
+        delay = min(delay * 2, 4.0)
+    with _rotated_pending_lock:
+        _rotated_pending[user_token] = {
+            'tokens': dict(tokens), 'consumed_rt': consumed_rt or '',
+            'ts': time.time()}
+    log.error('[lh_flightops] ROTATION-SAVE FEHLGESCHLAGEN token=%s rt8=%s — '
+              'neuer Refresh-Token nur noch im Prozess (wird bei jedem '
+              'Load nachpersistiert; Refresher rotiert diesen Grant NICHT '
+              'weiter, bis der Nachsave bestätigt ist)', (user_token or '')[:8],
+              _rt8(tokens.get('refresh')))
+    return False
 
 
 def _basic_header():
@@ -243,10 +450,42 @@ def _exchange_code(code, verifier):
     return tok
 
 
+# ── STRUKTURELLER REUSE-SCHUTZ: genau EIN Refresher im ganzen System ─────────
+# Architektur-Umbau 2026-07-27 nach Grant-Burn #4 (254/571 Grants tot, weil
+# unter SB-Degradierung ein blinder Guard-Fallback trotzdem refreshte und ein
+# unbestätigter Save den konsumierten RT stehen ließ). Vorher durfte JEDER
+# Prozess refreshen (3 Web-Worker × Threads, Poll-Cron, On-Demand-Import) und
+# vier Generationen von Guards (Lock, Grace-Reload, Claim-RPC, Nonce-Soft-
+# Guard) verkleinerten nur die Racefläche. Jetzt ist sie WEG:
+#   · Rotieren darf ausschließlich der Refresher-Loop (Poll-Container,
+#     LH_FLIGHTOPS_REFRESHER=1, flock → ein Thread im ganzen System).
+#   · _refresh() — die EINZIGE Stelle, die grant_type=refresh_token sendet —
+#     verweigert jeden Aufruf außerhalb dieses Threads (Choke-Point-Gate).
+#   · Alle anderen Pfade LESEN nur Access-Tokens; abgelaufen ⇒ Vormerkung +
+#     Cache/»kommt gleich«, nie selbst rotieren.
+_REFRESHER_THREAD_ID = [None]    # threading.get_ident() des Rotations-Threads
+
+
+def _refresher_may_rotate():
+    return (_REFRESHER_THREAD_ID[0] is not None
+            and _REFRESHER_THREAD_ID[0] == threading.get_ident())
+
+
 def _refresh(refresh_token):
     """→ (Token-Dict|None, err|None). Doku (Token_Endpoint): für
     grant_type=refresh_token sind client_id/redirect_uri/code/code_verifier
-    explizit NICHT nötig — nur Basic-Header + diese zwei Body-Params."""
+    explizit NICHT nötig — nur Basic-Header + diese zwei Body-Params.
+
+    CHOKE-POINT-GATE: nur der Refresher-Thread darf hier durch. Jeder andere
+    Aufrufer (Web-Worker, Cron-Import, künftiger neuer Code-Pfad) bekommt
+    eine laute Verweigerung statt eines LH-Calls — ein RT-Reuse ist damit
+    strukturell unmöglich, egal wie degradiert die Infrastruktur ist."""
+    if not _refresher_may_rotate():
+        log.error('[lh_flightops] REFRESH VERWEIGERT — Aufruf außerhalb des '
+                  'Refresher-Threads (struktureller Reuse-Schutz) rt8=%s',
+                  _rt8(refresh_token))
+        return None, {'http': None, 'oauth': None, 'fatal': False,
+                      'refused': True}
     body = urllib.parse.urlencode({
         'grant_type': 'refresh_token', 'refresh_token': refresh_token}).encode()
     # MIT ZÄHLEN (2026-07-26): der Refresh ist ein echter HTTP-Call gegen LH
@@ -310,10 +549,10 @@ def _notify_relogin(user_token):
              user_token[:8])
 
 
-# Pro-User-Refresh-Lock (in-process): serialisiert parallele Refreshes
-# INNERHALB eines Containers (gunicorn-Threads). Cross-Container (Backend vs.
-# Poll-Cron, KEIN shared Volume — Stand teilt nur der SB-Profil-Mirror) schützt
-# zusätzlich der CAS-/Grace-Pfad in _valid_access.
+# Pro-User-Refresh-Lock (in-process): der Refresher-Loop ist single-threaded,
+# das Lock ist seit dem Umbau 2026-07-27 reine Tiefenverteidigung (falls je
+# ein zweiter Aufrufer _refresher_refresh_grant erreicht, serialisiert es —
+# und das Choke-Point-Gate in _refresh verweigert ihm den LH-Call ohnehin).
 _user_refresh_locks = {}
 _user_refresh_locks_guard = threading.Lock()
 
@@ -327,119 +566,159 @@ def _user_refresh_lock(user_token):
         return lk
 
 
-def _valid_access(user_token):
-    """Gültigen Access-Token holen (Auto-Refresh). None wenn nicht verbunden.
-    Refresh-Fehler werden DIFFERENZIERT: nur ein toter Grant (invalid_grant/
-    invalid_client) markiert needs_relogin (+ einmaliger Push); transiente
-    Fehler (Wartung/Rate-Limit/Netz) lassen die Tokens unangetastet — der
-    nächste Versuch refresht normal weiter.
+# Vormerkliste »Access-Token abgelaufen« — Web-Worker/Cron-Import melden hier
+# nur AN (in-memory, gedeckelt); GEHÖRT wird sie ausschließlich vom Refresher-
+# Loop im selben Prozess (Poll-Container). In den Web-Containern ist sie ein
+# bewusster No-Op-Briefkasten: dort refresht NIEMAND, auch nicht auf Wunsch.
+_refresh_wanted = set()
+_refresh_wanted_lock = threading.Lock()
+_REFRESH_WANTED_CAP = 2000
 
-    RACE-HÄRTUNG (Miguels Grant nachts verloren, 2026-07-24 03:01Z): LH
-    rotiert den Refresh-Token bei JEDEM Refresh. Laufen zwei Refreshes
-    parallel (Backend-Request vs. Poll-Cron im ANDEREN Container), gewinnt
-    einer die Rotation, der Verlierer bekommt fatal invalid_token — und
-    ÜBERSCHRIEB vorher im Flag-Pfad den frischen Stand des Gewinners mit
-    needs_relogin + verbranntem Refresh → Grant endgültig tot, User muss neu
-    einloggen. Jetzt: (1) in-process Lock + Doppel-Check, (2) im Fatal-Pfad
-    GRACE-RELOAD (kurz warten, dann SB-Stand neu laden) — nur wenn der
-    persistierte Refresh noch UNSER verbrannter ist, wird geflaggt; und
-    geflaggt wird auf dem FRISCH geladenen Stand, nie ein alter Dict-Snapshot
-    zurückgeschrieben."""
+
+def _refresh_wanted_add(user_token):
+    try:
+        with _refresh_wanted_lock:
+            if len(_refresh_wanted) < _REFRESH_WANTED_CAP:
+                _refresh_wanted.add(user_token)
+    except Exception:
+        pass
+
+
+def _refresh_wanted_drain():
+    with _refresh_wanted_lock:
+        s = set(_refresh_wanted)
+        _refresh_wanted.clear()
+    return s
+
+
+def _access_state(user_token):
+    """(state, access) — state ∈ 'ok' | 'pending' | 'disconnected'.
+
+    LESEPFAD OHNE JEDEN REFRESH (Single-Refresher-Architektur, 2026-07-27):
+    Web-Worker, MQTT-Fanout und Cron-Import bekommen hier nur, was durabel
+    da ist. Abgelaufener Access-Token ⇒ 'pending' + Vormerkung für den
+    Refresher — der Caller degradiert weich (Last-Good-Cache bzw. »Daten
+    kommen gleich«), er rotiert NIEMALS selbst.
+
+    ASYMMETRIE (der Grund für alles hier): ein verpasster Refresh kostet
+    Minuten Datenfrische — ein Refresh-Token-Reuse kostet die ganze
+    LH-Token-Familie und den User (Zwangs-Relogin). »Kein LH-Call« ist in
+    jedem Zweifelsfall die richtige Antwort."""
     t = _tokens_load(user_token)
     if not t.get('access') or t.get('needs_relogin'):
-        return None
+        return 'disconnected', None
     if time.time() < (t.get('expires_at') or 0):
-        return t['access']
-    if not t.get('refresh'):
-        return None
+        return 'ok', t['access']
+    _refresh_wanted_add(user_token)
+    return 'pending', None
+
+
+def _valid_access(user_token):
+    """Gültigen Access-Token LESEN. None wenn nicht verbunden ODER der AT
+    gerade abgelaufen ist (dann übernimmt der zentrale Refresher; Details
+    und Zustands-Differenzierung: _access_state). Refresht selbst NIE."""
+    return _access_state(user_token)[1]
+
+
+# Wartezeit vor dem endgültigen Toter-Grant-Flag (Fatal-Pfad) — deckt den
+# Deploy-Übergang ab, in dem Alt-Code-Container theoretisch noch selbst
+# rotieren; danach reine Vorsicht. Tests patchen auf 0.
+_FATAL_GRACE_SEC = 2.0
+
+# TTL des server-seitigen Claim-Guards (p_ttl des RPC flightops_claim_refresh).
+_REFRESH_GUARD_SEC = 15.0
+
+# Refresher-Vorlauf: Grants werden rotiert, sobald der AT in weniger als
+# dieser Spanne abläuft — Web-Worker sehen dadurch praktisch nie 'pending'.
+_REFRESH_AHEAD_S = 15 * 60
+
+
+def _refresher_refresh_grant(user_token):
+    """EINE Grant-Rotation — ausschließlich vom Refresher-Thread aufgerufen
+    (das Gate sitzt zusätzlich in _refresh selbst). Gibt einen Status-String
+    für die Lauf-Statistik zurück.
+
+    FAIL-CLOSED OHNE AUSNAHME (Leitplanke aus Grant-Burn #4): kein gewonnenes
+    Claim, Claim-Infrastruktur nicht erreichbar oder Save nicht DB-bestätigt
+    ⇒ KEIN LH-Call bzw. keine weitere Rotation. Ein verpasster Refresh kostet
+    Minuten Datenfrische; ein RT-Reuse kostet die Token-Familie und den User —
+    diese Asymmetrie entscheidet jeden Zweifelsfall hier gegen den LH-Call."""
     with _user_refresh_lock(user_token):
-        # Doppel-Check im Lock: ein paralleler Thread kann eben rotiert haben
-        # → dessen frische Tokens nutzen statt den verbrannten nochmal zu
-        # verheizen. fresh=True: am Request-Memo vorbei, sonst sieht der
-        # Doppel-Check genau den Stand, den er widerlegen soll.
+        with _rotated_pending_lock:
+            parked = user_token in _rotated_pending
+        if parked:
+            # Unpersistierte Rotation im Prozess: NIE weiterrotieren (eine
+            # Kette unpersistierter RTs stirbt mit dem Prozess = Familientod).
+            # Nur den Nachsave versuchen — _rotated_pending_take tut das en
+            # passant beim Load.
+            _tokens_load(user_token, fresh=True)
+            with _rotated_pending_lock:
+                still = user_token in _rotated_pending
+            return 'save_pending' if still else 'save_healed'
         t = _tokens_load(user_token, fresh=True)
-        if t.get('needs_relogin') or not t.get('refresh'):
-            return None
-        if t.get('access') and time.time() < (t.get('expires_at') or 0):
-            return t['access']
-        # CROSS-CONTAINER-GUARD (2. Grant-Verlust Miguels, 2026-07-25 02:54Z):
-        # LH revoziert bei Refresh-Token-REUSE die GANZE Token-Familie — der
-        # In-Process-Lock schützt nicht vorm Backend↔Poll-Container-Paar, und
-        # der Grace-Reload rettet nur das Flag, nicht den Grant. Darum holt
-        # sich der Refresher VOR dem LH-Call ein Claim für DIESEN Refresh-
-        # Token: primär ATOMAR via RPC flightops_claim_refresh (Row-Lock im
-        # UPDATE — genau ein Gewinner pro RT), Fallback ohne RPC = Soft-Guard
-        # (rt-Hash + ts durabel speichern, ~100ms-Restfenster). Der Verlierer
-        # wartet und übernimmt die rotierten Tokens des Gewinners, statt den
-        # RT doppelt zu verheizen — und schreibt dabei NIE zurück.
-        claimed = _claim_refresh_sb(user_token, t.get('refresh'))
+        if t.get('needs_relogin'):
+            return 'dead_flagged'
+        rt = t.get('refresh')
+        if not rt:
+            return 'no_refresh'
+        if t.get('access') and ((t.get('expires_at') or 0) - time.time()) > _REFRESH_AHEAD_S:
+            return 'fresh'
+        claimed = _claim_refresh_sb(user_token, rt)
         if claimed is None:
-            g = t.get('refresh_guard') or {}
-            lost = (isinstance(g, dict)
-                    and g.get('rt8') == _rt8(t.get('refresh'))
-                    and (time.time() - (g.get('ts') or 0)) < _REFRESH_GUARD_SEC)
-        else:
-            lost = not claimed
-        if lost:
-            time.sleep(_GUARD_WAIT_SEC)
-            cur = _tokens_load(user_token, fresh=True)
-            if cur.get('needs_relogin'):
-                return None
-            if cur.get('access') and time.time() < (cur.get('expires_at') or 0):
-                return cur['access']
-            if (cur.get('refresh') or '') != (t.get('refresh') or ''):
-                # Gewinner hat rotiert (access nur schon wieder abgelaufen) —
-                # mit DESSEN frischem RT weitermachen, nie mit unserem alten.
-                t = cur
-            # Guard abgelaufen / Refresher gescheitert → selbst versuchen,
-            # aber wieder nur mit gewonnenem Claim.
-            claimed = _claim_refresh_sb(user_token, t.get('refresh'))
-            if claimed is False:
-                return None   # immer noch fremdes Claim — nächster Request erbt
-        if claimed is None:
-            # RPC nicht verfügbar → Soft-Guard best-effort persistieren.
-            guard_t = dict(t)
-            guard_t['refresh_guard'] = {'rt8': _rt8(t.get('refresh')),
-                                        'ts': time.time()}
-            _tokens_save(user_token, guard_t)
-        nt, err = _refresh(t['refresh'])
+            # Claim-Infra down/degradiert ⇒ FAIL-CLOSED: kein LH-Call. Genau
+            # hier refreshte der 26.07.-Soft-Guard-Fallback »trotzdem« und
+            # verbrannte 254 Familien. Wenn SB kein Claim bestätigen kann,
+            # könnte es auch den Rotations-Save nicht bestätigen — der
+            # Refresh wird vertagt, der nächste Tick versucht es erneut.
+            log.warning('[fo-refresher] claim nicht verfügbar -> Refresh '
+                        'vertagt (fail-closed) token=%s', (user_token or '')[:8])
+            return 'skipped_claim_unavailable'
+        if claimed is False:
+            # Fremder Claim auf diesem RT: praktisch nur im Deploy-Übergang
+            # möglich, solange irgendwo noch Alt-Code läuft, der selbst
+            # rotiert. Dessen Ergebnis wird beim nächsten Tick einfach
+            # gelesen — hier passiert bewusst NICHTS.
+            log.info('[fo-refresher] fremdes claim (Alt-Code/Übergang) '
+                     'token=%s', (user_token or '')[:8])
+            return 'skipped_claim_foreign'
+        nt, err = _refresh(rt)
         if nt:
             # Rotiert der Server den Refresh-Token, den NEUEN persistieren;
-            # sonst den bewährten behalten (Rotation ist LH-seitig undokumentiert).
-            nt['refresh'] = nt.get('refresh') or t.get('refresh')
-            _tokens_save(user_token, nt)
-            return nt['access']
+            # sonst den bewährten behalten (Rotation ist LH-seitig
+            # undokumentiert). Der neue RT gilt erst als »aktiv«, wenn der
+            # Save DB-bestätigt ist — sonst bleibt er geparkt und dieser
+            # Grant wird bis zum bestätigten Nachsave nicht mehr angefasst.
+            nt['refresh'] = nt.get('refresh') or rt
+            return ('rotated' if _tokens_save_rotated(user_token, rt, nt)
+                    else 'rotated_parked')
+        if err and err.get('refused'):
+            return 'refused'
         if err and err.get('fatal'):
-            # GRACE-RELOAD: der Save des parallelen Gewinners (anderer
-            # Container) kann noch in-flight sein — kurz warten, dann den
-            # durablen Stand neu laden. Refresh dort schon ein ANDERER
-            # → wir waren nur der Race-Verlierer, Grant lebt: nichts flaggen.
+            # GRACE-RELOAD (Deploy-Übergang): hat ein Alt-Code-Container
+            # parallel rotiert, ist unser fatal nur der Race-Verlierer —
+            # Grant lebt, nichts flaggen.
             time.sleep(_FATAL_GRACE_SEC)
-            cur = _tokens_load(user_token, fresh=True)
-            if (cur.get('refresh') or '') != (t.get('refresh') or ''):
-                if cur.get('access') and time.time() < (cur.get('expires_at') or 0):
-                    return cur['access']
-                return None
-            # Wirklich toter Grant: auf dem FRISCHEN Stand flaggen (nie den
-            # alten Snapshot zurückschreiben — der könnte inzwischen Neueres
-            # überschreiben).
+            cur = _tokens_mirror_raw(user_token)
+            if (cur.get('refresh') or '') != rt:
+                return 'raced'
+            # Wirklich toter Grant: auf dem FRISCHEN Stand flaggen (nie einen
+            # alten Snapshot zurückschreiben). FORENSIK-Log (Massen-Burn
+            # 26.07.: die Burns waren in den Logs unauffindbar): rt8 +
+            # Minuten seit dem letzten erfolgreichen Save — damit ist die
+            # Mechanik aus den Logs beweisbar statt aus SB-Timestamps
+            # rekonstruiert.
+            _last_ok_min = (time.time() - ((cur.get('expires_at') or 0) - 3540)) / 60.0
+            log.error('[lh_flightops] GRANT-BURN token=%s rt8=%s http=%s '
+                      'oauth=%s last_ok_vor_min=%.0f',
+                      user_token[:8], _rt8(rt),
+                      err.get('http'), err.get('oauth'), _last_ok_min)
             cur['needs_relogin'] = True
             cur['relogin_at'] = time.time()
             cur.pop('access', None)
             _tokens_save(user_token, cur)
             _notify_relogin(user_token)
-    return None
-
-
-# Wartezeit vor dem endgültigen Toter-Grant-Flag (Fatal-Pfad) — gibt dem
-# parallelen Race-Gewinner Zeit, seine rotierten Tokens zu persistieren.
-# Modul-Konstante, damit Tests sie auf 0 patchen können.
-_FATAL_GRACE_SEC = 2.0
-
-# Cross-Container-Refresh-Guard: Lebensdauer des durablen „ich refreshe
-# gerade DIESEN RT"-Markers und Wartezeit des Verlierers (Tests patchen auf 0).
-_REFRESH_GUARD_SEC = 15.0
-_GUARD_WAIT_SEC = 4.0
+            return 'dead'
+        return 'transient'
 
 
 def _rt8(rt):
@@ -448,10 +727,12 @@ def _rt8(rt):
 
 
 def _claim_refresh_sb(user_token, rt):
-    """Atomares Cross-Container-Claim via RPC flightops_claim_refresh.
-    True = Zuschlag gewonnen (Guard server-seitig gesetzt), False = ein
-    anderer Prozess refresht DIESEN RT gerade, None = RPC nicht verfügbar
-    (Caller fällt auf den Soft-Guard zurück)."""
+    """Atomares Claim via RPC flightops_claim_refresh. True = Zuschlag
+    gewonnen (Guard server-seitig gesetzt), False = ein anderer Prozess hält
+    das Claim auf DIESEM RT (nur im Deploy-Übergang mit Alt-Code relevant),
+    None = RPC nicht verfügbar ⇒ der Refresher vertagt FAIL-CLOSED (seit dem
+    Umbau 2026-07-27 gibt es KEINEN Soft-Guard-Fallback mehr — der blinde
+    Fallback war der Massen-Burn #4)."""
     if not rt:
         return None
     try:
@@ -470,8 +751,8 @@ def _claim_refresh_sb(user_token, rt):
                 'p_token': user_token, 'p_refresh': rt, 'p_rt8': _rt8(rt),
                 'p_ttl': _REFRESH_GUARD_SEC})
         if not ok:
-            log.warning('[lh_flightops] claim_rpc_unavailable -> soft-guard '
-                        '(Reuse-Race-Restfenster!) token=%s', user_token[:8])
+            log.warning('[lh_flightops] claim_rpc_unavailable -> Refresh wird '
+                        'vertagt (fail-closed) token=%s', user_token[:8])
             return None
         if isinstance(data, list) and data:
             data = (next(iter(data[0].values()), None)
@@ -1245,6 +1526,265 @@ def rotation_pickups_for(user_token, rotation_ids):
     return out
 
 
+# ── ZWEITE PICKUP-QUELLE: der myTime-/Kalender-Link ──────────────────────────
+# Owner 2026-07-27 („die Pickup-Zeit wird nicht aus dem iCal-Kalender-Link
+# geholt, wenn sie aus der primären Quelle fehlt"). Die Lücke ist belegt, nicht
+# geraten — seit dem FlightOps-Login ist COMMON_CREW_ROTATION.pickupTime die
+# EINZIGE Pickup-Quelle, und alle drei Wege zum Kalender-Link sind zu:
+#   • Server-Refresh: app.py `_maybe_refresh_calendar_feed` steigt bei
+#     `_flightops_active(token)` sofort aus (Quellen-Priorität).
+#   • Geräte-Abruf: iOS `RosterFeedDeviceSync.runIfDue` steigt beim
+#     `aerox.flightops.connected`-Flag sofort aus.
+#   • Bestand: `_ics_events_to_briefings` (app.py) baut JEDEN vom Import
+#     angefassten Tag frisch auf (REPLACE-NOT-ACCUMULATE) — ein früher aus dem
+#     myTime-iCal gelesener Pickup-Marker überlebt den FlightOps-Import nicht.
+# Ergebnis: liefert LH keinen `pickupTime` (Feld leer, Umlauf außerhalb
+# `_ROT_PICKUP_HORIZON_H`, Quota-Notbremse), gibt es GAR KEINEN Pickup — obwohl
+# er im myTime-Kalender steht.
+#
+# Diese Ebene hängt genau dann die Pickup-VEVENTs des Kalender-Links in das aus
+# FlightOps erzeugte ICS, wenn die Primärquelle für den Tag nichts geliefert hat
+# („primary wins"). Danach ist die Kette unverändert: der Feed-Import bucketed
+# den Marker wie jeden myTime-Pickup, `crew_live_state.parse_pickup_hhmm` und
+# iOS `RosterLabels.pickupTimeFromSummary` lesen ihn ohne eine Zeile Neu-Code.
+_ICS_LEG_LOCATION_RE = re.compile(r'^[A-Z]{3}\s*[-–]\s*[A-Z]{3}$')
+
+
+def _ics_stamp(iso_utc):
+    """'YYYY-MM-DDTHH:MM:SSZ' → 'YYYYMMDDTHHMMSSZ' (ICS-Form), sonst None."""
+    m = re.match(r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})',
+                 str(iso_utc or '').strip())
+    if not m:
+        return None
+    y, mo, d, hh, mi, ss = m.groups()
+    return f'{y}{mo}{d}T{hh}{mi}{ss}Z'
+
+
+def ical_pickup_candidates(ical_text):
+    """Kalender-ICS-Text → [{'utc': 'YYYY-MM-DDTHH:MM:SSZ', 'summary': str}]
+    für jedes Pickup-VEVENT. Pure/testbar, wirft nie.
+
+    Der Summary bleibt WÖRTLICH („10:55 LT Pickup PEK" / „Pickup 1430") — er
+    trägt die ORTSZEIT, und genau die liest der Konsument. Ganztags-Events
+    (kein `start_iso`) und Summaries ohne plausible Zeit fallen raus; geraten
+    wird nie."""
+    out = []
+    try:
+        import app as _app
+        from blueprints.crew_live_state import parse_pickup_hhmm
+        events = _app._parse_ics_to_events(ical_text or '')
+    except Exception as e:
+        log.warning('[lh_flightops] ical-pickup parse: %s', type(e).__name__)
+        return out
+    for ev in (events or []):
+        if not isinstance(ev, dict):
+            continue
+        summ = re.sub(r'[\r\n\t]+', ' ', str(ev.get('summary') or '')).strip()
+        iso = str(ev.get('start_iso') or '').strip()
+        if not summ or not _ics_stamp(iso):
+            continue
+        try:
+            if not parse_pickup_hhmm(summ):
+                continue
+        except Exception:
+            continue
+        out.append({'utc': iso, 'summary': summ[:120]})
+    return out
+
+
+def merge_ical_pickups(ics, candidates):
+    """Pickup-VEVENTs aus dem Kalender-Link in ein FlightOps-ICS einhängen —
+    NUR für Roster-Tage, die die Primärquelle leer gelassen hat. Pure/testbar,
+    wirft nie; ohne verwertbaren Kandidaten kommt das ICS unverändert zurück.
+
+    Riegel — bewusst DIESELBEN wie im Primärpfad, denn ein Marker aus einer
+    Zweitquelle darf nicht schwächer geprüft sein als einer aus der ersten:
+      • ANKER-PFLICHT: es muss ein Flug-VEVENT geben, dessen Abflug 0…6 h NACH
+        dem Pickup liegt (`_PICKUP_LEAD_MAX_MIN`). Ohne Anker kein Marker —
+        sonst wandert der Pickup eines stornierten/verschobenen Umlaufs aus dem
+        noch nicht nachgezogenen Kalender in den Roster.
+      • PRIMARY WINS: trägt der Roster-Tag (Berlin-Bucket des Abflugs) bereits
+        einen Pickup aus COMMON_CREW_ROTATION, passiert nichts.
+      • MITTERNACHTS-WRAP wie im Primärpfad: liegt der Pickup in einem anderen
+        Berlin-Tag als der Abflug, wird DTSTART auf den Abflug gezogen (die
+        Wahrheit steckt im Summary, `pickup_utc_for_leg` rekonstruiert sie).
+      • Höchstens EIN Pickup je Roster-Tag; bei mehreren Kandidaten gewinnt der
+        SPÄTESTE plausible — dieselbe Regel wie in `pickup_utc_for_leg`."""
+    if not ics or not candidates:
+        return ics
+    try:
+        import app as _app
+        from datetime import datetime as _d, timezone as _tz
+        from blueprints.crew_live_state import parse_pickup_hhmm
+
+        def _inst(iso):
+            try:
+                v = _d.fromisoformat(str(iso or '').replace('Z', '+00:00'))
+                return v if v.tzinfo else v.replace(tzinfo=_tz.utc)
+            except Exception:
+                return None
+
+        have_days = set()      # Berlin-Tage, die schon einen Pickup tragen
+        deps = []              # (instant, iso) aller Flug-VEVENTs
+        for ev in (_app._parse_ics_to_events(ics) or []):
+            if not isinstance(ev, dict):
+                continue
+            iso = str(ev.get('start_iso') or '').strip()
+            inst = _inst(iso)
+            if inst is None:
+                continue
+            summ = str(ev.get('summary') or '')
+            if parse_pickup_hhmm(summ):
+                d = _berlin_day(iso)
+                if d:
+                    have_days.add(d)
+                continue
+            loc = str(ev.get('location') or '').strip().upper()
+            if _ICS_LEG_LOCATION_RE.match(loc):
+                deps.append((inst, iso))
+        if not deps:
+            return ics
+        deps.sort()
+        chosen = {}            # Berlin-Tag → (pickup_instant, iso, summary, dep_iso)
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            p_iso = str(cand.get('utc') or '')
+            p_inst = _inst(p_iso)
+            summ = re.sub(r'[\r\n\t]+', ' ', str(cand.get('summary') or '')).strip()
+            if p_inst is None or not summ:
+                continue
+            anchor = None
+            for d_inst, d_iso in deps:
+                lead = (d_inst - p_inst).total_seconds() / 60.0
+                if 0 <= lead <= _PICKUP_LEAD_MAX_MIN:
+                    anchor = d_iso
+                    break
+            if anchor is None:
+                continue
+            day = _berlin_day(anchor)
+            if not day or day in have_days:
+                continue
+            prev = chosen.get(day)
+            if prev is None or p_inst > prev[0]:
+                chosen[day] = (p_inst, p_iso, summ[:120], anchor)
+        if not chosen:
+            return ics
+        add = []
+        for i, day in enumerate(sorted(chosen)):
+            _p_inst, p_iso, summ, dep_iso = chosen[day]
+            stamp = _ics_stamp(p_iso if _berlin_day(p_iso) == day else dep_iso)
+            if not stamp:
+                continue
+            add += ['BEGIN:VEVENT', f'UID:pu-ical-{i}@aerox-flightops',
+                    f'DTSTART:{stamp}', f'DTEND:{stamp}',
+                    f'SUMMARY:{summ}', 'END:VEVENT']
+        if not add:
+            return ics
+        log.info('[lh_flightops] pickup-fallback: %d Marker aus dem '
+                 'Kalender-Link ergaenzt', len(add) // 6)
+        # VOR dem ersten VEVENT einhängen — der Tages-Summary wird in
+        # Event-Reihenfolge zusammengesetzt, und der Hotel-Pickup ist der
+        # FRÜHESTE Termin des Tages (vor Briefing und Abflug). Damit liest der
+        # Marker sich exakt wie im myTime-Feed und wie im Primärpfad, der sein
+        # Pickup-VEVENT ebenfalls vor das Flug-VEVENT setzt.
+        marker = 'BEGIN:VEVENT'
+        head, sep, tail = ics.partition(marker)
+        if not sep:
+            return ics
+        return head + '\r\n'.join(add) + '\r\n' + marker + tail
+    except Exception as e:
+        log.warning('[lh_flightops] pickup-fallback: %s', type(e).__name__)
+        return ics
+
+
+# Der Kalender-Link wird für die Fallback-Quelle HÖCHSTENS alle 3 h geholt und
+# das Ergebnis prozess-lokal gecacht — der Import läuft (refresh-all, Foreground-
+# Sync, manueller Tap) deutlich häufiger, und ein myTime-Share ist genau das,
+# was wir NICHT im Takt hämmern wollen. Scheitert der Abruf, bleibt der letzte
+# gute Stand stehen (Grace) statt den Pickup wegfallen zu lassen.
+_PICKUP_ICAL_TTL_S = 3 * 3600
+_pickup_ical_cache = {}          # token → (ts, candidates)
+_pickup_ical_lock = threading.Lock()
+
+
+def pickup_ical_url(user_token, body_url=None):
+    """URL des Kalender-Links, der als ZWEITE Pickup-Quelle dient — oder ''.
+
+    `body_url` (aus dem Import-Body, die App kennt den Link lokal) gewinnt und
+    wird persistiert: der Direkt-ICS-Import in app.py hat die gespeicherte
+    `calendar_feed.url` bei Bestandsusern bereits geleert, `pickup_ical_url`
+    ist der Slot, der einen Direkt-Import überlebt. Wirft nie."""
+    try:
+        import app as _app
+        cand = _app._normalize_feed_scheme(
+            _app._sanitize_feed_url(body_url or ''))
+        pf = _app._profile_load(user_token) or {}
+        prof = dict(pf.get('profile') or {})
+        feed = prof.get('calendar_feed')
+        feed = dict(feed) if isinstance(feed, dict) else {}
+        if cand.startswith('https://'):
+            if feed.get('pickup_ical_url') != cand:
+                feed['pickup_ical_url'] = cand
+                prof['calendar_feed'] = feed
+                _app._profile_save(user_token, prof)
+            return cand
+        for k in ('pickup_ical_url', 'url'):
+            v = str(feed.get(k) or '').strip()
+            if v.startswith('https://'):
+                return v
+    except Exception as e:
+        log.warning('[lh_flightops] pickup_ical_url: %s', type(e).__name__)
+    return ''
+
+
+def pickup_ical_candidates_for(user_token, url):
+    """Pickup-Kandidaten des Kalender-Links (gecacht, gedrosselt). Wirft nie.
+    Respektiert den Server-iCal-Kill-Switch (`AEROX_SERVER_ICAL_REFRESH=0`) —
+    steht der auf 0, holt der Server GAR KEINE myTime-Links mehr."""
+    if not url:
+        return []
+    try:
+        import app as _app
+        if not _app._server_ical_refresh_enabled():
+            return []
+        now = time.time()
+        with _pickup_ical_lock:
+            hit = _pickup_ical_cache.get(user_token)
+            if hit and now - hit[0] < _PICKUP_ICAL_TTL_S:
+                return hit[1]
+        text, ferr = _app._fetch_calendar_feed_text(url)
+        if ferr or not text:
+            log.warning('[lh_flightops] pickup-fallback fetch: %s', ferr)
+            return (hit[1] if hit else [])
+        got = ical_pickup_candidates(text)
+        with _pickup_ical_lock:
+            _pickup_ical_cache[user_token] = (now, got)
+            if len(_pickup_ical_cache) > 2000:
+                for k in sorted(_pickup_ical_cache,
+                                key=lambda k: _pickup_ical_cache[k][0])[:1000]:
+                    _pickup_ical_cache.pop(k, None)
+        return got
+    except Exception as e:
+        log.warning('[lh_flightops] pickup-fallback: %s', type(e).__name__)
+        return []
+
+
+def apply_ical_pickup_fallback(user_token, ics, body_url=None):
+    """Kette: primär COMMON_CREW_ROTATION (steckt schon im `ics`), sekundär der
+    Kalender-Link. Gibt das (ggf. ergänzte) ICS zurück; wirft nie."""
+    try:
+        url = pickup_ical_url(user_token, body_url)
+        if not url:
+            return ics
+        return merge_ical_pickups(
+            ics, pickup_ical_candidates_for(user_token, url))
+    except Exception as e:
+        log.warning('[lh_flightops] pickup-fallback wiring: %s',
+                    type(e).__name__)
+        return ics
+
+
 def duty_events_to_ics(resp, pickups=None):
     """FlightOps-Duty-Events → ICS-String (oder None). Pure/testbar.
     Flight-Events → VEVENT im LH-Summary-Format ('LH400: FRA-JFK'), Off/Vac/
@@ -1569,7 +2109,25 @@ def duty_events_to_ics(resp, pickups=None):
                 # myTime-Prosa 'Absence (U1)' → iOS mappt ABSENCE auf Urlaub.
                 summary = f'Absence ({det})' if det else 'Absence'
             elif cat in ('res', 'frs'):
-                summary = f'Standby {frm}' if len(frm) == 3 else 'Standby'
+                # RESERVE ist NICHT Standby (LH-Crew-Feedback 2026-07-27:
+                # „Reserve wird als Standby angezeigt inkl. 60-min-Karenzzeit").
+                # MTV Nr. 2a, § 4, 6. Abschnitt: (1) Standby = binnen 60 Min
+                # nach Abruf am Reporting Point; (2) Reserve = 12 Std Karenzzeit
+                # zwischen Abruf und Dienstantritt, Reservezeiten 06–22 Uhr LT.
+                # Bis hierher minteten wir für eventCategory RES (= Reservedienst,
+                # CRS-Handbuch MPG.4.9.1.1) hart das Wort „Standby" — damit war
+                # die Dienstart im ICS unwiederbringlich verloren und iOS zeigte
+                # jedem Reserve-Tag die Standby-Karten (60 Min Meldezeit).
+                # LHs EIGENER Hauscode in eventDetails entscheidet (gleiche Lehre
+                # wie B1/„Office Day"): ein SB-Code bleibt Standby, alles andere
+                # ist Reserve. Der Code reist in Klammern mit (myTime-Prosa-Form
+                # wie „Absence (U1)"/„Office Day (B4)"), damit iOS/Kalender ihn
+                # weiter 1:1 zeigen können.
+                _du = det.upper().replace('_', '').replace('-', '')
+                _is_sb = _du.startswith('SB') or _du.startswith('STBY')
+                _word = 'Standby' if _is_sb else 'Reserve'
+                summary = f'{_word} ({det})' if det else (
+                    f'{_word} {frm}' if len(frm) == 3 else _word)
             elif etype == 'hotel' or cat == 'hotel':
                 # myTime-Paritaet (Tim/KRK 2026-07-25): 'Layover [BRE]' + die
                 # IATA als LOCATION — NUR mit LOCATION setzt der Feed-Import
@@ -1959,7 +2517,13 @@ def flightops_oauth_exchange():
     tok = _exchange_code(code, flow['verifier'])
     if not tok:
         return jsonify({'ok': False, 'error': 'exchange_failed'}), 502
-    _tokens_save(flow['user_token'], tok)
+    if not _tokens_save(flow['user_token'], tok):
+        # Save NICHT bestätigt ⇒ ehrlich scheitern: ein »verbunden« ohne
+        # durablen RT wäre eine Familie, die beim ersten Refresh stirbt.
+        # Der User loggt sich schlicht erneut ein (neuer Grant, kein Schaden).
+        log.error('[lh_flightops] exchange-save unbestätigt token=%s',
+                  (flow.get('user_token') or '')[:8])
+        return jsonify({'ok': False, 'error': 'store_failed'}), 503
     return jsonify({'ok': True, 'connected': True, 'scope': tok.get('scope')})
 
 
@@ -2012,7 +2576,13 @@ def flightops_import(token):
     Body optional {from_date, to_date} (YYYY-MM-DD); Default −7…+45 Tage."""
     if not flightops_configured():
         return jsonify({'ok': False, 'error': 'not_configured'}), 503
-    if not _valid_access(token):
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        # Grant lebt, nur der Access-Token ist gerade abgelaufen: der
+        # zentrale Refresher rotiert in Kürze. Transiente Antwort — der
+        # Status-Endpoint bleibt connected, iOS zeigt KEINE Relogin-Karte.
+        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+    if _st != 'ok':
         return jsonify({'ok': False, 'error': 'not_connected'}), 401
     body = request.get_json(silent=True) or {}
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
@@ -2059,6 +2629,10 @@ def flightops_import(token):
     if not ics:
         return jsonify({'ok': True, 'events_count': 0, 'source': 'flightops',
                         'detail': 'no_events'}), 200
+    # FALLBACK-EBENE (Owner 2026-07-27): fehlt der Pickup in der Primärquelle,
+    # holt ihn der gespeicherte Kalender-Link (myTime) nach — pro Tag, nur wo
+    # oben nichts stand. Siehe apply_ical_pickup_fallback. Nie eine Vorbedingung.
+    ics = apply_ical_pickup_fallback(token, ics, body.get('pickup_ical_url'))
     try:
         import app as _app
         with _app.app.test_request_context(json={'ics_text': ics}):
@@ -2202,7 +2776,10 @@ def flightops_raw(token):
     (Crew-List/Hotel/Landing…) final verdrahtet."""
     if not flightops_configured():
         return jsonify({'ok': False, 'error': 'not_configured'}), 503
-    if not _valid_access(token):
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+    if _st != 'ok':
         return jsonify({'ok': False, 'error': 'not_connected'}), 401
     body = request.get_json(silent=True) or {}
     service = (body.get('service') or '').strip().upper()
@@ -2308,7 +2885,10 @@ def flightops_checkin(token):
     Bevorzugt die fertigen Link-Params aus den Duty-Events (die tragen schon
     dutyType/crewCategory korrekt); sonst Doku-Defaults OD/COC. ±6-Tage-
     Fenster lt. Doku — außerhalb 404."""
-    if not _valid_access(token):
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+    if _st != 'ok':
         return jsonify({'ok': False, 'error': 'not_connected'}), 401
     b = request.get_json(silent=True) or {}
     flight, date = b.get('flight'), b.get('date')
@@ -2330,7 +2910,10 @@ def flightops_checkin(token):
 def flightops_hotel(token):
     """Layover-Hotel für eine Station (COMMON_CREW_HOTEL_INFO → normalisiert).
     Body {station, provider?}. Parser gegen echte Shape verifiziert."""
-    if not _valid_access(token):
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+    if _st != 'ok':
         return jsonify({'ok': False, 'error': 'not_connected'}), 401
     b = request.get_json(silent=True) or {}
     resp = crew_hotel(token, b.get('station'), b.get('provider'))
@@ -2348,6 +2931,42 @@ def flightops_hotel(token):
 # bei geschlossener App. Auth wie poll-boards (X-Poll-Secret / localhost).
 _refresh_all_lock = threading.Lock()
 _refresh_all_state = {'running': False, 'last': None, 'drain': False}
+_refresh_all_thread = [None]     # [Thread|None] — für den Exit-Drain
+
+# EXIT-DRAIN (Massen-Burn 26./27.07.2026): der Deploy-Drain in
+# deploy-hetzner.sh schützt NUR vor Deploys. gunicorn recycelt den
+# Poll-Worker aber auch per --max-requests (~alle 1–2 h bei aktueller
+# poll-tick-Rate) — und ein refresh-all-Lauf dauert mit 500+ Usern
+# inzwischen 60–90 min: Recycle mitten im Lauf killte den Daemon-Thread
+# hart, ggf. zwischen LH-Rotation und Persist (= Familien-Tod), und ließ
+# den Rest der Liste unrefresht. atexit läuft beim GRACEFUL Worker-Exit
+# (max-requests wie SIGTERM) VOR dem Abräumen der Daemon-Threads: Drain
+# setzen + auf das Ende des aktuellen Grants warten (deutlich unter
+# gunicorns --graceful-timeout 60).
+_EXIT_DRAIN_JOIN_SEC = 45
+
+
+def _refresh_all_exit_drain():
+    """Wirft nie (läuft in atexit; Tests ersetzen threading.Thread durch
+    synchrone Fakes ohne is_alive — duck-typed prüfen)."""
+    try:
+        th = _refresh_all_thread[0]
+        if not (th and getattr(th, 'is_alive', lambda: False)()):
+            return
+        with _refresh_all_lock:
+            _refresh_all_state['drain'] = True
+        log.info('[flightops-refresh-all] worker-exit -> drain, warte auf '
+                 'laufenden Grant (max %ds)', _EXIT_DRAIN_JOIN_SEC)
+        th.join(_EXIT_DRAIN_JOIN_SEC)
+        if th.is_alive():
+            log.error('[flightops-refresh-all] exit-drain TIMEOUT — Thread '
+                      'lebt noch, möglicher Mid-Rotation-Kill')
+    except Exception:
+        pass
+
+
+import atexit as _atexit
+_atexit.register(_refresh_all_exit_drain)
 
 
 def _internal_secret_ok():
@@ -2404,8 +3023,12 @@ def _refresh_all_work(tokens):
                          len(tokens))
                 break
             try:
-                if not flightops_connected(tok):
-                    skipped += 1     # needs_relogin / Tokens weg
+                _st, _acc = _access_state(tok)
+                if _st != 'ok':
+                    # needs_relogin / Tokens weg / AT abgelaufen (dann ist der
+                    # Grant beim Refresher vorgemerkt — dieser Lauf importiert
+                    # nur, refresht seit dem Umbau 2026-07-27 NIE selbst).
+                    skipped += 1
                     continue
                 with _app.app.test_request_context(json={}):
                     rv = flightops_import(tok)
@@ -2433,15 +3056,20 @@ def _refresh_all_work(tokens):
 
 @lh_flightops_bp.route('/api/internal/flightops/refresh-drain', methods=['POST'])
 def flightops_refresh_drain():
-    """Deploy-Vorbereitung: laufenden refresh-all-Lauf sauber auslaufen
-    lassen (kein neuer LH-Call startet, der aktuelle Grant persistiert
-    fertig). Der Deploy pollt bis running=False. Idempotent."""
+    """Deploy-Vorbereitung: laufenden refresh-all-Lauf UND den Refresher-Loop
+    sauber auslaufen lassen (kein neuer LH-Call startet, der aktuelle Grant
+    persistiert fertig). Der Deploy pollt bis running=False. Idempotent —
+    der Container wird danach ohnehin neu erstellt (frischer Prozess hebt
+    das Drain wieder auf)."""
     if not _internal_secret_ok():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
     with _refresh_all_lock:
         _refresh_all_state['drain'] = True
         running = bool(_refresh_all_state['running'])
-    return jsonify({'ok': True, 'running': running})
+    _refresher_state['drain'] = True
+    running = running or bool(_refresher_state.get('busy'))
+    return jsonify({'ok': True, 'running': running,
+                    'refresher_active': bool(_refresher_state.get('active'))})
 
 
 @lh_flightops_bp.route('/api/internal/flightops/refresh-all', methods=['POST'])
@@ -2462,7 +3090,318 @@ def flightops_refresh_all():
             _refresh_all_state['running'] = False
         return jsonify({'ok': True, 'users': 0,
                         'last': _refresh_all_state['last']})
-    threading.Thread(target=_refresh_all_work, args=(tokens,),
-                     daemon=True).start()
+    th = threading.Thread(target=_refresh_all_work, args=(tokens,),
+                          daemon=True)
+    _refresh_all_thread[0] = th
+    th.start()
     return jsonify({'ok': True, 'started': True, 'users': len(tokens),
                     'last': _refresh_all_state['last']})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DER REFRESHER — der EINZIGE Prozessteil im ganzen System, der je einen
+# LH-Refresh-Token benutzt (Architektur-Umbau 2026-07-27, siehe Banner über
+# _refresh). Läuft als ein Daemon-Thread im Poll-Container
+# (LH_FLIGHTOPS_REFRESHER=1 in der Compose, sonst startet nichts); ein flock
+# auf dem Container-FS garantiert Einzigkeit auch über den kurzen
+# gunicorn-Worker-Recycle-Overlap hinweg. Der Loop hält alle Access-Tokens
+# proaktiv frisch (Rotation _REFRESH_AHEAD_S vor Ablauf, mit Jitter und
+# QPS-Abstand) — Web-Worker sehen dadurch praktisch nie einen abgelaufenen AT.
+# ═════════════════════════════════════════════════════════════════════════════
+_REFRESHER_TICK_S = 60           # Scan-Takt (drain-aware, 1-s-Granularität)
+_REFRESHER_GRANT_GAP_S = 1.0     # Mindestabstand zwischen zwei Rotationen
+_REFRESHER_LOCKFILE = '/tmp/lh_flightops_refresher.lock'
+_refresher_state = {'active': False, 'drain': False, 'busy': False,
+                    'last_tick': 0.0, 'last': None}
+_refresher_thread = [None]
+_refresher_lock_fh = [None]      # offenes flock-Handle (hält den Lock am Leben)
+
+
+def _refresher_enabled():
+    return (os.environ.get('LH_FLIGHTOPS_REFRESHER') or '').strip() == '1'
+
+
+def _refresher_scan():
+    """(token, tokens)-Paare aller verbundenen Grants, paginiert aus SB
+    (PostgREST kappt bei 1000). Eine Query pro Tick — der Loop braucht nur
+    expires_at/needs_relogin/refresh-Präsenz zur Fällig-Entscheidung; die
+    eigentliche Rotation lädt ihren Stand ohnehin fresh."""
+    out = []
+    try:
+        import app as _app
+        if not getattr(_app, 'SB_AVAILABLE', False):
+            return out
+        page, size = 0, 500
+        while True:
+            r = (_app.sb.table('user_profiles')
+                 .select('token,metadata->flightops_tokens')
+                 .filter('metadata->flightops_tokens', 'not.is', 'null')
+                 .range(page * size, page * size + size - 1).execute())
+            rows = r.data or []
+            for row in rows:
+                t = row.get('flightops_tokens')
+                if row.get('token') and isinstance(t, dict):
+                    out.append((row['token'], t))
+            if len(rows) < size:
+                break
+            page += 1
+    except Exception as e:
+        log.warning('[fo-refresher] scan: %s', type(e).__name__)
+    return out
+
+
+def _refresher_due(scan, now=None):
+    """Fällige Grants, am knappsten ablaufende zuerst. needs_relogin und
+    Grants ohne RT fallen raus; geparkte behandelt _refresher_refresh_grant
+    selbst (nur Nachsave, keine Rotation)."""
+    now = now or time.time()
+    due = []
+    for tok, t in scan:
+        if t.get('needs_relogin') or not t.get('refresh'):
+            continue
+        exp = t.get('expires_at') or 0
+        if exp - now < _REFRESH_AHEAD_S:
+            due.append((exp, tok))
+    due.sort()
+    return [tok for _exp, tok in due]
+
+
+def _refresher_tick():
+    wanted = _refresh_wanted_drain()
+    due = _refresher_due(_refresher_scan())
+    # Vorgemerkte (ein Worker sah einen abgelaufenen AT) zuerst — aber nur,
+    # wenn der durable Stand die Fälligkeit bestätigt; sonst war die
+    # Vormerkung stale und wird verworfen.
+    ordered = ([t for t in due if t in wanted]
+               + [t for t in due if t not in wanted])
+    stats = {}
+    for tok in ordered:
+        if _refresher_state['drain']:
+            break
+        _refresher_state['busy'] = True
+        try:
+            st = _refresher_refresh_grant(tok)
+        except Exception as e:
+            st = 'error'
+            log.warning('[fo-refresher] grant tok=%s %s',
+                        (tok or '')[:8], type(e).__name__)
+        finally:
+            _refresher_state['busy'] = False
+        stats[st] = stats.get(st, 0) + 1
+        # QPS-Schonung + Jitter: Rotationen entzerren sich selbst, statt
+        # stündliche Refresh-Wellen zu bilden.
+        time.sleep(_REFRESHER_GRANT_GAP_S + secrets.randbelow(600) / 1000.0)
+    _refresher_state['last'] = {'ts': time.time(), 'due': len(ordered),
+                                'stats': stats}
+    if ordered:
+        log.info('[fo-refresher] tick due=%d %s', len(ordered), stats)
+
+
+def _refresher_main():
+    """Loop-Rumpf: flock erwerben (Einzigkeit im Container), sich als DER
+    Rotations-Thread registrieren (Choke-Point-Gate in _refresh), dann
+    ticken bis zum Drain (Deploy/Worker-Exit)."""
+    import fcntl
+    fh = None
+    while fh is None:
+        if _refresher_state['drain']:
+            return
+        f = None
+        try:
+            f = open(_REFRESHER_LOCKFILE, 'a+')
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fh = f
+        except OSError:
+            # Alt-Worker hält den Loop noch (Recycle-Overlap) — warten.
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
+            time.sleep(15)
+    _refresher_lock_fh[0] = fh
+    _REFRESHER_THREAD_ID[0] = threading.get_ident()
+    _refresher_state['active'] = True
+    log.info('[fo-refresher] aktiv pid=%s — einziger RT-Rotierer des Systems',
+             os.getpid())
+    try:
+        while not _refresher_state['drain']:
+            try:
+                _refresher_tick()
+            except Exception as e:
+                log.warning('[fo-refresher] tick: %s', type(e).__name__)
+            _refresher_state['last_tick'] = time.time()
+            for _i in range(_REFRESHER_TICK_S):
+                if _refresher_state['drain']:
+                    break
+                time.sleep(1)
+    finally:
+        _refresher_state['active'] = False
+        log.info('[fo-refresher] beendet (drain/exit)')
+
+
+def _maybe_start_refresher():
+    """Startet den Loop GENAU DANN, wenn dieser Container die Refresher-Rolle
+    trägt (Compose-Env) und FlightOps konfiguriert ist. In Web-/MQTT-
+    Containern und in Tests passiert hier nichts — strukturell, nicht per
+    Konvention."""
+    if not (_refresher_enabled() and flightops_configured()):
+        return None
+    if _refresher_thread[0] is not None:
+        return _refresher_thread[0]
+    th = threading.Thread(target=_refresher_main, daemon=True,
+                          name='fo-refresher')
+    _refresher_thread[0] = th
+    th.start()
+    return th
+
+
+def _refresher_exit_drain():
+    """atexit-Zwilling von _refresh_all_exit_drain für den Refresher-Loop:
+    Worker-Recycle (gunicorn --max-requests) und SIGTERM warten auf das Ende
+    der LAUFENDEN Rotation, statt sie zwischen LH-Rotation und Persist zu
+    killen. Wirft nie."""
+    try:
+        th = _refresher_thread[0]
+        if not (th and getattr(th, 'is_alive', lambda: False)()):
+            return
+        _refresher_state['drain'] = True
+        log.info('[fo-refresher] worker-exit -> drain, warte auf laufende '
+                 'Rotation (max %ds)', _EXIT_DRAIN_JOIN_SEC)
+        th.join(_EXIT_DRAIN_JOIN_SEC)
+        if th.is_alive():
+            log.error('[fo-refresher] exit-drain TIMEOUT — möglicher '
+                      'Mid-Rotation-Kill')
+    except Exception:
+        pass
+
+
+_atexit.register(_refresher_exit_drain)
+
+
+# ── WÄCHTER (Leitplanke 5): needs_relogin-Anstieg + Refresher-Herzschlag ─────
+# Host-Cron (stündlich, :07) → dieser Endpoint auf :8081. Alarmiert per
+# Resend-Mail wenn (a) needs_relogin um mehr als N in ~1h steigt (Burn-Muster)
+# oder (b) der Refresher-Loop fehlt/steht, obwohl er konfiguriert ist —
+# ohne ihn rotiert NIEMAND mehr (fail-closed heißt: still veraltende ATs,
+# kein Burn; genau deshalb muss das Fehlen laut sein).
+_RELOGIN_WATCH_STATE = '/tmp/fo_relogin_watch.json'
+_RELOGIN_ALERT_DEFAULT_N = 5
+_RELOGIN_ALERT_COOLDOWN_S = 3 * 3600
+
+
+def _relogin_count():
+    """Zahl der Grants mit needs_relogin=true (SB, count-only). None bei
+    Fehler/ohne SB — der Wächter meldet dann bewusst nichts Falsches."""
+    try:
+        import app as _app
+        if not getattr(_app, 'SB_AVAILABLE', False):
+            return None
+        r = (_app.sb.table('user_profiles').select('token', count='exact')
+             .filter('metadata->flightops_tokens->>needs_relogin', 'eq', 'true')
+             .limit(1).execute())
+        return int(r.count or 0)
+    except Exception as e:
+        log.warning('[fo-watch] count: %s', type(e).__name__)
+        return None
+
+
+def _fo_watch_alert_mail(reasons, count, delta):
+    """Alarm-Mail via Resend (Pattern _mk_send_alert_email). GOTCHA aus dem
+    Signup-Notify-Memory: Resend/CF blockt den Python-Default-User-Agent
+    (403/1010) — expliziter UA-Header ist Pflicht. Failures nur loggen."""
+    api_key = (os.environ.get('RESEND_API_KEY') or '').strip()
+    to_email = (os.environ.get('SUPPORT_NOTIFY_EMAIL')
+                or 'miguel.schumann@icloud.com').strip()
+    if not api_key:
+        log.warning('[fo-watch] RESEND_API_KEY fehlt — Alarm nur im Log: %s',
+                    '; '.join(reasons))
+        return False
+    try:
+        import html as _html
+        items = ''.join(f'<li>{_html.escape(r)}</li>' for r in reasons)
+        payload = json.dumps({
+            'from': 'AeroX FlightOps <support@aerosteuer.de>',
+            'to': [to_email],
+            'subject': f'[AeroX FLIGHTOPS-WACHE] {"; ".join(reasons)[:140]}',
+            'html': (f"<h2 style='font-family:sans-serif'>LH-FlightOps-Wächter</h2>"
+                     f"<ul style='font-family:sans-serif'>{items}</ul>"
+                     f"<p style='font-family:sans-serif'>needs_relogin gesamt: "
+                     f"<b>{count}</b> (Δ letzte Stunde: {delta})<br>"
+                     f"Forensik: <code>docker logs aerotax-poll | grep "
+                     f"'GRANT-BURN\\|fo-refresher'</code></p>"),
+        }).encode()
+        req = urllib.request.Request(
+            'https://api.resend.com/emails', data=payload,
+            headers={'Authorization': f'Bearer {api_key}',
+                     'Content-Type': 'application/json',
+                     'User-Agent': 'AeroX-Backend/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ok = 200 <= resp.status < 300
+        log.info('[fo-watch] alert-mail %s', 'sent' if ok else 'FAILED')
+        return ok
+    except Exception as e:
+        log.warning('[fo-watch] mail: %s', type(e).__name__)
+        return False
+
+
+@lh_flightops_bp.route('/api/internal/flightops/relogin-watch',
+                       methods=['POST', 'GET'])
+def flightops_relogin_watch():
+    """Stündlicher Wächter-Check (Host-Cron auf :8081, Auth wie refresh-all).
+    Vergleicht needs_relogin mit dem letzten Stand (/tmp-State überlebt
+    Worker-Recycles im Container) und prüft den Refresher-Herzschlag."""
+    if not _internal_secret_ok():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    now = time.time()
+    try:
+        alert_n = int(os.environ.get('LH_FLIGHTOPS_RELOGIN_ALERT_N')
+                      or _RELOGIN_ALERT_DEFAULT_N)
+    except ValueError:
+        alert_n = _RELOGIN_ALERT_DEFAULT_N
+    cnt = _relogin_count()
+    prev = {}
+    try:
+        with open(_RELOGIN_WATCH_STATE) as f:
+            prev = json.load(f) or {}
+    except Exception:
+        prev = {}
+    delta = None
+    if (cnt is not None and isinstance(prev.get('count'), int)
+            and now - (prev.get('ts') or 0) <= 2 * 3600):
+        delta = cnt - prev['count']
+    reasons = []
+    if delta is not None and delta >= alert_n:
+        reasons.append(f'needs_relogin +{delta} in ~1h (jetzt {cnt}) — '
+                       f'Burn-Muster?')
+    if _refresher_enabled():
+        if not _refresher_state.get('active'):
+            reasons.append('Refresher-Loop NICHT aktiv (konfiguriert, aber '
+                           'kein Thread/Lock) — niemand rotiert')
+        elif now - (_refresher_state.get('last_tick') or 0) > 15 * 60:
+            reasons.append('Refresher-Loop steht (>15min kein Tick)')
+    elif flightops_configured():
+        reasons.append('LH_FLIGHTOPS_REFRESHER nicht gesetzt — in dieser '
+                       'Architektur rotiert dann NIEMAND (ATs laufen ab)')
+    alerted = False
+    if reasons and now - (prev.get('alerted_at') or 0) > _RELOGIN_ALERT_COOLDOWN_S:
+        alerted = _fo_watch_alert_mail(reasons, cnt, delta)
+    try:
+        with open(_RELOGIN_WATCH_STATE, 'w') as f:
+            json.dump({'ts': now, 'count': cnt,
+                       'alerted_at': now if alerted else (prev.get('alerted_at') or 0)},
+                      f)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'needs_relogin': cnt, 'delta_1h': delta,
+                    'reasons': reasons, 'alerted': alerted,
+                    'refresher': {
+                        'expected': _refresher_enabled(),
+                        'active': bool(_refresher_state.get('active')),
+                        'last_tick': _refresher_state.get('last_tick'),
+                        'last': _refresher_state.get('last')}})
+
+
+# Rollen-gesteuerter Autostart (No-Op ohne LH_FLIGHTOPS_REFRESHER=1 bzw. ohne
+# Creds — Tests und Web-Container starten hier nie einen Thread).
+_maybe_start_refresher()

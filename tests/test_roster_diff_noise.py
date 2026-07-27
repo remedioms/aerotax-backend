@@ -66,6 +66,82 @@ def test_semantically_identical_roster_yields_no_change():
     d = A._compute_roster_diff(old, new, today=TODAY)
     assert d == []
 
+# ── Frei-/Urlaubs-/Krank-Tage sind KEINE Dienständerung ────────────────────
+# Miriam Baumgarten 2026-07-27: „Dienstplan → Verlauf zeigt immer wieder
+# Aenderungen — an manchen dieser Tage muss ich GAR NICHT arbeiten." Live
+# bewiesen: 'added' mit klass='Krank' (Marker „Sickness"), 'removed' mit
+# klass='Urlaub' (Marker „Absence (K)"), 'modified' „Off Day" → „Sickness".
+
+def _off(datum, klass='FREI', marker='Off Day'):
+    return {'datum': datum, 'klass': klass, 'marker': marker,
+            'reader_facts': {'marker_raw': marker}}
+
+
+def test_new_free_day_is_not_a_new_duty():
+    old = [_day('2026-07-16', klass='Z72')]
+    new = old + [_off('2026-07-18')]
+    assert A._compute_roster_diff(old, new, today=TODAY) == []
+
+
+def test_new_sick_day_is_not_a_new_duty():
+    # Live-Fall 2026-07-27: 29./30.07. tauchten als 'added' mit klass='Krank' auf.
+    old = [_day('2026-07-16', klass='Z72')]
+    new = old + [_off('2026-07-18', klass='Krank', marker='Sickness')]
+    assert A._compute_roster_diff(old, new, today=TODAY) == []
+
+
+def test_vanishing_vacation_day_is_not_duty_removed():
+    old = [_off('2026-07-19', klass='Urlaub', marker='Absence (K)')]
+    assert A._compute_roster_diff(old, [], today=TODAY) == []
+
+
+def test_free_to_sick_is_not_reported():
+    old = [_off('2026-07-18', klass='FREI', marker='Off Day')]
+    new = [_off('2026-07-18', klass='Krank', marker='Sickness')]
+    assert A._compute_roster_diff(old, new, today=TODAY) == []
+
+
+def test_free_becoming_duty_is_still_reported():
+    old = [_off('2026-07-18')]
+    new = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')]
+    d = A._compute_roster_diff(old, new, today=TODAY)
+    assert len(d) == 1 and d[0]['kind'] == 'modified'
+
+
+def test_duty_becoming_free_is_still_reported():
+    old = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')]
+    new = [_off('2026-07-18')]
+    d = A._compute_roster_diff(old, new, today=TODAY)
+    assert len(d) == 1 and d[0]['kind'] == 'modified'
+
+
+def test_standby_and_reserve_are_duty_not_off():
+    # STBY/RES/OFFICE sind DIENST — ein neuer Standby-Tag bleibt meldepflichtig.
+    old = [_day('2026-07-16', klass='Z72')]
+    for kl, mk in (('STBY', 'StandBy'), ('RES', 'Reserve'), ('OFFICE', 'Office Day')):
+        new = old + [_off('2026-07-18', klass=kl, marker=mk)]
+        d = A._compute_roster_diff(old, new, today=TODAY)
+        assert len(d) == 1 and d[0]['kind'] == 'added', kl
+
+
+def test_free_day_with_ground_duty_segment_is_not_suppressed():
+    # myTime merged zwei VEVENTs: „Off Day (OF) · B4" (Buerodienst) —
+    # der Boden-Dienst schlaegt die Frei-Klasse (_summary_has_ground_duty).
+    old = [_day('2026-07-16', klass='Z72')]
+    new = old + [_off('2026-07-18', klass='FREI', marker='Off Day (OF) · B4')]
+    d = A._compute_roster_diff(old, new, today=TODAY)
+    assert len(d) == 1 and d[0]['kind'] == 'added'
+
+
+def test_free_day_with_sectors_is_not_suppressed():
+    old = [_day('2026-07-16', klass='Z72')]
+    day = _off('2026-07-18')
+    day['ical_sectors'] = [{'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
+                            'dep_iso': '2026-07-18T08:00:00Z'}]
+    d = A._compute_roster_diff(old, old + [day], today=TODAY)
+    assert len(d) == 1 and d[0]['kind'] == 'added'
+
+
 def test_exact_same_roster_yields_no_change():
     # Byte-identisches Re-Sync (haeufigster Fall) → ZERO Diffs.
     r = [

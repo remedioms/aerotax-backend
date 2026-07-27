@@ -9885,6 +9885,18 @@ def _profile_metadata_merge_sb(token, patch):
         return False
 
 
+# ── LH-FlightOps-Token-Isolation (Refresher-Umbau 2026-07-27) ────────────────
+# `flightops_tokens` trägt einen ROTIERENDEN OAuth-Refresh-Token; LH revoziert
+# bei Reuse die GANZE Token-Familie. Jeder generische Profil-Save (Crew-Cache,
+# Location-Push, Avatar, pk-Store, …) trägt aber die zum Lade-Zeitpunkt aktuelle
+# Token-Kopie im Blob mit — der Top-Level-Merge (`metadata || meta`) würde eine
+# INZWISCHEN rotierte Familie mit dem konsumierten RT überschreiben, und der
+# nächste Refresh verbrennte sie deterministisch per Reuse-Detection. Darum ist
+# der Key hier STRUKTURELL schreibgeschützt: nur der Token-Store in
+# blueprints/lh_flightops.py setzt das Writer-Flag und darf ihn schreiben.
+_FLIGHTOPS_TOKEN_WRITER = _req_threading.local()
+
+
 def _profile_save_to_supabase(token, profile):
     """Upsert einer Profile-Row. True/False für Erfolg."""
     # Invalidieren, BEVOR irgendein Ausstieg greift. Sonst bleibt der Memo bei
@@ -9903,6 +9915,13 @@ def _profile_save_to_supabase(token, profile):
             row[k] = v
         else:
             meta[k] = v
+    # Token-Isolation (siehe _FLIGHTOPS_TOKEN_WRITER oben): generische Saves
+    # dürfen den rotierenden FlightOps-Token-Stand NIE mitschreiben — der
+    # durable Stand in SB bleibt unberührt (Merge ohne den Key). Nur der
+    # Token-Store selbst (Writer-Flag) kommt hier durch.
+    _fo_tokens_stripped = None
+    if not getattr(_FLIGHTOPS_TOKEN_WRITER, 'active', False):
+        _fo_tokens_stripped = meta.pop('flightops_tokens', None)
     # DURABILITY (2026-06-29 → atomar seit 2026-07-01): metadata-jsonb NICHT
     # clobbern. Ein voller Overwrite der metadata-Spalte loeschte avatar_url/
     # location_source/current_city/share_location fuer JEDEN aktiven User (DER
@@ -9932,6 +9951,13 @@ def _profile_save_to_supabase(token, profile):
                 meta = base
     except Exception:
         pass  # Merge best-effort — im Zweifel schreiben statt 500
+    # Voll-Overwrite-Fallback: fehlt der Key jetzt (prev-Read fehlgeschlagen
+    # oder Row hatte noch keinen), würde der Overwrite die Tokens ganz LÖSCHEN
+    # — dann lieber die (ggf. stale) Caller-Kopie behalten, exakt das alte
+    # Verhalten dieses seltenen Pfads. Rotationen selbst laufen nie hierher
+    # (der Token-Store schreibt über den atomaren Merge bzw. das CAS-RPC).
+    if _fo_tokens_stripped is not None and 'flightops_tokens' not in meta:
+        meta['flightops_tokens'] = _fo_tokens_stripped
     row['metadata'] = meta
     try:
         sb.table('user_profiles').upsert(row, on_conflict='token').execute()
@@ -19117,6 +19143,51 @@ def _rc_field_changed(av, bv):
     return bool(a) and bool(b) and a != b
 
 
+# Klassen, die EINDEUTIG „kein Dienst" bedeuten (iOS-Vertrag: die einzigen
+# klass-Werte im Roster-Snapshot sind FREI/Urlaub/Krank/STBY/RES/OFFICE bzw.
+# leer). STBY/RES/OFFICE sind DIENST und stehen bewusst NICHT hier.
+_RC_OFF_DUTY_KLASS = frozenset({'frei', 'urlaub', 'krank'})
+
+
+def _rc_day_is_off_duty(day):
+    """True NUR bei einem eindeutig dienstfreien Roster-Tag (Frei/Urlaub/Krank).
+
+    Miriam Baumgarten 2026-07-27 („Dienstplan → Verlauf zeigt immer wieder
+    Änderungen — an manchen dieser Tage muss ich GAR NICHT arbeiten"): der Diff
+    kannte nur Datums-Keys, nicht deren Inhalt. Ein Frei-/Urlaubs-/Kranktag, der
+    im Feed neu auftaucht (LH veröffentlicht die „Off Day (==)"-Events oft erst
+    Tage nach dem Dienstplan) wurde als kind='added' geloggt und in der Liste als
+    „NEU · Neuer Dienst" gerendert — für einen Tag ohne jeden Dienst. Bewiesen an
+    AT-4235F69669CB4EB2 (31.07./01.08. beide klass=FREI, Marker „Off Day (FREE) ·
+    Off Day (==)") und an einem zweiten Live-User (29./30.07. als 'added' mit
+    klass='Krank', Marker „Sickness").
+
+    FAIL-CLOSED: nur eine EXPLIZITE Frei-Klasse zählt. Fehlt `klass` (bei
+    Flug-/Layover-Tagen der Normalfall), ist der Tag NICHT off-duty. Zusätzlich
+    schlagen echte Dienst-Belege die Klasse: Sektoren, Routing, Layover-Ort oder
+    ein Boden-Dienst-Segment im gemergten Marker („Off Day (OF) · B4",
+    `_summary_has_ground_duty`, iOS-Spiegel hasGroundDutyEvidence). Wirft nie."""
+    try:
+        d = day if isinstance(day, dict) else {}
+        if _rc_norm_cmp(d.get('klass')) not in _RC_OFF_DUTY_KLASS:
+            return False
+        if d.get('ical_sectors') or d.get('legs'):
+            return False
+        rf = d.get('reader_facts') or {}
+        if str(d.get('routing') or '').strip():
+            return False
+        if str(rf.get('layover_ort') or '').strip():
+            return False
+        marker = ' · '.join(str(x) for x in (d.get('marker'), rf.get('marker_raw'),
+                                             d.get('ical_summary'), d.get('summary'))
+                            if x)
+        if marker and _summary_has_ground_duty(marker.upper()):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _rc_meaningfully_modified(a, b):
     """Substanz-Check zweier Roster-Tage (Kern von _compute_roster_diff,
     modul-weit hoisted damit das Pickup-Rauschen-Gate ihn wiederverwenden kann).
@@ -19179,6 +19250,16 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
        leer↔gefüllt-Übergang (Anreicherung/transientes Re-Parse) ist KEINE
        Änderung. `klass` bleibt exakt verglichen (Tour↔Frei ist echte Änderung).
 
+    3) DIENSTFREIE TAGE (Miriam Baumgarten 2026-07-27, „Verlauf zeigt immer
+       wieder Änderungen — an manchen dieser Tage muss ich GAR NICHT arbeiten"):
+       Frei-/Urlaubs-/Kranktage tauchen im Feed oft verspätet auf (LH schiebt die
+       „Off Day (==)"/„Absence"-Events nach) oder wechseln untereinander
+       (Frei→Krank). Der Diff kannte nur Datums-Keys → jeder solche Tag wurde
+       'added'/'removed' und in der Liste als „NEU · Neuer Dienst" bzw. „Dienst
+       entfernt" gerendert. Ein Tag ohne Dienst erzeugt keinen Eintrag mehr
+       (`_rc_day_is_off_duty`); sobald EINE Seite Dienst ist, bleibt alles wie
+       gehabt.
+
     Feld-Vergleichslogik lebt modul-weit in _rc_norm_cmp/_rc_field_changed/
     _rc_meaningfully_modified (geteilt mit dem Push-Pickup-Gate).
     """
@@ -19203,12 +19284,27 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
     for k in sorted(keys):
         a, b = old_by.get(k), new_by.get(k)
         if a is None and b is not None:
-            if _added_is_near(k):
+            # 3) FREI-/URLAUBS-/KRANK-TAGE (Miriam Baumgarten 2026-07-27): ein
+            #    dienstfreier Tag, der neu im Feed auftaucht, ist KEIN neuer
+            #    Dienst — die Liste rendert 'added' aber als „NEU · Neuer
+            #    Dienst" und der User sieht eine Änderung für einen Tag, an dem
+            #    er gar nicht arbeitet. Still. (Wird der Tag später ein echter
+            #    Dienst, greift der 'modified'-Zweig unten.)
+            if _added_is_near(k) and not _rc_day_is_off_duty(b):
                 changes.append({'datum': k, 'kind': 'added', 'new': b})
         elif b is None and a is not None:
-            changes.append({'datum': k, 'kind': 'removed', 'old': a})
+            # Analog: verschwindet ein Frei-/Urlaubs-/Kranktag aus dem Feed,
+            # ist das kein „Dienst entfernt".
+            if not _rc_day_is_off_duty(a):
+                changes.append({'datum': k, 'kind': 'removed', 'old': a})
         elif a and b and _rc_meaningfully_modified(a, b):
-            changes.append({'datum': k, 'kind': 'modified', 'old': a, 'new': b})
+            # Frei → Frei (z.B. „Off Day" → „Off Day (FREE) · Off Day (==)",
+            # Frei → Krank): beide Seiten dienstfrei → keine Dienständerung.
+            # Sobald EINE Seite Dienst ist (Frei→Tour, Tour→Krank), bleibt der
+            # Eintrag — genau das muss der User sehen.
+            if not (_rc_day_is_off_duty(a) and _rc_day_is_off_duty(b)):
+                changes.append({'datum': k, 'kind': 'modified',
+                                'old': a, 'new': b})
     return changes
 
 
@@ -20054,12 +20150,127 @@ def post_crash_report():
 
 _MK_MAX_BODY_BYTES = 512 * 1024
 
-# Alert-Throttle: max. 1 Mail pro Stunde pro (kind, app build) — in-process
-# TTL-Dict (Pattern wie _ip_rate_buckets; per-Instanz reicht: Cloud Run läuft
-# hier praktisch single-instance, und im Worst Case kommen ein paar Mails mehr,
-# nie ein Sturm pro Instanz).
-_MK_ALERT_LAST_SENT = {}     # (kind, build) -> unix ts
-_MK_ALERT_TTL_SEC = 3600
+# ABGELÖST 2026-07-27 durch das Signatur-Gate unten — der reine Zeit-Throttle
+# auf (kind, build) mailte auch inhaltsleere Reports und wiederholte bekannte
+# Signaturen stündlich. Konstanten bleiben nur als Referenz stehen.
+_MK_ALERT_LAST_SENT = {}     # (kind, build) -> unix ts  [unbenutzt]
+_MK_ALERT_TTL_SEC = 3600     # [unbenutzt]
+
+# ── SIGNATUR-GATE (2026-07-27, Owner: „die Mails nerven, vor allem wenn nichts
+#    Substanzielles drin ist") ────────────────────────────────────────────────
+# Vorher war die EINZIGE Bedingung ein Zeit-Throttle auf (kind, build). Folge:
+#   a) Reports OHNE verwertbaren Stack lösten trotzdem eine Mail aus, deren
+#      Body nur „Top-Frames: —" enthielt. Messung 27.07. gegen
+#      ax_crash_reports: 63 von 132 Hang-Reports haben `call_stack` als
+#      TRUNCATED STRING (Client-Cap) → _mk_top_frames liefert [] → Leer-Mail.
+#   b) Dieselbe seit Wochen bekannte Signatur mailte jede Stunde erneut.
+#   c) Nach jedem Deploy/Neustart war das In-Process-Dict leer → Mail-Welle.
+#
+# Neue Regel: gemailt wird NUR bei einem echten Fund.
+#   1. Kein Stack UND kein Detail  ⇒ gar keine Mail (nur Log).
+#   2. Signatur zum ersten Mal gesehen ⇒ Mail („NEU").
+#   3. Bekannte Signatur ⇒ Mail nur, wenn der Zähler eine Eskalationsstufe
+#      erreicht (10/50/200 Vorkommen) ⇒ „häuft sich".
+#   4. Globale Bremse: max. _MK_ALERT_MAX_PER_HOUR Mails/Stunde.
+#
+# „Schon gesehen?" wird gegen Supabase geprüft, nicht gegen In-Process-State:
+# die Signatur wandert als `_mk_sig` mit in die payload-JSONB, ein Deploy
+# verliert sie damit NICHT (das war Ursache (c)). Ist SB nicht erreichbar,
+# fällt die Prüfung auf das In-Process-Set zurück (fail-quiet: im Zweifel
+# NICHT mailen, außer die Signatur ist auch lokal neu).
+_MK_ALERT_ESCALATION_STEPS = (10, 50, 200)
+_MK_ALERT_MAX_PER_HOUR = 6
+_MK_SEEN_SIGS = {}           # sig -> unix ts (erste lokale Sichtung)
+_MK_ALERT_SENT_TS = []       # unix ts der zuletzt versendeten Mails
+_MK_ALERT_LOCK = _req_threading.Lock()   # `threading` ist modulweit nur als Alias da
+
+
+def _mk_signature(kind, build, top_frames):
+    """Stabile Kurz-Signatur eines Reports: kind + build + die obersten
+    Frame-BINÄRNAMEN (ohne Offsets — die wandern mit jedem Compile).
+
+    Leerer Stack ⇒ None. Ein Report ohne Stack bekommt bewusst KEINE Signatur,
+    weil er auch nichts zu unterscheiden hätte — er wird nie gemailt.
+    """
+    if not top_frames:
+        return None
+    names = [str(f).split(' +')[0] for f in top_frames[:6]]
+    raw = f'{kind}|{build}|' + '>'.join(names)
+    return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+
+
+def _mk_prior_count(sig):
+    """Wie oft wurde diese Signatur schon gespeichert (inkl. der gerade
+    eingefügten Zeile)? Liest `payload->>_mk_sig` aus ax_crash_reports.
+
+    Rückgabe: (count, verlaesslich). Bei SB-Fehler (None, False) — der
+    Aufrufer entscheidet dann konservativ über das In-Process-Set.
+    """
+    if not sig or not SB_AVAILABLE:
+        return None, False
+    try:
+        cap = max(_MK_ALERT_ESCALATION_STEPS) + 1
+
+        def _do():
+            return (sb.table('ax_crash_reports')
+                      .select('id')
+                      .eq('payload->>_mk_sig', sig)
+                      .limit(cap)
+                      .execute())
+        res, failed = _supabase_execute_with_timeout('mk_sig_count', _do, timeout_s=4)
+        if failed or res is None:
+            return None, False
+        return len(getattr(res, 'data', None) or []), True
+    except Exception as e:
+        print(f'[mk-diag] sig count fail ({type(e).__name__}: {str(e)[:120]})')
+        return None, False
+
+
+def _mk_should_alert(sig, has_detail):
+    """Entscheidet, ob dieser Report eine Mail wert ist.
+
+    Rückgabe: (bool, grund_text). `grund_text` landet im Betreff, damit man in
+    der Inbox sofort sieht WARUM die Mail kam.
+    """
+    # (1) Nichts Substanzielles im Report → nie mailen.
+    if not sig and not has_detail:
+        return False, 'leer'
+    if not sig:
+        # Detail (z.B. exception_type) ohne jeden Frame: das ist zu wenig für
+        # eine eigene Mail — steht vollständig in Supabase.
+        return False, 'kein-stack'
+
+    count, reliable = _mk_prior_count(sig)
+    with _MK_ALERT_LOCK:
+        now_ts = time.time()
+        # (4) Globale Bremse — alte Stempel wegwerfen, dann zählen.
+        _MK_ALERT_SENT_TS[:] = [t for t in _MK_ALERT_SENT_TS if now_ts - t < 3600]
+        if len(_MK_ALERT_SENT_TS) >= _MK_ALERT_MAX_PER_HOUR:
+            return False, 'stundenlimit'
+
+        locally_new = sig not in _MK_SEEN_SIGS
+        _MK_SEEN_SIGS[sig] = _MK_SEEN_SIGS.get(sig, now_ts)
+        if len(_MK_SEEN_SIGS) > 2000:
+            # LRU-artig kürzen statt clear() — ein voller clear() (alter Bug)
+            # macht JEDE bekannte Signatur wieder „neu" und löst eine Welle aus.
+            for k in sorted(_MK_SEEN_SIGS, key=_MK_SEEN_SIGS.get)[:1000]:
+                _MK_SEEN_SIGS.pop(k, None)
+
+        if reliable:
+            # count schließt die soeben eingefügte Zeile ein.
+            if count <= 1:
+                decision, reason = True, 'NEU'
+            elif count in _MK_ALERT_ESCALATION_STEPS:
+                decision, reason = True, f'{count}x'
+            else:
+                decision, reason = False, f'bekannt ({count}x)'
+        else:
+            # SB stumm: nur die allererste lokale Sichtung mailen.
+            decision, reason = (locally_new, 'NEU?' if locally_new else 'bekannt (lokal)')
+
+        if decision:
+            _MK_ALERT_SENT_TS.append(now_ts)
+        return decision, reason
 
 
 def _mk_top_frames(call_stack, limit=8):
@@ -20107,9 +20318,13 @@ def _mk_top_frames(call_stack, limit=8):
         return []
 
 
-def _mk_send_alert_email(row, top_frames):
+def _mk_send_alert_email(row, top_frames, reason='', sig=''):
     """Alert-Mail an SUPPORT_NOTIFY_EMAIL via Resend (Pattern wie
-    _send_support_email_notification). Failures nur loggen."""
+    _send_support_email_notification). Failures nur loggen.
+
+    `reason` steht im Betreff ('NEU' / '10x' …), damit in der Inbox sofort
+    sichtbar ist, WARUM diese Mail kam — der Rest ist bewusst still.
+    """
     api_key = os.environ.get('RESEND_API_KEY', '').strip()
     to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL', 'miguel.schumann@icloud.com').strip()
     if not api_key:
@@ -20135,7 +20350,8 @@ def _mk_send_alert_email(row, top_frames):
                 detail_bits.append(f'hang {round(float(dur), 1)}s')
         e = _html.escape
         frames_html = ''.join(f'<li><code>{e(f)}</code></li>' for f in top_frames) or '<li>—</li>'
-        subject = f"[AeroX {kind.upper()}] {ver} · {row.get('os', '?')}"
+        tag = f" {reason}" if reason else ''
+        subject = f"[AeroX {kind.upper()}{tag}] {ver} · {row.get('os', '?')}"
         # Subject header-safe halten (kein CRLF aus payload-Strings).
         subject = subject.replace('\r', ' ').replace('\n', ' ')[:200]
         html_body = (
@@ -20149,8 +20365,11 @@ def _mk_send_alert_email(row, top_frames):
             f"<p style='font-family:sans-serif'><b>Top-Frames:</b></p>"
             f"<ol style='font-family:monospace;font-size:13px'>{frames_html}</ol>"
             f"<p style='font-family:sans-serif;font-size:12px;color:#888'>"
+            f"Signatur <code>{e(str(sig or '—'))}</code> · Anlass: {e(str(reason or '—'))}<br>"
             f"Voller Report in Supabase <code>ax_crash_reports</code> "
-            f"(throttled: max. 1 Mail/h pro Kind+Build).</p>"
+            f"(Filter: <code>payload-&gt;&gt;_mk_sig = {e(str(sig or ''))}</code>).<br>"
+            f"Es wird nur bei NEUER Signatur gemailt, danach erst wieder bei "
+            f"{', '.join(str(s) for s in _MK_ALERT_ESCALATION_STEPS)} Vorkommen.</p>"
         )
         payload = json.dumps({
             'from': 'AeroX Crash <support@aerosteuer.de>',
@@ -20219,6 +20438,14 @@ def post_telemetry_diagnostics():
         'payload': body,
     }
 
+    # Signatur VOR dem Insert bilden und in die payload-JSONB legen: dadurch
+    # überlebt das „kenne ich schon" jeden Deploy/Neustart (siehe Kommentar am
+    # _MK_SEEN_SIGS-Block). `body` ist dasselbe Objekt wie row['payload'].
+    top_frames = _mk_top_frames(body.get('call_stack'))
+    mk_sig = _mk_signature(kind, row['build'], top_frames)
+    if mk_sig:
+        body['_mk_sig'] = mk_sig
+
     # Persistenz best-effort: Supabase-Insert; Tabelle fehlt / SB down →
     # Logging-only-Fallback (Report ist dann wenigstens in Cloud-Run-Logs).
     stored = False
@@ -20236,20 +20463,18 @@ def post_telemetry_diagnostics():
         except Exception:
             print(f'[mk-diag] FALLBACK-LOG kind={kind} version={row["app_version"]} build={row["build"]}')
 
-    # Alert-Mail — throttled auf 1/h pro (kind, build).
-    top_frames = _mk_top_frames(body.get('call_stack'))
-    throttle_key = (kind, row['build'])
-    now_ts = datetime.utcnow().timestamp()
-    last = _MK_ALERT_LAST_SENT.get(throttle_key, 0)
-    if now_ts - last >= _MK_ALERT_TTL_SEC:
-        _MK_ALERT_LAST_SENT[throttle_key] = now_ts
-        if len(_MK_ALERT_LAST_SENT) > 500:   # Dict klein halten
-            _MK_ALERT_LAST_SENT.clear()
-            _MK_ALERT_LAST_SENT[throttle_key] = now_ts
-        _mk_send_alert_email(row, top_frames)
+    # Alert-Mail — NUR bei echtem Fund (neue Signatur oder Eskalationsstufe).
+    # Reports ohne verwertbaren Stack lösen gar nichts mehr aus; sie liegen
+    # vollständig in ax_crash_reports und sind dort auswertbar.
+    has_detail = (body.get('exception_type') is not None
+                  or bool(body.get('termination_reason'))
+                  or body.get('hang_duration_s') is not None)
+    should, reason = _mk_should_alert(mk_sig, has_detail)
+    if should:
+        _mk_send_alert_email(row, top_frames, reason=reason, sig=mk_sig or '')
     else:
-        print(f'[mk-diag] alert throttled (kind={kind} build={row["build"]}, '
-              f'next in {int(_MK_ALERT_TTL_SEC - (now_ts - last))}s)')
+        print(f'[mk-diag] keine Mail (kind={kind} build={row["build"]} '
+              f'sig={mk_sig or "-"} grund={reason})')
 
     return jsonify({'ok': True, 'stored': stored})
 
@@ -44778,6 +45003,16 @@ def import_calendar_feed(token):
     except Exception:
         feed_obj = {}
         feed_obj_2 = {}
+    # PICKUP-FALLBACK-SLOT (Owner 2026-07-27 „Pickup kommt nicht aus dem
+    # Kalender-Link"): der zuletzt bekannte myTime-Link ist die ZWEITE
+    # Pickup-Quelle (blueprints/lh_flightops.apply_ical_pickup_fallback). Ein
+    # Direkt-ICS-Import (FlightOps/PDF/Geräte-Abruf) leert unten `url` — vorher
+    # ging der Link damit UNWIEDERBRINGLICH verloren und der Fallback hatte
+    # nichts zu holen. `pickup_ical_url` überlebt; er wird NUR von der
+    # Pickup-Kette gelesen, nicht vom Auto-Refresh (`_maybe_refresh_calendar_feed`
+    # liest weiterhin ausschließlich `url` — der Geräte-Abruf bleibt also der
+    # alleinige Roster-Weg, kein neues Server-„Bot"-Muster).
+    _prev_feed_url = str(feed_obj.get('url') or '').strip()
     if not err_1:
         # Der Primär-Slot trägt die MERGED Event-Liste (Duty + Off-Days) — alle
         # bestehenden Reader (Friend-Roster-Fallback, get_briefings-Pfade) sehen
@@ -44797,8 +45032,13 @@ def import_calendar_feed(token):
         if ics_text_direct:
             # PDF-Import: kein URL-Zyklus (Auto-Refresh hat nichts zu holen) —
             # Quelle ehrlich markieren, damit Diagnose/UI sie unterscheiden kann.
+            if _prev_feed_url.startswith('https://'):
+                feed_obj['pickup_ical_url'] = _prev_feed_url
             feed_obj['url'] = ''
             feed_obj['source'] = 'pdf'
+        elif url.startswith('https://'):
+            # Echter Link-Import → derselbe Link ist auch die Pickup-Zweitquelle.
+            feed_obj['pickup_ical_url'] = url
     # err_1 gesetzt → Slot 1 UNVERÄNDERT lassen (kein frisches imported_at über
     # einen gescheiterten Duty-Fetch stempeln — J5-Lektion; Backoff-Zähler hat
     # _calendar_feed_note_refresh_failure oben schon erhöht).

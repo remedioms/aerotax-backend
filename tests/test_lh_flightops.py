@@ -424,180 +424,266 @@ def test_token_request_classifies_fatal_vs_transient(monkeypatch):
     assert tok is None and err['fatal'] is False
 
 
-def test_refresh_fatal_marks_relogin_and_pushes_once(monkeypatch):
+# ── Single-Refresher-Architektur (Umbau 2026-07-27 nach Grant-Burn #4) ──────
+# Rotieren darf NUR noch der Refresher-Loop (Poll-Container, ein Thread).
+# Diese Tests registrieren den Test-Thread über _as_refresher als DEN
+# Rotations-Thread — exakt das, was _refresher_main im Poll-Container tut.
+import contextlib as _ctx
+import threading as _thr
+
+
+@_ctx.contextmanager
+def _as_refresher():
+    old = fo._REFRESHER_THREAD_ID[0]
+    fo._REFRESHER_THREAD_ID[0] = _thr.get_ident()
+    try:
+        yield
+    finally:
+        fo._REFRESHER_THREAD_ID[0] = old
+
+
+def test_valid_access_never_refreshes(monkeypatch):
+    """Web-Worker-/Cron-Lesepfad: abgelaufener AT ⇒ None + Vormerkung für den
+    Refresher — NIEMALS ein eigener Refresh oder auch nur ein Claim. Die
+    Racefläche aus Burn #1–#4 (jeder Prozess rotiert selbst) existiert nicht
+    mehr."""
     import time as _t
-    saves = []
-    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)   # kein echtes Warten im Test
+    fo._refresh_wanted.clear()
     monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
-    monkeypatch.setattr(fo, '_refresh', lambda r: (
-        None, {'http': 400, 'oauth': 'invalid_grant', 'fatal': True}))
-    pushes = []
-    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: pushes.append(tok))
-    assert fo._valid_access('AT-U') is None
-    # Save 1 = Cross-Container-Guard (Tokens unverändert), Save 2 = Flag.
-    assert saves[0]['refresh_guard']['rt8'] == fo._rt8('R')
-    assert saves[0]['access'] == 'OLD' and saves[0]['refresh'] == 'R'
-    flagged = saves[-1]
-    assert flagged.get('needs_relogin') is True and 'access' not in flagged
-    assert pushes == ['AT-U']
-    # needs_relogin → connected False + kein weiterer Refresh-Versuch
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: dict(flagged))
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
-        AssertionError('toter Grant darf nicht weiter refreshen')))
-    assert fo.flightops_connected('AT-U') is False
+        AssertionError('Lesepfad darf NIE refreshen')))
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: (_ for _ in ()).throw(
+        AssertionError('Lesepfad darf nicht einmal claimen')))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('Lesepfad darf nichts schreiben')))
     assert fo._valid_access('AT-U') is None
-
-
-def test_refresh_fatal_race_loser_does_not_kill_winner(monkeypatch):
-    """Cross-Container-Rotations-Race (Miguels Grant 2026-07-24 03:01Z tot):
-    LH rotiert den Refresh-Token bei JEDEM Refresh. Unser Refresh mit 'R'
-    schlägt fatal fehl (der PARALLELE Gewinner — Poll-Cron im anderen
-    Container — hat 'R' schon verbraucht und R2/NEW persistiert). Der
-    Verlierer darf dann: NICHT flaggen, NICHT pushen, den Gewinner-Stand
-    NIE überschreiben — und liefert dessen frischen Access weiter."""
-    import time as _t
-    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)
-    states = [
-        {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10},   # vor Lock
-        {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10},   # im Lock
-        {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}, # Grace-Reload
-    ]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
-
-    def _save_only_guard(tok, t):
-        # Erlaubt ist NUR der Cross-Container-Guard-Save (Tokens identisch,
-        # kein Flag) — alles andere würde den Gewinner-Stand überschreiben.
-        assert t.get('access') == 'OLD' and t.get('refresh') == 'R'
-        assert not t.get('needs_relogin') and t.get('refresh_guard')
-        return True
-    monkeypatch.setattr(fo, '_tokens_save', _save_only_guard)
-    monkeypatch.setattr(fo, '_refresh', lambda r: (
-        None, {'http': 401, 'oauth': 'invalid_token', 'fatal': True}))
-    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
-        AssertionError('Race-Verlierer darf keinen Re-Login-Push senden')))
-    assert fo._valid_access('AT-U') == 'NEW'
-
-
-def test_refresh_transient_keeps_tokens(monkeypatch):
-    saved = []
+    assert 'AT-U' in fo._refresh_wanted
+    st, acc = fo._access_state('AT-U')
+    assert st == 'pending' and acc is None
+    # gültiger AT wird normal serviert
     monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
-        'access': 'OLD', 'refresh': 'R', 'expires_at': 0})
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saved.append(t) or True)
-    monkeypatch.setattr(fo, '_refresh', lambda r: (
-        None, {'http': 503, 'oauth': 'service_unavailable', 'fatal': False}))
-    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
-        AssertionError('transient darf keinen Re-Login-Push senden')))
-    assert fo._valid_access('AT-U') is None
-    # Einziger Save = Cross-Container-Guard; Tokens selbst UNANGETASTET →
-    # nächster Versuch refresht normal weiter.
-    assert len(saved) == 1
-    assert saved[0]['access'] == 'OLD' and saved[0]['refresh'] == 'R'
-    assert not saved[0].get('needs_relogin')
-    assert saved[0]['refresh_guard']['rt8'] == fo._rt8('R')
+        'access': 'ACC', 'refresh': 'R', 'expires_at': _t.time() + 999})
+    assert fo._valid_access('AT-U') == 'ACC'
+    fo._refresh_wanted.clear()
 
 
-def test_refresh_guard_loser_adopts_winner_without_lh_call(monkeypatch):
-    """Cross-Container-Guard (2. Grant-Verlust 2026-07-25 02:54Z): Sieht ein
-    Prozess einen FRISCHEN Guard für DENSELBEN Refresh-Token, wartet er und
-    übernimmt die rotierten Tokens des Gewinners — KEIN LH-Call, KEIN Save
-    (sonst würde der stale Stand den Gewinner clobbern)."""
+def test_refresh_refuses_outside_refresher_thread(monkeypatch):
+    """Choke-Point-Gate: _refresh — die EINZIGE Stelle, die grant_type=
+    refresh_token sendet — verweigert außerhalb des Refresher-Threads,
+    OHNE einen HTTP-Call abzusetzen. Damit ist RT-Reuse durch fremde
+    Code-Pfade strukturell unmöglich."""
+    reqs = []
+    monkeypatch.setattr(fo, '_token_request',
+                        lambda body: reqs.append(body) or (None, {
+                            'http': 503, 'oauth': None, 'fatal': False}))
+    assert fo._REFRESHER_THREAD_ID[0] != _thr.get_ident()
+    tok, err = fo._refresh('R')
+    assert tok is None and err.get('refused') is True
+    assert reqs == []                    # Gate griff VOR dem Token-Request
+    # innerhalb des Gates geht der Call normal raus
+    with _as_refresher():
+        fo._refresh('R')
+    assert len(reqs) == 1 and b'refresh_token' in reqs[0]
+
+
+def test_refresher_claim_unavailable_is_fail_closed(monkeypatch):
+    """Burn-#4-Kernfix: Claim-Infra down/degradiert ⇒ KEIN LH-Call, Refresh
+    vertagt. (Vorher refreshte der blinde Soft-Guard-Fallback trotzdem —
+    254/571 tote Grants.) Es gibt KEINEN Soft-Guard mehr."""
     import time as _t
-    monkeypatch.setattr(fo, '_GUARD_WAIT_SEC', 0)
-    guarded = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10,
-               'refresh_guard': {'rt8': fo._rt8('R'), 'ts': _t.time()}}
-    states = [dict(guarded), dict(guarded),                             # vor/im Lock
-              {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
-        AssertionError('Guard-Verlierer darf nichts zurückschreiben')))
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: None)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
-        AssertionError('Guard-Verlierer darf den RT nicht doppelt verheizen')))
-    assert fo._valid_access('AT-U') == 'NEW'
+        AssertionError('ohne bestätigtes Claim KEIN LH-Call (fail-closed)')))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('fail-closed schreibt auch nichts')))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'skipped_claim_unavailable'
 
 
-def test_refresh_claim_rpc_loser_adopts_winner(monkeypatch):
-    """Atomares RPC-Claim: False = anderer Prozess refresht DIESEN RT gerade
-    → warten, neu laden, Gewinner-Tokens übernehmen. KEIN LH-Call, KEIN
-    Save — auch ganz OHNE lokalen Soft-Guard im geladenen Stand."""
+def test_refresher_claim_foreign_no_call(monkeypatch):
+    """Claim False (Alt-Code-Container im Deploy-Übergang hält den RT):
+    bewusst NICHTS tun — kein LH-Call, kein Save, kein Flag. Der nächste
+    Tick liest einfach das Ergebnis des anderen."""
     import time as _t
-    monkeypatch.setattr(fo, '_GUARD_WAIT_SEC', 0)
     monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: False)
-    old = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
-    states = [dict(old), dict(old),
-              {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
-        AssertionError('Claim-Verlierer darf nichts zurückschreiben')))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
-        AssertionError('Claim-Verlierer darf den RT nicht doppelt verheizen')))
-    assert fo._valid_access('AT-U') == 'NEW'
+        AssertionError('fremdes Claim ⇒ kein LH-Call')))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('fremdes Claim ⇒ kein Save')))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'skipped_claim_foreign'
 
 
-def test_refresh_claim_rpc_winner_skips_guard_save(monkeypatch):
-    """Claim True = Guard wurde server-seitig atomar gesetzt → kein
-    zusätzlicher Soft-Guard-Save; einziger Save sind die rotierten Tokens."""
-    saves = []
+def test_refresher_rotates_and_persists_new_keeps_old(monkeypatch):
+    """Happy-Path des Refreshers: Claim gewonnen → Rotation → neuer RT wird
+    DB-bestätigt persistiert; rotiert LH den RT nicht mit, bleibt der
+    bewährte gespeichert."""
+    import time as _t
+    saved = {}
     monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
     monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
-        'access': 'OLD', 'refresh': 'R', 'expires_at': 0})
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
-    monkeypatch.setattr(fo, '_refresh', lambda r: (
-        {'access': 'NEW', 'refresh': 'R2', 'scope': 's', 'expires_at': 9e18}, None))
-    assert fo._valid_access('AT-U') == 'NEW'
-    assert len(saves) == 1 and saves[0]['refresh'] == 'R2'
-    assert 'refresh_guard' not in saves[0]
-
-
-def test_refresh_claim_rpc_still_foreign_gives_up(monkeypatch):
-    """Nach Warten+Reload ist der RT unverändert und das Claim IMMER NOCH
-    fremd → aufgeben (None) statt busy-loopen oder LH anfassen."""
-    import time as _t
-    monkeypatch.setattr(fo, '_GUARD_WAIT_SEC', 0)
-    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: False)
-    old = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
-    states = [dict(old), dict(old), dict(old)]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
-        AssertionError('kein Save ohne Claim')))
-    monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
-        AssertionError('kein LH-Call ohne Claim')))
-    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
-        AssertionError('kein Push ohne Claim')))
-    assert fo._valid_access('AT-U') is None
-
-
-def test_refresh_guard_stale_does_not_block(monkeypatch):
-    """Abgelaufener Guard (Refresher gecrasht o.ä.) darf den Refresh nicht
-    dauerhaft blockieren — nach _REFRESH_GUARD_SEC wird normal refresht."""
-    import time as _t
-    saves = []
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
-        'access': 'OLD', 'refresh': 'R', 'expires_at': 0,
-        'refresh_guard': {'rt8': fo._rt8('R'), 'ts': _t.time() - 9999}})
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
-    monkeypatch.setattr(fo, '_refresh', lambda r: (
-        {'access': 'NEW', 'refresh': 'R2', 'scope': 's', 'expires_at': 9e18}, None))
-    assert fo._valid_access('AT-U') == 'NEW'
-    # frischer Guard geschrieben, dann rotierte Tokens OHNE Guard persistiert
-    assert saves[0]['refresh_guard']['ts'] > _t.time() - 60
-    assert saves[-1]['refresh'] == 'R2' and 'refresh_guard' not in saves[-1]
-
-
-def test_refresh_rotation_persists_new_keeps_old(monkeypatch):
-    saved = {}
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
-        'access': 'OLD', 'refresh': 'R1', 'expires_at': 0})
+        'access': 'OLD', 'refresh': 'R1', 'expires_at': _t.time() - 10})
+    monkeypatch.setattr(fo, '_save_rotated_cas', lambda tok, c, t: None)
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: {'refresh': 'R1'})
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saved.update(t) or True)
     monkeypatch.setattr(fo, '_refresh', lambda r: (
         {'access': 'NEW', 'refresh': 'R2', 'scope': 's', 'expires_at': 9e18}, None))
-    assert fo._valid_access('AT-U') == 'NEW'
-    assert saved['refresh'] == 'R2'      # Rotation → neuer Token persistiert
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'rotated'
+    assert saved['refresh'] == 'R2'
     monkeypatch.setattr(fo, '_refresh', lambda r: (
         {'access': 'NEW2', 'refresh': None, 'scope': 's', 'expires_at': 9e18}, None))
-    assert fo._valid_access('AT-U') == 'NEW2'
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'rotated'
     assert saved['refresh'] == 'R1'      # keine Rotation → bewährter bleibt
+
+
+def test_refresher_fresh_grant_untouched(monkeypatch):
+    """Ein AT mit reichlich Restlaufzeit wird NICHT rotiert (Refreshes sind
+    selten und planbar — nur der Vorlauf _REFRESH_AHEAD_S triggert)."""
+    import time as _t
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'ACC', 'refresh': 'R', 'expires_at': _t.time() + 3000})
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: (_ for _ in ()).throw(
+        AssertionError('frischer Grant: kein Claim nötig')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
+        AssertionError('frischer Grant: kein LH-Call')))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'fresh'
+
+
+def test_refresher_fatal_flags_on_fresh_state(monkeypatch):
+    """Wirklich toter Grant: needs_relogin wird auf dem FRISCH geladenen
+    Stand geflaggt (nie ein alter Snapshot zurückgeschrieben), forensisch
+    geloggt, kein Push (Owner-Entscheid)."""
+    import time as _t
+    saves = []
+    pushes = []
+    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
+    state = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: dict(state))
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: dict(state))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 400, 'oauth': 'invalid_grant', 'fatal': True}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: pushes.append(tok))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'dead'
+    flagged = saves[-1]
+    assert flagged.get('needs_relogin') is True and 'access' not in flagged
+    assert pushes == ['AT-U']
+    # needs_relogin → connected False, Lesepfad None, Refresher fasst ihn
+    # nicht mehr an
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: dict(flagged))
+    assert fo.flightops_connected('AT-U') is False
+    assert fo._valid_access('AT-U') is None
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'dead_flagged'
+
+
+def test_refresher_fatal_race_does_not_kill_winner(monkeypatch):
+    """Deploy-Übergangs-Race: unser fatal kam nur, weil ein Alt-Code-
+    Container den RT parallel verbraucht und schon R2 persistiert hat.
+    Der Refresher darf dann NICHT flaggen und nichts überschreiben."""
+    import time as _t
+    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: {
+        'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('Race-Verlierer darf nichts speichern/flaggen')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 401, 'oauth': 'invalid_token', 'fatal': True}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
+        AssertionError('Race-Verlierer darf keinen Re-Login ausrufen')))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'raced'
+
+
+def test_refresher_transient_keeps_tokens(monkeypatch):
+    """Transienter LH-Fehler (Wartung/Rate-Limit/Netz): Tokens bleiben
+    unangetastet, kein Flag — der nächste Tick versucht es erneut."""
+    import time as _t
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('transient darf nichts schreiben')))
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 503, 'oauth': 'service_unavailable', 'fatal': False}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
+        AssertionError('transient darf keinen Re-Login ausrufen')))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'transient'
+
+
+def test_refresher_parked_rotation_blocks_further_rotation(monkeypatch):
+    """CHAOS: SB-Timeout mid-Rotation — der Save nach der Rotation blieb
+    unbestätigt (RT nur im Prozess geparkt). Der Refresher rotiert diesen
+    Grant dann NICHT weiter (eine Kette unpersistierter RTs stirbt mit dem
+    Prozess), sondern versucht nur den Nachsave; nach der Heilung läuft
+    alles normal."""
+    import time as _t
+    fo._rotated_pending.clear()
+    fo._rotated_pending['AT-U'] = {
+        'tokens': {'access': 'NEW', 'refresh': 'R2',
+                   'expires_at': _t.time() + 3000},
+        'consumed_rt': 'R1', 'ts': _t.time()}
+    monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
+        AssertionError('geparkter Grant darf NICHT weiterrotieren')))
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: (_ for _ in ()).throw(
+        AssertionError('geparkter Grant claimt nicht')))
+    # Nachsave schlägt weiter fehl → save_pending
+    import app as backend
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda tok, fresh=False: {'profile': {
+                            'flightops_tokens': {'access': 'OLD',
+                                                 'refresh': 'R1'}}})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: False)
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'save_pending'
+    assert 'AT-U' in fo._rotated_pending
+    # SB wieder da → Nachsave heilt, Parkplatz leer
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: True)
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'save_healed'
+    assert 'AT-U' not in fo._rotated_pending
+
+
+def test_refresher_two_parallel_processes_single_lh_call(monkeypatch):
+    """CHAOS: zwei 'Prozesse' (simuliert über das geteilte atomare Claim)
+    wollen denselben RT rotieren — genau EINER bekommt den Zuschlag und
+    macht den einzigen LH-Call; der andere tut NICHTS."""
+    import time as _t
+    claim_state = {'taken': False}
+
+    def _claim(tok, rt):
+        if claim_state['taken']:
+            return False
+        claim_state['taken'] = True
+        return True
+    calls = []
+    monkeypatch.setattr(fo, '_claim_refresh_sb', _claim)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'OLD', 'refresh': 'R1', 'expires_at': _t.time() - 10})
+    monkeypatch.setattr(fo, '_save_rotated_cas', lambda tok, c, t: None)
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: {'refresh': 'R1'})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: True)
+    monkeypatch.setattr(fo, '_refresh', lambda r: calls.append(r) or (
+        {'access': 'NEW', 'refresh': 'R2', 'scope': 's', 'expires_at': 9e18}, None))
+    with _as_refresher():
+        r1 = fo._refresher_refresh_grant('AT-U')
+        r2 = fo._refresher_refresh_grant('AT-U')
+    assert sorted([r1, r2]) == ['rotated', 'skipped_claim_foreign']
+    assert calls == ['R1']               # exakt EIN LH-Call
 
 
 def test_crewlist_serves_cache_when_grant_dead(monkeypatch):
@@ -792,7 +878,7 @@ def test_crewlist_endpoint_404_without_access(monkeypatch):
 def test_checkin_endpoint_prefers_link_params(monkeypatch):
     _pass_auth_gate(monkeypatch)
     monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
-    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
     monkeypatch.setattr(fo, '_links_load',
                         lambda tok: fo.extract_duty_links(DUTY_LINKS))
     got = {}
@@ -850,8 +936,9 @@ def test_refresh_all_requires_secret_when_set(monkeypatch):
 
 def test_refresh_all_work_counts_and_releases_lock(monkeypatch):
     calls = []
-    monkeypatch.setattr(fo, 'flightops_connected',
-                        lambda tok: tok != 'AT-DEAD')
+    monkeypatch.setattr(fo, '_access_state',
+                        lambda tok: (('disconnected', None) if tok == 'AT-DEAD'
+                                     else ('ok', 'ACC')))
     monkeypatch.setattr(fo, 'flightops_import',
                         lambda tok: calls.append(tok) or ({}, 200))
     monkeypatch.setattr(fo.time, 'sleep', lambda s: None)
@@ -887,23 +974,29 @@ def test_exchange_endpoint_unwraps_token_tuple(monkeypatch):
     assert r2.status_code == 502
 
 
-def test_refresh_fatal_race_guard_skips_flag_when_rotated(monkeypatch):
-    """LH rotiert den Refresh-Token bei JEDEM Refresh (live 2026-07-23) — ein
-    paralleler Refresh darf beim Verlierer des Races KEIN needs_relogin
-    ausloesen. Simuliert: beim Re-Load nach dem fatal-Fehler liegt schon ein
-    NEUER (rotierter) Refresh-Token mit gueltigem Access im Store."""
+def test_import_endpoint_reports_pending_as_transient(monkeypatch):
+    """AT abgelaufen, Grant lebt: der Import antwortet 503
+    token_refresh_pending (transient, iOS zeigt KEINE Relogin-Karte) —
+    nie 401 not_connected. Der Refresher rotiert; refresht wird hier NIE."""
     import time as _t
-    stale = {'access': 'OLD', 'refresh': 'R1', 'expires_at': 0}
-    fresh = {'access': 'NEWACC', 'refresh': 'R2', 'expires_at': _t.time() + 3000}
-    loads = [dict(stale), dict(fresh)]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: loads.pop(0))
-    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
-        AssertionError('Race darf nichts speichern/flaggen')))
-    monkeypatch.setattr(fo, '_refresh', lambda r: (
-        None, {'http': 401, 'oauth': 'invalid_token', 'fatal': True}))
-    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
-        AssertionError('Race darf keinen Re-Login-Push senden')))
-    assert fo._valid_access('AT-U') == 'NEWACC'
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    fo._refresh_wanted.clear()
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
+    monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
+        AssertionError('Import-Endpoint darf nie refreshen')))
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/import/AT-U',
+                                       headers={'Authorization': 'Bearer AT-U'},
+                                       json={})
+    assert r.status_code == 503
+    assert r.get_json()['error'] == 'token_refresh_pending'
+    assert 'AT-U' in fo._refresh_wanted        # Vormerkung für den Refresher
+    fo._refresh_wanted.clear()
+    # Status bleibt währenddessen connected (keine Relogin-Karte)
+    d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
+    assert d['connected'] is True and d['needs_relogin'] is False
 
 
 def test_crewlist_endpoint_attaches_aerox_profiles(monkeypatch):
@@ -1529,6 +1622,161 @@ def test_pickup_leg_match_tolerates_a_day_shift_only_with_flightnumber():
     assert fo._pickup_for_leg(far, 'LH443', 'DTW', 'FRA', '20260726T200000Z') is None
 
 
+# ── FALLBACK-QUELLE: Pickup aus dem myTime-/Kalender-Link ────────────────────
+# Owner 2026-07-27: „die Pickup-Zeit wird nicht aus dem iCal-Kalender-Link
+# geholt, wenn sie aus der primaeren Quelle fehlt". Fuer FlightOps-User ist der
+# Kalender-Link server- (app._maybe_refresh_calendar_feed) UND geraeteseitig
+# (RosterFeedDeviceSync) pausiert, und der Import baut jeden Tag frisch auf —
+# ohne pickupTime von LH gab es GAR KEINEN Pickup. Diese Ebene holt ihn nach.
+
+def _mytime_ics(*events):
+    """Minimales myTime-foermiges ICS. `events` = (summary, dtstart_stamp)."""
+    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//myTime//DE']
+    for i, (summ, stamp) in enumerate(events):
+        lines += ['BEGIN:VEVENT', f'UID:mt-{i}@mytime', f'DTSTART:{stamp}',
+                  f'DTEND:{stamp}', f'SUMMARY:{summ}', 'END:VEVENT']
+    lines.append('END:VCALENDAR')
+    return '\r\n'.join(lines)
+
+
+def test_ical_pickup_candidates_reads_both_mytime_schreibweisen():
+    """LH schreibt Pickup-VEVENTs in beiden Formen — beide muessen ankommen,
+    und der Summary bleibt WOERTLICH (er traegt die Ortszeit)."""
+    got = fo.ical_pickup_candidates(_mytime_ics(
+        ('14:00 LT Pickup DTW', '20260726T180000Z'),
+        ('Pickup 1430', '20260728T120000Z')))
+    assert [c['summary'] for c in got] == ['14:00 LT Pickup DTW', 'Pickup 1430']
+    assert got[0]['utc'] == '2026-07-26T18:00:00Z'
+
+
+def test_ical_pickup_candidates_ignores_everything_that_is_no_pickup():
+    """Fluege, Layover, Briefings und unplausible Zeiten sind keine Kandidaten."""
+    assert fo.ical_pickup_candidates(_mytime_ics(
+        ('LH 443: DTW-FRA', '20260726T200000Z'),
+        ('19:00 LT Briefing DTW', '20260726T190000Z'),
+        ('Pickup 2599', '20260726T180000Z'))) == []
+    assert fo.ical_pickup_candidates('') == []
+    assert fo.ical_pickup_candidates('kein ICS') == []
+
+
+def test_ical_pickup_fills_the_gap_the_primary_source_left():
+    """KERNFALL: LH liefert keinen pickupTime (pickups=None), der myTime-Link
+    hat den Marker. Ende-zu-Ende durch die echte Feed-Pipeline."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    assert 'Pickup' not in ics                       # Primaerquelle: nichts
+    merged = fo.merge_ical_pickups(ics, fo.ical_pickup_candidates(
+        _mytime_ics(('14:00 LT Pickup DTW', '20260726T180000Z'))))
+    assert 'SUMMARY:14:00 LT Pickup DTW' in merged
+    # Reihenfolge wie im myTime-Feed: der Pickup ist der frueheste Termin.
+    assert merged.index('Pickup DTW') < merged.index('LH 443: DTW-FRA')
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(merged))[0]
+    assert backend._rc_pickup_hhmm(b['2026-07-26']) == '14:00'
+
+
+def test_ical_pickup_never_overrides_the_primary_source():
+    """PRIMARY WINS: steht fuer den Tag schon ein Pickup aus
+    COMMON_CREW_ROTATION, bleibt das ICS unveraendert."""
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=PICKUP_DTW)
+    merged = fo.merge_ical_pickups(ics, fo.ical_pickup_candidates(
+        _mytime_ics(('13:00 LT Pickup DTW', '20260726T170000Z'))))
+    assert merged == ics
+    assert '13:00 LT Pickup' not in merged
+
+
+def test_ical_pickup_needs_an_anchor_leg_within_six_hours():
+    """GEISTER-RIEGEL: ein Pickup ohne Abflug 0…6 h danach (stornierter oder
+    laengst vergangener Umlauf im noch nicht nachgezogenen Kalender) darf NIE
+    in den Roster wandern — gleiches Fenster wie im Primaerpfad."""
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    for stamp in ('20260726T100000Z',      # 10 h vor dem Abflug
+                  '20260726T210000Z',      # NACH dem Abflug
+                  '20260701T180000Z'):     # ganz anderer Umlauf
+        merged = fo.merge_ical_pickups(ics, fo.ical_pickup_candidates(
+            _mytime_ics(('14:00 LT Pickup DTW', stamp))))
+        assert 'Pickup' not in merged, stamp
+
+
+def test_ical_pickup_midnight_wrap_lands_on_the_return_leg_day():
+    """Wie im Primaerpfad (RN 171012): Pickup 28.07. 21:50Z, Abflug 29.07.
+    00:30Z — verschiedene Berlin-Tage. Der Marker gehoert auf den RUECKFLUG-Tag,
+    denn _rc_pickup_hhmm liest pro TAG."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_KIX_MULTINIGHT)
+    assert 'Pickup' not in ics
+    merged = fo.merge_ical_pickups(ics, fo.ical_pickup_candidates(
+        _mytime_ics(('06:50 LT Pickup KIX', '20260728T215000Z'))))
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(merged))[0]
+    assert backend._rc_pickup_hhmm(b['2026-07-29']) == '06:50'
+    assert not backend._rc_pickup_hhmm(b.get('2026-07-28') or {})
+
+
+def test_ical_pickup_one_marker_per_day_latest_plausible_wins():
+    """Mehrere Kandidaten fuer denselben Tag (LH traegt nach/korrigiert):
+    genau EIN Marker, und zwar der SPAETESTE plausible — dieselbe Regel wie
+    pickup_utc_for_leg."""
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    merged = fo.merge_ical_pickups(ics, fo.ical_pickup_candidates(_mytime_ics(
+        ('13:00 LT Pickup DTW', '20260726T170000Z'),
+        ('14:00 LT Pickup DTW', '20260726T180000Z'))))
+    assert merged.count('BEGIN:VEVENT') == ics.count('BEGIN:VEVENT') + 1
+    assert 'SUMMARY:14:00 LT Pickup DTW' in merged
+    assert '13:00 LT Pickup' not in merged
+
+
+def test_pickup_ical_candidates_are_cached_and_respect_the_killswitch(monkeypatch):
+    """Der myTime-Share darf NICHT im Import-Takt gehaemmert werden: ein Abruf
+    je TTL, und der Server-Kill-Switch (AEROX_SERVER_ICAL_REFRESH=0) schaltet
+    ihn komplett ab."""
+    import app as backend
+    calls = []
+    text = _mytime_ics(('14:00 LT Pickup DTW', '20260726T180000Z'))
+    monkeypatch.setattr(backend, '_fetch_calendar_feed_text',
+                        lambda u: (calls.append(u), (text, None))[1])
+    fo._pickup_ical_cache.clear()
+    monkeypatch.setattr(backend, '_server_ical_refresh_enabled', lambda: False)
+    assert fo.pickup_ical_candidates_for('tokA', 'https://x/f.ics') == []
+    assert calls == []
+    monkeypatch.setattr(backend, '_server_ical_refresh_enabled', lambda: True)
+    first = fo.pickup_ical_candidates_for('tokA', 'https://x/f.ics')
+    assert len(first) == 1 and len(calls) == 1
+    assert fo.pickup_ical_candidates_for('tokA', 'https://x/f.ics') == first
+    assert len(calls) == 1                      # zweiter Aufruf aus dem Cache
+    fo._pickup_ical_cache.clear()
+
+
+def test_pickup_ical_fetch_failure_keeps_the_last_good_stand(monkeypatch):
+    """Ein toter Link darf den Pickup nicht wegnehmen — Grace auf den Cache."""
+    import app as backend
+    text = _mytime_ics(('14:00 LT Pickup DTW', '20260726T180000Z'))
+    monkeypatch.setattr(backend, '_server_ical_refresh_enabled', lambda: True)
+    fo._pickup_ical_cache.clear()
+    monkeypatch.setattr(backend, '_fetch_calendar_feed_text', lambda u: (text, None))
+    good = fo.pickup_ical_candidates_for('tokB', 'https://x/f.ics')
+    assert len(good) == 1
+    # TTL kuenstlich abgelaufen + Fetch kaputt → letzter guter Stand bleibt.
+    fo._pickup_ical_cache['tokB'] = (0.0, good)
+    monkeypatch.setattr(backend, '_fetch_calendar_feed_text',
+                        lambda u: (None, 'fetch_failed'))
+    assert fo.pickup_ical_candidates_for('tokB', 'https://x/f.ics') == good
+    fo._pickup_ical_cache.clear()
+
+
+def test_apply_ical_pickup_fallback_is_inert_without_a_stored_link(monkeypatch):
+    """Kein Kalender-Link im Profil ⇒ das FlightOps-ICS bleibt Byte-identisch
+    (der Normalfall fuer User, die NUR ueber FlightOps reinkamen)."""
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=PICKUP_DTW)
+    monkeypatch.setattr(fo, 'pickup_ical_url', lambda tok, body=None: '')
+    assert fo.apply_ical_pickup_fallback('tok', ics) == ics
+
+
+def test_merge_ical_pickups_is_a_noop_without_usable_input():
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    for cands in ([], None, [{}], [{'utc': 'kaputt', 'summary': 'Pickup 1000'}]):
+        assert fo.merge_ical_pickups(ics, cands) == ics
+    assert fo.merge_ical_pickups(None, [{'utc': 'x', 'summary': 'y'}]) is None
+
+
 # ── Welche Umlaeufe kosten einen Call? ───────────────────────────────────────
 
 def _now(iso):
@@ -1965,3 +2213,224 @@ def test_hotelname_does_not_leak_across_stations():
     p = fo.parse_rotation_pickups(resp)
     assert p[('LH2', 'LIS', 'WAW', '20260726')]['hotel'] == 'Altis Grand Hotel'
     assert p[('LH3', 'WAW', 'FRA', '20260727')]['hotel'] == 'Mercure Warszawa Grand'
+
+
+# ── Grant-Burn #4 (Massen-Burn 26.07.2026): Rotations-Save + Soft-Guard ─────
+def test_rotation_save_failure_parks_tokens_and_heals(monkeypatch):
+    """Schlägt der Persist NACH erfolgreicher LH-Rotation fehl (SB-Ausfall),
+    darf der neue RT nicht verloren gehen: er wird geparkt, _tokens_load
+    serviert ihn weiter (Mirror hängt am konsumierten RT) und persistiert
+    nach, sobald SB wieder schreibbar ist."""
+    import time as _t
+    fo._rotated_pending.clear()
+    monkeypatch.setattr(fo, '_ROTATED_SAVE_RETRIES', 2)
+    monkeypatch.setattr(fo, '_ROTATED_SAVE_BACKOFF_S', 0)
+    calls = []
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: calls.append(dict(t)) and False)
+    nt = {'access': 'NEW', 'refresh': 'R2', 'scope': 's',
+          'expires_at': _t.time() + 3540}
+    assert fo._tokens_save_rotated('AT-U', 'R1', nt) is False
+    assert len(calls) == 2                      # echte Retries
+    assert fo._rotated_pending['AT-U']['tokens']['refresh'] == 'R2'
+    # Mirror zeigt noch den KONSUMIERTEN R1 → Prozess-Kopie ist die Wahrheit
+    got = fo._rotated_pending_take('AT-U', {'access': 'OLD', 'refresh': 'R1'})
+    assert got and got['refresh'] == 'R2'
+    assert 'AT-U' in fo._rotated_pending       # Save schlug wieder fehl → bleibt
+    # SB wieder da → Nachsave heilt und räumt den Parkplatz
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: True)
+    got = fo._rotated_pending_take('AT-U', {'access': 'OLD', 'refresh': 'R1'})
+    assert got and got['refresh'] == 'R2'
+    assert 'AT-U' not in fo._rotated_pending
+
+
+def test_rotation_pending_discarded_when_foreign_state_newer(monkeypatch):
+    """Hat INZWISCHEN ein anderer Prozess erfolgreich rotiert+persistiert
+    (Mirror-RT ≠ konsumierter ≠ unserer), ist die Parkkopie Geschichte —
+    sie darf den neueren Stand nie überschreiben."""
+    fo._rotated_pending.clear()
+    fo._rotated_pending['AT-U'] = {
+        'tokens': {'access': 'NEW', 'refresh': 'R2'},
+        'consumed_rt': 'R1', 'ts': __import__('time').time()}
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('verworfene Parkkopie darf nicht gespeichert werden')))
+    assert fo._rotated_pending_take(
+        'AT-U', {'access': 'X', 'refresh': 'R3'}) is None
+    assert 'AT-U' not in fo._rotated_pending
+
+
+def test_rotated_save_superseded_by_relogin_is_dropped(monkeypatch):
+    """CHAOS: während der Rotation loggt sich der User neu ein (neue
+    Familie). Der Rotations-Save der ALTEN Familie darf die neue nie
+    überschreiben — CAS/Readback erkennt den fremden Stand, Kopie wird
+    verworfen, nichts geparkt."""
+    fo._rotated_pending.clear()
+    monkeypatch.setattr(fo, '_save_rotated_cas', lambda tok, c, t: 'superseded')
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
+        AssertionError('superseded darf nie plain-saven')))
+    assert fo._tokens_save_rotated('AT-U', 'R1', {
+        'access': 'NEW', 'refresh': 'R2'}) is True
+    assert 'AT-U' not in fo._rotated_pending
+    # …und der Readback-Fallback (RPC fehlt) erkennt dasselbe:
+    monkeypatch.setattr(fo, '_save_rotated_cas', lambda tok, c, t: None)
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: {'refresh': 'R9'})
+    assert fo._tokens_save_rotated('AT-U', 'R1', {
+        'access': 'NEW', 'refresh': 'R2'}) is True
+    assert 'AT-U' not in fo._rotated_pending
+
+
+def test_generic_profile_save_cannot_clobber_tokens(monkeypatch):
+    """RACEFLÄCHEN-FUND 2026-07-27: generische Profil-Saves (Crew-Cache,
+    Location, pk) tragen eine STALE flightops_tokens-Kopie im Blob — der
+    Top-Level-Merge hätte damit eine frisch rotierte Familie überschrieben
+    (konsumierter RT zurück im Mirror ⇒ nächster Refresh = Reuse = Burn).
+    app._profile_save_to_supabase strippt den Key jetzt strukturell; nur
+    der Token-Store (Writer-Flag) darf ihn schreiben."""
+    import app as backend
+    merged = []
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(backend, '_profile_metadata_merge_sb',
+                        lambda tok, meta: merged.append(dict(meta)) or True)
+
+    class _T:
+        def upsert(self, *a, **k):
+            return self
+
+        def execute(self):
+            return type('R', (), {'data': []})()
+    monkeypatch.setattr(backend, 'sb', type('SB', (), {
+        'table': lambda self, n: _T()})())
+    with backend.app.test_request_context():
+        # generischer Save (z.B. Crew-Cache): Key wird GESTRIPPT
+        backend._profile_save_to_supabase('AT-U', {
+            'flightops_crew_cache': [1], 'flightops_tokens': {'refresh': 'STALE'}})
+        assert 'flightops_tokens' not in merged[-1]
+        assert 'flightops_crew_cache' in merged[-1]
+        # Token-Store (Writer-Flag über _tokens_save): Key kommt durch
+        monkeypatch.setattr(backend, '_profile_load_from_disk', lambda tok: {})
+        monkeypatch.setattr(backend, '_user_profile_path', lambda tok: None)
+        assert fo._tokens_save('AT-U', {'refresh': 'R2'}) is True
+        assert merged[-1] == {'flightops_tokens': {'refresh': 'R2'}}
+
+
+def test_refresher_due_selection_orders_by_expiry():
+    """Fällig-Auswahl: nur Grants mit RT, ohne needs_relogin, innerhalb des
+    Vorlaufs — knappste zuerst (planbare, entzerrte Rotationen)."""
+    now = 1000000.0
+    scan = [
+        ('AT-FRESH', {'refresh': 'R', 'expires_at': now + 7200}),
+        ('AT-SOON', {'refresh': 'R', 'expires_at': now + 300}),
+        ('AT-EXPIRED', {'refresh': 'R', 'expires_at': now - 50}),
+        ('AT-DEAD', {'refresh': 'R', 'needs_relogin': True,
+                     'expires_at': now - 50}),
+        ('AT-NORT', {'expires_at': now - 50}),
+    ]
+    assert fo._refresher_due(scan, now=now) == ['AT-EXPIRED', 'AT-SOON']
+
+
+def test_refresher_exit_drain_sets_drain_and_joins(monkeypatch):
+    """CHAOS Worker-Kill: gunicorn-Recycle/SIGTERM muss die laufende
+    Rotation zu Ende kommen lassen (atexit-Drain + Join) statt sie zwischen
+    LH-Rotation und Persist zu killen."""
+    joined = []
+
+    class _Th:
+        def __init__(self):
+            self._alive = True
+
+        def is_alive(self):
+            return self._alive
+
+        def join(self, timeout=None):
+            joined.append(timeout)
+            self._alive = False
+    fo._refresher_thread[0] = _Th()
+    fo._refresher_state['drain'] = False
+    fo._refresher_exit_drain()
+    assert fo._refresher_state['drain'] is True
+    assert joined and joined[0] == fo._EXIT_DRAIN_JOIN_SEC
+    # Fake ohne is_alive → stiller No-Op
+    fo._refresher_thread[0] = object()
+    fo._refresher_exit_drain()
+    fo._refresher_thread[0] = None
+    fo._refresher_state.update(drain=False, busy=False, active=False)
+
+
+def test_refresher_only_starts_with_role_env(monkeypatch):
+    """Rollen-Gate: ohne LH_FLIGHTOPS_REFRESHER=1 startet NIRGENDS ein
+    Refresher-Thread (Web-/MQTT-Container, Tests); mit Rolle + Creds genau
+    einer pro Prozess."""
+    monkeypatch.delenv('LH_FLIGHTOPS_REFRESHER', raising=False)
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    assert fo._maybe_start_refresher() is None
+    monkeypatch.setenv('LH_FLIGHTOPS_REFRESHER', '1')
+    started = []
+
+    class _FakeTh:
+        def __init__(self, *a, **k):
+            started.append(k.get('name'))
+
+        def start(self):
+            pass
+    monkeypatch.setattr(fo.threading, 'Thread', _FakeTh)
+    th = fo._maybe_start_refresher()
+    assert th is not None and started == ['fo-refresher']
+    assert fo._maybe_start_refresher() is th        # idempotent
+    fo._refresher_thread[0] = None
+
+
+def test_relogin_watch_alerts_on_spike_and_dead_refresher(monkeypatch, tmp_path):
+    """Wächter: needs_relogin-Sprung > N in ~1h ⇒ Alarm-Mail; ebenso ein
+    konfigurierter, aber toter Refresher. Cooldown verhindert Mail-Spam."""
+    import json as _json
+    import app as backend
+    monkeypatch.setattr(fo, '_RELOGIN_WATCH_STATE',
+                        str(tmp_path / 'watch.json'))
+    monkeypatch.delenv('ADSB_POLL_SECRET', raising=False)
+    monkeypatch.setenv('LH_FLIGHTOPS_REFRESHER', '1')
+    mails = []
+    monkeypatch.setattr(fo, '_fo_watch_alert_mail',
+                        lambda reasons, cnt, delta: mails.append(reasons) or True)
+    counts = [10, 40]
+    monkeypatch.setattr(fo, '_relogin_count', lambda: counts.pop(0))
+    fo._refresher_state.update(active=False, drain=False, busy=False)
+    c = backend.app.test_client()
+    d1 = c.post('/api/internal/flightops/relogin-watch').get_json()
+    # Lauf 1: Baseline (kein prev) — aber toter Refresher alarmiert sofort
+    assert any('NICHT aktiv' in r for r in d1['reasons'])
+    assert mails
+    # Lauf 2: +30 in 1h → Spike-Grund dabei, aber Cooldown drosselt die Mail
+    d2 = c.post('/api/internal/flightops/relogin-watch').get_json()
+    assert d2['delta_1h'] == 30
+    assert any('needs_relogin +30' in r for r in d2['reasons'])
+    assert len(mails) == 1                       # Cooldown griff
+    st = _json.loads((tmp_path / 'watch.json').read_text())
+    assert st['count'] == 40
+
+
+def test_refresh_all_exit_drain_sets_drain_and_joins(monkeypatch):
+    """Worker-Recycle (gunicorn --max-requests) killte den refresh-all-Thread
+    mid-Rotation — der atexit-Drain muss das drain-Flag setzen und auf den
+    laufenden Grant warten. Wirft nie, auch mit Test-Fakes ohne is_alive."""
+    joined = []
+
+    class _Th:
+        def __init__(self):
+            self._alive = True
+
+        def is_alive(self):
+            return self._alive
+
+        def join(self, timeout=None):
+            joined.append(timeout)
+            self._alive = False
+    fo._refresh_all_thread[0] = _Th()
+    fo._refresh_all_state['drain'] = False
+    fo._refresh_all_state['running'] = True
+    fo._refresh_all_exit_drain()
+    assert fo._refresh_all_state['drain'] is True
+    assert joined and joined[0] == fo._EXIT_DRAIN_JOIN_SEC
+    # Fake ohne is_alive (Sync-Thread der Testsuite) → stiller No-Op
+    fo._refresh_all_thread[0] = object()
+    fo._refresh_all_exit_drain()
+    fo._refresh_all_thread[0] = None
+    fo._refresh_all_state.update(running=False, drain=False)

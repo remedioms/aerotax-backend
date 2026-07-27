@@ -1,0 +1,45 @@
+# Compose-Patch für den FlightOps-Refresher-Umbau (2026-07-27).
+# ANWENDEN AUF: /opt/aerox/compose.yaml auf Hetzner (Stand latenzsweep-d0d8749).
+# NICHT automatisch deployen — Owner-Zustimmung für Compose-Änderungen nötig.
+#
+# Änderungen:
+#  1) aerotax-poll bekommt die Refresher-Rolle: LH_FLIGHTOPS_REFRESHER=1.
+#     NUR dieser Container darf je einen LH-Refresh-Token rotieren (der
+#     Code verweigert es überall sonst per Choke-Point-Gate).
+#  2) stop_grace_period: gunicorn --graceful-timeout 60 + atexit-Drain (45s)
+#     brauchen mehr als Dockers Default-10s, sonst SIGKILL mitten in einer
+#     Rotation (= potenzieller Familientod). Poll 120s, Backend 90s.
+#  3) Poll --max-requests 2000→10000 (+Jitter 1000): der Worker recycelte
+#     alle ~1–2h — jedes Recycle ist ein Refresher-Handover (flock-Wechsel,
+#     Schedule-Neuaufbau). Mit 10000 passiert das nur noch alle ~5–10h;
+#     der Memory-Leak-Schutz bleibt erhalten.
+#
+--- compose.yaml.orig
++++ compose.yaml
+@@ aerotax-backend @@
+     command: ["gunicorn","app:app","--bind","0.0.0.0:8080","--workers","3","--worker-class","gthread","--threads","8","--timeout","1800","--graceful-timeout","60","--max-requests","5000","--max-requests-jitter","500","--access-logfile","-","--error-logfile","-"]
+     ports:
+       - "127.0.0.1:8080:8080"
+     mem_limit: 2g
++    stop_grace_period: 90s
+@@ aerotax-poll @@
+     environment:
+       - PORT=8081
+       - AX_EU_SWEEP_POINTS_PER_TICK=1
+       - FR24_ARR_BACKFILL=1
+       - AEROTAX_DISABLE_BG_THREADS=1
+       # Quittung zum Boot-Riegel in app.py (_assert_calc_worker_sane):
+       # dieser Sidecar faehrt nur Cron-Endpunkte und rechnet bewusst
+       # keine Auftraege. Ohne diese Zeile startet der Prozess nicht.
+       - AEROTAX_ALLOW_NO_CALC_WORKER=1
++      # DER eine Refresher (Architektur 2026-07-27): einziger Prozess im
++      # System, der LH-FlightOps-Refresh-Tokens rotieren darf. Web-Worker
++      # und MQTT lesen nur Access-Tokens. NIE auf einem zweiten Container
++      # setzen.
++      - LH_FLIGHTOPS_REFRESHER=1
+-    command: ["gunicorn","app:app","--bind","0.0.0.0:8081","--workers","1","--worker-class","gthread","--threads","4","--timeout","1800","--graceful-timeout","60","--max-requests","2000","--max-requests-jitter","200","--access-logfile","-","--error-logfile","-"]
++    command: ["gunicorn","app:app","--bind","0.0.0.0:8081","--workers","1","--worker-class","gthread","--threads","4","--timeout","1800","--graceful-timeout","60","--max-requests","10000","--max-requests-jitter","1000","--access-logfile","-","--error-logfile","-"]
+     ports:
+       - "127.0.0.1:8081:8081"
+     mem_limit: 1200m
++    stop_grace_period: 120s

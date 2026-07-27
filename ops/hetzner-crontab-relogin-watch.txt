@@ -1,0 +1,8 @@
+# Wächter-Cron für den FlightOps-Refresher (2026-07-27). In /etc/crontab auf
+# Hetzner ergänzen (neben dem refresh-all-Eintrag Zeile 29). Stündlich :07 —
+# bewusst NICHT zur vollen Stunde (Kollision mit dem :23-refresh-all-Fenster
+# vermeiden ist egal, aber :07 hält die Cron-Last gestreut).
+# Der Endpoint mailt selbst via Resend (Cooldown 3h) bei:
+#   · needs_relogin-Anstieg > LH_FLIGHTOPS_RELOGIN_ALERT_N (Default 5) pro ~1h
+#   · Refresher-Loop fehlt/steht (dann rotiert NIEMAND — fail-closed)
+7 * * * * root PS=$(grep "^ADSB_POLL_SECRET=" /opt/aerox/env.list|cut -d= -f2-); curl -s -o /var/log/flightops-relogin-watch.last -m 30 -X POST -H "X-Poll-Secret: $PS" http://127.0.0.1:8081/api/internal/flightops/relogin-watch

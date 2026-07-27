@@ -1702,7 +1702,11 @@ def duty_from_roster_day(klass=None, marker=None):
     behandelt (Smart-Pickup ausgelöst). Jetzt eigene Nicht-Commute-Kategorie."""
     marker_up = str(marker or '').upper()
     klass_up = str(klass or '').strip().upper()
-    if 'SBY' in marker_up:
+    # 'STANDBY'/'STBY' ergänzt (2026-07-27): der FlightOps-Import mintet die
+    # myTime-Prosa „Standby (SB60)" — die trägt KEIN 'SBY' als Substring
+    # (S-T-A-N-D-B-Y) und fiel deshalb bis hierher durch. Ohne diesen Zweig
+    # war ein echter SB-Tag genauso „unbekannt" wie ein Reserve-Tag.
+    if 'SBY' in marker_up or 'STANDBY' in marker_up or 'STBY' in marker_up:
         return 'standby'
     # RB/Reserve (Anita, Forum 22.07.: „habe RB, App zeigt SB"): eigener
     # Dienst-Typ — Zustand wie Standby, aber ehrliches Label. 'RB' nur als
