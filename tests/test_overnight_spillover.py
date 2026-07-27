@@ -38,6 +38,22 @@ from blueprints.crew_live_state import (
     STATE_HOME, STATE_PRE_FLIGHT, STATE_FLYING, STATE_LANDED, STATE_LAYOVER,
 )
 
+# Deterministische Test-Uhr (2026-07-27): Die get_friends_today-Tests unten
+# bauen ihre Roster-Tage aus `date.today()` + Sektor-Zeiten relativ zu
+# `datetime.now()` — ohne eingefrorene Uhr kippen sie, sobald Prozess-TZ,
+# Berlin-Betriebstag und UTC nicht mehr auf demselben Kalendertag liegen.
+# Mechanik + WARUM: tests/_clock_freeze.py (FROZEN_UTC = 2026-07-16 10:00 UTC).
+from _clock_freeze import apply_frozen_clock  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _freeze_clock(monkeypatch):
+    # extra_modules: friert auch die hiesigen Modul-Globals `datetime`/`_date`
+    # ein, damit Test-Eingaben und App dieselbe Uhr sehen.
+    apply_frozen_clock(monkeypatch, extra_modules=(sys.modules[__name__],),
+                       app_module=A)
+    yield
+
 
 @pytest.fixture(autouse=True)
 def _pin_app_module():

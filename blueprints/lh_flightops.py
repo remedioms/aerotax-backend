@@ -736,9 +736,14 @@ def check_in_times(user_token, flight, date, dep, arr,
                       crewBusDeparture 19:12Z → paxOnBoard 19:37Z → STD 20:15Z
     Der Hotel-Pickup liegt real ~2:10–2:30 h VOR Abflug (myTime-Bestand:
     'Layover [PEK] … 10:55 LT Pickup PEK', 'Layover [EWR] … 18:40 LT Pickup
-    EWR'), also klar VOR briefingBegin. Kein Feld dieser Response trägt ihn.
-    → Aus FlightOps ist die Pickup-Zeit NICHT ableitbar; es wird deshalb auch
-    KEIN Pickup-VEVENT synthetisiert (Grundregel: nie raten)."""
+    EWR'), also klar VOR briefingBegin. Kein Feld DIESER Response trägt ihn.
+
+    NACHTRAG 2026-07-27 (Owner-Fund, in PROD belegt): die Pickup-Zeit gibt es
+    doch — nur in einem ANDEREN Service. `COMMON_CREW_ROTATION` liefert
+    `legs[].pickupTime` (UTC) + `legs[].pickupTimeLT` + `legs[].hotelName`.
+    Siehe parse_rotation_pickups/pickup_rotation_ids. Dieser Service hier bleibt
+    trotzdem der falsche Ort dafür — `crewBusDeparture` ist und bleibt der
+    Apron-Bus."""
     params = {
         'flightDesignator': (flight or '').upper().replace(' ', ''),
         'flightDate': _date_z(date), 'departureAirport': (dep or '').upper(),
@@ -776,11 +781,471 @@ _MOCK_WINDOW = ('2016-10-01', '2016-10-31')
 _FLIGHT_CATS = {'flight', 'flightother'}
 
 
-def duty_events_to_ics(resp):
+# ── HOTEL-PICKUP aus COMMON_CREW_ROTATION ───────────────────────────────────
+# Owner-Fund 2026-07-26, live in PROD belegt: die Hotel-Pickup-Zeit, die seit
+# dem Umstieg auf den direkten FlightOps-Login fehlte, steckt NICHT in
+# COMMON_CHECK_IN_TIMES (dort ist `crewBusDeparture` der APRON-Bus, siehe
+# check_in_times-Docstring), sondern in COMMON_CREW_ROTATION als
+# `rotations[].shifts[].legs[].pickupTime` (UTC) — plus `pickupTimeLT`
+# (Ortszeit, fertig) in der aktuellen PROD-Shape.
+#
+# Zwei echte Messungen (Owner):
+#   RN 169929  LH443 DTW→FRA  Abflug 26.07. 20:00Z  Briefing 19:00Z
+#              pickupTime 18:00Z  pickupTimeLT 14:00 (DTW)   → 2:00 h vor Abflug
+#   RN 171012  LH743 KIX→MUC  Abflug 29.07. 00:30Z  Briefing 28.07. 23:30Z
+#              pickupTime 28.07. 21:50Z  pickupTimeLT 06:50 (KIX) → 2:40 h
+# Das trifft die myTime-Semantik exakt (dort real: 'Layover [PEK] … 10:55 LT
+# Pickup PEK'): VOR dem Briefing, ~2:00–2:40 h vor Abflug.
+#
+# SEMANTIK, die den Bau bestimmt (alles am echten Bestand geprüft):
+#  * gesetzt NUR am Layover-Rückflug; am Homebase-Abflug immer None.
+#  * erst ~1 Tag vorher gefüllt — für Umläufe in 6–10 Tagen stand überall None,
+#    und LH trägt spät nach und löscht später wieder (Florian). Deshalb enger
+#    Horizont + kurze Cache-TTL, und ein späteres Verschwinden muss den Marker
+#    wieder verschwinden lassen (kein Sticky-Cache).
+#  * das `hotel`-Flag ist UNBRAUCHBAR (False trotz gesetztem hotelName) — nur
+#    den Namen auswerten, nie das Flag.
+#  * `rotationId` liegt bereits in `eventAttributes` der Duty-Events-Response,
+#    die der Import ohnehin holt → kein Extra-Call zum Auffinden.
+#  * EIN Rotations-Call liefert alle Shifts und Legs → 1 Call pro UMLAUF.
+#
+# GOTCHA in der LH-Shape: das Abflugdatum-Feld heißt `depatureDate` (LH-Typo,
+# so in der echten Response und in tests/fixtures/flightops_COMMON_CREW_ROTATION
+# .json). Beide Schreibweisen werden gelesen.
+_ROT_DEP_KEYS = ('depatureDate', 'departureDate')
+
+
+def _rot_hhmm_lt(v):
+    """`pickupTimeLT` → 'HH:MM' oder None. LH liefert das Feld je nach Service-
+    Version als ISO-Ortszeit ('2026-07-29T06:50:00') ODER als nackte Uhrzeit
+    ('06:50' / '0650'). Nur plausible Zeiten (h<24, m<60) — nie raten."""
+    s = str(v or '').strip()
+    if not s:
+        return None
+    if 'T' in s:
+        s = s.split('T', 1)[1]
+    m = re.match(r'^(\d{1,2}):(\d{2})', s) or re.match(r'^(\d{2})(\d{2})$', s)
+    if not m:
+        return None
+    hh, mm = int(m.group(1)), int(m.group(2))
+    return f'{hh:02d}:{mm:02d}' if 0 <= hh <= 23 and 0 <= mm <= 59 else None
+
+
+def parse_rotation_pickups(resp):
+    """COMMON_CREW_ROTATION-Response → {leg_key: {...}}. Pure/testbar.
+
+    leg_key = (flightDesignator, departureAirport, arrivalAirport, 'YYYYMMDD'
+    des Abflugs in UTC). Zusätzlich wird derselbe Eintrag unter dem
+    flugnummernlosen Schlüssel ('', dep, arr, day8) abgelegt — die Flugnummer
+    aus `eventDetails` der Duty-Events kann Deadhead-Präfixe/Leerzeichen
+    tragen, die Stations-/Datums-Kombination ist der robustere Anker.
+
+    ABER (adversarialer Review 2026-07-27, an echten Roster-Formen bewiesen):
+    der flugnummernlose Schlüssel ist NUR eindeutig, wenn die Route an diesem
+    Tag GENAU EINMAL vorkommt. Bei MUC-FRA-MUC-FRA (alltäglicher LH-Umlauf)
+    kollidiert er, und der Pickup des einen Legs landete am anderen — sichtbar
+    als „PU 15:00" an einem Tag, der um 07:00 Ortszeit beginnt, während das Leg
+    MIT echtem Pickup leer blieb. Mehrfach belegte Routen-Schlüssel werden
+    deshalb wieder ENTFERNT: dann gilt nur der Treffer mit Flugnummer.
+
+    Wert: {'pickup_utc': 'YYYY-MM-DDTHH:MM:SSZ', 'pickup_lt': 'HH:MM'|None,
+           'hotel': str|None, 'station': 'XXX'}
+    Legs OHNE pickupTime erscheinen NICHT — kein Eintrag heißt kein Event."""
+    out = {}
+    if not isinstance(resp, dict):
+        return out
+    _route_seen = {}          # ('', dep, arr, day8) → Zahl der Legs der Route
+    # ── hotelName ↔ pickupTime hängen an VERSCHIEDENEN Legs ──────────────────
+    # Live gemessen 2026-07-27 (10 PROD-Rotationen, 24 Legs): 8 Legs trugen
+    # pickupTime, 8 trugen hotelName — und es war NIE dasselbe Leg.
+    #   FRA→BOS  hotelName 'Hyatt Regency Boston'   pickupTime None
+    #   BOS→MUC  hotelName None                     pickupTime gesetzt
+    # Logisch: der Name hängt am HINFLUG (arrivalAirport = Hotel-Station), der
+    # Pickup am RÜCKFLUG (departureAirport = Hotel-Station). Ein Parser, der nur
+    # Legs MIT pickupTime ansieht, verliert deshalb JEDEN Hotelnamen (erste
+    # Fassung tat genau das und lieferte durchgehend hotel=None). Also: erst
+    # eine Station→Name-Karte über ALLE Legs bauen, dann an den Pickup hängen.
+    # Echte Namen, keine Codes ('Radisson Blu Hamburg', 'Altis Grand Hotel',
+    # 'Mercure Warszawa Grand') — die Repo-Fixture mit 'H9941671' ist das
+    # Doku-Beispiel, nicht die PROD-Shape.
+    _hotel_at = {}
+    for rot in _as_list(resp.get('rotations')):
+        if not isinstance(rot, dict):
+            continue
+        for sh in _as_list(rot.get('shifts')):
+            if not isinstance(sh, dict):
+                continue
+            for lg in _as_list(sh.get('legs')):
+                if not isinstance(lg, dict):
+                    continue
+                hn = str(lg.get('hotelName') or '').strip()
+                stn = str(lg.get('arrivalAirport') or '').upper().strip()
+                if hn and len(stn) == 3:
+                    _hotel_at.setdefault(stn, hn)
+    for rot in _as_list(resp.get('rotations')):
+        if not isinstance(rot, dict):
+            continue
+        for sh in _as_list(rot.get('shifts')):
+            if not isinstance(sh, dict):
+                continue
+            for lg in _as_list(sh.get('legs')):
+                if not isinstance(lg, dict):
+                    continue
+                dep = str(lg.get('departureAirport') or '').upper().strip()
+                arr = str(lg.get('arrivalAirport') or '').upper().strip()
+                if len(dep) != 3 or len(arr) != 3:
+                    continue
+                dd = ''
+                for k in _ROT_DEP_KEYS:
+                    if str(lg.get(k) or '').strip():
+                        dd = str(lg[k]).strip()
+                        break
+                if len(dd) < 10:
+                    continue
+                day8 = dd[:10].replace('-', '')
+                rkey = ('', dep, arr, day8)
+                # JEDES Leg der Route zählt für die Eindeutigkeit — auch die
+                # ohne pickupTime, sonst bliebe ein Duplikat unentdeckt.
+                _route_seen[rkey] = _route_seen.get(rkey, 0) + 1
+                pu = str(lg.get('pickupTime') or '').strip()
+                if not pu:
+                    continue
+                flt = re.sub(r'\s', '',
+                             str(lg.get('flightDesignator') or '').upper())
+                # Hotelname der ABFLUG-Station (= Hotel-Station des Rückflugs);
+                # notfalls der am Leg selbst. `hotel`/`airportRoom` bewusst
+                # ignoriert — das Flag ist False trotz gesetztem Namen.
+                hn = (_hotel_at.get(dep)
+                      or str(lg.get('hotelName') or '').strip() or None)
+                val = {'pickup_utc': pu, 'pickup_lt': _rot_hhmm_lt(lg.get('pickupTimeLT')),
+                       'hotel': hn, 'station': dep}
+                out[(flt, dep, arr, day8)] = val
+                out.setdefault(rkey, val)
+    for rkey, n in _route_seen.items():
+        if n > 1:
+            out.pop(rkey, None)
+    return out
+
+
+def _pickup_for_leg(pickups, flt, frm, to, st):
+    """Pickup-Eintrag für EIN Duty-Flug-Event oder None. `st` ist das bereits
+    ICS-formatierte DTSTART ('YYYYMMDDTHHMMSSZ'), sein Datum ist der Anker.
+    Reihenfolge: exakter Treffer mit Flugnummer → Treffer nur über Route+Datum
+    (die Flugnummer aus `eventDetails` kann Deadhead-Präfixe tragen) → ±1 Tag,
+    aber NUR mit Flugnummer (Flug + Route + Nachbartag ist eindeutig; ohne
+    Flugnummer würde ein täglicher Umlauf auf dieselbe Route falsch matchen)."""
+    if not isinstance(pickups, dict) or not pickups:
+        return None
+    st, frm, to = str(st or ''), str(frm or ''), str(to or '')
+    if len(st) < 8 or len(frm) != 3 or len(to) != 3:
+        return None
+    day8 = st[:8]
+    for key in ((flt, frm, to, day8), ('', frm, to, day8)):
+        hit = pickups.get(key)
+        if hit:
+            return hit
+    if not flt:
+        return None
+    from datetime import datetime as _d, timedelta as _td
+    try:
+        base = _d.strptime(day8, '%Y%m%d')
+    except Exception:
+        return None
+    for delta in (-1, 1):
+        hit = pickups.get((flt, frm, to,
+                           (base + _td(days=delta)).strftime('%Y%m%d')))
+        if hit:
+            return hit
+    return None
+
+
+# Vorlauf-Fenster wie iOS RosterLabels.maxLeadWindowMinutes und
+# crew_live_state._PRE_LEAD_MAX_MIN. Bewusst DERSELBE Wert: was der Konsument
+# still verwirft, darf gar nicht erst in den Roster geschrieben werden.
+_PICKUP_LEAD_MAX_MIN = 6 * 60
+
+
+def _pickup_lead_ok(pickup_utc, dep_utc):
+    """True, wenn der Pickup 0…6 h VOR dem Plan-Abflug liegt. Beides sind echte
+    UTC-Instanzen, der Vergleich ist deshalb DST- und zeitzonenfrei — anders als
+    die HH:MM-Rückrechnung im Konsumenten. Bei Parse-Fehler False (fail-closed:
+    lieber kein Marker als ein falscher)."""
+    try:
+        from datetime import datetime as _d, timezone as _tz
+        a = _d.fromisoformat(str(pickup_utc or '').replace('Z', '+00:00'))
+        b = _d.fromisoformat(str(dep_utc or '').replace('Z', '+00:00'))
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=_tz.utc)
+        if b.tzinfo is None:
+            b = b.replace(tzinfo=_tz.utc)
+    except Exception:
+        return False
+    lead_min = (b - a).total_seconds() / 60.0
+    return 0 <= lead_min <= _PICKUP_LEAD_MAX_MIN
+
+
+def _berlin_day(iso_utc):
+    """UTC-ISO → 'YYYY-MM-DD' im EUROPE/BERLIN-Kalender, sonst None. Genau der
+    Bucket, den der Feed-Import für ein zeitbehaftetes VEVENT bildet (der
+    Stations-Lokal-Rebucket in app.py läuft nur für SWISS/ITA, nicht für LH)."""
+    s = str(iso_utc or '').strip()
+    if not s:
+        return None
+    try:
+        from datetime import datetime as _d, timezone as _tz
+        from zoneinfo import ZoneInfo
+        dt = _d.fromisoformat(s.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return dt.astimezone(ZoneInfo('Europe/Berlin')).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+# Horizont für Rotations-Calls. BEGRÜNDUNG mit gemessenen Zahlen (26.07.2026,
+# echter lhfo-Zähler via /api/ax/lh-quota, Stunde 2026072622 = ein voller
+# refresh-all-Lauf):
+#   FlightOps-Key-Kontingent          1.000 Calls/h  (+ 5/s)
+#   gemessen in der refresh-all-Stunde  478 Calls    (262 COMMON_DUTY_EVENTS
+#                                                    + 216 oauth_refresh)
+#   → freier Kopfraum                   522 Calls/h
+#   verbundene Grants                   227 (455 Profile, 228 needs_relogin)
+# Ein Rotations-Call fällt nur für einen User mit Layover-Rückflug IM Horizont
+# an, und ALLE seine Umläufe gehen in EINEN Call (bis 6 RNs pro Request) →
+# höchstens 1 Call pro User pro Lauf. P2 hat bei 36 h 25–35 Calls/Lauf gemessen.
+# 30 h statt 36 h, weil der Wert erst ~24 h vorher überhaupt gefüllt wird: 30 h
+# deckt die Füllzeit + 6 h Reserve, und weil refresh-all alle 2 h läuft, sieht
+# jeder Umlauf den Wert danach noch ~15-mal — ein größerer Horizont kauft keinen
+# Nutzen, nur Calls. Erwartete Last also ~20–30 Calls/h = ~5 % des freien
+# Kopfraums, ~3 % des Kontingents. Die echte Zahl steht nach dem Deploy als
+# lhfo:<stunde>:common_crew_rotation im Zähler.
+_ROT_PICKUP_HORIZON_H = 30
+# Rückblick: ein Rückflug, der GERADE abgeht, soll seinen Marker behalten
+# (die Kachel „Dienst heute" liest ihn bis zum Abflug).
+_ROT_PICKUP_BACK_H = 3
+# COMMON_CREW_ROTATION nimmt bis zu 6 Rotationsnummern pro Request
+# (crew_rotation baut RN, RN_2 … RN_6). Deshalb ist die Obergrenze pro Import
+# genau 6: mehr Umläufe kosten NICHTS extra, solange sie in einen Call passen,
+# und mehr als 6 Layover-Rückflüge in 30 h sind operativ unmöglich (die Kappe
+# schützt gegen kaputte Payloads, nicht gegen echte Roster).
+_ROT_RN_PER_CALL = 6
+_ROT_MAX_PER_IMPORT = _ROT_RN_PER_CALL
+# NOTBREMSE: oberhalb dieses lhfo-Stundenstands werden Rotations-Calls
+# komplett übersprungen. Der Roster (COMMON_DUTY_EVENTS) ist das Kernprodukt
+# und darf NIE an einem Pickup-Nice-to-have verhungern. Gemessener Normalstand
+# ist 478/h, die Kappe greift also nur bei echter Anomalie.
+_ROT_LHFO_HOUR_CEILING = 800
+
+
+def pickup_rotation_ids(resp, now=None, horizon_h=_ROT_PICKUP_HORIZON_H):
+    """Duty-Events-Response → Liste der rotationIds, für die ein Pickup-Wert
+    plausibel VORLIEGEN kann und GEBRAUCHT wird. Pure/testbar.
+
+    Ein Leg qualifiziert, wenn ALLE vier Bedingungen gelten:
+      1. Flug-Event mit startTime im Fenster [now − 3 h, now + horizon_h].
+      2. Es startet an einer Station, an der laut Roster eine HOTEL-Nacht
+         liegt (±2 Tage) — nur dort gibt es einen Hotel-Pickup. Am
+         Homebase-Abflug ist pickupTime laut LH immer None, ein Call dorthin
+         wäre garantiert verschwendet.
+      3. Das Event trägt eine rotationId in eventAttributes.
+      4. Ergebnis dedupliziert und auf _ROT_MAX_PER_IMPORT gekappt.
+    Reihenfolge: früheste Abflüge zuerst (die brauchen den Wert am dringendsten)."""
+    if not isinstance(resp, dict):
+        return []
+    from datetime import datetime as _d, timedelta as _td, timezone as _tz
+    now = now or _d.now(_tz.utc)
+    lo = (now - _td(hours=_ROT_PICKUP_BACK_H)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    hi = (now + _td(hours=max(1, int(horizon_h)))).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    hotel_days = []          # (day8, station)
+    legs = []                # (start_iso, station, day8, rotation_id)
+    for d in _as_list(resp.get('rosterDays')):
+        if not isinstance(d, dict):
+            continue
+        day8 = (d.get('day') or '')[:10].replace('-', '')
+        for ev in _as_list(d.get('events')):
+            if not isinstance(ev, dict):
+                continue
+            cat = re.sub(r'[_\s]', '', (ev.get('eventCategory') or '').lower())
+            et = re.sub(r'[_\s]', '', (ev.get('eventType') or '').lower())
+            frm = (ev.get('startLocation') or '').upper().strip()
+            to = (ev.get('endLocation') or '').upper().strip()
+            if et == 'hotel' or cat == 'hotel':
+                stn = to or frm
+                if len(day8) == 8 and len(stn) == 3:
+                    hotel_days.append((day8, stn))
+                continue
+            if not (et == 'flight' or cat in _FLIGHT_CATS):
+                continue
+            s = (ev.get('startTime') or '').strip()
+            if not (s and len(frm) == 3 and lo <= s <= hi):
+                continue
+            # _as_list wegen der LH-Known-Issue (Ein-Element-Arrays kommen als
+            # Skalar) — hier defensiv in BEIDE Richtungen: käme
+            # eventAttributes je als [{…}], wäre `isinstance(ea, dict)` False
+            # und das Feature ginge komplett und lautlos dunkel.
+            rn = None
+            for ea in _as_list(ev.get('eventAttributes')):
+                if isinstance(ea, dict) and ea.get('rotationId') not in (None, ''):
+                    rn = ea['rotationId']
+                    break
+            if rn is None:
+                continue
+            legs.append((s, frm, s[:10].replace('-', ''), str(rn)))
+
+    def _near_hotel(stn, day8):
+        """Hotel-Nacht derselben Station binnen ±2 Kalendertagen? Immer über
+        echte Datumsarithmetik — ein numerischer Vergleich der day8-Strings
+        bricht über Monats-/Jahresgrenzen (20260801 vs 20260731)."""
+        for hd, hs in hotel_days:
+            if hs != stn:
+                continue
+            try:
+                a = _d.strptime(hd, '%Y%m%d')
+                b = _d.strptime(day8, '%Y%m%d')
+            except Exception:
+                continue
+            if abs((a - b).days) <= 2:
+                return True
+        return False
+
+    out = []
+    for s, stn, day8, rn in sorted(legs):
+        if rn in out or not _near_hotel(stn, day8):
+            continue
+        out.append(rn)
+        if len(out) >= _ROT_MAX_PER_IMPORT:
+            break
+    return out
+
+
+# Rotations-Cache (prozess-lokal). TTL absichtlich KURZ: LH trägt pickupTime
+# spät nach UND löscht sie später wieder — ein langer Cache würde einen
+# gelöschten Pickup als Geist weiterleben lassen. 30 min ist kürzer als der
+# 2-h-refresh-all-Takt, jeder Cron-Lauf holt also frisch (das ist die Zahl, die
+# im Zähler auftaucht), während wiederholte On-Demand-Syncs desselben Users
+# innerhalb der halben Stunde gratis sind.
+_ROT_CACHE_TTL_S = 1800.0
+# Cache-Key ist (user_token, rotation_id), NICHT die rotationId allein
+# (adversarialer Review 2026-07-27): die COMMON_CREW_ROTATION-Response ist
+# ROLLENSPEZIFISCH — die Repo-Fixture zeigt `briefingBeginCoc: null` neben
+# `briefingBeginCab: …` und rein kabinenseitige `CAB_*`-attributes. Cockpit und
+# Kabine haben auf Langstrecke regelmäßig verschiedene Hotels und damit
+# verschiedene Pickup-Zeiten; ein Cache nur über die rotationId hätte den
+# Kollegen der anderen Rolle deren Werte serviert.
+_rot_cache = {}                  # (user_token, rotation_id) → (ts, pickups)
+_rot_cache_lock = threading.Lock()
+# Stundenstand-Memo: _budget_key_used geht auf Supabase. Einmal pro Minute
+# genügt für eine Notbremse und hält den Roster-Hot-Path netzfrei (sonst ~227
+# zusätzliche SELECTs pro refresh-all-Lauf).
+_rot_budget_memo = [0.0, 0]      # (ts, used)
+_ROT_BUDGET_MEMO_S = 60.0
+
+
+def _rot_hour_used():
+    """Aktueller lhfo-Stundenstand (memoisiert) oder 0, wenn nicht ermittelbar."""
+    now = time.time()
+    if (now - _rot_budget_memo[0]) < _ROT_BUDGET_MEMO_S:
+        return _rot_budget_memo[1]
+    try:
+        from blueprints.aerox_data_blueprint import _budget_key_used
+        used = int(_budget_key_used(
+            'lhfo:' + time.strftime('%Y%m%d%H', time.gmtime())) or 0)
+    except Exception:
+        used = 0
+    _rot_budget_memo[0], _rot_budget_memo[1] = now, used
+    return used
+
+
+def rotation_pickups_for(user_token, rotation_ids):
+    """rotationIds → gemergtes Pickup-Dict (siehe parse_rotation_pickups).
+    Cache pro (Token, rotationId) mit kurzer TTL.
+
+    KOSTEN: COMMON_CREW_ROTATION nimmt bis zu SECHS rotationIds pro Request
+    (`RN`, `RN_2` … `RN_6`, siehe crew_rotation). Alle Cache-Misses eines
+    Imports gehen deshalb in EINEN Call — nicht einen pro Umlauf. Das war die
+    wichtigste Korrektur des adversarialen Reviews: die Variante mit einem Call
+    pro rotationId riss bei parallelen Imports (ein Daemon-Thread pro Token)
+    gemessen 24 Calls in ein 1-s-Fenster gegen das 5/s-Limit des Keys — und
+    brauchte dafür noch ein sleep, das den Deploy-Drain verlängert. Ein Call
+    pro User braucht keine Bremse.
+
+    Wirft NIE — ohne Pickup-Daten muss der Roster-Import normal durchlaufen."""
+    out = {}
+    # Dedupe unter Erhalt der Reihenfolge — EIN Eintrag pro Umlauf, auch wenn
+    # mehrere Legs desselben Umlaufs im Horizont liegen.
+    ids, _seen = [], set()
+    try:
+        _src = list(rotation_ids or [])
+    except TypeError:
+        return out
+    for r in _src:
+        s = str(r or '').strip()
+        if s and s not in _seen:
+            _seen.add(s)
+            ids.append(s)
+    if not ids:
+        return out
+    now = time.time()
+    misses = []
+    with _rot_cache_lock:
+        for rn in ids:
+            hit = _rot_cache.get((user_token, rn))
+            if hit and (now - hit[0]) < _ROT_CACHE_TTL_S:
+                out.update(hit[1] or {})
+            else:
+                misses.append(rn)
+    if not misses:
+        return out
+    # NOTBREMSE: steht der FlightOps-Key diese Stunde schon hoch, wird der
+    # Pickup geopfert — nie der Roster.
+    used = _rot_hour_used()
+    if used >= _ROT_LHFO_HOUR_CEILING:
+        log.warning('[lh_flightops] pickup: lhfo-Stundenstand %s >= %s -> '
+                    'Rotations-Calls uebersprungen', used, _ROT_LHFO_HOUR_CEILING)
+        return out
+    batch = misses[:_ROT_RN_PER_CALL]
+    try:
+        # Gezählt wird automatisch in _api_get als
+        # lhfo:<YYYYMMDDHH>:common_crew_rotation (eigenes Aufrufer-Label, im
+        # Report /api/ax/lh-quota sichtbar) — EIN Zähl-Ereignis pro Batch.
+        raw = crew_rotation(user_token, *batch)
+    except Exception as e:
+        log.warning('[lh_flightops] rotation %s: %s', batch, type(e).__name__)
+        return out
+    if not isinstance(raw, dict):
+        # KEIN Negativ-Cache bei Transportfehler (adversarialer Review):
+        # _api_get gibt bei HTTP 403/500/Timeout `None` zurück, es WIRFT nicht.
+        # Ein solches None als „dieser Umlauf hat keinen Pickup" zu cachen hätte
+        # den Marker bei einem einzigen LH-Schluckauf für 30 min gelöscht und
+        # beim Wiederauftauchen eine erfundene „Dienstplan-Änderung" gepusht.
+        # Nur eine echte, geparste Antwort darf den Cache füllen.
+        log.warning('[lh_flightops] rotation %s: keine Antwort (kein '
+                    'Negativ-Cache)', batch)
+        return out
+    got = parse_rotation_pickups(raw)
+    # Ein geparstes, aber pickupfreies Ergebnis WIRD gecacht — sonst fragt jeder
+    # Sync denselben Umlauf erneut ab. Die kurze TTL sorgt dafür, dass ein spät
+    # nachgetragener Wert trotzdem ankommt.
+    with _rot_cache_lock:
+        for rn in batch:
+            _rot_cache[(user_token, rn)] = (time.time(), got)
+        if len(_rot_cache) > 4000:
+            for k in sorted(_rot_cache, key=lambda k: _rot_cache[k][0])[:2000]:
+                _rot_cache.pop(k, None)
+    out.update(got or {})
+    return out
+
+
+def duty_events_to_ics(resp, pickups=None):
     """FlightOps-Duty-Events → ICS-String (oder None). Pure/testbar.
     Flight-Events → VEVENT im LH-Summary-Format ('LH400: FRA-JFK'), Off/Vac/
     Standby/Hotel → Marker-/Layover-Events. Zeiten kommen als UTC-ISO. NICHTS
-    wird erfunden; unbekannte Kategorien reisen als Roh-Summary mit."""
+    wird erfunden; unbekannte Kategorien reisen als Roh-Summary mit.
+
+    `pickups` (optional) = Ergebnis von parse_rotation_pickups/
+    rotation_pickups_for. Ist es leer oder trägt es für ein Leg keinen Wert,
+    entsteht KEIN Pickup-Event — geraten wird nie."""
     if not isinstance(resp, dict):
         return None
     days = _as_list(resp.get('rosterDays'))
@@ -988,6 +1453,68 @@ def duty_events_to_ics(resp):
                 is_dh = det.upper().strip().startswith('DH ')
                 summary = ((f'DH {flt_disp}' if is_dh else flt_disp) + f': {frm}-{to}'
                            if flt else f'{frm}-{to}')
+                # ── HOTEL-PICKUP vor dem Layover-Rückflug ────────────────────
+                # VOR dem Flug-VEVENT emittiert, damit der Tages-Summary die
+                # myTime-Reihenfolge behält ('… 16:45 LT Pickup MEX · LH 499:
+                # MEX-FRA'). Quelle ist ausschließlich pickupTime aus
+                # COMMON_CREW_ROTATION; ohne Wert entsteht KEIN Event.
+                _pu = _pickup_for_leg(pickups, flt, frm, to, st)
+                if _pu and not _pickup_lead_ok(_pu.get('pickup_utc'),
+                                               ev.get('startTime')):
+                    # PLAUSIBILITÄT vor allem anderen (adversarialer Review
+                    # 2026-07-27): ohne diesen Riegel wanderte ein Pickup NACH
+                    # dem Abflug, ein 14-h-Vorlauf oder ein 3 Tage alter Wert
+                    # aus einem noch gecachten Umlauf in den Roster — sichtbar
+                    # für den User, während die Pre-Flight-Timeline ihn
+                    # (zurecht) still verwarf. Fenster wie iOS/crew_live_state:
+                    # 0…6 h vor dem Plan-Abflug.
+                    _pu = None
+                if _pu:
+                    # ORTSZEIT: bewusst PRIMÄR aus `pickupTime` + Stations-TZ
+                    # gerechnet, `pickupTimeLT` nur als Fallback. Ursprünglich
+                    # war es umgekehrt (LT ist ja „fertig"), aber der Review hat
+                    # gezeigt: ein LT, das nicht zum UTC-Wert passt (LH rendert
+                    # es in Base-TZ o. ä.), zeigt dem User eine falsche Zeit UND
+                    # killt die Pre-Flight-Timeline still (6-h-Fenster). Der
+                    # UTC-Wert ist die Größe, gegen die wir oben plausibilisiert
+                    # haben — die angezeigte Zeit muss zu IHM passen.
+                    _hh = None
+                    try:
+                        import app as _app
+                        _hh = _app._ics_local_hhmm_at(_pu.get('pickup_utc'), frm)
+                    except Exception:
+                        _hh = None
+                    _lt = _pu.get('pickup_lt')
+                    if _hh and _lt and _hh != _lt:
+                        log.warning('[lh_flightops] pickupTimeLT %s != aus '
+                                    'pickupTime gerechnet %s (%s %s) -> UTC '
+                                    'gewinnt', _lt, _hh, flt, frm)
+                    if not _hh:
+                        # Stations-TZ unbekannt → fertige Ortszeit von LH.
+                        _hh = _lt
+                    _pst = _dt(_pu.get('pickup_utc'))
+                    if _hh and _pst:
+                        # MITTERNACHTS-WRAP (bewiesen an RN 171012): der
+                        # Tages-Bucket des Feed-Imports ist das EUROPE/BERLIN-
+                        # Datum von DTSTART. Pickup 28.07. 21:50Z (Berlin
+                        # 23:50 am 28.) und Abflug 29.07. 00:30Z (Berlin 02:30
+                        # am 29.) fallen damit auf VERSCHIEDENE Roster-Tage —
+                        # der Marker landete auf dem Layover-Tag statt auf dem
+                        # Rückflug-Tag, und _rc_pickup_hhmm liest ihn pro TAG.
+                        # Deshalb: liegt der echte Pickup-Zeitpunkt in einem
+                        # anderen Berlin-Tag als der Abflug, wird DTSTART auf
+                        # den Abflug-Zeitpunkt gezogen. Die WAHRHEIT bleibt
+                        # erhalten, weil der Summary die Ortszeit trägt und
+                        # crew_live_state.pickup_utc_for_leg den echten UTC-
+                        # Zeitpunkt aus (HH:MM + Stations-TZ + Abflug)
+                        # rekonstruiert — inklusive Tagesabzug beim Wrap.
+                        if _berlin_day(_pu.get('pickup_utc')) != _berlin_day(
+                                ev.get('startTime')):
+                            _pst = st
+                        lines += ['BEGIN:VEVENT', f'UID:pu-{uid}',
+                                  f'DTSTART:{_pst}', f'DTEND:{_pst}',
+                                  f'SUMMARY:{_hh} LT Pickup {frm}',
+                                  'END:VEVENT']
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART:{st}', f'DTEND:{en}',
                           f'SUMMARY:{summary}',
@@ -1504,7 +2031,23 @@ def flightops_import(token):
     # Crew-Liste wiederfinden (COMMON_CREWLIST liefert pkNumber pro Mitglied).
     _store_own_pk(token, (resp.get('pkNumber') or '').strip()
                   if isinstance(resp, dict) else '')
-    ics = duty_events_to_ics(resp)
+    # ── HOTEL-PICKUP (Owner 2026-07-26: „Pickup-Zeiten verschwunden seit dem
+    # direkten FlightOps-Login") ────────────────────────────────────────────
+    # pickupTime lebt in COMMON_CREW_ROTATION, die rotationId liegt schon in
+    # dieser Duty-Events-Response. Nur Umläufe mit Layover-Rückflug im engen
+    # Horizont (_ROT_PICKUP_HORIZON_H, Begründung dort mit Zähler-Zahlen),
+    # dedupliziert pro rotationId, gecacht, mit Stunden-Notbremse. Schlägt
+    # etwas fehl, läuft der Roster-Import unverändert weiter — der Pickup ist
+    # eine Zugabe, nie eine Vorbedingung.
+    _pickups = None
+    try:
+        _rns = pickup_rotation_ids(resp)
+        if _rns:
+            _pickups = rotation_pickups_for(token, _rns)
+    except Exception as e:
+        log.warning('[lh_flightops] pickup lookup: %s', type(e).__name__)
+        _pickups = None
+    ics = duty_events_to_ics(resp, pickups=_pickups)
     if not ics:
         return jsonify({'ok': True, 'events_count': 0, 'source': 'flightops',
                         'detail': 'no_events'}), 200

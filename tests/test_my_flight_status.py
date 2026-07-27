@@ -21,6 +21,23 @@ import app as A
 from blueprints.aerox_data_blueprint import _derive_on_time
 import blueprints.aerox_data_blueprint as BP
 
+# Deterministische Test-Uhr (2026-07-27): `_setup_flying_friend` baut den
+# Roster-Tag aus `_date.today()` und die Leg-Zeiten relativ zu `_now()` — ohne
+# eingefrorene Uhr kippen die flights_live-Tests, sobald Prozess-TZ,
+# Berlin-Betriebstag und UTC nicht mehr auf demselben Kalendertag liegen.
+# Mechanik + WARUM: tests/_clock_freeze.py (FROZEN_UTC = 2026-07-16 10:00 UTC).
+from _clock_freeze import apply_frozen_clock  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _freeze_clock(monkeypatch):
+    import sys
+    # extra_modules: friert auch die hiesigen Modul-Globals `datetime`/`_date`
+    # ein — `_now()` (unten) liefert damit FROZEN_UTC statt der Wanduhr.
+    apply_frozen_clock(monkeypatch, extra_modules=(sys.modules[__name__],),
+                       app_module=A)
+    yield
+
 
 @pytest.fixture(autouse=True)
 def _clear_caches():

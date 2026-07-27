@@ -331,6 +331,23 @@ def test_beide_ohne_ts_snapshot_default():
 import app as A                                          # noqa: E402
 import blueprints.family_watch as FW                     # noqa: E402
 
+# Deterministische Test-Uhr (2026-07-27): Die Consumer-Wiring-Tests unten bauen
+# Roster-Tage aus `date.today()` + Zeiten relativ zu `datetime.now()` — ohne
+# eingefrorene Uhr kippen sie, sobald Prozess-TZ, Berlin-Betriebstag und UTC
+# nicht mehr auf demselben Kalendertag liegen. Mechanik + WARUM:
+# tests/_clock_freeze.py (FROZEN_UTC = 2026-07-16 10:00 UTC).
+from _clock_freeze import apply_frozen_clock             # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _freeze_clock(monkeypatch):
+    import sys
+    # extra_modules: friert auch die hiesigen Modul-Globals `datetime`/`_date`
+    # ein, damit Test-Eingaben und App dieselbe Uhr sehen.
+    apply_frozen_clock(monkeypatch, extra_modules=(sys.modules[__name__],),
+                       app_module=A)
+    yield
+
 
 @pytest.fixture(autouse=True)
 def _pin_app_module():

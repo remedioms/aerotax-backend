@@ -1317,3 +1317,651 @@ def test_groundduty_prose_only_for_an_exact_code():
     assert 'SUMMARY:MED B4 MUC' in ics
     assert 'Office Day' not in ics
     assert backend._summary_has_ground_duty('MED B4 MUC')
+
+
+# ── HOTEL-PICKUP aus COMMON_CREW_ROTATION ────────────────────────────────────
+# Owner-Fund 2026-07-26: die seit dem direkten FlightOps-Login fehlende
+# Pickup-Zeit steckt in COMMON_CREW_ROTATION (legs[].pickupTime/pickupTimeLT),
+# NICHT in COMMON_CHECK_IN_TIMES. Die beiden Payloads unten sind die ZWEI in
+# PROD gemessenen Faelle (RN 169929 DTW / RN 171012 KIX) — inklusive des
+# Mitternachts-Wraps, an dem eine naive Fassung zerbricht.
+
+def _rot_fixture():
+    import json as _json
+    import os as _os
+    p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                      'fixtures', 'flightops_COMMON_CREW_ROTATION.json')
+    with open(p) as f:
+        return _json.load(f)
+
+
+def test_parse_rotation_pickups_reads_the_real_repo_fixture():
+    """Echte COMMON_CREW_ROTATION-Response: nur Legs MIT pickupTime landen im
+    Dict, hotelName wird mitgenommen, das luegende `hotel`-Flag ignoriert."""
+    p = fo.parse_rotation_pickups(_rot_fixture())
+    # LH492 FRA-YVR (pickupTime gesetzt) und LH493 YVR-FRA (gesetzt) — je mit
+    # und ohne Flugnummer-Schluessel.
+    assert p[('LH492', 'FRA', 'YVR', '20260817')]['pickup_utc'] == '2026-08-17T09:10:00Z'
+    assert p[('LH493', 'YVR', 'FRA', '20260819')]['pickup_utc'] == '2026-08-19T21:05:00Z'
+    assert p[('', 'FRA', 'YVR', '20260817')]['station'] == 'FRA'
+    # hotelName mitgenommen, obwohl `hotel` im Payload False ist (Flag luegt) —
+    # und zwar der Name der ABFLUG-Station des Pickups: LH492 startet in FRA,
+    # dort hat die Crew genaechtigt, und dieser Name steht am HINFLUG-Leg
+    # LH117 MUC-FRA ('H9941671'). 'H9945745' ist das YVR-Hotel und gehoert an
+    # den YVR-Rueckflug, nicht hierhin.
+    assert p[('LH492', 'FRA', 'YVR', '20260817')]['hotel'] == 'H9941671'
+    assert p[('LH493', 'YVR', 'FRA', '20260819')]['hotel'] == 'H9945745'
+    assert _rot_fixture()['rotations'][0]['shifts'][1]['legs'][0]['hotel'] is False
+    # LH117 MUC-FRA und LH104 FRA-MUC haben pickupTime null → KEIN Eintrag.
+    assert not [k for k in p if k[0] == 'LH117']
+    assert not [k for k in p if k[0] == 'LH104']
+
+
+def test_parse_rotation_pickups_prod_shape_with_pickuptimelt():
+    """PROD-Shape mit fertiger Ortszeit (pickupTimeLT) — beide Owner-Messungen."""
+    resp = {"rotations": [{"rotationNumber": "169929", "shifts": [
+        {"shiftNumber": 1, "legs": [
+            {"flightDesignator": "LH443", "departureAirport": "DTW",
+             "arrivalAirport": "FRA", "depatureDate": "2026-07-26T20:00:00Z",
+             "pickupTime": "2026-07-26T18:00:00Z", "pickupTimeLT": "14:00",
+             "hotelName": "The Henry Hotel Dearborn", "hotel": False}]}]}]}
+    p = fo.parse_rotation_pickups(resp)
+    v = p[('LH443', 'DTW', 'FRA', '20260726')]
+    assert v['pickup_lt'] == '14:00'
+    assert v['pickup_utc'] == '2026-07-26T18:00:00Z'
+    assert v['hotel'] == 'The Henry Hotel Dearborn'
+
+
+def test_rot_hhmm_lt_accepts_both_shapes_and_rejects_nonsense():
+    assert fo._rot_hhmm_lt('2026-07-29T06:50:00') == '06:50'
+    assert fo._rot_hhmm_lt('06:50') == '06:50'
+    assert fo._rot_hhmm_lt('0650') == '06:50'
+    assert fo._rot_hhmm_lt('6:50') == '06:50'
+    for bad in ('', None, '2599', '25:99', 'abc', '24:00'):
+        assert fo._rot_hhmm_lt(bad) is None
+
+
+# RN 169929 · LH443 DTW→FRA · Abflug 26.07. 20:00Z · Pickup 18:00Z = 14:00 LT
+DUTY_DTW_PICKUP = {
+    "rosterDays": [
+        {"day": "2026-07-25Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH442", "wholeDay": False,
+             "startTime": "2026-07-25T09:50:00Z", "startLocation": "FRA",
+             "endTime": "2026-07-25T19:05:00Z", "endLocation": "DTW",
+             "eventAttributes": {"rotationId": 169929, "dayOfShift": 1}},
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False, "startTime": None,
+             "startLocation": "DTW", "endTime": None, "endLocation": None}]},
+        {"day": "2026-07-26Z", "events": [
+            {"eventType": "BRIEFING", "eventCategory": "briefing",
+             "eventDetails": "Briefing", "wholeDay": False,
+             "startTime": "2026-07-26T19:00:00Z", "startLocation": "DTW",
+             "endTime": None, "endLocation": None},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH443", "wholeDay": False,
+             "startTime": "2026-07-26T20:00:00Z", "startLocation": "DTW",
+             "endTime": "2026-07-27T04:10:00Z", "endLocation": "FRA",
+             "eventAttributes": {"rotationId": 169929, "dayOfShift": 2}}]},
+    ]
+}
+
+PICKUP_DTW = {('LH443', 'DTW', 'FRA', '20260726'): {
+    'pickup_utc': '2026-07-26T18:00:00Z', 'pickup_lt': '14:00',
+    'hotel': 'The Henry Hotel Dearborn', 'station': 'DTW'}}
+
+# RN 171012 · LH743 KIX→MUC · Abflug 29.07. 00:30Z · Pickup 28.07. 21:50Z =
+# 06:50 LT (KIX) — der MITTERNACHTS-WRAP: Pickup und Abflug liegen in
+# VERSCHIEDENEN Berlin-Kalendertagen.
+PICKUP_KIX = {('LH743', 'KIX', 'MUC', '20260729'): {
+    'pickup_utc': '2026-07-28T21:50:00Z', 'pickup_lt': '06:50',
+    'hotel': 'Hotel New Otani Osaka', 'station': 'KIX'}}
+
+
+def test_pickup_vevent_summary_is_read_by_the_parser():
+    """Ziel-Form „HH:MM LT Pickup XXX" — genau das, was parse_pickup_hhmm liest."""
+    from blueprints.crew_live_state import parse_pickup_hhmm
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=PICKUP_DTW)
+    assert 'SUMMARY:14:00 LT Pickup DTW' in ics
+    assert parse_pickup_hhmm('14:00 LT Pickup DTW') == (14, 0)
+    # Zeitbehaftetes Event am ECHTEN Pickup-Zeitpunkt (gleicher Berlin-Tag wie
+    # der Abflug → keine Verschiebung noetig).
+    assert 'DTSTART:20260726T180000Z' in ics
+    # Der Pickup steht VOR dem Flug-VEVENT (myTime-Reihenfolge im Tages-Summary).
+    assert ics.index('Pickup DTW') < ics.index('LH 443: DTW-FRA')
+
+
+def test_pickup_lands_on_the_days_summary_and_is_read_per_day():
+    """Ende-zu-Ende durch die echte Feed-Pipeline: der Pickup muss im
+    ical_summary DES RUECKFLUGTAGS stehen, denn _rc_pickup_hhmm liest pro TAG."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=PICKUP_DTW)
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(ics))[0]
+    day = b['2026-07-26']
+    assert 'Pickup DTW' in (day.get('ical_summary') or '')
+    assert backend._rc_pickup_hhmm(day) == '14:00'
+
+
+def test_pickup_midnight_wrap_lands_on_the_return_leg_day():
+    """RN 171012: Pickup 28.07. 21:50Z (Berlin 23:50 am 28.), Abflug 29.07.
+    00:30Z (Berlin 02:30 am 29.). Ein VEVENT am echten Pickup-Zeitpunkt fiele
+    auf den 28. — also auf den Layover-Tag statt auf den Rueckflug-Tag, und
+    der Tages-Leser fand ihn nie. DTSTART wird deshalb auf den Abflug gezogen;
+    die WAHRHEIT bleibt im Summary und wird unten exakt rekonstruiert."""
+    import app as backend
+    from blueprints.crew_live_state import parse_pickup_hhmm, pickup_utc_for_leg
+    assert fo._berlin_day('2026-07-28T21:50:00Z') == '2026-07-28'
+    assert fo._berlin_day('2026-07-29T00:30:00Z') == '2026-07-29'
+    ics = fo.duty_events_to_ics(DUTY_KIX_MULTINIGHT, pickups=PICKUP_KIX)
+    assert 'SUMMARY:06:50 LT Pickup KIX' in ics
+    assert 'DTSTART:20260728T215000Z' not in ics      # NICHT am 28. gebucketet
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(ics))[0]
+    assert 'Pickup KIX' in (b['2026-07-29'].get('ical_summary') or '')
+    assert backend._rc_pickup_hhmm(b['2026-07-29']) == '06:50'
+    # ...und NICHT am Layover-Tag davor (dort haette der echte Zeitpunkt
+    # gebucketet und der Tages-Leser haette ihn nie gefunden).
+    assert 'Pickup' not in (b['2026-07-28'].get('ical_summary') or '')
+    # Der echte UTC-Zeitpunkt ist aus dem Summary voll rekonstruierbar
+    # (Tagesabzug beim Wrap macht pickup_utc_for_leg selbst).
+    got = pickup_utc_for_leg(parse_pickup_hhmm('06:50 LT Pickup KIX'),
+                             '2026-07-29T00:30:00Z', 'Asia/Tokyo')
+    assert got.strftime('%Y-%m-%dT%H:%M:%SZ') == '2026-07-28T21:50:00Z'
+
+
+def test_no_pickup_value_means_no_pickup_event():
+    """Grundregel: nie raten. Ohne Wert kein Event — auch nicht aus dem
+    Briefing abgeleitet (DUTY_DTW_PICKUP hat ein Briefing um 19:00Z)."""
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    assert 'Pickup' not in ics
+    assert 'Briefing DTW' in ics
+    for empty in ({}, None, {('LH999', 'XXX', 'YYY', '20260726'): {}}):
+        assert 'Pickup' not in fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=empty)
+
+
+def test_pickup_disappears_again_when_lh_deletes_the_value():
+    """Florian: LH traegt spaet nach und LOESCHT spaeter wieder. Der Marker
+    darf nicht kleben — derselbe Roster ohne Wert ergibt kein Event."""
+    with_pu = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=PICKUP_DTW)
+    assert 'Pickup DTW' in with_pu
+    after_delete = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups={})
+    assert 'Pickup' not in after_delete
+
+
+def test_pickup_without_pickuptimelt_derives_station_local_time():
+    """Aeltere Service-Version ohne pickupTimeLT → Ortszeit aus dem UTC-Wert
+    an der ABFLUG-Station (DTW = America/Detroit, 18:00Z = 14:00 LT)."""
+    pu = {('LH443', 'DTW', 'FRA', '20260726'): {
+        'pickup_utc': '2026-07-26T18:00:00Z', 'pickup_lt': None,
+        'hotel': None, 'station': 'DTW'}}
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=pu)
+    assert 'SUMMARY:14:00 LT Pickup DTW' in ics
+
+
+def test_pickup_only_for_the_layover_return_never_the_homebase_departure():
+    """Am Homebase-Abflug liefert LH nie eine pickupTime; selbst wenn ein Wert
+    fuer das Hinflug-Leg dastuende, darf er nur an SEINEM Leg haengen."""
+    pu = dict(PICKUP_DTW)
+    pu[('LH442', 'FRA', 'DTW', '20260725')] = {
+        'pickup_utc': '2026-07-25T08:00:00Z', 'pickup_lt': '10:00',
+        'hotel': None, 'station': 'FRA'}
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=pu)
+    assert 'SUMMARY:10:00 LT Pickup FRA' in ics
+    assert 'SUMMARY:14:00 LT Pickup DTW' in ics
+    # und jeder Pickup steht direkt vor SEINEM Leg
+    assert ics.index('Pickup FRA') < ics.index('LH 442: FRA-DTW')
+    assert ics.index('Pickup DTW') < ics.index('LH 443: DTW-FRA')
+
+
+def test_pickup_leg_match_tolerates_a_day_shift_only_with_flightnumber():
+    """Verschiebt LH das Leg um einen Tag, matcht der Flugnummer-Schluessel
+    noch (+-1 Tag). OHNE Flugnummer darf das NICHT greifen, sonst matcht ein
+    taeglicher Umlauf auf dieselbe Route den falschen Tag."""
+    ok = {('LH443', 'DTW', 'FRA', '20260727'): {
+        'pickup_utc': '2026-07-26T18:00:00Z', 'pickup_lt': '14:00',
+        'hotel': None, 'station': 'DTW'}}
+    assert fo._pickup_for_leg(ok, 'LH443', 'DTW', 'FRA', '20260726T200000Z')
+    bad = {('', 'DTW', 'FRA', '20260727'): {
+        'pickup_utc': '2026-07-26T18:00:00Z', 'pickup_lt': '14:00',
+        'hotel': None, 'station': 'DTW'}}
+    assert fo._pickup_for_leg(bad, '', 'DTW', 'FRA', '20260726T200000Z') is None
+    # 2 Tage Versatz ist auch mit Flugnummer zu viel
+    far = {('LH443', 'DTW', 'FRA', '20260728'): {'pickup_utc': 'x'}}
+    assert fo._pickup_for_leg(far, 'LH443', 'DTW', 'FRA', '20260726T200000Z') is None
+
+
+# ── Welche Umlaeufe kosten einen Call? ───────────────────────────────────────
+
+def _now(iso):
+    from datetime import datetime, timezone
+    return datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+
+
+def test_pickup_rotation_ids_only_layover_returns_in_the_horizon():
+    """Nur Legs, die AB einer Hotel-Station starten und im Horizont liegen."""
+    # 26.07. 12:00Z → LH443 (26.07. 20:00Z ab DTW mit Hotel-Nacht) qualifiziert.
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
+                                 now=_now('2026-07-26T12:00:00')) == ['169929']
+    # Das Hinflug-Leg LH442 startet an FRA — dort liegt keine Hotel-Nacht →
+    # bei einem Fenster, das NUR den Hinflug enthaelt, faellt kein Call an.
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
+                                 now=_now('2026-07-25T06:00:00'),
+                                 horizon_h=6) == []
+    # Weit vorne: LH traegt den Wert erst ~1 Tag vorher nach → kein Call.
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
+                                 now=_now('2026-07-20T12:00:00')) == []
+    # Schon abgeflogen und ausserhalb des Rueckblicks → kein Call.
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
+                                 now=_now('2026-07-27T12:00:00')) == []
+
+
+def test_pickup_rotation_ids_keeps_a_just_departing_leg_in_the_lookback():
+    """Die Kachel „Dienst heute" liest den Marker bis zum Abflug — ein Leg, das
+    gerade weg ist, behaelt seinen Call im 3-h-Rueckblick."""
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
+                                 now=_now('2026-07-26T22:00:00')) == ['169929']
+
+
+def test_pickup_rotation_ids_dedupes_one_call_per_rotation():
+    """Mehrere Layover-Rueckfluege desselben Umlaufs = EIN Call."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-26Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+             "startTime": None, "startLocation": "JFK"},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH401", "wholeDay": False,
+             "startTime": "2026-07-26T18:00:00Z", "startLocation": "JFK",
+             "endTime": "2026-07-27T04:00:00Z", "endLocation": "FRA",
+             "eventAttributes": {"rotationId": 555}}]},
+        {"day": "2026-07-27Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+             "startTime": None, "startLocation": "FRA"},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH100", "wholeDay": False,
+             "startTime": "2026-07-27T09:00:00Z", "startLocation": "FRA",
+             "endTime": "2026-07-27T10:00:00Z", "endLocation": "MUC",
+             "eventAttributes": {"rotationId": 555}}]}]}
+    assert fo.pickup_rotation_ids(payload,
+                                 now=_now('2026-07-26T12:00:00')) == ['555']
+
+
+def test_pickup_rotation_ids_is_capped_and_ordered_earliest_first():
+    days = []
+    for i in range(11):
+        d = f'2026-07-{26 + (i // 4):02d}'
+        days.append({"day": f"{d}Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+             "startTime": None, "startLocation": "JFK"},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": f"LH{400 + i}", "wholeDay": False,
+             "startTime": f"{d}T{(i % 4) * 2 + 8:02d}:00:00Z",
+             "startLocation": "JFK", "endTime": f"{d}T23:00:00Z",
+             "endLocation": "FRA",
+             "eventAttributes": {"rotationId": 900 + i}}]})
+    got = fo.pickup_rotation_ids({"rosterDays": days},
+                                 now=_now('2026-07-26T06:00:00'))
+    # Kappe == _ROT_RN_PER_CALL: so viele passen in EINEN Call, mehr kostet
+    # nichts extra und mehr als 6 Layover-Rueckfluege in 30 h gibt es nicht.
+    assert len(got) == fo._ROT_MAX_PER_IMPORT == fo._ROT_RN_PER_CALL == 6
+    assert got == ['900', '901', '902', '903', '904', '905']
+
+
+def test_pickup_rotation_ids_needs_a_rotation_id_and_survives_garbage():
+    no_attr = {"rosterDays": [{"day": "2026-07-26Z", "events": [
+        {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+         "startTime": None, "startLocation": "DTW"},
+        {"eventType": "FLIGHT", "eventCategory": "flight",
+         "eventDetails": "LH443", "wholeDay": False,
+         "startTime": "2026-07-26T20:00:00Z", "startLocation": "DTW",
+         "endTime": "2026-07-27T04:00:00Z", "endLocation": "FRA"}]}]}
+    assert fo.pickup_rotation_ids(no_attr, now=_now('2026-07-26T12:00:00')) == []
+    assert fo.pickup_rotation_ids(None) == []
+    assert fo.pickup_rotation_ids({'rosterDays': 'nonsense'}) == []
+    assert fo.parse_rotation_pickups(None) == {}
+    assert fo.parse_rotation_pickups({'rotations': 'nonsense'}) == {}
+
+
+def test_pickup_rotation_ids_ignores_a_hotel_night_far_from_the_leg():
+    """Dieselbe Station, aber die Hotel-Nacht liegt Wochen entfernt → das ist
+    ein anderer Umlauf, kein Layover-Rueckflug. Kein Call."""
+    payload = {"rosterDays": [
+        {"day": "2026-07-02Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+             "startTime": None, "startLocation": "DTW"}]},
+        {"day": "2026-07-26Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH443", "wholeDay": False,
+             "startTime": "2026-07-26T20:00:00Z", "startLocation": "DTW",
+             "endTime": "2026-07-27T04:00:00Z", "endLocation": "FRA",
+             "eventAttributes": {"rotationId": 169929}}]}]}
+    assert fo.pickup_rotation_ids(payload, now=_now('2026-07-26T12:00:00')) == []
+
+
+# ── Cache / Kosten / Notbremse ───────────────────────────────────────────────
+
+def _rot_resp(*legs):
+    return {"rotations": [{"shifts": [{"legs": list(legs)}]}]}
+
+
+_LEG_DTW = {"flightDesignator": "LH443", "departureAirport": "DTW",
+            "arrivalAirport": "FRA", "depatureDate": "2026-07-26T20:00:00Z",
+            "pickupTime": "2026-07-26T18:00:00Z", "pickupTimeLT": "14:00",
+            "hotelName": "The Henry Hotel Dearborn"}
+
+
+def _reset_rot_state(monkeypatch):
+    monkeypatch.setattr(fo, '_rot_cache', {})
+    monkeypatch.setattr(fo, '_rot_budget_memo', [0.0, 0])
+    import blueprints.aerox_data_blueprint as adb
+    monkeypatch.setattr(adb, '_budget_key_used', lambda k: 0)
+
+
+def test_rotation_pickups_for_batches_all_misses_into_one_call(monkeypatch):
+    """COMMON_CREW_ROTATION nimmt bis 6 RNs pro Request. Alle Cache-Misses
+    eines Imports muessen in EINEN Call gehen — sonst reisst ein User mit 4
+    Umlaeufen 4 Calls in <1 s gegen das 5/s-Limit des Keys."""
+    _reset_rot_state(monkeypatch)
+    calls = []
+
+    def _rot(tok, *rns):
+        calls.append(rns)
+        return _rot_resp(_LEG_DTW)
+    monkeypatch.setattr(fo, 'crew_rotation', _rot)
+    got = fo.rotation_pickups_for('AT-X', ['1', '2', '3', '4', '1'])
+    assert calls == [('1', '2', '3', '4')]          # EIN Call, dedupliziert
+    assert got[('LH443', 'DTW', 'FRA', '20260726')]['pickup_lt'] == '14:00'
+    # zweiter Lauf komplett aus dem Cache
+    fo.rotation_pickups_for('AT-X', ['1', '2', '3', '4'])
+    assert len(calls) == 1
+
+
+def test_rotation_cache_is_scoped_per_token_not_per_rotation(monkeypatch):
+    """Die Rotations-Response ist ROLLENSPEZIFISCH (Coc/Cab: verschiedene
+    Hotels und Pickup-Zeiten). Ein Cache nur ueber die rotationId serviert dem
+    Kollegen der anderen Rolle fremde Werte."""
+    _reset_rot_state(monkeypatch)
+    calls = []
+    monkeypatch.setattr(fo, 'crew_rotation',
+                        lambda tok, *rns: calls.append(tok) or _rot_resp(_LEG_DTW))
+    fo.rotation_pickups_for('AT-COCKPIT', ['169929'])
+    fo.rotation_pickups_for('AT-CABIN', ['169929'])
+    assert calls == ['AT-COCKPIT', 'AT-CABIN']
+    fo.rotation_pickups_for('AT-COCKPIT', ['169929'])
+    assert calls == ['AT-COCKPIT', 'AT-CABIN']     # jetzt gecacht, pro Token
+
+
+def test_transient_lh_failure_is_not_negative_cached(monkeypatch):
+    """_api_get gibt bei HTTP 403/500/Timeout None zurueck und WIRFT NICHT. Als
+    „kein Pickup" gecacht haette ein einziger LH-Schluckauf den Marker 30 min
+    geloescht und beim Wiederauftauchen eine erfundene „Dienstplan-Aenderung"
+    gepusht. Nur eine echte, geparste Antwort darf cachen."""
+    _reset_rot_state(monkeypatch)
+    calls = []
+    monkeypatch.setattr(fo, 'crew_rotation',
+                        lambda tok, *rns: calls.append('fail') or None)
+    assert fo.rotation_pickups_for('AT-X', ['169929']) == {}
+    assert fo.rotation_pickups_for('AT-X', ['169929']) == {}
+    assert calls == ['fail', 'fail']                # KEIN Negativ-Cache
+    # ...und die Erholung kommt sofort an
+    monkeypatch.setattr(fo, 'crew_rotation',
+                        lambda tok, *rns: calls.append('ok') or _rot_resp(_LEG_DTW))
+    got = fo.rotation_pickups_for('AT-X', ['169929'])
+    assert got[('LH443', 'DTW', 'FRA', '20260726')]['pickup_lt'] == '14:00'
+
+
+def test_parsed_but_pickupless_rotation_is_cached(monkeypatch):
+    """Eine ECHTE Antwort ohne pickupTime darf cachen — sonst fragt jeder Sync
+    denselben Umlauf erneut ab."""
+    _reset_rot_state(monkeypatch)
+    calls = []
+    monkeypatch.setattr(fo, 'crew_rotation', lambda tok, *rns: (
+        calls.append(rns) or _rot_resp(
+            {"flightDesignator": "LH100", "departureAirport": "MUC",
+             "arrivalAirport": "FRA", "depatureDate": "2026-07-26T08:00:00Z",
+             "pickupTime": None})))
+    assert fo.rotation_pickups_for('AT-X', ['7']) == {}
+    assert fo.rotation_pickups_for('AT-X', ['7']) == {}
+    assert len(calls) == 1
+
+
+def test_rotation_pickups_for_never_raises(monkeypatch):
+    _reset_rot_state(monkeypatch)
+
+    def _boom(tok, *rns):
+        raise RuntimeError('LH down')
+    monkeypatch.setattr(fo, 'crew_rotation', _boom)
+    assert fo.rotation_pickups_for('AT-X', ['2']) == {}
+    assert fo.rotation_pickups_for('AT-X', []) == {}
+    assert fo.rotation_pickups_for('AT-X', None) == {}
+    assert fo.rotation_pickups_for('AT-X', 5) == {}          # nicht iterierbar
+    assert fo.rotation_pickups_for('AT-X', ['', None]) == {}
+
+
+def test_rotation_pickups_for_skips_calls_above_the_hour_ceiling(monkeypatch):
+    """Der Roster darf NIE an einem Pickup verhungern: steht der lhfo-Zaehler
+    diese Stunde hoch, fallen die Rotations-Calls komplett weg."""
+    import blueprints.aerox_data_blueprint as adb
+    _reset_rot_state(monkeypatch)
+    calls = []
+    monkeypatch.setattr(fo, 'crew_rotation',
+                        lambda tok, *rns: calls.append(rns) or _rot_resp(_LEG_DTW))
+    monkeypatch.setattr(adb, '_budget_key_used',
+                        lambda k: fo._ROT_LHFO_HOUR_CEILING + 1)
+    assert fo.rotation_pickups_for('AT-X', ['169929']) == {}
+    assert calls == []
+    monkeypatch.setattr(fo, '_rot_budget_memo', [0.0, 0])
+    monkeypatch.setattr(adb, '_budget_key_used', lambda k: 10)
+    fo.rotation_pickups_for('AT-X', ['169929'])
+    assert calls == [('169929',)]
+
+
+def test_hour_ceiling_lookup_is_memoized_off_the_hot_path(monkeypatch):
+    """_budget_key_used geht auf Supabase — einmal pro Minute genuegt, sonst
+    ~227 zusaetzliche SELECTs pro refresh-all-Lauf im Roster-Hot-Path."""
+    import blueprints.aerox_data_blueprint as adb
+    _reset_rot_state(monkeypatch)
+    hits = []
+    monkeypatch.setattr(adb, '_budget_key_used', lambda k: hits.append(k) or 0)
+    monkeypatch.setattr(fo, 'crew_rotation', lambda tok, *rns: _rot_resp(_LEG_DTW))
+    for i in range(5):
+        fo.rotation_pickups_for(f'AT-{i}', ['169929'])
+    assert len(hits) == 1
+
+
+def test_rotation_call_is_counted_under_its_own_caller_label(monkeypatch):
+    """Der neue Call muss von Anfang an im lhfo-Zaehler sichtbar sein —
+    Label kommt aus dem Pfad: lhfo:<YYYYMMDDHH>:common_crew_rotation."""
+    seen = []
+    import blueprints.lh_open_api as loa
+    monkeypatch.setattr(loa, 'budget_inc',
+                        lambda prefix, caller=None, units=1: seen.append((prefix, caller)))
+    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACCESS')
+    monkeypatch.setattr(fo.urllib.request, 'urlopen',
+                        lambda *a, **k: (_ for _ in ()).throw(OSError('no net')))
+    fo.crew_rotation('AT-X', '169929')
+    assert ('lhfo', 'COMMON_CREW_ROTATION') in seen
+
+
+# ── Haertungen aus dem adversarialen Review (2026-07-27) ─────────────────────
+
+def test_duplicate_route_on_one_day_drops_the_flightless_key():
+    """MUC-FRA-MUC-FRA ist ein alltaeglicher LH-Umlauf. Der flugnummernlose
+    Schluessel waere dort NICHT eindeutig — der Pickup des einen Legs landete
+    am anderen (sichtbar als „PU 15:00" an einem Tag, der 07:00 Ortszeit
+    beginnt), waehrend das Leg MIT echtem Pickup leer blieb."""
+    resp = {"rotations": [{"shifts": [{"legs": [
+        {"flightDesignator": "LH100", "departureAirport": "MUC",
+         "arrivalAirport": "FRA", "depatureDate": "2026-07-28T05:00:00Z",
+         "pickupTime": "2026-07-28T03:00:00Z", "pickupTimeLT": "05:00"},
+        {"flightDesignator": "LH101", "departureAirport": "FRA",
+         "arrivalAirport": "MUC", "depatureDate": "2026-07-28T09:00:00Z",
+         "pickupTime": None},
+        {"flightDesignator": "LH102", "departureAirport": "MUC",
+         "arrivalAirport": "FRA", "depatureDate": "2026-07-28T11:00:00Z",
+         "pickupTime": None}]}]}]}
+    p = fo.parse_rotation_pickups(resp)
+    assert ('LH100', 'MUC', 'FRA', '20260728') in p        # exakter Treffer bleibt
+    assert ('', 'MUC', 'FRA', '20260728') not in p         # Route ist 2x belegt
+    # → das Leg OHNE Pickup bekommt keinen fremden Wert angehaengt
+    assert fo._pickup_for_leg(p, 'LH102', 'MUC', 'FRA', '20260728T110000Z') is None
+    assert fo._pickup_for_leg(p, 'LH100', 'MUC', 'FRA', '20260728T050000Z')
+    # Eine EINMALIGE Route behaelt ihren flugnummernlosen Schluessel.
+    single = fo.parse_rotation_pickups({"rotations": [{"shifts": [{"legs": [
+        {"flightDesignator": "LH443", "departureAirport": "DTW",
+         "arrivalAirport": "FRA", "depatureDate": "2026-07-26T20:00:00Z",
+         "pickupTime": "2026-07-26T18:00:00Z"}]}]}]})
+    assert ('', 'DTW', 'FRA', '20260726') in single
+
+
+def test_duplicate_route_end_to_end_emits_no_bogus_pickup():
+    payload = {"rosterDays": [{"day": "2026-07-28Z", "events": [
+        {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+         "startTime": None, "startLocation": "MUC"},
+        {"eventType": "FLIGHT", "eventCategory": "flight",
+         "eventDetails": "LH100", "wholeDay": False,
+         "startTime": "2026-07-28T05:00:00Z", "startLocation": "MUC",
+         "endTime": "2026-07-28T06:00:00Z", "endLocation": "FRA"},
+        {"eventType": "FLIGHT", "eventCategory": "flight",
+         "eventDetails": "LH102", "wholeDay": False,
+         "startTime": "2026-07-28T11:00:00Z", "startLocation": "MUC",
+         "endTime": "2026-07-28T12:00:00Z", "endLocation": "FRA"}]}]}
+    pu = fo.parse_rotation_pickups({"rotations": [{"shifts": [{"legs": [
+        {"flightDesignator": "LH100", "departureAirport": "MUC",
+         "arrivalAirport": "FRA", "depatureDate": "2026-07-28T05:00:00Z",
+         "pickupTime": "2026-07-28T03:00:00Z", "pickupTimeLT": "05:00"},
+        {"flightDesignator": "LH102", "departureAirport": "MUC",
+         "arrivalAirport": "FRA", "depatureDate": "2026-07-28T11:00:00Z",
+         "pickupTime": None}]}]}]})
+    ics = fo.duty_events_to_ics(payload, pickups=pu)
+    assert ics.count('LT Pickup MUC') == 1
+
+
+def test_implausible_pickup_lead_is_refused():
+    """0…6 h vor dem Abflug — genau das Fenster, das der Konsument
+    (crew_live_state.pickup_utc_for_leg) ohnehin erzwingt. Was der still
+    verwirft, darf gar nicht erst in den Roster geschrieben werden: sonst zeigt
+    die App eine Zeit, die die Pre-Flight-Timeline nicht benutzt."""
+    assert fo._pickup_lead_ok('2026-07-26T18:00:00Z', '2026-07-26T20:00:00Z')
+    assert fo._pickup_lead_ok('2026-07-28T21:50:00Z', '2026-07-29T00:30:00Z')
+    assert fo._pickup_lead_ok('2026-07-26T14:00:00Z', '2026-07-26T20:00:00Z')  # 6h
+    # NACH dem Abflug
+    assert not fo._pickup_lead_ok('2026-07-26T21:00:00Z', '2026-07-26T20:00:00Z')
+    # 14 h Vorlauf
+    assert not fo._pickup_lead_ok('2026-07-26T06:00:00Z', '2026-07-26T20:00:00Z')
+    # 3 Tage alter Wert (Stale-Cache + -+1-Tag-Toleranz)
+    assert not fo._pickup_lead_ok('2026-07-23T18:00:00Z', '2026-07-26T20:00:00Z')
+    for bad in ((None, None), ('', '2026-07-26T20:00:00Z'), ('kaputt', 'x')):
+        assert not fo._pickup_lead_ok(*bad)
+    # ...und der Riegel greift im ICS-Pfad
+    for bad_pu in ('2026-07-27T03:00:00Z', '2026-07-26T04:00:00Z'):
+        pu = {('LH443', 'DTW', 'FRA', '20260726'): {
+            'pickup_utc': bad_pu, 'pickup_lt': '12:00', 'hotel': None,
+            'station': 'DTW'}}
+        assert 'Pickup' not in fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=pu)
+
+
+def test_pickup_time_utc_wins_over_a_disagreeing_pickuptimelt():
+    """Die angezeigte Ortszeit muss zu dem UTC-Wert passen, gegen den
+    plausibilisiert wurde. Ein LT, das nicht dazu passt (LH rendert es in
+    Base-TZ o. ae.), zeigte sonst eine falsche Zeit UND killte die
+    Pre-Flight-Timeline still (6-h-Fenster)."""
+    pu = {('LH443', 'DTW', 'FRA', '20260726'): {
+        'pickup_utc': '2026-07-26T18:00:00Z', 'pickup_lt': '20:00',
+        'hotel': None, 'station': 'DTW'}}
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP, pickups=pu)
+    # 18:00Z ist 14:00 in America/Detroit — nicht 20:00.
+    assert 'SUMMARY:14:00 LT Pickup DTW' in ics
+    assert '20:00 LT Pickup' not in ics
+
+
+def test_pickup_rotation_ids_reads_scalar_event_attributes():
+    """LH-Known-Issue: Ein-Element-Arrays kommen als Skalar. Defensiv in BEIDE
+    Richtungen — als [{...}] gerendert waere das Feature sonst lautlos dunkel."""
+    for attrs in ({"rotationId": 901}, [{"rotationId": 901}]):
+        payload = {"rosterDays": [{"day": "2026-07-26Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+             "startTime": None, "startLocation": "DTW"},
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH443", "wholeDay": False,
+             "startTime": "2026-07-26T20:00:00Z", "startLocation": "DTW",
+             "endTime": "2026-07-27T04:00:00Z", "endLocation": "FRA",
+             "eventAttributes": attrs}]}]}
+        assert fo.pickup_rotation_ids(
+            payload, now=_now('2026-07-26T12:00:00')) == ['901']
+
+
+def test_pickup_for_leg_survives_garbage_input():
+    assert fo._pickup_for_leg(None, 'LH1', 'AAA', 'BBB', '20260726T000000Z') is None
+    assert fo._pickup_for_leg('nonsense', 'LH1', 'AAA', 'BBB', '20260726T000000Z') is None
+    assert fo._pickup_for_leg({}, 'LH1', None, 'BBB', '20260726T000000Z') is None
+    assert fo._pickup_for_leg({('a',): 1}, 'LH1', 'AAA', 'BBB', None) is None
+
+
+def test_repo_fixture_second_wrap_case_end_to_end():
+    """Die Repo-Fixture traegt einen ZWEITEN, nicht dokumentierten Wrap-Fall:
+    LH493 YVR-FRA, Pickup 19.08. 21:05Z (Berlin 23:05 am 19.), Abflug 23:15Z
+    (Berlin 01:15 am 20.). Er muss auf dem 20. landen und exakt rekonstruierbar
+    sein."""
+    import app as backend
+    from blueprints.crew_live_state import parse_pickup_hhmm, pickup_utc_for_leg
+    p = fo.parse_rotation_pickups(_rot_fixture())
+    payload = {"rosterDays": [
+        {"day": "2026-08-17Z", "events": [
+            {"eventType": "HOTEL", "eventCategory": "hotel", "wholeDay": False,
+             "startTime": None, "startLocation": "YVR"}]},
+        {"day": "2026-08-20Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH493", "wholeDay": False,
+             "startTime": "2026-08-19T23:15:00Z", "startLocation": "YVR",
+             "endTime": "2026-08-20T08:55:00Z", "endLocation": "FRA"}]}]}
+    ics = fo.duty_events_to_ics(payload, pickups=p)
+    assert 'LT Pickup YVR' in ics
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(ics))[0]
+    hh = backend._rc_pickup_hhmm(b['2026-08-20'])
+    assert hh == '14:05'
+    got = pickup_utc_for_leg(parse_pickup_hhmm(f'{hh} LT Pickup YVR'),
+                             '2026-08-19T23:15:00Z', 'America/Vancouver')
+    assert got.strftime('%Y-%m-%dT%H:%M:%SZ') == '2026-08-19T21:05:00Z'
+
+
+def test_hotelname_is_paired_from_the_outbound_leg():
+    """Live gemessen (2026-07-27, 24 PROD-Legs): hotelName haengt am HINFLUG
+    (arrivalAirport = Hotel-Station), pickupTime am RUECKFLUG — NIE am selben
+    Leg. Ein Parser, der nur Pickup-Legs ansieht, verliert jeden Hotelnamen."""
+    resp = {"rotations": [{"shifts": [
+        {"legs": [{"flightDesignator": "LH424", "departureAirport": "MUC",
+                   "arrivalAirport": "BOS",
+                   "depatureDate": "2026-07-25T13:00:00Z",
+                   "pickupTime": None, "hotelName": "Hyatt Regency Boston",
+                   "hotel": False}]},
+        {"legs": [{"flightDesignator": "LH425", "departureAirport": "BOS",
+                   "arrivalAirport": "MUC",
+                   "depatureDate": "2026-07-27T00:00:00Z",
+                   "pickupTime": "2026-07-26T22:15:00Z",
+                   "pickupTimeLT": "18:15", "hotelName": None,
+                   "hotel": False}]}]}]}
+    p = fo.parse_rotation_pickups(resp)
+    v = p[('LH425', 'BOS', 'MUC', '20260727')]
+    assert v['hotel'] == 'Hyatt Regency Boston'
+    assert v['station'] == 'BOS'
+    assert v['pickup_lt'] == '18:15'
+    # Das Hinflug-Leg selbst hat keinen Pickup → taucht nicht auf.
+    assert not [k for k in p if k[0] == 'LH424']
+
+
+def test_hotelname_does_not_leak_across_stations():
+    """Zwei Layover in einem Umlauf → jede Station behaelt IHREN Namen."""
+    resp = {"rotations": [{"shifts": [
+        {"legs": [{"flightDesignator": "LH1", "departureAirport": "FRA",
+                   "arrivalAirport": "LIS", "depatureDate": "2026-07-25T06:00:00Z",
+                   "pickupTime": None, "hotelName": "Altis Grand Hotel"},
+                  {"flightDesignator": "LH2", "departureAirport": "LIS",
+                   "arrivalAirport": "WAW", "depatureDate": "2026-07-26T06:00:00Z",
+                   "pickupTime": "2026-07-26T03:40:00Z", "pickupTimeLT": "03:40",
+                   "hotelName": "Mercure Warszawa Grand"},
+                  {"flightDesignator": "LH3", "departureAirport": "WAW",
+                   "arrivalAirport": "FRA", "depatureDate": "2026-07-27T06:00:00Z",
+                   "pickupTime": "2026-07-27T03:15:00Z", "pickupTimeLT": "05:15",
+                   "hotelName": None}]}]}]}
+    p = fo.parse_rotation_pickups(resp)
+    assert p[('LH2', 'LIS', 'WAW', '20260726')]['hotel'] == 'Altis Grand Hotel'
+    assert p[('LH3', 'WAW', 'FRA', '20260727')]['hotel'] == 'Mercure Warszawa Grand'

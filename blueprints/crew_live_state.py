@@ -215,21 +215,40 @@ def pickup_utc_for_leg(hhmm, dep_iso, tzname):
     Kalendertag des Abflugs; liegt das Ergebnis NACH dem Abflug
     (Mitternachts-Wrap: Pickup 23:00, Abflug 00:30), wird ein Tag abgezogen.
     Plausibilität wie iOS (maxLeadWindow): Pickup muss binnen 6 h VOR dem
-    Plan-Abflug liegen, sonst None (nie geratene Zeiten). Wirft nie."""
+    Plan-Abflug liegen, sonst None (nie geratene Zeiten). Wirft nie.
+
+    DST-FIX 2026-07-27: Die alte Fassung rechnete Wanduhr-Arithmetik — an
+    DST-Kanten doppelt falsch: (1) `replace()` erbt `fold=0` und löst eine
+    ambige Herbst-Doppelstunde immer zur ERSTEN Vorkommnis auf (1 h zu früh,
+    wenn der reale Pickup nach dem Zurückstellen lag); (2) das 6-h-Fenster
+    verglich Wanduhr- statt Absolutdifferenz — im Frühjahr wurde ein realer
+    5-h-55-Vorlauf als 6 h 55 gerechnet und der legitime Pickup still
+    verworfen (bzw. im Herbst ein realer 6-h-45-Vorlauf durchgelassen).
+    Jetzt: Kandidaten (Abflugtag + Vortag, je fold 0/1) → alles in echtes
+    UTC → Fenster + Auswahl in ABSOLUTER Differenz; gewählt wird der
+    SPÄTESTE plausible Pickup vor dem Abflug."""
     try:
         dep = _parse_iso(dep_iso)
         if dep is None or not tzname or not hhmm:
             return None
         from zoneinfo import ZoneInfo
-        dep_local = dep.astimezone(ZoneInfo(str(tzname)))
-        p = dep_local.replace(hour=int(hhmm[0]), minute=int(hhmm[1]),
-                              second=0, microsecond=0)
-        if p > dep_local:
-            p -= _dt.timedelta(days=1)
-        lead_min = (dep_local - p).total_seconds() / 60.0
-        if not (0 <= lead_min <= _PRE_LEAD_MAX_MIN):
-            return None
-        return p.astimezone(_dt.timezone.utc)
+        tz = ZoneInfo(str(tzname))
+        dep_local = dep.astimezone(tz)
+        dep_utc = dep.astimezone(_dt.timezone.utc)
+        best = None
+        for day_back in (0, 1):
+            # Wanduhr-Verschiebung um ganze Tage (aware+timedelta = naive
+            # Wanduhr-Arithmetik, hier gewollt: „gleiche Uhrzeit am Vortag").
+            base = dep_local - _dt.timedelta(days=day_back)
+            wall = base.replace(hour=int(hhmm[0]), minute=int(hhmm[1]),
+                                second=0, microsecond=0)
+            for fold in (0, 1):
+                cand = wall.replace(fold=fold).astimezone(_dt.timezone.utc)
+                lead_min = (dep_utc - cand).total_seconds() / 60.0
+                if 0 <= lead_min <= _PRE_LEAD_MAX_MIN:
+                    if best is None or cand > best:
+                        best = cand
+        return best
     except Exception:
         return None
 

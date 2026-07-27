@@ -907,6 +907,25 @@ def lh_mqtt_event():
             except Exception as e:
                 log.warning('[lh_mqtt] push fail %s: %s', flight_disp,
                             type(e).__name__)
+    # LIVE-ACTIVITY-FANOUT (P7-Verdrahtung 2026-07-27, s. Push-Notifications.md
+    # „Noch nicht verdrahtet"): aktualisiert die Lockscreen-Karte der WIRKLICH
+    # betroffenen Crews. `push_for_affected` gate't selbst (leeres `affected`
+    # oder nicht anzeige-relevante Event-Art → 0) — hier gilt also „nur wenn
+    # jemand betroffen ist". BEWUSST GETRENNT vom Inbound-Watch unten: der
+    # abonniert absichtlich auch Zubringer-Maschinen, die in KEINEM Roster
+    # stehen (`affected` dort per Definition leer) — dort darf ein
+    # Betroffenheits-Gate nie eingebaut werden, und Live-Activities gibt es
+    # dort nicht. Zähler getrennt von `pushed` (Alert-Pushes), damit die
+    # Event-Statistik vergleichbar bleibt.
+    la_sent = 0
+    if affected:
+        try:
+            from blueprints.live_activity import push_for_affected
+            la_sent = push_for_affected(affected, kind, flight_disp,
+                                        topic_date, facts=facts or None)
+        except Exception as e:
+            log.warning('[lh_mqtt] live-activity fanout fail %s: %s',
+                        flight_disp, type(e).__name__)
     if kind in ('departed', 'arrived', 'est_dep'):
         # Inbound-Watch: diese Maschine ist der Zubringer für wen? est_dep
         # zusätzlich zur Direkt-Crew — der Zubringer eines ANDEREN Legs kann
@@ -919,10 +938,10 @@ def lh_mqtt_event():
                         type(e).__name__)
 
     _record_event(topic, kind, len(affected), pushed)
-    log.info('[lh_mqtt] event %s kind=%s users=%d pushed=%d', topic, kind,
-             len(affected), pushed)
+    log.info('[lh_mqtt] event %s kind=%s users=%d pushed=%d la=%d', topic,
+             kind, len(affected), pushed, la_sent)
     return jsonify({'ok': True, 'kind': kind, 'users': len(affected),
-                    'pushed': pushed})
+                    'pushed': pushed, 'la_sent': la_sent})
 
 
 @lh_mqtt_bp.route('/api/lh/mqtt/status', methods=['GET'])

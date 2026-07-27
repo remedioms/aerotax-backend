@@ -110,7 +110,9 @@ for _bp_path, _bp_name in [
     ('blueprints.legal_consent_blueprint',   'legal_consent_bp'),  # versioniertes accountgebundenes Consent-Ledger
     ('blueprints.lh_open_api',               'lh_open_bp'),  # LH Open API — autoritative Flug-Fakten (free-first, Engine A)
     ('blueprints.lh_flightops',              'lh_flightops_bp'),  # LH FlightOps Crew API — Roster-Quelle (Engine B, Mock-Gerüst)
+    ('blueprints.daily_briefing',            'daily_briefing_bp'),  # Daily Briefing nach Florians Spez (P10, README = fachliche Wahrheit)
     ('blueprints.lh_mqtt',                   'lh_mqtt_bp'),  # LH MQTT-Push-Notifications — Topics/Event-Fanout (Engine A2)
+    ('blueprints.live_activity',             'live_activity_bp'),  # Live Activities — ActivityKit-Token-Registry + APNs-Push (P6)
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
@@ -550,6 +552,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/ax/turnaround/',            # /<token> → nächster Sektor / Bodenzeit
     '/api/ax/flight-recap/',          # /<token> → Post-Flight-Wahrheit
     '/api/ax/my-flight-status/',      # /<token> → eigener Tail + Pünktlich-Verdikt
+    '/api/ax/daily-briefing/',        # /<token> → Crew-Namen/PKs + Hotel/Pickup (P10)
 )
 
 
@@ -18766,7 +18769,17 @@ def _rc_field_changed(av, bv):
 
 def _rc_meaningfully_modified(a, b):
     """Substanz-Check zweier Roster-Tage (Kern von _compute_roster_diff,
-    modul-weit hoisted damit das Pickup-Rauschen-Gate ihn wiederverwenden kann)."""
+    modul-weit hoisted damit das Pickup-Rauschen-Gate ihn wiederverwenden kann).
+
+    ERWEITERT (Florian-Whitelist 2026-07-27): Vorher lösten Sektor-Änderungen
+    für sich allein GAR KEINEN Change aus — ein reiner Erst-Abflug-Shift oder
+    ein PU-Wechsel ohne begleitende start_time-/routing-Änderung war für Diff,
+    Liste UND Push unsichtbar. Jetzt zählen zusätzlich: Leg-Struktur
+    (Flugnummern+Stationen, ohne Zeiten), die station-lokale Abflugzeit des
+    ERSTEN Legs (nur wenn beidseitig auflösbar) und die Pickup-Zeit (nur
+    gefüllt↔gefüllt bzw. neu — reines PU-Löschen bleibt hier draußen, das ist
+    LH-Hygiene). Bewusst NICHT dabei: arr_iso/Zwischen-Leg-Zeiten
+    (Blockzeiten-Pflege wäre sonst wieder eine Diff-Flut)."""
     arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
     # klass: Case/Whitespace-normalisiert (auch leer↔gefüllt): ein Tag wird
     # Tour / verliert Tour. „Z76" == „z76", aber Tour↔Frei bleibt echt.
@@ -18778,6 +18791,20 @@ def _rc_meaningfully_modified(a, b):
                    (arf.get('layover_ort'), brf.get('layover_ort'))):
         if _rc_field_changed(af, bf):
             return True
+    try:
+        sa_, sb_ = _rc_sector_structure(a), _rc_sector_structure(b)
+        if sa_ and sb_ and sa_ != sb_:
+            return True           # Legs kommen/gehen bzw. andere Flüge
+            # (leer↔gefüllt zählt NICHT — das ist Sektoren-Anreicherung beim
+            # ersten Sync nach einem Backend-Parse-Upgrade, keine Änderung)
+        da, db = _rc_first_dep_local_hhmm(a), _rc_first_dep_local_hhmm(b)
+        if da and db and da != db:
+            return True           # erster Abflug verschoben
+        pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
+        if pb and pa != pb:
+            return True           # Pickup neu oder verschoben
+    except Exception:
+        pass
     return False
 
 
@@ -18995,15 +19022,14 @@ def take_roster_snapshot(token):
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
     if diff:
         try:
-            # PUSH-GATES (Flo Z 2026-07-20) — die in-App-Liste behält ALLE
-            # Changes (oben schon persistiert), nur der Push wird gefiltert:
-            #   1) Vergangenheit (Tag < heute Homebase-lokal): Tour vorbei,
-            #      nichts mehr zu entscheiden → still.
-            #   2) Pickup-Abbau: LH entfernt die PU-Zeit nach der Tour aus
-            #      MyTime (reine Hygiene) → still, solange sonst nichts anders.
-            #   3) Blockzeiten-Drift (Florian 2026-07-24): gleiche Legs, gleiche
-            #      PU, gleicher erster Abflug, gleiches Briefing — nur Minuten-
-            #      Pflege an End-/Zwischenzeiten → still.
+            # PUSH-GATES — die in-App-Liste behält ALLE Changes (oben schon
+            # persistiert), nur der Push wird gefiltert:
+            #   1) Vergangenheit (Tag < heute Homebase-lokal, inkl. Ist-Zeiten-
+            #      Nachtrag nach Dienstende): Tour vorbei → still.
+            #   2) WHITELIST (Florian 2026-07-26, ersetzt die alten Gates 2+3):
+            #      Push NUR bei PU-Zeit neu/geändert, erstem Abflug, Klasse,
+            #      Routing/Legs, Layover-Ort oder Tag neu/entfallen — reine
+            #      Blockzeiten-Pflege und reines PU-Löschen bleiben still.
             _now_hhmm = None
             try:
                 _now_hhmm = (_airport_local_now(_hb).strftime('%H:%M')
@@ -19012,8 +19038,7 @@ def take_roster_snapshot(token):
                 _now_hhmm = datetime.now().strftime('%H:%M')
             push_diff = [c for c in diff
                          if not _roster_change_is_past(c, _today_ymd, _now_hhmm)
-                         and not _roster_change_is_pickup_prune(c)
-                         and not _roster_change_is_blocktime_drift(c)]
+                         and _roster_change_is_push_worthy(c)]
             n = len(push_diff)
             # PUSH-INHALT: konkrete erste Änderung („Di 22.07.: LH440 FRA-IAH
             # neu" / „Mo 21.07.: Briefing 09:40 → 10:15") + „(+N weitere)".
@@ -19122,13 +19147,25 @@ def _rc_sector_fingerprint(day):
     return out
 
 
+def _rc_flight_norm(v):
+    """Flugnummer für Struktur-Vergleiche normalisieren: Spaces raus, upper,
+    führende Nullen der Nummer weg („LH 0839" == „LH839" == „lh0839"). Ein
+    Quellen-seitiger Padding-Flip ist KEIN Leg-Tausch (P7-Review 2026-07-27 —
+    seit der Push-Whitelist wäre er sonst erstmals push-wirksam)."""
+    fn = str(v or '').replace(' ', '').upper()
+    m = re.match(r'^([A-Z0-9]{2}[A-Z]?)(\d{1,4})$', fn)
+    if m:
+        return f'{m.group(1)}{int(m.group(2))}'
+    return fn
+
+
 def _rc_sector_structure(day):
     """Struktur-Fingerprint der Flüge OHNE Zeiten (Flugnummer + Stationen) —
     fürs Blockzeiten-Drift-Gate: gleiche Legs, nur Zeiten gedriftet."""
     out = []
     for s in ((day or {}).get('ical_sectors') or []):
         if isinstance(s, dict):
-            out.append((str(s.get('flight') or '').replace(' ', '').upper(),
+            out.append((_rc_flight_norm(s.get('flight')),
                         str(s.get('from') or '').upper(),
                         str(s.get('to') or '').upper()))
     return out
@@ -19252,6 +19289,78 @@ def _roster_change_is_pickup_prune(change):
         return not _rc_meaningfully_modified(a_neutral, b)
     except Exception:
         return False
+
+
+def _roster_change_is_push_worthy(change):
+    """PUSH-WHITELIST (Florian 2026-07-26: „Derzeit wird jede Änderung von
+    MyTime angezeigt … Besser: nur wenn sich die PU-Zeit oder die Abflugzeit
+    vom ersten Flug des Tages ändert"). Ersetzt die alte BLACKLIST aus
+    `_roster_change_is_pickup_prune` + `_roster_change_is_blocktime_drift` im
+    Push-Pfad (die Funktionen bleiben für die in-App-Diff-Semantik erhalten,
+    werden im Push aber nicht mehr benutzt). Die Blacklist hatte zwei Löcher:
+      A) „PU gelöscht UND Ist-Zeiten nachgetragen im selben Update" (der
+         LH-Normalfall) passierte BEIDE Gates — das Prune-Gate stieg am
+         Zeiten-Fingerprint aus, das Drift-Gate am PU-Wegfall.
+      B) Tage OHNE ical_sectors (Standby/Ground) wurden nie unterdrückt —
+         dort pushte jede end_time-Minutenpflege.
+    Ein Push geht NUR raus, wenn mindestens eines zutrifft:
+      · Tag entsteht oder verschwindet (kind added/removed),
+      · Klasse (`klass`) ändert sich,
+      · Routing: Legs kommen/gehen bzw. Flugnummern/Stationen ändern sich
+        (`_rc_sector_structure`, bewusst OHNE Zeiten) oder das
+        `routing`-Freitextfeld ändert sich,
+      · Layover-Ort ändert sich,
+      · Pickup-Zeit NEU oder GEÄNDERT (reines PU-Löschen = LH-Hygiene → still),
+      · Abflugzeit des ersten Legs (station-lokal, nur wenn beidseitig
+        auflösbar),
+      · Loch-B-Analog: an Tagen OHNE Legs ist `start_time` die tragende Zeit
+        (Standby-Beginn/Meldezeit) — ihre Änderung pusht; end_time-Pflege
+        bleibt auch dort still.
+    Reine end_time-/Blockzeiten-/Zwischen-Leg-Zeiten-Pflege: KEIN Push. Die
+    in-App-Änderungsliste behält weiterhin ALLE Changes. Wirft nie — im
+    Fehlerfall True (lieber ein Push zu viel als eine echte Änderung still)."""
+    try:
+        kind = (change or {}).get('kind')
+        if kind != 'modified':
+            return True           # added/removed (und Unbekanntes): immer Push
+        a = change.get('old') if isinstance(change.get('old'), dict) else {}
+        b = change.get('new') if isinstance(change.get('new'), dict) else {}
+        if _rc_norm_cmp(a.get('klass')) != _rc_norm_cmp(b.get('klass')):
+            return True           # Klassenwechsel (Flug↔Standby↔Frei …)
+        sa, sb_ = _rc_sector_structure(a), _rc_sector_structure(b)
+        if sa and sb_ and sa != sb_:
+            return True           # Legs kommen/gehen bzw. andere Flüge
+            # (leer↔gefüllt = Sektoren-Anreicherung, keine echte Änderung —
+            # gleiche Semantik wie _rc_field_changed / Diff-Trigger)
+        arf = (a.get('reader_facts') or {})
+        brf = (b.get('reader_facts') or {})
+        if _rc_field_changed(a.get('routing'), b.get('routing')):
+            return True           # Routing-Freitext (auch sektorlose Feeds)
+        if _rc_field_changed(arf.get('layover_ort'), brf.get('layover_ort')):
+            return True           # anderer Layover-Ort
+        pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
+        if pb and pa != pb:
+            return True           # Pickup neu oder verschoben
+        da, db = _rc_first_dep_local_hhmm(a), _rc_first_dep_local_hhmm(b)
+        if da and db and da != db:
+            return True           # erster Abflug verschoben
+        if not sa and not sb_ and _rc_field_changed(arf.get('start_time'),
+                                                    brf.get('start_time')):
+            return True           # Standby-/Meldezeit-Shift ohne Legs
+        if sa and sb_ and not pa and not pb \
+                and _rc_field_changed(arf.get('start_time'),
+                                      brf.get('start_time')):
+            return True           # Meldezeit-Shift an Sektor-Tagen OHNE
+                                  # Pickup-Quelle (Homebase-Report: „Crew muss
+                                  # früher da sein" — Security/De-Icing/Sonder-
+                                  # Briefing; P7-Review-Fund E1). MIT Pickup
+                                  # bleibt die PU die tragende Zeit — und der
+                                  # PU-Abbau-Fall (start_time fällt auf die
+                                  # Briefing-Zeit zurück) bleibt still, weil
+                                  # dort pa gesetzt ist.
+        return False              # Rest = Blockzeiten-/PU-Abbau-Rauschen
+    except Exception:
+        return True
 
 
 _RC_WEEKDAYS_DE = ('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So')
@@ -24327,15 +24436,40 @@ def _crew_hotel_token_hash(token):
 
 
 def _crew_hotel_dir_serve(airline):
-    """Approved+active Crewhotels EINER Airline. [] bei fehlender Airline/DB."""
+    """Approved+active Crewhotels EINER Airline. [] bei fehlender Airline/DB.
+
+    ANZEIGE-REGEL (Owner 27.07.2026, Daily-Briefing-Runde): trägt ein Eintrag
+    einen von LH bestätigten offiziellen Klarnamen (`official_name`, aus
+    COMMON_CREW_ROTATION angereichert — blueprints/daily_briefing.py), gewinnt
+    DER für die Anzeige. Der crowdgesourcte `hotel`-Wert bleibt in der Tabelle
+    unverändert (Schlüssel für Transferzeit/Votes/ilike-Dedupe) und reist als
+    `hotel_crowd` mit; `official: true` markiert die Herkunft. iOS dekodiert
+    nur `hotel` → die Layover-Karte zeigt den offiziellen Namen ohne
+    App-Update. Migration 20260727_crew_hotel_official_name; Fallback auf die
+    alte Spaltenliste, falls die Spalte (Dev-DB) fehlt."""
     a = (airline or '').strip().upper()
     if not a or not SB_AVAILABLE:
         return []
     try:
-        r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
-            'iata,base,hotel,transfer_min,votes').eq('airline', a).eq(
-            'status', 'approved').eq('active', True).limit(3000).execute()
-        return r.data or []
+        try:
+            r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
+                'iata,base,hotel,transfer_min,votes,official_name').eq(
+                'airline', a).eq(
+                'status', 'approved').eq('active', True).limit(3000).execute()
+        except Exception:
+            r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
+                'iata,base,hotel,transfer_min,votes').eq('airline', a).eq(
+                'status', 'approved').eq('active', True).limit(3000).execute()
+        out = []
+        for row in (r.data or []):
+            row = dict(row)
+            official = (row.pop('official_name', None) or '').strip()
+            if official and official != (row.get('hotel') or '').strip():
+                row['hotel_crowd'] = row.get('hotel')
+                row['hotel'] = official
+                row['official'] = True
+            out.append(row)
+        return out
     except Exception as e:
         print(f"[crew-hotel] serve fail: {e}")
         return []
@@ -25572,6 +25706,77 @@ def _trip_stats_compute(token):
             for tg in targets:
                 tg['aircraft_regs'][ac_reg] += 1
 
+    # FLUGBUCH-IMPORT einmischen (Kevin 2026-07-26: „Statistik zeigt nur Werte
+    # seit App-Nutzung" — Commit 1e170dd hat nur den Crew-Passport gefixt, die
+    # Trip-Stats-Hälfte blieb offen). Importierte Karriere-Legs zählen in
+    # Flüge/Distanz/Länder/Flugstunden/Airline/Muster mit. Dedupe: das Roster
+    # GEWINNT — ein Import-Leg wird übersprungen, wenn der Roster-Tag dieselbe
+    # Strecke (date + from-to aus dem routing-String) schon trägt. Bewusst
+    # OHNE Mutation der geladenen Strukturen (kein data[d]-in-place wie im
+    # Passport-Merge): alles fließt nur in die lokalen Akkumulatoren — damit
+    # ist der Pfad auch gegen einen künftigen Loader-Prozess-Cache sicher.
+    imported_leg_count = 0
+    try:
+        _imp = _logbook_import_load(token) or {}
+        _imp_legs = _imp.get('legs') or []
+        if _imp_legs:
+            roster_pairs = set()
+            for t in tage:
+                if not isinstance(t, dict):
+                    continue
+                d = (t.get('datum') or '')[:10]
+                parts = [pp.strip().upper() for pp in (t.get('routing') or '').split('-')
+                         if pp and len(pp.strip()) == 3]
+                for a, b in zip(parts[:-1], parts[1:]):
+                    roster_pairs.add(f'{d}|{a}|{b}')
+            for L in _imp_legs:
+                if not isinstance(L, dict):
+                    continue
+                d = (L.get('date') or '')[:10]
+                frm = (L.get('from') or '').strip().upper()
+                to = (L.get('to') or '').strip().upper()
+                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d) \
+                        or len(frm) != 3 or len(to) != 3:
+                    continue
+                if f'{d}|{frm}|{to}' in roster_pairs:
+                    continue          # Roster trägt die Strecke schon → gewinnt
+                try:
+                    year = int(d[:4])
+                except ValueError:
+                    continue
+                imported_leg_count += 1
+                ym = d[:7]
+                targets = [life]
+                if year == current_year:
+                    targets.append(ytd)
+                ca, cb = ap_lookup.get(frm), ap_lookup.get(to)
+                for tg in targets:
+                    tg['flights'] += 1
+                    if ca and cb:
+                        tg['distance_km'] += _haversine_km(ca[0], ca[1], cb[0], cb[1])
+                    for ent in (ca, cb):
+                        if ent and ent[2]:
+                            tg['countries'].add(ent[2])
+                monthly_flights[ym] = monthly_flights.get(ym, 0) + 1
+                bm = L.get('block_min')
+                if isinstance(bm, (int, float)) and 0 < bm < 20 * 60:
+                    for tg in targets:
+                        tg['hours_flown_min'] += int(bm)
+                    monthly_hours[ym] = monthly_hours.get(ym, 0.0) + bm / 60.0
+                fn = (L.get('flight') or '').strip().upper()
+                airline = ''.join(c for c in fn if c.isalpha())[:3] if fn else ''
+                ac_type = (L.get('type') or '').strip().upper()
+                ac_reg = (L.get('reg') or '').strip().upper()
+                for tg in targets:
+                    if airline:
+                        tg['airlines'][airline] += 1
+                    if ac_type:
+                        tg['aircraft_types'][ac_type] += 1
+                    if ac_reg:
+                        tg['aircraft_regs'][ac_reg] += 1
+    except Exception:
+        pass
+
     # Tour/Layover-Längen + fastest turn
     cur_tour_len = 0
     cur_tour_routing = ''
@@ -25642,7 +25847,7 @@ def _trip_stats_compute(token):
         except (ValueError, TypeError):
             pass
 
-    has_data = bool(tage) or bool(fops)
+    has_data = bool(tage) or bool(fops) or imported_leg_count > 0
 
     def _serialize(bucket):
         return {
@@ -26061,15 +26266,50 @@ def _passport_stats_compute(token, rng):
                 first_date = datum
             last_date = datum
 
+    # WELTKARTEN-BÖGEN (Kevin 2026-07-27, live bewiesen: len(routes)==80,
+    # airports_count=89, aber nur 37 Flughäfen auf der Karte — SYD fehlte):
+    # 1) HIN und RÜCK sind EIN Bogen (FRA→SYD + SYD→FRA verbrannten vorher
+    #    ZWEI der 80 Slots; eine 1–2× geflogene Fernstrecke fiel dadurch aus
+    #    den most_common(80), obwohl airports_count sie mitzählte).
+    # 2) Koordinaten-Filter VOR der Kappung — eine koordinatenlose Route
+    #    verbrauchte vorher einen Slot und lieferte trotzdem keinen Bogen.
+    # 3) Kappung: Top-120 nach Häufigkeit + ABDECKUNGS-VERVOLLSTÄNDIGUNG —
+    #    danach bekommt jeder noch fehlende (koordinaten-auflösbare) Flughafen
+    #    seinen häufigsten Bogen, harte Grenze 200. Grund (live an Kevins
+    #    Karriere gemessen, NACH dem Richtungs-Merge): 134 Bögen, SYD auf
+    #    Rang 117 mit n=1 — die reine 80er-Kappung ließ die Karte weiter
+    #    hinter der airports_count-Kennzahl zurückfallen. Die Karte soll
+    #    zeigen, was die Kennzahl zählt.
+    arcs = Counter()
+    arc_disp = {}                  # ungerichteter Key → Anzeige-Richtung
+    for (frm, to), n in routes.items():
+        k = (frm, to) if frm <= to else (to, frm)
+        if k not in arc_disp or n > routes.get(arc_disp[k], 0):
+            arc_disp[k] = (frm, to)   # häufigere Richtung bestimmt die Anzeige
+        arcs[k] += n
     routes_out = []
-    for (frm, to), n in routes.most_common(80):
+    covered = set()
+    deferred = []                  # jenseits Top-120: nur für Abdeckung
+    for k, n in arcs.most_common():
+        frm, to = arc_disp.get(k, k)
         ca = ap_lookup.get(frm)
         cb = ap_lookup.get(to)
         if not (ca and cb):
             continue   # ohne Koordinaten kein Bogen — ehrlich weglassen
-        routes_out.append({'from': frm, 'to': to, 'n': n,
-                           'lat1': round(ca[0], 3), 'lon1': round(ca[1], 3),
-                           'lat2': round(cb[0], 3), 'lon2': round(cb[1], 3)})
+        row = {'from': frm, 'to': to, 'n': n,
+               'lat1': round(ca[0], 3), 'lon1': round(ca[1], 3),
+               'lat2': round(cb[0], 3), 'lon2': round(cb[1], 3)}
+        if len(routes_out) < 120:
+            routes_out.append(row)
+            covered.add(frm); covered.add(to)
+        else:
+            deferred.append(row)
+    for row in deferred:           # häufigste zuerst (Reihenfolge aus oben)
+        if len(routes_out) >= 200:
+            break
+        if row['from'] not in covered or row['to'] not in covered:
+            routes_out.append(row)
+            covered.add(row['from']); covered.add(row['to'])
 
     return {
         'ok': True,
@@ -32450,7 +32690,17 @@ def _fra_local_now():
     """Aktuelle Europe/Berlin-Lokalzeit als naive datetime (gleiche Basis wie die
     Fraport-`sched`-Strings, die lokal ohne Offset kommen). DST-robust via ZoneInfo,
     Fallback +2 (CEST) / grob, ohne harte pytz-Abhängigkeit."""
-    from datetime import datetime, timezone, timedelta
+    # KEIN lokaler `from datetime import datetime, timezone, timedelta` mehr
+    # (2026-07-27): identisch zum Schwester-Fix in `_airport_local_now`
+    # (2026-07-17), der hier übersehen wurde. Der lokale Import überschattete das
+    # modul-weite `datetime` (Zeile 18) und machte diese Funktion gegen einen
+    # eingefrorenen Test-Clock (monkeypatch A.datetime) IMMUN — `get_friends_today`
+    # leitete sein Berliner „heute" damit aus der ECHTEN Wanduhr ab, während die
+    # Tests ihren Roster-Tages-Key aus der eingefrorenen Uhr bauten → zwischen
+    # 22:00 und 24:00 UTC (Berlin schon am Folgetag) matchte KEINE Freundes-Zeile
+    # und tests/test_leg_delay_enrichment.py war reproduzierbar rot.
+    # `datetime`, `timezone` und `timedelta` sind alle modulweit importiert
+    # (Zeile 18) → in Produktion identisches Verhalten, aber jetzt mockbar.
     try:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo('Europe/Berlin')).replace(tzinfo=None)
@@ -35993,7 +36243,12 @@ def ax_transit():
     Suche → `leave_at` (wann aus dem Haus inkl. Fußweg zur ersten Station) + Legs
     [Fuß/U4/S8 mit dep/arr]. ALLES in try/except → kann den Live-Service nie
     crashen; die App fällt zur Not auf Apple-Transit-ETA zurück.
-    Query: from_lat,from_lon,to_lat,to_lon,arrival(ISO mit TZ),fern(0/1),debug(0/1)."""
+    GEGENRICHTUNG „Feierabend" (Flughafen→Zuhause nach der Landung): `departure`
+    (ISO mit TZ) statt `arrival` → depart-after-Suche, gesucht ist die FRÜHESTE
+    Verbindung, die NICHT VOR dieser Zeit losgeht. `arrival` GEWINNT, wenn beide
+    gesetzt sind (Smart-Pickup-Verhalten bleibt garantiert unverändert).
+    Query: from_lat,from_lon,to_lat,to_lon,arrival(ISO mit TZ),
+    departure(ISO mit TZ; nur wirksam ohne arrival),fern(0/1),debug(0/1)."""
     # Abuse-Guard (Audit 2026-07-05): offener Endpoint ohne Auth — ein per-IP-
     # Limit schützt die fremden Gratis-Quotas (MVV-EFA/RMV/Transitous/db-rest)
     # vor anonymem Drain. Großzügig fürs echte Nutzungsmuster (App fragt pro
@@ -36017,6 +36272,16 @@ def ax_transit():
     # sonst keine Leerzeichen → Space wieder zu `+` machen ist sicher. (Die App sendet
     # ohnehin UTC-„Z" ohne `+`; das hier rettet `+offset`-Clients/Tests.)
     arrival_s = (request.args.get('arrival') or '').strip().replace(' ', '+')
+    # ISO „frühestens losfahren" (Feierabend-Richtung Flughafen→Zuhause). Gleicher
+    # `+`-im-Query-wird-zu-Space-Fix wie bei `arrival`.
+    departure_s = (request.args.get('departure') or '').strip().replace(' ', '+')
+    # `arrival` GEWINNT immer: solange ein Client `arrival` schickt, ist der
+    # depart-Modus aus und der bestehende Smart-Pickup-Pfad bleibt bit-identisch.
+    depart_mode = bool(departure_s) and not arrival_s
+    # Gemeinsamer ZEIT-Anker für alle Provider-Anfragen (itdDate/itdTime, HAPI
+    # date/time, mgate outDate/outTime, dbrest, motis, bahn_body). Die RICHTUNG
+    # hängt dagegen an `depart_mode` — nicht an diesem String.
+    anchor_s = arrival_s if arrival_s else departure_s
     want_fern = request.args.get('fern') == '1'
     try:
         import requests
@@ -36506,9 +36771,19 @@ def ax_transit():
 
         prod = 'true'
         fern = 'true' if want_fern else 'false'
+        # FLUGHAFEN-BAHNHOF-SNAP, richtungsabhängig. Der Snap existiert, weil das
+        # geometrische Flughafen-Zentrum im Vorfeld OHNE Haltestelle liegt (HAFAS:
+        # „keine Station in der Nähe"). Im arrival-Modus ist der Flughafen das ZIEL
+        # (unverändert: Ziel-Snap in den Provider-Blöcken). Im departure-Modus ist er
+        # der START → hier den ORIGIN snappen. Der jeweils ANDERE Endpunkt wird NIE
+        # gesnappt: ein Wohnhaus 2 km neben einem Flughafenbahnhof darf nicht auf den
+        # Bahnhof springen. Im arrival-Modus ist `_dep_snap` None → `_o_lat/_o_lon`
+        # sind exakt `flat/flon` (kein Verhaltensunterschied).
+        _dep_snap = _snap_to_airport_rail(flat, flon) if depart_mode else None
+        _o_lat, _o_lon = (_dep_snap[0], _dep_snap[1]) if _dep_snap else (flat, flon)
         # db-rest: EINE Tür-zu-Tür-Abfrage direkt mit Koordinaten → Fußweg als Leg.
         dbrest_params = {
-            'from.latitude': flat, 'from.longitude': flon, 'from.address': 'Zuhause',
+            'from.latitude': _o_lat, 'from.longitude': _o_lon, 'from.address': 'Zuhause',
             'to.latitude': tlat, 'to.longitude': tlon, 'to.address': 'Flughafen',
             'nationalExpress': fern, 'national': fern,
             'regionalExpress': prod, 'regional': prod,
@@ -36516,27 +36791,30 @@ def ax_transit():
             'bus': prod, 'ferry': prod, 'taxi': 'false',
             'results': 5, 'stopovers': 'false', 'remarks': 'false', 'walkingSpeed': 'normal',
         }
+        # (dormant, s.u. — aber konsistent halten, sonst tickt hier eine Zeitbombe)
         if arrival_s:
             dbrest_params['arrival'] = arrival_s
+        elif depart_mode:
+            dbrest_params['departure'] = departure_s
         else:
             dbrest_params['departure'] = 'now'
 
         # Transitous (MOTIS): freier, kein-Key, DE-weiter ÖPNV-Router. Native
         # arrive-by-Suche (`arriveBy`+`time`). Wird ZUERST versucht (purpose-built,
         # zuverlässiger als die langsamen db-rest-Public-Proxies), db-rest als Fallback.
-        motis_params = {'fromPlace': f'{flat},{flon}', 'toPlace': f'{tlat},{tlon}',
+        motis_params = {'fromPlace': f'{_o_lat},{_o_lon}', 'toPlace': f'{tlat},{tlon}',
                         'numItineraries': 5}
-        if arrival_s:
+        if anchor_s:
             # MOTIS will RFC3339; ein TZ-Offset („+02:00") lässt v6 500en → immer auf
             # UTC-„Z" normalisieren (db-rest/EFA bekommen weiter ihr eigenes Format).
             try:
-                _au = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                _au = datetime.fromisoformat(anchor_s.replace('Z', '+00:00'))
                 from datetime import timezone as _tz
                 motis_time = (_au.astimezone(_tz.utc) if _au.tzinfo else _au).strftime('%Y-%m-%dT%H:%M:%SZ')
             except Exception:
-                motis_time = arrival_s
+                motis_time = anchor_s
             motis_params['time'] = motis_time
-            motis_params['arriveBy'] = 'true'
+            motis_params['arriveBy'] = 'false' if depart_mode else 'true'
 
         # MVV-EFA (Großraum München): die eigene, authoritative ÖPNV-Auskunft des
         # Verkehrsverbunds — gratis, kein Key, liefert echte U-/S-/Tram-/Bus-Linien
@@ -36551,27 +36829,32 @@ def ax_transit():
             try:
                 from zoneinfo import ZoneInfo
                 tz = ZoneInfo('Europe/Berlin')
-                if arrival_s:
-                    a = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                if anchor_s:
+                    a = datetime.fromisoformat(anchor_s.replace('Z', '+00:00'))
                     a = a.astimezone(tz) if a.tzinfo else a.replace(tzinfo=tz)
                 else:
                     a = datetime.now(tz)
                 # Ziel ggf. auf den Flughafen-Bahnhof snappen (MUC: München Flughafen
                 # Terminal S1/S8) statt aufs Terminal-Zentrum — Route endet am Bahnhof.
+                # NUR im arrival-Modus: dort ist der Flughafen das Ziel. Im
+                # departure-Modus ist das Ziel ZUHAUSE → nie snappen (s. `_dep_snap`).
                 _elat, _elon = tlat, tlon
-                _esnap = _snap_to_airport_rail(tlat, tlon)
-                if _esnap:
-                    _elat, _elon = _esnap[0], _esnap[1]
-                    efa_dbg['airport_rail_snap'] = _esnap[2]
+                if not depart_mode:
+                    _esnap = _snap_to_airport_rail(tlat, tlon)
+                    if _esnap:
+                        _elat, _elon = _esnap[0], _esnap[1]
+                        efa_dbg['airport_rail_snap'] = _esnap[2]
+                elif _dep_snap:
+                    efa_dbg['origin_rail_snap'] = _dep_snap[2]
                 efa_params = {
                     'outputFormat': 'rapidJSON',
                     'coordOutputFormat': 'WGS84[DD.ddddd]',
                     'type_origin': 'coord',
-                    'name_origin': f'{flon}:{flat}:WGS84[DD.ddddd]',   # EFA = lon:lat!
+                    'name_origin': f'{_o_lon}:{_o_lat}:WGS84[DD.ddddd]',   # EFA = lon:lat!
                     'type_destination': 'coord',
                     'name_destination': f'{_elon}:{_elat}:WGS84[DD.ddddd]',
                     'itdDate': a.strftime('%Y%m%d'), 'itdTime': a.strftime('%H%M'),
-                    'itdTripDateTimeDepArr': 'arr',
+                    'itdTripDateTimeDepArr': 'dep' if depart_mode else 'arr',
                     'calcNumberOfTrips': 5, 'useRealtime': 1,
                 }
             except Exception as ee:
@@ -36586,18 +36869,19 @@ def ax_transit():
         try:
             from zoneinfo import ZoneInfo as _ZI
             _tzb = _ZI('Europe/Berlin')
-            if arrival_s:
-                _ab = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+            if anchor_s:
+                _ab = datetime.fromisoformat(anchor_s.replace('Z', '+00:00'))
                 _ab = _ab.astimezone(_tzb) if _ab.tzinfo else _ab.replace(tzinfo=_tzb)
             else:
                 _ab = datetime.now(_tzb)
             _nah = ['IR', 'REGIONAL', 'SBAHN', 'BUS', 'SCHIFF', 'UBAHN', 'TRAM', 'ANRUFPFLICHTIG']
             _prod = (['ICE', 'EC_IC'] + _nah) if want_fern else _nah
             bahn_body = {
-                'abfahrtsHalt': f'A=2@O=Zuhause@X={int(round(flon * 1e6))}@Y={int(round(flat * 1e6))}@',
+                'abfahrtsHalt': f'A=2@O=Zuhause@X={int(round(_o_lon * 1e6))}@Y={int(round(_o_lat * 1e6))}@',
                 'ankunftsHalt': f'A=2@O=Flughafen@X={int(round(tlon * 1e6))}@Y={int(round(tlat * 1e6))}@',
                 'anfrageZeitpunkt': _ab.strftime('%Y-%m-%dT%H:%M:%S'),
-                'ankunftSuche': 'ANKUNFT',          # arrive-by
+                # arrive-by bzw. depart-after (dormant, aber konsistent gehalten)
+                'ankunftSuche': 'ABFAHRT' if depart_mode else 'ANKUNFT',
                 'klasse': 'KLASSE_2',
                 'produktgattungen': _prod,
                 'reisende': [{'typ': 'ERWACHSENER',
@@ -36632,8 +36916,8 @@ def ax_transit():
             try:
                 from zoneinfo import ZoneInfo as _ZR
                 _tzr = _ZR('Europe/Berlin')
-                if arrival_s:
-                    _ar = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                if anchor_s:
+                    _ar = datetime.fromisoformat(anchor_s.replace('Z', '+00:00'))
                     _ar = _ar.astimezone(_tzr) if _ar.tzinfo else _ar.replace(tzinfo=_tzr)
                 else:
                     _ar = datetime.now(_tzr)
@@ -36647,28 +36931,38 @@ def ax_transit():
                 # (s. _snap_to_airport_rail): so endet die Route am Regional-/S-Bahnhof
                 # und HAFAS hängt KEINEN People-Mover (SkyLine/SkyTrain) an. Kein
                 # Treffer → Ziel bleibt die Original-Koordinate (Verhalten wie zuvor).
+                # Im departure-Modus ist der Flughafen der START (→ `_o_lat/_o_lon`
+                # ist bereits gesnappt) und das ZIEL ist ZUHAUSE: dann NICHTS am Ziel
+                # snappen — weder per _snap_to_airport_rail noch per nearbystops-extId
+                # (r=6000 würde ein Wohnhaus auf einen 6 km entfernten Bahnhof ziehen
+                # und den Fußweg-bis-zur-Haustür verschlucken).
                 _dlat, _dlon = tlat, tlon
-                _snap = _snap_to_airport_rail(tlat, tlon)
-                if _snap:
-                    _dlat, _dlon, _snap_label = _snap[0], _snap[1], _snap[2]
-                    efa_dbg['airport_rail_snap'] = _snap_label
                 rmv_dest_ext = None
-                try:
-                    _nb = _get_json('https://www.rmv.de/hapi/location.nearbystops', {
-                        'accessId': rmv_key, 'format': 'json',
-                        'originCoordLat': _dlat, 'originCoordLong': _dlon,
-                        'maxNo': 1, 'r': 6000, 'products': 447,
-                    }, 8)
-                    _items = (_nb or {}).get('stopLocationOrCoordLocation') or []
-                    if _items:
-                        rmv_dest_ext = (_items[0].get('StopLocation') or {}).get('extId')
-                except Exception:
-                    rmv_dest_ext = None
+                if not depart_mode:
+                    _snap = _snap_to_airport_rail(tlat, tlon)
+                    if _snap:
+                        _dlat, _dlon, _snap_label = _snap[0], _snap[1], _snap[2]
+                        efa_dbg['airport_rail_snap'] = _snap_label
+                    try:
+                        _nb = _get_json('https://www.rmv.de/hapi/location.nearbystops', {
+                            'accessId': rmv_key, 'format': 'json',
+                            'originCoordLat': _dlat, 'originCoordLong': _dlon,
+                            'maxNo': 1, 'r': 6000, 'products': 447,
+                        }, 8)
+                        _items = (_nb or {}).get('stopLocationOrCoordLocation') or []
+                        if _items:
+                            rmv_dest_ext = (_items[0].get('StopLocation') or {}).get('extId')
+                    except Exception:
+                        rmv_dest_ext = None
+                elif _dep_snap:
+                    efa_dbg['origin_rail_snap'] = _dep_snap[2]
                 rmv_params = {
                     'accessId': rmv_key, 'format': 'json',
-                    'originCoordLat': flat, 'originCoordLong': flon,
+                    'originCoordLat': _o_lat, 'originCoordLong': _o_lon,
                     'date': _ar.strftime('%Y-%m-%d'), 'time': _ar.strftime('%H:%M'),
-                    'searchForArrival': 1, 'numB': 0, 'numF': 4, 'rtMode': 'REALTIME',
+                    # 0 = depart-after („frühestens losfahren"), 1 = arrive-by
+                    'searchForArrival': 0 if depart_mode else 1,
+                    'numB': 0, 'numF': 4, 'rtMode': 'REALTIME',
                     # Leg-Geometrie (Polyline.crd) mitliefern → iOS zeichnet die
                     # Linie entlang der Gleise statt Luftlinie (s. _norm_rmv).
                     'poly': 1,
@@ -36698,18 +36992,23 @@ def ax_transit():
             try:
                 from zoneinfo import ZoneInfo as _ZM
                 _tzm = _ZM('Europe/Berlin')
-                if arrival_s:
-                    _am = datetime.fromisoformat(arrival_s.replace('Z', '+00:00'))
+                if anchor_s:
+                    _am = datetime.fromisoformat(anchor_s.replace('Z', '+00:00'))
                     _am = _am.astimezone(_tzm) if _am.tzinfo else _am.replace(tzinfo=_tzm)
                 else:
                     _am = datetime.now(_tzm)
                 # Ziel auf den Flughafen-BAHNHOF snappen (FRA-Terminal-Zentrum =
-                # Vorfeld ohne Haltestelle → HAFAS H9220, live reproduziert).
+                # Vorfeld ohne Haltestelle → HAFAS H9220, live reproduziert). NUR im
+                # arrival-Modus; im departure-Modus ist der START der Flughafen
+                # (`_o_lat/_o_lon` gesnappt) und das Ziel ZUHAUSE = nie snappen.
                 _mlat, _mlon = tlat, tlon
-                _msnap = _snap_to_airport_rail(tlat, tlon)
-                if _msnap:
-                    _mlat, _mlon = _msnap[0], _msnap[1]
-                    efa_dbg['airport_rail_snap'] = _msnap[2]
+                if not depart_mode:
+                    _msnap = _snap_to_airport_rail(tlat, tlon)
+                    if _msnap:
+                        _mlat, _mlon = _msnap[0], _msnap[1]
+                        efa_dbg['airport_rail_snap'] = _msnap[2]
+                elif _dep_snap:
+                    efa_dbg['origin_rail_snap'] = _dep_snap[2]
                 # Produkt-Bitmaske (RMV): 1 ICE + 2 EC/IC = Fern; Rest (4 RE/RB,
                 # 8 S, 16 U, 32 Tram, 64/128 Bus, 256 Schiff, 512 AST,
                 # 1024 Seilbahn) = 2044.
@@ -36718,10 +37017,11 @@ def ax_transit():
                     'auth': {'type': 'AID', 'aid': 'x0k4ZR33ICN9CWmj'},
                     'client': {'id': 'RMV', 'type': 'WEB', 'name': 'webapp'},
                     'svcReqL': [{'meth': 'TripSearch', 'req': {
-                        'depLocL': [{'lid': f'A=2@O=Zuhause@X={int(round(flon * 1e6))}@Y={int(round(flat * 1e6))}@'}],
+                        'depLocL': [{'lid': f'A=2@O=Zuhause@X={int(round(_o_lon * 1e6))}@Y={int(round(_o_lat * 1e6))}@'}],
                         'arrLocL': [{'lid': f'A=2@O=Flughafen@X={int(round(_mlon * 1e6))}@Y={int(round(_mlat * 1e6))}@'}],
                         'outDate': _am.strftime('%Y%m%d'), 'outTime': _am.strftime('%H%M%S'),
-                        'outFrwd': not bool(arrival_s),   # False = arrive-by
+                        # False = arrive-by; True = depart-after (Feierabend-Richtung)
+                        'outFrwd': True if depart_mode else (not bool(arrival_s)),
                         'numF': 5, 'getPolyline': True, 'getPasslist': False,
                         'jnyFltrL': [{'type': 'PROD', 'mode': 'INC',
                                       'value': 2047 if want_fern else 2044}],
@@ -36801,7 +37101,10 @@ def ax_transit():
                 return dt.astimezone(_utctz.utc)
             except Exception:
                 return None
-        target_dt = _parse(arrival_s) if arrival_s else None
+        # Zeit-Anker: arrival-Modus = „spätestens da sein", departure-Modus =
+        # „frühestens losfahren". `anchor_s` ist im arrival-Modus identisch mit
+        # `arrival_s` → der bestehende Pfad bleibt unverändert.
+        target_dt = _parse(anchor_s) if anchor_s else None
 
         # ECHTE "arrive-by"-Auswahl: die Verbindung, die SO SPÄT WIE MÖGLICH ankommt,
         # aber noch rechtzeitig (Ankunft ≤ `arrival_s`) — also Ankunft so NAH wie
@@ -36811,10 +37114,17 @@ def ax_transit():
         # die VIEL ZU FRÜH ankommt (User-Bug 2026-06-29: 14:32 statt ~15:15). Fern-
         # Treffer verwerfen. Kommt KEINE rechtzeitig an (Randfall), nimm die früheste
         # Ankunft (besser zu früh als verpasst).
+        # GEGENRICHTUNG „Feierabend" (departure_s): die Zielzeit ist die früheste
+        # ABFAHRT. Zulässig ist eine Verbindung, deren LOSGEH-Zeit nicht VOR der
+        # Zielzeit liegt; unter den zulässigen gewinnt die FRÜHESTE ANKUNFT (so
+        # schnell wie möglich nach Hause). Randfall (Provider ignoriert
+        # depart-after) → die mit der SPÄTESTEN Losgeh-Zeit, also die am wenigsten
+        # „zu früh" — nie eine, die noch weiter in der Vergangenheit losgeht.
         best = None              # späteste pünktliche Ankunft (≤ Zielzeit, max. Ankunft)
         best_arr = None          # deren Ankunfts-datetime (zum Vergleich)
         fallback = None          # früheste Ankunft, falls keine pünktlich ist
         fallback_arr = None
+        fallback_leave = None    # departure-Modus: späteste Losgeh-Zeit (Randfall)
         # ALLE pünktlichen Kandidaten sammeln (Owner 2026-07-20, „warum kann
         # man die Verbindung nicht aussuchen? ICE statt RE") — die App zeigt
         # sie als wählbare Alternativen; `best` bleibt die Default-Empfehlung.
@@ -36836,6 +37146,30 @@ def ax_transit():
                     'first_dep_planned': ft.get('dep_planned'),
                     'first_dep_delay_min': ft.get('delay_min')}
             arr_dt = _parse(last_arr)
+            if depart_mode:
+                # GEPRÜFT WIRD `leave_at`, NICHT `first_dep`: `leave_at` ist der
+                # Start des FUSSWEGS am Crew-Anlaufpunkt (Terminal/Gate-Ausgang).
+                # Der Fußweg kann nicht beginnen, bevor die Crew dort ist — eine
+                # Prüfung auf `first_dep` (erste ÖPNV-Abfahrt) würde einen Fußweg
+                # empfehlen, der VOR Dienstende losgeht. Fehlt `leave_at`
+                # (Provider ohne Fußweg-Leg), ersatzweise `transit_dep`.
+                leave_dt = _parse(leave_at or transit_dep)
+                # Randfall-Fallback: späteste Losgeh-Zeit = am wenigsten „zu früh".
+                if leave_dt is not None and (fallback is None or fallback_leave is None
+                                             or leave_dt > fallback_leave):
+                    fallback, fallback_leave = cand, leave_dt
+                # zulässig? Losgehen NICHT VOR der Zielzeit (2 Min Toleranz, gleiche
+                # Richtung wie im arrival-Modus). Ohne Zielzeit gilt jede als ok.
+                if not ((target_dt is None) or (leave_dt is not None and
+                                                leave_dt >= target_dt - timedelta(minutes=2))):
+                    continue
+                on_time_cands.append((arr_dt, cand))
+                # FRÜHESTE Ankunft gewinnt (schnellstmöglich zu Hause). Bei fehlender
+                # Ankunftszeit (arr_dt None) nur als allererster Treffer nehmen.
+                if best is None or (arr_dt is not None and
+                                    (best_arr is None or arr_dt < best_arr)):
+                    best, best_arr = cand, arr_dt
+                continue
             # früheste-Ankunft-Fallback unabhängig von Pünktlichkeit
             if arr_dt is not None and (fallback is None or fallback_arr is None
                                        or arr_dt < fallback_arr):
@@ -36869,7 +37203,12 @@ def ax_transit():
             'first_dep_planned': best.get('first_dep_planned'),  # planmäßige Abfahrt
             'first_dep_delay_min': best.get('first_dep_delay_min'),  # Verspätung Min (None=unbekannt)
             'last_arr': best['last_arr'],
+            # `arrival_target` bleibt EXAKT wie bisher (leerer String wenn kein
+            # `arrival`-Param — genau wie heute schon ohne den Param), damit kein
+            # Client-Contract kippt. `departure_target` ist rein additiv.
             'arrival_target': arrival_s,
+            'departure_target': departure_s or None,
+            'mode': 'departure' if depart_mode else 'arrival',
             'legs': best['legs'],
         }
         # WÄHLBARE Alternativen (Owner 2026-07-20): alle pünktlichen
@@ -36877,12 +37216,15 @@ def ax_transit():
         # dedupliziert über (erste Linie, erste ÖPNV-Abfahrt), max. 4. Gleiche
         # Feld-Shape wie das Top-Level, damit die App eine Wahl 1:1 als
         # Ergebnis übernehmen kann. Additiv — alte Clients ignorieren den Key.
+        # Im departure-Modus ist die Reihenfolge INVERTIERT (früheste Ankunft
+        # zuerst), damit auch dort die Default-Empfehlung vorne steht.
+        _alt_key = ((lambda x: (x[0] is None, x[0].timestamp() if x[0] else 0))
+                    if depart_mode else
+                    (lambda x: (x[0] is None, -(x[0].timestamp() if x[0] else 0))))
         try:
             alts = []
             seen = set()
-            for arr_dt, cand in sorted(on_time_cands,
-                                       key=lambda x: (x[0] is None,
-                                                      -(x[0].timestamp() if x[0] else 0))):
+            for arr_dt, cand in sorted(on_time_cands, key=_alt_key):
                 first_line = next((l.get('line') for l in cand['legs']
                                    if l['mode'] == 'transit'), None)
                 key = (first_line or '', cand.get('transit_dep') or '')
@@ -43629,14 +43971,27 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
                     return True                    # Zukunfts-Geist HINTER dem Feed-Horizont
                 return False
 
+            # BIRGIT-FIX 2026-07-27: `ical_sectors` + `legs` gehören MIT in die
+            # Räum-Liste. Vorher überlebten beide den Prune → der stornierte Tag
+            # blieb non-empty (`if b:`), wurde nach dem SB-Delete vom Upsert-Save
+            # (`_ical_briefings_save`, kein Prune) als frische Row NUR mit
+            # `raw_event.ical_sectors` wiedergeboren — und GENAU dieses Feld liest
+            # der LH-MQTT-Fanout (`_SECTOR_SELECT` in blueprints/lh_mqtt.py):
+            # Birgit bekam ewig Pushes zu ihrem gestrichenen Umlauf.
             ical_keys = ('ical_summary', 'ical_location', 'ical_start_iso',
                          'ical_end_iso', 'ical_klass', 'ical_layover_ort',
-                         'ical_imported_at', 'block_minutes')
+                         'ical_imported_at', 'block_minutes', 'ical_sectors',
+                         'legs')
+            # Clearing-Gate: `ical_sectors`/`legs` zählen jetzt auch als Beleg,
+            # dass der Tag aus einem iCal-Import stammt — sonst bleiben BESTANDS-
+            # Zombies (Summary schon geprunt, Sektoren-Rest lebt) für immer
+            # stehen, weil das alte Gate nur die Summary-Keys prüfte.
+            _ical_evidence = ('ical_summary', 'ical_location', 'ical_start_iso',
+                              'ical_end_iso', 'ical_sectors', 'legs')
             for dkey in list(briefings.keys()):
                 if _is_stale_day(dkey):
                     b = briefings.get(dkey) or {}
-                    if any(b.get(k) for k in ('ical_summary', 'ical_location',
-                                              'ical_start_iso', 'ical_end_iso')):
+                    if any(b.get(k) for k in _ical_evidence):
                         for k in ical_keys:
                             b.pop(k, None)
                         dbg['cleared'] += 1
@@ -43647,14 +44002,14 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
                             briefings.pop(dkey, None)
             # ZWEITE Quelle: die manuelle Briefing-Map (user_manual_briefings) von
             # ical_*-Resten säubern; User-Notizen (personal_note) bleiben erhalten.
+            _manual_after = None
             try:
                 manual = dict(_manual_briefings_load(token) or {})
                 m_changed = False
                 for dkey in list(manual.keys()):
                     if _is_stale_day(dkey):
                         mb = manual.get(dkey) or {}
-                        if any(mb.get(k) for k in ('ical_summary', 'ical_location',
-                                                   'ical_start_iso', 'ical_end_iso')):
+                        if any(mb.get(k) for k in _ical_evidence):
                             for k in ical_keys:
                                 mb.pop(k, None)
                             dbg['cleared'] += 1
@@ -43666,6 +44021,7 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
                                 manual.pop(dkey, None)
                 if m_changed:
                     _manual_briefings_save(token, manual)
+                _manual_after = manual
             except Exception as _me:
                 dbg['manual_error'] = str(_me)[:100]
             # KERN: geräumte Tage EXPLIZIT aus beiden SB-Tabellen löschen — sonst
@@ -43673,8 +44029,27 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
             if removed_dates and SB_AVAILABLE:
                 try:
                     dl = sorted(removed_dates)
-                    for tbl in ('user_ical_briefings', 'user_manual_briefings'):
-                        sb.table(tbl).delete().eq('token', token).in_('datum', dl).execute()
+                    # NOTIZ-SCHUTZ (Birgit-Fix 2026-07-27): eine manuelle Row, die
+                    # nach dem Prune noch echte User-Daten trägt (personal_note,
+                    # weather_summary, …), darf das Delete NICHT mitreißen — der
+                    # Save oben läuft VOR dem Delete, die Notiz wäre sonst weg.
+                    # (Bestand hier: Tage, die NUR im iCal-Branch geräumt wurden,
+                    # deren manuelle Row aber notizen-only ist.)
+                    if _manual_after is None:
+                        try:
+                            _manual_after = _manual_briefings_load(token) or {}
+                        except Exception:
+                            _manual_after = None
+                    # FAIL-CLOSED (Review-Fund): ist der Manual-Stand unbekannt
+                    # (Doppel-Fehler: Prune-Branch UND Reload warfen), lieber
+                    # GAR keine manual-Rows löschen als eine Notiz mitreißen —
+                    # der iCal-Delete unten reicht, um den Fanout verstummen zu
+                    # lassen.
+                    dl_manual = ([d for d in dl if not _manual_after.get(d)]
+                                 if _manual_after is not None else [])
+                    sb.table('user_ical_briefings').delete().eq('token', token).in_('datum', dl).execute()
+                    if dl_manual:
+                        sb.table('user_manual_briefings').delete().eq('token', token).in_('datum', dl_manual).execute()
                     dbg['sb_deleted'] = len(dl)
                 except Exception as _de:
                     dbg['sb_delete_error'] = str(_de)[:100]

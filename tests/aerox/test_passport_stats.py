@@ -116,10 +116,13 @@ def test_compute_sets_airports_airlines_countries(synth_days):
 def test_compute_routes_dedup_and_order(synth_days):
     p = A._passport_stats_compute(TOKEN, "all")
     routes = p["routes"]
-    # FRA→JFK 2x = häufigste zuerst; Hin/Rück sind getrennte Routen.
+    # SEIT P7 (Kevin, 2026-07-27): Hin und Rück sind EIN Bogen — FRA→JFK (2×)
+    # + JFK→FRA (1×) = ein Eintrag mit n=3, Anzeige-Richtung = die häufigere.
+    # Vorher verbrannten beide Richtungen je einen der 80 Karten-Slots und
+    # seltene Fernstrecken fielen von der Weltkarte.
     assert routes[0]["from"] == "FRA" and routes[0]["to"] == "JFK"
-    assert routes[0]["n"] == 2
-    assert len(routes) == 4
+    assert routes[0]["n"] == 3
+    assert len(routes) == 3            # FRA↔JFK, FRA-BKK, MUC-LHR
     for r in routes:
         for k in ("lat1", "lon1", "lat2", "lon2"):
             assert isinstance(r[k], float)
@@ -347,3 +350,59 @@ def test_friend_route_shares_memo_with_owner_route(client, friend_setup):
 
 def test_friend_pii_prefix_registered():
     assert "/api/user/friend-passport/" in A._BUG004_GET_PII_PREFIXES
+
+
+# ── P7 (Kevin 3b, 2026-07-27): Kappungs-Eventualitäten ─────────────────────
+
+def _many_routes_days(n_pairs, with_bogus=False):
+    """Ein Tag pro Richtungs-Paar: Hub FRA → n_pairs verschiedene Ziele
+    (echte IATA-Codes aus der Referenz-DB, damit Koordinaten existieren)."""
+    ap = A._airports_compact_lookup()
+    dests = [c for c in sorted(ap.keys())
+             if len(c) == 3 and c != 'FRA' and ap[c][0] and ap[c][1]]
+    days = {}
+    for i, dst in enumerate(dests[:n_pairs]):
+        d = f'2026-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}'
+        days.setdefault(d, {'ical_sectors': []})['ical_sectors'].append(
+            _sector('LH1', 'FRA', dst, f'{d}T08:00:00+00:00',
+                    f'{d}T10:00:00+00:00'))
+    if with_bogus:
+        # Route zu einem Code OHNE Koordinaten: darf keinen Slot verbrennen.
+        days['2026-01-02'] = {'ical_sectors': [
+            _sector('LH2', 'FRA', 'QQX', '2026-01-02T08:00:00+00:00',
+                    '2026-01-02T09:00:00+00:00')] * 99}
+    return days
+
+
+def _patch_days(monkeypatch, days):
+    monkeypatch.setattr(A, '_manual_briefings_load', lambda t: days)
+    monkeypatch.setattr(A, '_ical_briefings_load', lambda t: {})
+    monkeypatch.setattr(A, '_logbook_import_load', lambda t: {})
+    monkeypatch.setattr(A, '_passport_route_duration_min',
+                        lambda frm, to, budget: None)
+
+
+def test_routes_genau_80_boegen_bleiben(monkeypatch):
+    _patch_days(monkeypatch, _many_routes_days(80))
+    p = A._passport_stats_compute(TOKEN, 'all')
+    assert len(p['routes']) == 80
+
+
+def test_routes_ueber_120_abdeckung_garantiert(monkeypatch):
+    # Kevins Live-Fall: >120 Bögen — Top-120 nach Häufigkeit, danach bekommt
+    # jeder noch fehlende Flughafen seinen Bogen (SYD-Garantie), Grenze 200.
+    _patch_days(monkeypatch, _many_routes_days(140))
+    p = A._passport_stats_compute(TOKEN, 'all')
+    assert len(p['routes']) == 140            # alle 140 <= 200: alles sichtbar
+    aps = {x['from'] for x in p['routes']} | {x['to'] for x in p['routes']}
+    assert len(aps) == 141                    # JEDER Airport auf der Karte
+    assert p['airports_count'] == 141         # Karte == Kennzahl
+
+def test_route_ohne_koordinaten_verbrennt_keinen_slot(monkeypatch):
+    # 80 echte Ziele + eine 99×-geflogene Phantom-Route (kein Koordinaten-
+    # Eintrag): vorher fraß sie einen der 80 Slots UND fehlte trotzdem auf
+    # der Karte; jetzt wird VOR der Kappung gefiltert → alle 80 echten bleiben.
+    _patch_days(monkeypatch, _many_routes_days(80, with_bogus=True))
+    p = A._passport_stats_compute(TOKEN, 'all')
+    assert len(p['routes']) == 80
+    assert all(r['to'] != 'QQX' for r in p['routes'])

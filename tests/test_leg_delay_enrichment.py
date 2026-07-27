@@ -21,6 +21,64 @@ import pytest
 
 import app as A
 
+# Deterministische Test-Uhr (Test-Infra-Fix 2026-07-27): Mechanik + WARUM
+# komplett in tests/_clock_freeze.py (dorthin extrahiert, damit
+# test_overnight_spillover / test_crew_live_state / test_my_flight_status
+# dieselbe eingefrorene Uhr nutzen). Kern: FROZEN_UTC = 2026-07-16 10:00 UTC
+# liegt in jeder Prozess-TZ von UTC−10 bis UTC+13 auf demselben Kalendertag.
+from _clock_freeze import (  # noqa: E402
+    FROZEN_DATE, FROZEN_EPOCH, FROZEN_UTC, apply_frozen_clock,
+)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_clock(monkeypatch):
+    """Friert JEDE Uhr ein, die dieses Testmodul erreicht — s. _clock_freeze.
+
+    Dieses Modul baut seine Eingaben schon über `_now()`/`_today()` (unten)
+    direkt auf FROZEN_UTC — die eigenen Modul-Globals brauchen daher keinen
+    Patch (kein `extra_modules`). app_module=A: im Full-Run kann
+    sys.modules['app'] eine fremde Kopie sein (test_calculation-Reimport) —
+    gefroren werden muss DIESES A.
+    """
+    apply_frozen_clock(monkeypatch, app_module=A)
+    yield
+
+
+def test_freeze_fixture_reaches_every_clock_the_suite_uses():
+    """REGRESSIONS-WÄCHTER für die Einfrier-Fixture selbst.
+
+    Ein funktions-LOKALER `from datetime import datetime` überschattet das
+    modulweite `datetime` und macht die betroffene Funktion gegen den Test-Clock
+    immun. Genau das ist zweimal passiert: `_airport_local_now` (gefixt
+    2026-07-17) und `_fra_local_now` (gefixt 2026-07-27, davor war diese Suite
+    zwischen 22:00 und 24:00 UTC reproduzierbar rot). Dieser Test bricht sofort,
+    wenn so ein Import zurückkommt oder eine neue Uhr-Quelle ungefroren bleibt —
+    statt erst nachts als „Flake".
+    """
+    import datetime as _dtmod
+    import blueprints.aerox_data_blueprint as _ADB
+    import blueprints.leg_status_gate as _LSG
+
+    # Berliner Betriebstag-Anker (get_friends_today) — beide Varianten.
+    assert A._fra_local_now().isoformat() == '2026-07-16T12:00:00'
+    assert A._airport_local_now('FRA').isoformat() == '2026-07-16T12:00:00'
+    # Fremd-TZ-Pfad nutzt dasselbe modulweite `datetime`.
+    assert A._airport_local_now('JFK').date().isoformat() == '2026-07-16'
+    # app.datetime: now() UND utcnow().
+    assert A.datetime.now(timezone.utc) == FROZEN_UTC
+    assert A.datetime.utcnow() == FROZEN_UTC.replace(tzinfo=None)
+    # date.today() über den funktions-lokalen Import-Pfad der Produktion
+    # (today±1-Guard in _enrich_leg_delays, Berlin-Fallback in get_friends_today).
+    from datetime import date as _d
+    assert _d.today() == FROZEN_DATE
+    assert _dtmod.date.today() == FROZEN_DATE
+    # time.time() in den Blueprints (Landed-Gate / Cache-Cutoffs).
+    assert _LSG.time.time() == FROZEN_EPOCH
+    assert _ADB.time.time() == FROZEN_EPOCH
+    # Der Anker liegt in JEDER Prozess-TZ auf demselben Kalendertag wie UTC.
+    assert FROZEN_UTC.astimezone().date() == FROZEN_DATE
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fixtures / Helpers
@@ -42,14 +100,24 @@ def _iso(dt):
 
 
 def _now():
-    return datetime.now(timezone.utc)
+    """„Jetzt" für ALLE relativen Sektor-Zeiten — die eingefrorene Uhr, NICHT
+    die Wanduhr (s. FROZEN_UTC oben)."""
+    return FROZEN_UTC
 
 
-# Dynamischer "heute"-Tag (UTC): _enrich_leg_delays hat seit 2026-07-04 einen
-# Datums-Guard (nur today ±1 ohne dep_iso) — ein hart kodierter Tag driftet aus
-# dem Fenster und ließ die Suite ab 2026-07-06 rot werden. Semantik unverändert:
-# der Tag ist nur der Roster-Tages-Key.
-TODAY = _now().strftime('%Y-%m-%d')
+def _today():
+    """„Heute" für alle Roster-Tages-Keys — identisch zu dem, was die
+    Produktion unter der eingefrorenen Uhr sieht (UTC == Berlin == prozess-
+    lokal). Ersetzt die früheren `date.today()`-Aufrufe, die die PROZESS-
+    Zeitzone lasen und unter TZ=UTC vom Berliner Produktions-Tag abwichen."""
+    return FROZEN_DATE
+
+
+# „heute"-Tag: _enrich_leg_delays hat seit 2026-07-04 einen Datums-Guard (nur
+# today ±1 ohne dep_iso). Der Key kommt jetzt aus der eingefrorenen Uhr — kein
+# Import-Zeit-Snapshot der Wanduhr mehr (der wurde VOR jeder Fixture ausgewertet
+# und konnte über Mitternacht aus dem Fenster driften).
+TODAY = FROZEN_UTC.strftime('%Y-%m-%d')
 
 
 def _sector(flight='LH400', frm='FRA', to='MUC', dep_iso=None, arr_iso=None):
@@ -394,7 +462,7 @@ def test_enrich_offset_carrying_esti_normalized_to_utc():
 
 def test_enrich_no_dep_iso_deep_future_date_skipped():
     # Leg OHNE dep_iso, date = +3 Tage → grober Datums-Guard überspringt (kein Scan).
-    far = (_date.today() + timedelta(days=3)).isoformat()
+    far = (_today() + timedelta(days=3)).isoformat()
     secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC', 'date': far}]
     with patch.object(A, '_flight_obs_merged',
                       side_effect=AssertionError('should not scan deep future')):
@@ -403,7 +471,7 @@ def test_enrich_no_dep_iso_deep_future_date_skipped():
 
 
 def test_enrich_no_dep_iso_deep_past_date_skipped():
-    past = (_date.today() - timedelta(days=3)).isoformat()
+    past = (_today() - timedelta(days=3)).isoformat()
     secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC', 'date': past}]
     with patch.object(A, '_flight_obs_merged',
                       side_effect=AssertionError('should not scan deep past')):
@@ -413,7 +481,7 @@ def test_enrich_no_dep_iso_deep_past_date_skipped():
 
 def test_enrich_no_dep_iso_today_date_enriched():
     # Leg OHNE dep_iso, aber date = heute → angereichert (Tag-von wird bedient).
-    today = _date.today().isoformat()
+    today = _today().isoformat()
     secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC', 'date': today}]
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_known=True, delay_min=12,
@@ -425,7 +493,7 @@ def test_enrich_no_dep_iso_today_date_enriched():
 
 def test_enrich_no_dep_iso_uses_daykey_when_no_sector_date():
     # Kein sector['date'], aber Tages-Key = heute → angereichert (Fallback auf date-Param).
-    today = _date.today().isoformat()
+    today = _today().isoformat()
     secs = [{'flight': 'LH400', 'from': 'FRA', 'to': 'MUC'}]
     with patch.object(A, '_flight_obs_merged',
                       return_value=_merged(delay_known=True, delay_min=7,
@@ -647,15 +715,12 @@ def test_enrich_overnight_arr_facts_use_arrival_day_not_dep_day(monkeypatch):
     # GESTRIGEN Rotation (est_arr ~24 h VOR sched_arr) und hängte sie ans Leg.
     # Erwartet: das Physik-Gate verwirft die Fremd-Rotations-Ankunft und die
     # arr-seitige Neu-Abfrage am ARR-Tag liefert die RICHTIGE Ist-Ankunft.
-    # Uhr DETERMINISTISCH einfrieren (kein Wall-Clock-Flake an der UTC-Tages-
-    # grenze): fixe „jetzt" am Vormittag des ARR-Tags.
-    now = datetime(2026, 7, 16, 10, 0, tzinfo=timezone.utc)
-
-    class _FrozenDT(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return now if tz is None else now.astimezone(tz)
-    monkeypatch.setattr(A, 'datetime', _FrozenDT)
+    # Uhr ist modulweit via `_freeze_clock` eingefroren (FROZEN_UTC =
+    # 2026-07-16 10:00 UTC — der Vormittag des ARR-Tags, exakt der Zeitpunkt,
+    # den die frühere handgerollte Fixture hier lokal setzte). Kein eigener
+    # Teil-Freeze mehr: der überschrieb nur `A.datetime.now` und ließ
+    # `date.today()`/`time.time()` auf der Wanduhr laufen.
+    now = _now()
 
     dep = now - timedelta(hours=13)          # gestern Abend (15.07)
     arr = now - timedelta(minutes=95)         # heute früh (~arr_iso, 16.07)
@@ -898,7 +963,7 @@ def test_merged_keeps_bare_overnight_est_arr_no_scrub():
     # Abflugtag (date_q) datiert würde. Der crew_state-Probe nutzt jetzt die bereits
     # d/d+1-korrekt aufgelöste Zeit bzw. die Scrub-Hebung. DEP heute abend, ARR-Plan
     # morgen früh (sched_arr d+1), Ist bare '07:50' → bleibt erhalten.
-    today = _date.today()
+    today = _today()
     tomorrow = today + timedelta(days=1)
     store = {
         'BOS': [_row(flight='LH423', dest_iata='FRA',
@@ -1021,9 +1086,9 @@ def client():
 
 
 def _briefings_map():
-    today = _date.today().isoformat()
-    tomorrow = (_date.today() + timedelta(days=1)).isoformat()
-    far = (_date.today() + timedelta(days=5)).isoformat()
+    today = _today().isoformat()
+    tomorrow = (_today() + timedelta(days=1)).isoformat()
+    far = (_today() + timedelta(days=5)).isoformat()
     return today, tomorrow, far, {
         today: {'ical_sectors': [_sector(flight='LH100', frm='FRA', to='MUC')]},
         tomorrow: {'ical_sectors': [_sector(flight='LH200', frm='MUC', to='FRA')]},
@@ -1095,7 +1160,7 @@ def _setup_friend(monkeypatch, first_dep_offset_h=-1.0, layover_ort='XXX',
                   routing='BLL-CPH', frm='BLL', to='CPH', flight='LH400'):
     """Ein Friend mit heutigem Tour-Tag. Gibt (token, day) zurück."""
     tok = 'FRIENDTOKEN'
-    today = _date.today().isoformat()
+    today = _today().isoformat()
     dep = _now() + timedelta(hours=first_dep_offset_h)
     day = {
         'datum': today,
@@ -1236,7 +1301,7 @@ def test_layeff_multisector_advances_past_intermediate_stop(client, monkeypatch)
     # Nachmittag „an der Basis" statt im RIX-Layover. Jetzt läuft die Kaskade
     # alle heutigen Sektoren ab.
     tok = 'FRIENDTOKEN'
-    today = _date.today().isoformat()
+    today = _today().isoformat()
     d1 = _now() + timedelta(hours=-8)
     d2 = _now() + timedelta(hours=-5)
     day = {
@@ -1267,7 +1332,7 @@ def test_layeff_multisector_waits_at_intermediate_before_next_leg(client, monkey
     # Leg 1 gelandet, Leg 2 ohne Signal und Plan-Abflug erst in 1h → die Crew
     # ist ehrlich am Zwischenstopp (FRA), nicht schon am Tagesziel.
     tok = 'FRIENDTOKEN'
-    today = _date.today().isoformat()
+    today = _today().isoformat()
     d1 = _now() + timedelta(hours=-4)
     d2 = _now() + timedelta(hours=1)
     day = {
@@ -1328,22 +1393,17 @@ def test_layeff_fresh_delay_pin_still_holds(client, monkeypatch):
 # Zeiten hier relativ zu now: Leg1 dep −2h50, PLAN-ARR −35min; Leg2 dep +55min.
 def _setup_tibor_bcn_fra_arn(monkeypatch):
     tok = 'FRIENDTOKEN'
-    # Uhr DETERMINISTISCH auf 12:00 UTC des echten Heute einfrieren (dynamisches
-    # Datum wegen des today-±1-Guards in _enrich_leg_delays): die Sektoren
-    # liegen relativ zu „jetzt" bei −170 … +400 min — mit Wall-Clock kippte a3
-    # bei Suite-Läufen nach ~17:20 UTC über Mitternacht, der Rückflug lag auf
-    # „morgen" und die Nightstop-Logik hielt ARN für einen Layover (Suite
-    # abends rot, vormittags grün). Mit fixem Mittag bleibt die Rotation ein
-    # Ein-Tages-Turn, egal wann die Tests laufen.
-    frozen = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0,
-                                                microsecond=0)
-
-    class _FrozenDT(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return frozen if tz is None else frozen.astimezone(tz)
-    monkeypatch.setattr(A, 'datetime', _FrozenDT)
-    today = frozen.date().isoformat()
+    # Uhr kommt modulweit aus `_freeze_clock` (FROZEN_UTC = 10:00 UTC / 12:00
+    # Berlin): die Sektoren liegen relativ zu „jetzt" bei −170 … +400 min —
+    # mit Wall-Clock kippte a3 bei Suite-Läufen nach ~17:20 UTC über Mitternacht,
+    # der Rückflug lag auf „morgen" und die Nightstop-Logik hielt ARN für einen
+    # Layover (Suite abends rot, vormittags grün). Der frühere lokale Teil-Freeze
+    # („heute um 12:00 UTC") blieb außerdem an der WANDUHR hängen: er fror nur
+    # `A.datetime.now` ein, nicht `_fra_local_now` (lokaler datetime-Import) und
+    # nicht `date.today()` → ab 22:00 UTC lag der Berliner Produktions-Tag einen
+    # Tag vor dem Tages-Key des Tests und der Freund fiel komplett aus der Liste.
+    frozen = _now()
+    today = _today().isoformat()
     d1, a1 = frozen - timedelta(minutes=170), frozen - timedelta(minutes=35)
     d2, a2 = frozen + timedelta(minutes=55), frozen + timedelta(minutes=205)
     d3, a3 = frozen + timedelta(minutes=250), frozen + timedelta(minutes=400)
