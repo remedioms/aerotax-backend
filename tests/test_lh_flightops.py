@@ -254,7 +254,8 @@ def test_is_mock():
 def test_duty_events_error_shape_is_none(monkeypatch):
     monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
     # _api_get liefert die Gateway-Fehler-Shape → duty_events muss None geben
-    monkeypatch.setattr(fo, '_api_get', lambda tok, path, params=None: {
+    monkeypatch.setattr(fo, '_api_get',
+                        lambda tok, path, params=None, interactive=False: {
         'serviceHost': 'x', 'processingErrors': [{'code': 500, 'type': 'NoHttpResponse'}]})
     assert fo.duty_events('AT-U', '2016-10-01', '2016-10-31') is None
 

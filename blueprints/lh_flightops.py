@@ -785,9 +785,36 @@ def _flightops_budget_inc(path):
         pass
 
 
-def _api_get(user_token, path, params=None):
+# ── KEY-BUDGET-GATE (Quota-403-Vorfall 27.07. ~21 UTC) ──────────────────────
+# Der FlightOps-Key hat 1.000 Calls/h; die Stunden 16/18/20 UTC lagen bei
+# 1.052–1.183 → LH antwortete pauschal 403 — und zwar AUCH auf die frischen
+# Roster-Abrufe direkt nach „Neu verbinden": ausgerechnet die Re-Login-
+# Heilung der needs_relogin-User schlug fehl („Es hat nicht geklappt"),
+# während Hintergrund-Syncs das Kontingent weiter leerten. Anders als der
+# Open-API-Key hatte lhfo KEIN eigenes Budget-Gate.
+# Regel: Hintergrund (refresh-all) stoppt bei 700/h und lässt damit Headroom
+# für interaktive Flows (Connect-Erstimport, manuelles „Jetzt aktualisieren"),
+# die bis 950/h dürfen; darüber ist Schluss BEVOR LH selbst 403t (die 403s
+# zählen sonst weiter aufs Kontingent und verlängern die Sperre). Der
+# oauth_refresh des Ein-Refreshers läuft UNGEGATET (Grant-Hygiene schlägt
+# Roster-Frische; ~170/h passen in den Headroom). Zähler-Memo ist 60 s
+# (_rot_budget_memo) — Überschwinger ≤ ~85 Calls (0,7-s-Takt) sind in den
+# Puffern (950+85+Refresher < 1000 knapp; 700er-Grenze völlig entspannt).
+_LHFO_HOUR_BACKGROUND_CEILING = 700
+_LHFO_HOUR_INTERACTIVE_CEILING = 950
+
+
+def _api_get(user_token, path, params=None, interactive=False):
     access = _valid_access(user_token)
     if not access:
+        return None
+    _used = _rot_hour_used()
+    _ceiling = (_LHFO_HOUR_INTERACTIVE_CEILING if interactive
+                else _LHFO_HOUR_BACKGROUND_CEILING)
+    if _used >= _ceiling:
+        log.warning('[lh_flightops] lhfo-Stundenbudget %s >= %s — %s-Call %s '
+                    'übersprungen', _used, _ceiling,
+                    'interaktiver' if interactive else 'Hintergrund', path)
         return None
     _flightops_budget_inc(path)
     url = _BASE + path
@@ -825,13 +852,16 @@ def _as_list(v):
     return v if isinstance(v, list) else [v]
 
 
-def duty_events(user_token, from_date, to_date):
+def duty_events(user_token, from_date, to_date, interactive=False):
     """COMMON_DUTY_EVENTS für ein Zeitfenster → Response-Dict oder None.
     Datumsformat YYYY-MM-DDZ. HINWEIS: die MOCK-Umgebung liefert NUR für das
     dokumentierte Beispiel-Fenster (2016-10-01Z..2016-10-31Z) Daten; echte
-    Fenster gehen erst gegen PROD."""
+    Fenster gehen erst gegen PROD. `interactive=True` = nutzerausgelöster
+    Abruf (Connect-Erstimport, manuelles Aktualisieren) → höhere
+    Budget-Grenze im Key-Gate (siehe _api_get)."""
     resp = _api_get(user_token, '/COMMON_DUTY_EVENTS',
-                    {'fromDate': _date_z(from_date), 'toDate': _date_z(to_date)})
+                    {'fromDate': _date_z(from_date), 'toDate': _date_z(to_date)},
+                    interactive=interactive)
     # Gateway-/Backend-Fehler kommen als {processingErrors:[…]} MIT 200/4xx/5xx —
     # nie als Duty-Events missdeuten.
     if isinstance(resp, dict) and resp.get('processingErrors'):
@@ -2595,7 +2625,12 @@ def flightops_import(token):
     else:
         fd = body.get('from_date') or (today - _td(days=7)).strftime('%Y-%m-%d')
         td = body.get('to_date') or (today + _td(days=45)).strftime('%Y-%m-%d')
-    resp = duty_events(token, fd, td)
+    # Interaktiv = alles, was NICHT der refresh-all-Hintergrundlauf ist
+    # (der markiert sich via body.background) — Connect-Erstimport und
+    # manuelles „Jetzt aktualisieren" bekommen die höhere Budget-Grenze,
+    # damit die Re-Login-Heilung nie an Hintergrund-Syncs verhungert.
+    resp = duty_events(token, fd, td,
+                       interactive=not bool(body.get('background')))
     if resp is None:
         return jsonify({'ok': False, 'error': 'duty_events_failed'}), 502
     # Service-Referenzen (accessCode für Crew-Liste/Check-in!) mitnehmen —
@@ -3030,7 +3065,9 @@ def _refresh_all_work(tokens):
                     # nur, refresht seit dem Umbau 2026-07-27 NIE selbst).
                     skipped += 1
                     continue
-                with _app.app.test_request_context(json={}):
+                # background-Flag → niedrigere Budget-Grenze im Key-Gate
+                # (interaktive Connects/Refreshes behalten Headroom).
+                with _app.app.test_request_context(json={'background': 1}):
                     rv = flightops_import(tok)
                 status = rv[1] if isinstance(rv, tuple) else 200
                 if status == 200:
