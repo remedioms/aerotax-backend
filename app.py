@@ -24599,15 +24599,33 @@ def ax_crew_hotels_suggest():
 
 @app.route('/api/admin/crew-hotels/pending', methods=['GET'])
 def admin_crew_hotels_pending():
-    """Owner: offene Crew-Vorschläge (nach Votes sortiert)."""
+    """Owner: offene Crew-Vorschläge (nach Votes sortiert) — und die laufende
+    LH-Hotelwechsel-Evidenz.
+
+    `contested` = Stationen, an denen LH ein ANDERES Haus bucht als das
+    Verzeichnis kennt (blueprints/daily_briefing.py, Owner-Regel 27.07.2026:
+    „LH gewinnt"). `votes` ist dort die Zahl der bisher gesehenen Layover-
+    NÄCHTE, `official_name_source` listet sie. Erst ab der Schwelle
+    (_CONTEST_MIN_NIGHTS Nächte über _CONTEST_MIN_SPAN_DAYS Tage) schreibt der
+    Automat um — bis dahin kann der Owner hier mitlesen und selbst entscheiden.
+    Fail-open: fehlt der Status (Alt-DB), bleibt es bei der Vorschlagsliste."""
     if not _crew_hotel_admin_ok():
         return jsonify({'error': 'Unauthorized'}), 401
     if not SB_AVAILABLE:
-        return jsonify({'count': 0, 'pending': []})
+        return jsonify({'count': 0, 'pending': [], 'contested': []})
     try:
         r = sb.table(_CREW_HOTEL_DIR_TABLE).select('*').eq(
             'status', 'suggested').order('votes', desc=True).limit(500).execute()
-        return jsonify({'count': len(r.data or []), 'pending': r.data or []})
+        try:
+            from blueprints.daily_briefing import _LH_CONTEST_STATUS
+            c = sb.table(_CREW_HOTEL_DIR_TABLE).select('*').eq(
+                'status', _LH_CONTEST_STATUS).eq('active', True).order(
+                'votes', desc=True).limit(500).execute()
+            contested = c.data or []
+        except Exception:
+            contested = []
+        return jsonify({'count': len(r.data or []), 'pending': r.data or [],
+                        'contested': contested})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

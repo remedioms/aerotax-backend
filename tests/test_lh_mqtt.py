@@ -6,7 +6,7 @@ gemonkeypatcht. Topic-/Payload-Shapes sind die LIVE verifizierten
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from flask import Flask
@@ -414,7 +414,8 @@ def test_inbound_topics_subscribe_feeder_flight(monkeypatch):
     # Die Topics-Rechnung löst Regs seit 2026-07-27 im BATCH auf (_legs_regs),
     # nicht mehr pro Leg — der Mock muss die echte Form spiegeln.
     monkeypatch.setattr(lh_mqtt, '_legs_regs',
-                        lambda legs: {leg_key: 'D-AIKP' for leg_key in legs})
+                        lambda legs, dep_times=None:
+                        {leg_key: 'D-AIKP' for leg_key in legs})
     monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: board)
     topics = lh_mqtt.inbound_topics_for_rows(_rows([leg]), now)
     d0 = arr_local.date()
@@ -616,3 +617,93 @@ def test_shared_cache_hit_skips_lh_entirely(monkeypatch):
     monkeypatch.setattr(lh_mqtt, '_sb', lambda: object())
     assert lh_mqtt._legs_regs([leg]) == {leg: 'D-AIKP'}
     assert not calls
+
+
+# ── Reg-TTL nach Abflugnähe + Gate-Abbruch (Quota-Runde 2 · 2026-07-27) ─────
+# Messung nach dem Reg-Cache-Fix: `mqtt_leg_reg` blieb mit ~560–940 Calls/h der
+# grösste Verbraucher, weil die FLACHE 3-h-TTL jedes der ~320 Legs im
+# 17-h-Fenster ~5,7-mal neu kaufte. Und bei geschlossenem Gate versuchte JEDER
+# Topic-Poll (alle 300 s) alle Legs erneut → 3.901 abgewiesene Versuche/h.
+
+def test_reg_ttl_expires_exactly_at_the_recheck_before_departure():
+    """Weit vor dem Abflug hält die Reg genau bis zum Gegencheck (Abflug −90
+    min) — nicht kürzer (Verschwendung), nicht länger (Tailswap-blind)."""
+    now = datetime(2026, 7, 27, 9, 0, tzinfo=timezone.utc)
+    dep = now + timedelta(hours=6)
+    ttl = lh_mqtt._reg_ttl(dep, now.timestamp())
+    assert ttl == int(6 * 3600 - lh_mqtt._REG_RECHECK_LEAD_S)
+
+
+def test_reg_ttl_is_final_inside_the_recheck_window():
+    """Ab 90 min vor Abflug (und nach dem Abflug) ist die Reg final — genau
+    hier lag der Grossteil der alten Wiederholungskäufe."""
+    now = datetime(2026, 7, 27, 9, 0, tzinfo=timezone.utc)
+    for lead_min in (89, 0, -60):
+        dep = now + timedelta(minutes=lead_min)
+        assert lh_mqtt._reg_ttl(dep, now.timestamp()) == lh_mqtt._REG_FINAL_TTL_S
+
+
+def test_reg_ttl_without_departure_time_keeps_the_old_flat_ttl():
+    """Aufrufer ohne Abflugzeit verhalten sich unverändert."""
+    assert lh_mqtt._reg_ttl(None, time.time()) == lh_mqtt._REG_TTL_S
+
+
+def test_shut_gate_stops_the_batch_instead_of_hammering_it(_clean_reg,
+                                                           monkeypatch):
+    """Weist der EIGENE Throttle ab, gilt das für jeden weiteren Call dieser
+    Stunde. Der Batch muss abbrechen — sonst feuert er alle ~320 Legs gegen
+    dieselbe Wand (gemessen: 3.901 abgewiesene Versuche/h, kein einziger
+    davon konnte je eine Reg liefern)."""
+    calls = []
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: calls.append(a) or {})
+    monkeypatch.setattr(lh_mqtt, '_leg_reg_gate_shut', lambda: True)
+    import blueprints.lh_open_api as lho
+    monkeypatch.setattr(lho, 'last_call_answered', lambda: False)
+    legs = [('LH40%d' % i, '2026-07-27', 'FRA', 'JFK') for i in range(5)]
+    out = lh_mqtt._legs_regs(legs)
+    assert out == {leg: None for leg in legs}
+    assert len(calls) == 1          # nach dem ersten „Gate zu" kein Versuch mehr
+
+
+def test_lh_outage_does_not_stop_the_batch(_clean_reg, monkeypatch):
+    """Gegenprobe: ein LH-503 betrifft NUR diesen einen Flug — die restlichen
+    Legs müssen weiter versucht werden (sonst wäre ein einzelner kaputter Flug
+    ein Totalausfall des Inbound-Watch)."""
+    calls = []
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: calls.append(a) or {})
+    monkeypatch.setattr(lh_mqtt, '_leg_reg_gate_shut', lambda: False)
+    import blueprints.lh_open_api as lho
+    monkeypatch.setattr(lho, 'last_call_answered', lambda: False)
+    legs = [('LH40%d' % i, '2026-07-27', 'FRA', 'JFK') for i in range(5)]
+    lh_mqtt._legs_regs(legs)
+    assert len(calls) == 5
+
+
+def test_unknown_hold_outlasts_the_topic_poll_interval():
+    """Die Sperre nach einer Lücke MUSS länger sein als der Topic-Abgleich des
+    Daemons (LH_MQTT_REFRESH_S, Default 300 s) — sonst versucht es der nächste
+    Poll sofort wieder und der Sturm ist zurück."""
+    assert lh_mqtt._REG_UNKNOWN_TTL_S > 300
+
+
+def test_found_reg_is_shared_with_its_own_ttl(_clean_reg, monkeypatch):
+    """Prozess-Memo und geteilter Cache müssen DIESELBE TTL bekommen."""
+    written = []
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: {'reg': 'D-AIKP'})
+    monkeypatch.setattr(lh_mqtt, '_sb', lambda: object())
+    monkeypatch.setattr(lh_mqtt, '_reg_cache_read', lambda keys: {})
+    monkeypatch.setattr(lh_mqtt, '_reg_cache_write',
+                        lambda items: written.extend(items))
+    now = datetime.now(timezone.utc)
+    leg = ('LH400', now.date().isoformat(), 'FRA', 'JFK')
+    dep = now + timedelta(hours=8)
+    lh_mqtt._legs_regs([leg], dep_times={leg: dep})
+    assert len(written) == 1
+    key, reg, ttl = written[0]
+    assert (key, reg) == (lh_mqtt._reg_cache_key(*leg), 'D-AIKP')
+    assert ttl == lh_mqtt._reg_ttl(dep, time.time())
+    memo_expiry, _v = lh_mqtt._reg_memo[key]
+    assert abs((memo_expiry - time.time()) - ttl) < 2

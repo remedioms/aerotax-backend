@@ -543,11 +543,29 @@ def _fold(s):
     return ''.join(c for c in s if not unicodedata.combining(c)).lower()
 
 
+def _degeneric(tok):
+    """'intercityhotel' → 'intercity'. Ein ANGEKLEBTES generisches Wort am
+    ENDE eines Tokens wird abgetrennt, damit die Zusammenschreibung nicht zwei
+    Häuser aus einem macht.
+
+    Der konkrete Fall (BUD, 27.07.): das Verzeichnis kennt 'Intercity
+    Budapest', LH bucht 'IntercityHotel Budapest' — dasselbe Haus, aber die
+    Token-Mengen {intercity, budapest} und {intercityhotel, budapest} waren
+    ungleich. Bewusst NUR als Suffix und nur für die Wort-Wurzeln 'hotel(s)':
+    ein Präfix-Strip ('Hotelissimo' → 'issimo') oder eine breitere Wortliste
+    wäre genau die Fuzzy-Magie, die hier schon zweimal zwei Häuser
+    verschmolzen hat. Der Rest muss ≥ 3 Zeichen behalten."""
+    for g in ('hotels', 'hotel'):
+        if tok.endswith(g) and len(tok) - len(g) >= 3:
+            return tok[:-len(g)]
+    return tok
+
+
 def _hotel_tokens(name):
     """Hotelname → signifikante Token-Menge (Klammern raus, Akzente gefaltet).
     Deterministisch — keine Fuzzy-Magie."""
     s = re.sub(r'\([^)]*\)', ' ', str(name or ''))
-    toks = {t for t in re.split(r'[^a-z0-9]+', _fold(s)) if t}
+    toks = {_degeneric(t) for t in re.split(r'[^a-z0-9]+', _fold(s)) if t}
     return toks - _GENERIC_HOTEL_TOKENS
 
 
@@ -730,6 +748,10 @@ def hotel_block(shift, legs_today, all_legs, directory, hotel_event_days):
         'hotel_source': ('lh' if lh_name else ('directory' if display_name else None)),
         'transfer_min': tm['transfer_min'], 'transfer_marker': tm['marker'],
         'transfer_reason': tm['reason'],
+        # Die NACHT, in der die Crew hier schläft (Ankunft des letzten Legs).
+        # Evidenz-Schlüssel des Hotelwechsel-Pfads: gezählt werden Nächte,
+        # nicht Payloads — acht Crews derselben Rotation sind EIN Ereignis.
+        'night_of': _utc_day(last.get('arr_iso')),
         'pickup_utc': pickup_utc, 'pickup_local': pickup_lt,
         'pickup_day': _utc_day((ret or {}).get('dep_iso')) if ret else None,
         'return_flight': (ret or {}).get('flight'),
@@ -769,18 +791,18 @@ def official_name_action(lh_name, match):
                   offiziellen Namen am Eintrag ergänzen (gleiches Haus).
       'suggest' — Station hat GAR KEINEN Eintrag → über den bestehenden
                   Vorschlags-Weg als `suggested` anlegen (ohne erfundene Zeit).
-      'report'  — Station hat Einträge, LHs Name trifft aber keinen davon
-                  (Umbuchung / zweites Haus / Hotelvertrag-Wechsel). NUR
-                  melden: kein Schreiben, kein Vorschlag. Ein einzelner Payload
-                  darf einen freigegebenen Eintrag nie kippen — und ein
-                  automatisch angelegter Vorschlag an einer belegten Station
-                  kippt ihn mittelbar doch: die Vote-Promotion in
-                  /api/ax/crew-hotels/suggest hätte ihn beim ERSTEN menschlichen
-                  Tap auf `approved` gehoben und den bisherigen Eintrag
-                  deaktiviert (adversarialer Review 27.07.).
+      'contest' — Station hat Einträge, LHs Name trifft aber keinen davon.
+                  OWNER-KORREKTUR 27.07.2026 (LH-Kabinencrew): „wenn LH ein
+                  anderes Hotel liefert, ist es wahrscheinlich ein neues
+                  Hotel." LHs Buchung ist die Wahrheit darüber, WO die Crew
+                  schläft — der Verzeichnis-Eintrag ist im Konfliktfall
+                  vermutlich veraltet. Trotzdem kippt EIN Payload nichts:
+                  'contest' legt nur Evidenz an (s. `_record_lh_hotel_evidence`),
+                  gekippt wird erst bei wiederholter Buchung über mehrere
+                  getrennte Layover-Nächte (`hotel_change_decision`).
       None      — nichts tun (Platzhalter, oder Name schon identisch).
-    conflict=True begleitet 'report' — das Signal für einen möglichen
-    Hotelvertrag-Wechsel, das ein Mensch entscheidet.
+    conflict=True begleitet 'contest' — das Signal für einen möglichen
+    Hotelwechsel.
 
     Angereichert wird ausschliesslich bei `matched` — nie aufgrund des Reasons
     allein (siehe transfer_match: der Regel-3-Rückfall sah früher aus wie ein
@@ -802,7 +824,135 @@ def official_name_action(lh_name, match):
         return 'enrich', False
     if reason == 'no_entry':
         return 'suggest', False
-    return 'report', True
+    return 'contest', True
+
+
+# ── Hotelwechsel: LH gewinnt, aber erst mit Evidenz (Owner 27.07.2026) ──────
+# „Wenn LH ein anderes Hotel liefert, ist es wahrscheinlich ein neues Hotel."
+# Zwei Dinge bleiben davon unberührt:
+#   1. Die FAHRTZEIT wandert NIE mit. Ein neues Haus startet ohne Zeit → die
+#      bestehenden Regeln von `transfer_match` liefern N/A bzw. (an einer
+#      Station mit genau EINEM Eintrag) die allgemeine Destinations-Zeit mit
+#      '*'. Ein richtiger Name mit fremder Fahrtzeit ist schlimmer als gar
+#      keine Zeit — genau dieser Fehler wurde am 27.07. zweimal gefunden
+#      (BUD, Mercure Frankfurt).
+#   2. Ein EINZELNER Payload kippt nichts. Crews werden auch kurzfristig
+#      umgebucht (Überbuchung, Messe-Wochen).
+#
+# SCHWELLE: 3 verschiedene Layover-NÄCHTE, die zusammen ≥ 7 Tage auseinander
+# liegen, innerhalb der letzten 120 Tage. Begründung:
+#   • 1 Nacht  = ein einzelner Payload (ausgeschlossen, s.o.).
+#   • 2 Nächte = kann eine einzige zweitägige Layover-Phase sein oder zwei
+#     Crews derselben Umbuchungswelle.
+#   • Gezählt werden NÄCHTE, nicht Payloads — acht Crews derselben Rotation
+#     sind EIN Ereignis, nicht acht.
+#   • Die 7-Tage-Spanne ist der eigentliche Filter gegen die Umbuchung:
+#     „Stammhaus war während der Messe voll" verteilt sich auf aufeinander-
+#     folgende Tage, ein geänderter Hotelvertrag auf Wochen.
+# Der Preis der Vorsicht ist klein: die Briefing-Karte zeigt LHs Namen ohnehin
+# SOFORT (`hotel_block`: LH-Name schlägt Verzeichnis-Name). Die Schwelle
+# verzögert nur das Umschreiben des Verzeichnisses — und die ist rücknehmbar.
+_LH_CONTEST_STATUS = 'lh_contested'
+_EVIDENCE_PREFIX = 'lh_evidence:'
+_CONTEST_MIN_NIGHTS = 3
+_CONTEST_MIN_SPAN_DAYS = 7
+_CONTEST_WINDOW_DAYS = 120
+
+
+def _parse_nights(raw):
+    """'lh_evidence:2026-07-20,2026-07-24' → ['2026-07-20', '2026-07-24'].
+    Alles Unbekannte → []. Wirft nie."""
+    s = str(raw or '')
+    if not s.startswith(_EVIDENCE_PREFIX):
+        return []
+    out = []
+    for part in s[len(_EVIDENCE_PREFIX):].split(','):
+        p = part.strip()[:10]
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p):
+            out.append(p)
+    return sorted(set(out))
+
+
+def _fmt_nights(nights):
+    return _EVIDENCE_PREFIX + ','.join(sorted(set(nights)))
+
+
+def hotel_change_decision(nights, today=None):
+    """Reicht die gesammelte Evidenz, um das Verzeichnis umzuschreiben? Pure.
+
+    `nights` = ISO-Daten der Layover-NÄCHTE, an denen LH dasselbe neue Haus
+    gebucht hat. Returns (flip, kept, reason) — `kept` ist die auf das
+    120-Tage-Fenster beschnittene, sortierte Liste (und damit das, was
+    zurückgeschrieben wird; alte Evidenz verfällt von selbst)."""
+    from datetime import date as _date
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+    elif isinstance(today, str):
+        today = _date.fromisoformat(today[:10])
+    kept = []
+    for n in sorted(set(nights or [])):
+        try:
+            d = _date.fromisoformat(n[:10])
+        except Exception:
+            continue
+        if 0 <= (today - d).days <= _CONTEST_WINDOW_DAYS:
+            kept.append(n[:10])
+        elif (today - d).days < 0:
+            kept.append(n[:10])      # Zukunfts-Layover ist normale Planung
+    if len(kept) < _CONTEST_MIN_NIGHTS:
+        return False, kept, 'need_more_nights'
+    span = (_date.fromisoformat(kept[-1]) - _date.fromisoformat(kept[0])).days
+    if span < _CONTEST_MIN_SPAN_DAYS:
+        return False, kept, 'need_wider_span'
+    return True, kept, 'flip'
+
+
+def hotel_supersede_plan(rows, lh_name):
+    """Was genau passiert, wenn die Schwelle erreicht ist. Pure/testbar.
+
+    `rows` = ALLE Verzeichnis-Zeilen dieser (airline, iata) — auch inaktive und
+    andere Status. Returns dict:
+      {'resurrect': row|None, 'insert': bool, 'deactivate': [row, …],
+       'reason': str}
+
+    Zwei Regeln, die der Owner explizit gezogen hat:
+      • Kennt das Verzeichnis DIESES Haus schon (auch als stillgelegte Zeile),
+        wird GENAU DIESE Zeile reaktiviert — mit ihrer eigenen `transfer_min`
+        und ihren `votes`. Das ist keine wandernde Fahrtzeit, sondern die Zeit
+        DES HAUSES, das zurückkommt (BUD: 'Intercity Budapest', 35 min, am
+        18.07. stillgelegt — und genau dorthin bucht LH wieder).
+      • Stillgelegt wird nur, wenn die Station bisher GENAU EIN aktives Hotel
+        hatte. Bei mehreren aktiven Häusern sind das bewusste Optionen
+        (`/api/admin/crew-hotels/approve` kollabiert sie auch nicht) — dort
+        kommt LHs Haus dazu, statt die anderen zu löschen."""
+    rows = [r for r in (rows or [])
+            if str(r.get('status') or '') != _LH_CONTEST_STATUS]
+    same = [r for r in rows
+            if _same_house(lh_name, r.get('hotel'))
+            or (r.get('official_name')
+                and _same_house(lh_name, r.get('official_name')))]
+    if len(same) > 1:
+        # Nicht eindeutig adressierbar → NICHTS anfassen (dieselbe Linie wie
+        # der 'enrich'-Pfad). Ein Mensch entscheidet.
+        return {'resurrect': None, 'insert': False, 'deactivate': [],
+                'reason': 'ambiguous_same_house'}
+    same_ids = {r.get('id') for r in same}
+    active = [r for r in rows
+              if str(r.get('status') or '') == 'approved' and r.get('active')
+              and r.get('id') not in same_ids]
+    deactivate = active if len(active) == 1 else []
+    reason = 'replace' if deactivate else (
+        'added_as_option' if active else 'added_to_empty')
+    if same:
+        hit = same[0]
+        if (str(hit.get('status') or '') == 'approved' and hit.get('active')
+                and not deactivate):
+            return {'resurrect': None, 'insert': False, 'deactivate': [],
+                    'reason': 'already_current'}
+        return {'resurrect': hit, 'insert': False,
+                'deactivate': deactivate, 'reason': reason}
+    return {'resurrect': None, 'insert': True, 'deactivate': deactivate,
+            'reason': reason}
 
 
 # Doppel-Schreib-Schutz pro Prozess: derselbe abweichende Name erzeugt nie
@@ -820,13 +970,16 @@ _LHFO_AIRLINE_BUCKETS = ('LUFTHANSA', 'LUFTHANSA CITY')
 _SUGGESTED_BY_MACHINE = 'lh_flightops:auto'
 
 
-def _sync_official_name(token, station, lh_name, directory):
+def _sync_official_name(token, station, lh_name, directory, night=None):
     """Best-effort-Anreicherung nach einem gebauten Hotel-Block. Wirft nie und
-    blockiert das Briefing nie. Schreibt ausschließlich official_name-Felder
-    bzw. einen neuen `suggested`-Eintrag — transfer_min/votes/status bestehender
-    Zeilen werden NIE berührt. Airline fail-closed über das Profil des Tokens
+    blockiert das Briefing nie. Airline fail-closed über das Profil des Tokens
     (dieselbe Linie wie _crew_hotel_dir_serve; _filter_crew_hotels der
-    Layover-Recs bleibt komplett unberührt)."""
+    Layover-Recs bleibt komplett unberührt).
+
+    `night` = ISO-Datum der Layover-Nacht. Es ist der EVIDENZ-Schlüssel des
+    Hotelwechsel-Pfads: gezählt werden Nächte, nicht Payloads — acht Crews
+    derselben Rotation sind EIN Ereignis. Ohne `night` wird keine Evidenz
+    gesammelt (der Konflikt wird dann nur wie früher gemeldet)."""
     try:
         match = transfer_match(station, lh_name, directory)
         action, conflict = official_name_action(lh_name, match)
@@ -851,7 +1004,11 @@ def _sync_official_name(token, station, lh_name, directory):
         clean = _clean_hotel_name(lh_name)
         if len(clean) < 3:
             return None
-        mk = (airline, (station or '').upper(), clean.lower(), action)
+        # Die NACHT gehört in den Memo-Key: ohne sie hätte der 6-h-Schutz eine
+        # zweite Layover-Nacht verschluckt, die kurz nach Mitternacht auf die
+        # erste folgt — und genau die Nächte sind die Evidenz.
+        mk = (airline, (station or '').upper(), clean.lower(), action,
+              str(night or '')[:10])
         now = time.time()
         if (now - _dir_sync_memo.get(mk, 0)) < _DIR_SYNC_TTL_S:
             return None
@@ -863,18 +1020,20 @@ def _sync_official_name(token, station, lh_name, directory):
         from datetime import datetime as _d, timezone as _tz
         now_iso = _d.now(_tz.utc).isoformat()
         sbc = _app.sb
-        if action == 'report':
-            # Fall 2/4: die Station HAT Einträge, LHs Name trifft keinen davon
-            # (Umbuchung, zweites Haus, oder ein echter Hotelvertrag-Wechsel).
-            # Hier wird NICHTS geschrieben — auch kein Vorschlag. Ein Mensch
-            # entscheidet über den bestehenden Weg (GET /api/admin/crew-hotels/
-            # pending → /approve, altes Hotel per /deactivate abloesen).
+        if action == 'contest':
+            # Fall 2/4: die Station HAT Einträge, LHs Name trifft keinen davon.
+            # LH gewinnt (Owner 27.07.) — aber erst mit Evidenz über mehrere
+            # getrennte Layover-Nächte, s. `hotel_change_decision`.
             log.warning('[daily_briefing] hotel-name-conflict station=%s '
-                        'lh="%s" verzeichnis=%s (melden, nicht umschreiben)',
+                        'lh="%s" verzeichnis=%s (Evidenz sammeln)',
                         station, clean,
                         [r.get('hotel') for r in directory
                          if str(r.get('iata') or '').upper() == (station or '').upper()])
-            return 'reported'
+            if not night:
+                return 'reported'    # ohne Nacht kein Evidenz-Schlüssel
+            return _record_lh_hotel_evidence(sbc, airline,
+                                             (station or '').upper(), clean,
+                                             str(night)[:10], now_iso)
         if action == 'enrich':
             crowd = str((match['row'] or {}).get('hotel_crowd')
                         or (match['row'] or {}).get('hotel') or '').strip()
@@ -927,6 +1086,126 @@ def _sync_official_name(token, station, lh_name, directory):
     except Exception as e:
         log.warning('[daily_briefing] official-name-sync: %s', type(e).__name__)
         return None
+
+
+_DIR_TABLE = 'crew_hotel_directory'
+
+
+def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso):
+    """Eine Layover-Nacht als Evidenz für „LH bucht hier ein anderes Haus"
+    festhalten und — sobald die Schwelle steht — den Wechsel vollziehen.
+
+    SPEICHERORT ist bewusst `crew_hotel_directory` selbst, mit dem eigenen
+    Status `lh_contested`: keine neue Tabelle, also kein Migrations-Schritt
+    zwischen Code und Wirkung (Migrationen laufen hier von Hand über den
+    Supabase-SQL-Editor, s. RUNBOOK). Alle bestehenden Lesepfade filtern hart
+    auf status='approved' bzw. 'suggested' — eine contested-Zeile ist für
+    Serve, Vorschlags-Liste und Vote-Promotion unsichtbar.
+    Feldbelegung: `hotel`/`official_name` = LHs Klarname, `votes` = Zahl der
+    Nächte, `official_name_source` = 'lh_evidence:<datum>,<datum>,…'.
+    Wirft nie."""
+    try:
+        rows = (sbc.table(_DIR_TABLE)
+                .select('id,official_name_source,votes')
+                .eq('airline', airline).eq('iata', station)
+                .eq('status', _LH_CONTEST_STATUS)
+                .ilike('hotel', clean).limit(2).execute().data) or []
+    except Exception as e:
+        log.warning('[daily_briefing] hotel-evidence read: %s', type(e).__name__)
+        return 'reported'
+    row = rows[0] if len(rows) == 1 else None
+    nights = set(_parse_nights((row or {}).get('official_name_source')))
+    if night in nights and row is not None:
+        return 'evidence_known'          # diese Nacht zählt genau einmal
+    nights.add(night)
+    flip, kept, reason = hotel_change_decision(nights)
+    payload = {'official_name_source': _fmt_nights(kept),
+               'votes': len(kept), 'official_name_at': now_iso,
+               'updated_at': now_iso}
+    try:
+        if row is None:
+            sbc.table(_DIR_TABLE).insert(dict(payload, **{
+                'airline': airline, 'iata': station, 'base': None,
+                'hotel': clean, 'official_name': clean, 'transfer_min': 0,
+                'status': _LH_CONTEST_STATUS,
+                'suggested_by': _SUGGESTED_BY_MACHINE, 'active': True,
+            })).execute()
+        else:
+            sbc.table(_DIR_TABLE).update(payload).eq('id', row['id']).execute()
+    except Exception as e:
+        log.warning('[daily_briefing] hotel-evidence write: %s', type(e).__name__)
+        return 'reported'
+    log.warning('[daily_briefing] hotel-evidence %s/%s "%s": %d Nacht/Nächte '
+                '%s -> %s', airline, station, clean, len(kept), kept, reason)
+    if not flip:
+        return 'evidence_recorded'
+    return _apply_lh_hotel_change(sbc, airline, station, clean, kept,
+                                  (row or {}).get('id'), now_iso)
+
+
+def _apply_lh_hotel_change(sbc, airline, station, clean, nights, evidence_id,
+                           now_iso):
+    """Den Wechsel vollziehen: LHs Haus wird der aktuelle Eintrag, das bisherige
+    wird STILLGELEGT (active=False) — nie gelöscht, nie umgeschrieben.
+    `transfer_min`, `votes` und `status` der alten Zeile bleiben unangetastet,
+    damit ein Rückweg über /api/admin/crew-hotels/approve genügt und die Zeit
+    wieder gilt, falls das Haus zurückkommt.
+    Eine FAHRTZEIT wird nie erfunden: ein neu angelegtes Haus startet mit
+    transfer_min=0, was `transfer_match` als „keine Zeit hinterlegt" liest
+    (→ N/A bzw. Regel 3). Wirft nie."""
+    try:
+        rows = (sbc.table(_DIR_TABLE)
+                .select('id,hotel,official_name,status,active,transfer_min,votes')
+                .eq('airline', airline).eq('iata', station)
+                .limit(200).execute().data) or []
+    except Exception as e:
+        log.warning('[daily_briefing] hotel-change read: %s', type(e).__name__)
+        return 'evidence_recorded'
+    plan = hotel_supersede_plan(rows, clean)
+    if not (plan['resurrect'] or plan['insert'] or plan['deactivate']):
+        log.warning('[daily_briefing] hotel-change %s/%s "%s": kein Plan (%s)',
+                    airline, station, clean, plan['reason'])
+        return 'evidence_recorded'
+    try:
+        for old in plan['deactivate']:
+            # NUR active umlegen. transfer_min/votes/status bleiben stehen —
+            # die Zeit gehört dem Haus, nicht der Station.
+            sbc.table(_DIR_TABLE).update(
+                {'active': False, 'updated_at': now_iso}
+            ).eq('id', old['id']).execute()
+        if plan['resurrect'] is not None:
+            sbc.table(_DIR_TABLE).update({
+                'status': 'approved', 'active': True,
+                'official_name': clean, 'official_name_source': 'lh_flightops',
+                'official_name_at': now_iso, 'updated_at': now_iso,
+            }).eq('id', plan['resurrect']['id']).execute()
+        elif plan['insert']:
+            sbc.table(_DIR_TABLE).insert({
+                'airline': airline, 'iata': station, 'base': None,
+                'hotel': clean, 'transfer_min': 0, 'status': 'approved',
+                'suggested_by': _SUGGESTED_BY_MACHINE, 'votes': len(nights),
+                'active': True, 'official_name': clean,
+                'official_name_source': 'lh_flightops',
+                'official_name_at': now_iso,
+            }).execute()
+        if evidence_id:
+            # Evidenz-Zeile stilllegen, nicht löschen — sie ist das Protokoll,
+            # warum gewechselt wurde.
+            sbc.table(_DIR_TABLE).update(
+                {'active': False, 'updated_at': now_iso}
+            ).eq('id', evidence_id).execute()
+    except Exception as e:
+        log.warning('[daily_briefing] hotel-change write: %s', type(e).__name__)
+        return 'evidence_recorded'
+    log.warning('[daily_briefing] HOTELWECHSEL %s/%s -> "%s" (%s, %d Nächte %s)'
+                ' · stillgelegt: %s · reaktiviert: %s · Rückweg: POST '
+                '/api/admin/crew-hotels/approve {"id":"<alte id>"} + '
+                '/deactivate {"id":"<neue id>"}',
+                airline, station, clean, plan['reason'], len(nights), nights,
+                [(o.get('id'), o.get('hotel'), o.get('transfer_min'))
+                 for o in plan['deactivate']],
+                (plan['resurrect'] or {}).get('id'))
+    return 'hotel_changed'
 
 
 # ── Header (Briefing Room) ──────────────────────────────────────────────────
@@ -1386,12 +1665,14 @@ def ax_daily_briefing(token):
     # Verzeichnis-Anreicherung (Owner 27.07.): LHs Klarname ERGÄNZT den
     # crowdgesourcten Eintrag (gleiches Haus), wird an einer leeren Station als
     # `suggested` vorgeschlagen — und an einer belegten Station mit anderem
-    # Namen NUR gemeldet. Nur wenn der Name wirklich von LH kommt (ein aus dem
-    # Verzeichnis gezogener Crowd-Name darf nie als „offiziell" zurücklaufen);
-    # best-effort, blockiert das Briefing nie.
+    # Namen als Hotelwechsel-Evidenz gezählt (LH gewinnt, aber erst nach
+    # mehreren getrennten Nächten). Nur wenn der Name wirklich von LH kommt
+    # (ein aus dem Verzeichnis gezogener Crowd-Name darf nie als „offiziell"
+    # zurücklaufen); best-effort, blockiert das Briefing nie.
     hb = briefing.get('hotel') or {}
     if hb.get('hotel') and hb.get('hotel_source') == 'lh':
-        _sync_official_name(token, hb.get('station'), hb.get('hotel'), directory)
+        _sync_official_name(token, hb.get('station'), hb.get('hotel'),
+                            directory, night=hb.get('night_of'))
 
     out = {'ok': True, 'available': True, 'briefing': briefing,
            'complete': not errors, 'errors': errors, 'lh_calls': calls}

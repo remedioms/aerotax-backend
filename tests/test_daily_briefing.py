@@ -412,7 +412,7 @@ def test_zero_minute_entry_never_merges_two_houses(sync_env):
     als deren Anzeigename ausgeliefert — zwei verschiedene Häuser verschmolzen,
     ausgelöst von einer Crowd-Null."""
     m = db.transfer_match('BUD', 'IntercityHotel Budapest', DIRECTORY)
-    assert db.official_name_action('IntercityHotel Budapest', m) == ('report', True)
+    assert db.official_name_action('IntercityHotel Budapest', m) == ('contest', True)
     fake = sync_env([])
     assert db._sync_official_name('AT-U', 'BUD', 'IntercityHotel Budapest',
                                   DIRECTORY) == 'reported'
@@ -430,7 +430,7 @@ def test_parenthesis_content_can_be_the_distinguishing_feature():
     assert m['matched'] is False and m['reason'] == 'destination_general'
     assert m['marker'] == '*'          # sichtbar nur ein Richtwert
     assert db.official_name_action('Mercure Hotel Frankfurt (City)', m) == \
-        ('report', True)
+        ('contest', True)
     # Trägt nur EINE Seite eine Klammer, ist sie eine Notiz — Fall 1 bleibt heil.
     assert db._same_house('Clayton Hotel Düsseldorf',
                           'Clayton Hotel Düsseldorf (ehem. Nikko)')
@@ -968,12 +968,15 @@ def test_official_name_action_four_owner_cases():
     # Fall 1: Schreibweise weicht ab, gleiches Haus → enrich
     m = db.transfer_match('DUS', 'Clayton Hotel Düsseldorf', DIRECTORY)
     assert db.official_name_action('Clayton Hotel Düsseldorf', m) == ('enrich', False)
-    # Fall 2: anderes Haus an Multi-Hotel-Station → NUR melden, nie schreiben
+    # Fall 2: anderes Haus an Multi-Hotel-Station → Evidenz sammeln (LH gewinnt,
+    # aber nie durch EINEN Payload — Owner-Korrektur 27.07.)
     m2 = db.transfer_match('BCN', 'Hilton Barcelona', DIRECTORY)
-    assert db.official_name_action('Hilton Barcelona', m2) == ('report', True)
-    # Fall 2b: anderes Haus an Ein-Hotel-Station → ebenfalls nur melden
+    assert db.official_name_action('Hilton Barcelona', m2) == ('contest', True)
+    # Fall 2b: anderes Haus an Ein-Hotel-Station → ebenfalls Evidenz
     m2b = db.transfer_match('ZAG', 'Westin Zagreb', DIRECTORY)
-    assert db.official_name_action('Westin Zagreb', m2b) == ('report', True)
+    assert db.official_name_action('Westin Zagreb', m2b) == ('contest', True)
+    # In BEIDEN Fällen bleibt matched False — die Fahrtzeit wandert nie mit.
+    assert m2['matched'] is False and m2b['matched'] is False
     # Fall 3: Station ganz ohne Eintrag → suggest, kein Konflikt
     m3 = db.transfer_match('NRT', 'Hilton Narita', DIRECTORY)
     assert db.official_name_action('Hilton Narita', m3) == ('suggest', False)
@@ -1395,11 +1398,13 @@ def test_endpoint_enriches_only_lh_sourced_names(client, monkeypatch):
     Name zurückgeschrieben werden (das wäre eine erfundene LH-Bestätigung)."""
     seen = []
     monkeypatch.setattr(db, '_sync_official_name',
-                        lambda tok, stn, name, d: seen.append((stn, name)))
+                        lambda tok, stn, name, d, night=None:
+                        seen.append((stn, name, night)))
     r = client.get(f'/api/ax/daily-briefing/AT-TEST?date={DATE}')
     assert r.status_code == 200
     assert r.get_json()['briefing']['hotel']['hotel_source'] == 'lh'
-    assert seen == [('BUD', 'IntercityHotel Budapest')]
+    # night_of = Ankunftsnacht des letzten Legs (Evidenz-Schluessel)
+    assert seen == [('BUD', 'IntercityHotel Budapest', '2026-07-27')]
     # ZAG-Nacht: Name stammt aus dem Verzeichnis → kein Rückschreiben.
     db._cache.clear()
     seen.clear()
@@ -1494,3 +1499,190 @@ def test_enrichment_survives_its_own_serve_substitution(sync_env):
     m2 = db.transfer_match('CDG', lh, served)
     assert m2['matched'] is True and m2['transfer_min'] == 40
     assert db.official_name_action(lh, m2) == (None, False)   # idempotent
+
+
+# ── Hotelwechsel: LH gewinnt, aber erst mit Evidenz (Owner 27.07.2026) ───────
+# „Wenn LH ein anderes Hotel liefert, ist es wahrscheinlich ein neues Hotel."
+# Unverändert bleiben zwei Dinge: die Fahrtzeit wandert NIE mit, und ein
+# EINZELNER Payload kippt keinen Eintrag.
+
+def test_degeneric_reunites_a_glued_generic_word():
+    """Der konkrete BUD-Fall: das Verzeichnis kennt 'Intercity Budapest' (mit
+    35 min Fahrtzeit, am 18.07. stillgelegt), LH bucht 'IntercityHotel
+    Budapest' — dasselbe Haus."""
+    assert db._same_house('IntercityHotel Budapest', 'Intercity Budapest')
+    assert db._same_house('Parkhotel Bremen', 'Park Hotel Bremen')
+
+
+def test_degeneric_does_not_merge_different_houses():
+    """Gegenprobe zu den teuren Altfehlern: der Suffix-Strip darf keine zwei
+    Häuser verschmelzen."""
+    assert not db._same_house('Hilton Frankfurt Airport',
+                              'Hilton Garden Inn Frankfurt Airport')
+    assert not db._same_house('Mercure Hotel Frankfurt (Airport)',
+                              'Mercure Hotel Frankfurt (City)')
+    assert not db._same_house('IntercityHotel Budapest',
+                              'Hilton Garden Inn Budapest City Centre')
+    # Kein Präfix-Strip und kein Kahlschlag bei kurzen Wurzeln.
+    assert db._hotel_tokens('Hotelissimo Rom') == {'hotelissimo', 'rom'}
+
+
+def test_change_decision_needs_three_nights_over_a_week():
+    assert db.hotel_change_decision(['2026-07-20'], today='2026-08-20')[0] is False
+    assert db.hotel_change_decision(['2026-07-20', '2026-07-21'],
+                                    today='2026-08-20')[0] is False
+    # Drei Nächte, aber alle in derselben Woche = eher Umbuchung (Messe,
+    # Überbuchung) als geänderter Hotelvertrag.
+    flip, kept, reason = db.hotel_change_decision(
+        ['2026-08-01', '2026-08-03', '2026-08-05'], today='2026-08-20')
+    assert flip is False and reason == 'need_wider_span' and len(kept) == 3
+    flip, kept, reason = db.hotel_change_decision(
+        ['2026-08-01', '2026-08-05', '2026-08-12'], today='2026-08-20')
+    assert flip is True and reason == 'flip' and len(kept) == 3
+
+
+def test_change_decision_forgets_old_evidence():
+    """Evidenz jenseits des 120-Tage-Fensters verfällt — sonst würde ein
+    Hotelwechsel von vor einem Jahr ewig mitzählen."""
+    flip, kept, _r = db.hotel_change_decision(
+        ['2025-01-01', '2026-08-01', '2026-08-12'], today='2026-08-20')
+    assert kept == ['2026-08-01', '2026-08-12'] and flip is False
+
+
+def test_change_decision_counts_nights_not_payloads():
+    """Acht Crews derselben Rotation sind EIN Ereignis."""
+    assert db.hotel_change_decision(['2026-08-01'] * 8, today='2026-08-20')[0] is False
+
+
+def test_supersede_plan_resurrects_the_same_house_with_its_own_time():
+    """Der BUD-Fall: das zurückkehrende Haus steht schon als stillgelegte Zeile
+    im Verzeichnis — MIT seiner eigenen Fahrtzeit. Die gehört dem Haus, nicht
+    der Station; sie wandert also nicht, sie kommt mit ihrer Zeile zurück."""
+    rows = [
+        {'id': 'old', 'hotel': 'Intercity Budapest', 'transfer_min': 35,
+         'votes': 1, 'status': 'approved', 'active': False},
+        {'id': 'cur', 'hotel': 'Hilton Garden Inn Budapest City Centre',
+         'transfer_min': 0, 'votes': 1, 'status': 'approved', 'active': True},
+    ]
+    plan = db.hotel_supersede_plan(rows, 'IntercityHotel Budapest')
+    assert plan['resurrect']['id'] == 'old' and plan['insert'] is False
+    assert [r['id'] for r in plan['deactivate']] == ['cur']
+    assert plan['reason'] == 'replace'
+
+
+def test_supersede_plan_new_house_gets_no_invented_time():
+    rows = [{'id': 'cur', 'hotel': 'Hilton Garden Inn Budapest City Centre',
+             'transfer_min': 40, 'votes': 3, 'status': 'approved',
+             'active': True}]
+    plan = db.hotel_supersede_plan(rows, 'IntercityHotel Budapest')
+    assert plan['resurrect'] is None and plan['insert'] is True
+    assert [r['id'] for r in plan['deactivate']] == ['cur']
+
+
+def test_supersede_plan_keeps_multi_hotel_options():
+    """An einer Station mit MEHREREN aktiven Häusern sind das bewusste Optionen
+    (auch /api/admin/crew-hotels/approve kollabiert sie nicht) — LHs Haus kommt
+    dazu, statt die anderen stillzulegen."""
+    rows = [{'id': 'a', 'hotel': 'Hotel A', 'status': 'approved', 'active': True},
+            {'id': 'b', 'hotel': 'Hotel B', 'status': 'approved', 'active': True}]
+    plan = db.hotel_supersede_plan(rows, 'Hotel C')
+    assert plan['insert'] is True and plan['deactivate'] == []
+    assert plan['reason'] == 'added_as_option'
+
+
+def test_supersede_plan_is_idempotent_and_refuses_ambiguity():
+    same = [{'id': 'a', 'hotel': 'Hotel A', 'status': 'approved', 'active': True}]
+    assert db.hotel_supersede_plan(same, 'Hotel A')['reason'] == 'already_current'
+    dup = [{'id': 'a', 'hotel': 'Hotel A', 'status': 'approved', 'active': False},
+           {'id': 'b', 'hotel': 'Hotel A', 'status': 'suggested', 'active': True},
+           {'id': 'c', 'hotel': 'Hotel Z', 'status': 'approved', 'active': True}]
+    assert db.hotel_supersede_plan(dup, 'Hotel A')['reason'] == 'ambiguous_same_house'
+    assert db.hotel_supersede_plan(dup, 'Hotel A')['deactivate'] == []
+
+
+def test_supersede_plan_ignores_the_evidence_rows_themselves():
+    rows = [{'id': 'ev', 'hotel': 'IntercityHotel Budapest',
+             'status': db._LH_CONTEST_STATUS, 'active': True},
+            {'id': 'cur', 'hotel': 'Hilton Garden Inn Budapest City Centre',
+             'status': 'approved', 'active': True}]
+    plan = db.hotel_supersede_plan(rows, 'IntercityHotel Budapest')
+    assert plan['insert'] is True and [r['id'] for r in plan['deactivate']] == ['cur']
+
+
+def test_single_payload_only_records_evidence(sync_env):
+    """Der Kern der Owner-Auflage: EIN Payload kippt nichts. Er legt genau eine
+    Evidenz-Zeile an — der approved-Bestand wird nicht angefasst."""
+    fake = sync_env([[]])            # noch keine Evidenz-Zeile
+    out = db._sync_official_name('AT-U', 'BUD', 'IntercityHotel Budapest',
+                                 DIRECTORY, night='2026-07-28')
+    assert out == 'evidence_recorded'
+    assert len(fake.ops) == 1
+    table, op, payload, _f = fake.ops[0]
+    assert (table, op) == ('crew_hotel_directory', 'insert')
+    assert payload['status'] == db._LH_CONTEST_STATUS
+    assert payload['transfer_min'] == 0          # nie eine Zeit erfinden
+    assert payload['official_name_source'] == 'lh_evidence:2026-07-28'
+    assert payload['votes'] == 1
+
+
+def test_repeated_same_night_does_not_count_twice(sync_env):
+    fake = sync_env([[{'id': 'ev', 'votes': 1,
+                       'official_name_source': 'lh_evidence:2026-07-28'}]])
+    out = db._sync_official_name('AT-U', 'BUD', 'IntercityHotel Budapest',
+                                 DIRECTORY, night='2026-07-28')
+    assert out == 'evidence_known'
+    assert fake.ops == []
+
+
+def test_threshold_reached_flips_the_directory_and_keeps_the_old_row(sync_env):
+    """Vollzug am echten BUD-Bestand: die Intercity-Zeile (35 min, stillgelegt)
+    wird reaktiviert, die Hilton-Zeile NUR auf active=False gesetzt.
+    transfer_min/votes/status der alten Zeile bleiben unangetastet — der
+    Rückweg ist ein einziger /approve-Call."""
+    fake = sync_env([
+        [{'id': 'ev', 'votes': 2,
+          'official_name_source': 'lh_evidence:2026-07-01,2026-07-12'}],
+        [{'id': 'old', 'hotel': 'Intercity Budapest', 'transfer_min': 35,
+          'votes': 1, 'status': 'approved', 'active': False},
+         {'id': 'cur', 'hotel': 'Hilton Garden Inn Budapest City Centre',
+          'transfer_min': 0, 'votes': 1, 'status': 'approved', 'active': True}],
+    ])
+    out = db._sync_official_name('AT-U', 'BUD', 'IntercityHotel Budapest',
+                                 DIRECTORY, night='2026-07-28')
+    assert out == 'hotel_changed'
+    ops = {(t, op, tuple(sorted(p or {}))): (p, f) for t, op, p, f in fake.ops}
+    # 1) Evidenz-Zeile fortgeschrieben, 2) alte deaktiviert, 3) neue aktiviert,
+    # 4) Evidenz stillgelegt.
+    updates = [(p, f) for _t, op, p, f in fake.ops if op == 'update']
+    assert len(fake.ops) == 4 and len(updates) == 4
+    deact = [(p, f) for p, f in updates if p.get('active') is False]
+    assert any(('eq', 'id', 'cur') in f for _p, f in deact)
+    assert all(set(p) <= {'active', 'updated_at'} for p, _f in deact)
+    res = [(p, f) for p, f in updates if p.get('active') is True]
+    assert len(res) == 1 and ('eq', 'id', 'old') in res[0][1]
+    assert 'transfer_min' not in res[0][0] and 'votes' not in res[0][0]
+    assert ops is not None
+
+
+def test_evidence_is_never_collected_without_a_night(sync_env):
+    """Ohne Layover-Nacht gibt es keinen Evidenz-Schlüssel — dann bleibt es beim
+    reinen Melden (Altverhalten), aber garantiert ohne Schreibzugriff."""
+    fake = sync_env([])
+    assert db._sync_official_name('AT-U', 'ZAG', 'Westin Zagreb',
+                                  DIRECTORY) == 'reported'
+    assert fake.ops == []
+
+
+def test_hotel_block_reports_the_night_it_is_about():
+    """`night_of` ist der Evidenz-Schlüssel und muss die Ankunftsnacht sein."""
+    legs = [{'flight': 'LH1334', 'dep': 'FRA', 'arr': 'BUD',
+             'dep_iso': '2026-07-28T18:00:00+00:00',
+             'arr_iso': '2026-07-28T20:10:00+00:00',
+             'hotel_name': 'IntercityHotel Budapest'}]
+    ret = {'flight': 'LH1335', 'dep': 'BUD', 'arr': 'FRA',
+           'dep_iso': '2026-07-29T06:00:00+00:00',
+           'arr_iso': '2026-07-29T08:00:00+00:00', 'hotel_name': None}
+    hb = db.hotel_block({'homebase': 'FRA'}, legs, legs + [ret], DIRECTORY, [])
+    assert hb['night_of'] == '2026-07-28'
+    # Und die Fahrtzeit bleibt ehrlich leer (BUD-Eintrag hat transfer_min=0).
+    assert hb['transfer_min'] is None and 'N/A' in hb['line']

@@ -298,14 +298,47 @@ def _sector_tail(s):
 # API-Call-Cache (Spalte `provider` ist genau dafür da).
 _reg_lock = threading.Lock()
 _reg_memo = {}
-_REG_TTL_S = 3 * 3600
+_REG_TTL_S = 3 * 3600          # Rückfall, wenn die Abflugzeit unbekannt ist
 _REG_NEG_TTL_S = 1800
 # Transportfehler/Throttle-Abweisung sind KEIN „hat keine Reg" — nur kurz
 # zurückhalten, damit ein LH-503 nicht 30 min als Fakt gilt (in der Stichprobe
 # vom 27.07. waren ALLE Fehlschläge 503er).
-_REG_UNKNOWN_TTL_S = 120
+# 600 s statt 120 s (Messung 27.07.): der Daemon gleicht die Topic-Liste alle
+# 300 s ab (LH_MQTT_REFRESH_S). Eine Sperre UNTER dem Poll-Intervall heißt, dass
+# jeder Poll alle ~320 Legs erneut versucht — bei geschlossenem Gate ergab das
+# 3.901 abgewiesene Versuche/h, ohne dass je eine Reg dabei herauskam.
+_REG_UNKNOWN_TTL_S = 600
 _REG_CACHE_PROVIDER = 'lhopen'
 _REG_KEY_CHUNK = 80            # PostgREST-URL-Länge: in_() nicht überdehnen
+
+# ── Wie lange eine BEKANNTE Reg gilt (Owner 2026-07-27) ─────────────────────
+# Die Maschinenzuteilung eines konkreten Flugs an einem konkreten Datum ist
+# faktisch unveränderlich; nur ein Tailswap kippt sie, und der ist in der Regel
+# bis ~90 min vor Abflug entschieden. Die alte FLACHE 3-h-TTL bezahlte das mit
+# ~5,7 Käufen pro Leg über seine 17 h im Beobachtungsfenster (Abflug −1 h …
+# +16 h) — bei ~320 Legs also ~107 Calls/h reine Wiederholung.
+# Neue Politik: EINMAL früh holen, die TTL so setzen, dass sie exakt zum
+# Gegencheck ~90 min vor Abflug abläuft, und danach als final behandeln.
+# Ergebnis: 2 Käufe pro Leg statt 5,7 — und der letzte davon liegt NÄHER am
+# Abflug als bisher, die Aussage wird also nicht schlechter, sondern besser.
+_REG_RECHECK_LEAD_S = 90 * 60
+_REG_FINAL_TTL_S = 12 * 3600
+
+
+def _reg_ttl(dep_utc, now_ts):
+    """TTL einer bekannten Reg (Sekunden). Pure. `dep_utc` unbekannt → die
+    alte flache TTL (kein Verhaltenswechsel für Aufrufer ohne Abflugzeit)."""
+    if dep_utc is None:
+        return _REG_TTL_S
+    try:
+        lead = dep_utc.timestamp() - now_ts
+    except Exception:
+        return _REG_TTL_S
+    if lead > _REG_RECHECK_LEAD_S:
+        # Läuft genau dann ab, wenn der Gegencheck fällig ist (min. 5 min, damit
+        # ein Leg knapp über der Schwelle keine Mikro-TTL bekommt).
+        return int(max(300, min(_REG_FINAL_TTL_S, lead - _REG_RECHECK_LEAD_S)))
+    return _REG_FINAL_TTL_S
 
 
 def _reg_cache_key(flight_disp, date, dep, arr):
@@ -374,23 +407,27 @@ def _ts_after(val, now):
 
 
 def _reg_cache_write(items):
-    """items = [(call_key, reg_or_None)] → Upsert in den geteilten Cache.
+    """items = [(call_key, reg_or_None, ttl_s)] → Upsert in den geteilten Cache.
     Wirft nie. Ein negativer Eintrag (reg=None) wird bewusst MITgeschrieben:
     „dieser Flug hat bei LH keine Reg" ist eine Antwort und spart die nächsten
     Aufrufe. Nicht geschrieben werden Lücken (LH kaputt) — die kommen hier
-    gar nicht erst an."""
+    gar nicht erst an.
+
+    Die TTL kommt vom Aufrufer (`_reg_ttl`, abflugnah gestaffelt) und muss
+    dieselbe sein wie im Prozess-Memo — sonst wäre der geteilte Cache je nach
+    Prozess mal kürzer, mal länger gültig als der lokale."""
     client = _sb()
     if client is None or not items:
         return
     now = datetime.now(timezone.utc)
     rows = []
-    for key, reg in items:
+    for key, reg, ttl in items:
         pos = reg is not None
         rows.append({
             'call_key': key,
             'provider': _REG_CACHE_PROVIDER,
             'result': {'reg': reg} if pos else None,
-            'result_until': (now + timedelta(seconds=_REG_TTL_S)).isoformat()
+            'result_until': (now + timedelta(seconds=int(ttl))).isoformat()
                             if pos else None,
             'negative_reason': None if pos else 'no_reg',
             'negative_until': None if pos else
@@ -420,20 +457,26 @@ def _fetch_leg_reg(flight_disp, date, dep, arr):
         return None, False
 
 
-def _cached_leg_reg(flight_disp, date, dep, arr):
+def _cached_leg_reg(flight_disp, date, dep, arr, dep_utc=None):
     """Reg EINES Legs über alle drei Ebenen. Für Einzelabfragen
     (`_push_inbound`); die Topics-Rechnung nutzt `_legs_regs` (Batch)."""
-    return _legs_regs([(flight_disp, date, dep, arr)]).get(
-        (flight_disp, date, dep, arr))
+    leg = (flight_disp, date, dep, arr)
+    return _legs_regs([leg],
+                      dep_times={leg: dep_utc} if dep_utc else None).get(leg)
 
 
-def _legs_regs(legs):
+def _legs_regs(legs, dep_times=None):
     """Regs für viele Legs: Prozess-Memo → geteilter Cache (EIN Batch-Read) →
     LH nur für den Rest. Returns {(flight,date,dep,arr): reg-or-None}.
 
     Der Batch ist der Punkt: vorher stand pro Leg ein potenzieller LH-Call, und
-    ein frisch recycelter Worker feuerte alle auf einmal."""
+    ein frisch recycelter Worker feuerte alle auf einmal.
+
+    `dep_times` = {leg: aware datetime} — optional, steuert die TTL einer
+    gefundenen Reg (s. `_reg_ttl`). Fehlt der Eintrag, gilt die alte flache
+    3-h-TTL."""
     now = time.time()
+    dep_times = dep_times or {}
     out = {}
     todo = []
     # DEDUPE ist Pflicht, nicht Kosmetik: ein Flug mit 8 AeroX-Crews steht 8×
@@ -456,23 +499,47 @@ def _legs_regs(legs):
             reg = shared[key]
             out[leg] = reg
             _reg_memo_put(key, reg,
-                          _REG_TTL_S if reg else _REG_NEG_TTL_S, now)
+                          _reg_ttl(dep_times.get(leg), now) if reg
+                          else _REG_NEG_TTL_S, now)
         else:
             misses.append((leg, key))
 
     fresh = []
+    gate_shut = False
     for leg, key in misses:
+        if gate_shut:
+            # GATE ZU: der eigene Throttle hat schon abgewiesen, das gilt für
+            # jeden weiteren Call dieser Stunde. Die restlichen Legs gar nicht
+            # erst versuchen — ohne diesen Abbruch feuerte JEDER Topic-Poll
+            # alle ~320 Legs gegen dieselbe Wand (gemessen 3.901 abgewiesene
+            # Versuche/h, kein einziger davon konnte je eine Reg liefern).
+            out[leg] = None
+            _reg_memo_put(key, None, _REG_UNKNOWN_TTL_S, now)
+            continue
         reg, answered = _fetch_leg_reg(*leg)
         out[leg] = reg
         if not answered:
             # Lücke, kein Fakt: nur kurz zurückhalten, NICHT teilen.
             _reg_memo_put(key, None, _REG_UNKNOWN_TTL_S, now)
+            if _leg_reg_gate_shut():
+                gate_shut = True
             continue
-        _reg_memo_put(key, reg, _REG_TTL_S if reg else _REG_NEG_TTL_S, now)
-        fresh.append((key, reg))
+        ttl = _reg_ttl(dep_times.get(leg), now) if reg else _REG_NEG_TTL_S
+        _reg_memo_put(key, reg, ttl, now)
+        fresh.append((key, reg, ttl))
     if fresh:
         _reg_cache_write(fresh)
     return out
+
+
+def _leg_reg_gate_shut():
+    """True, wenn der letzte LH-Versuch am EIGENEN Throttle scheiterte (nicht
+    an LH). Eigene Funktion, damit Tests sie ersetzen können. Wirft nie."""
+    try:
+        from blueprints.lh_open_api import last_call_denied
+        return bool(last_call_denied())
+    except Exception:
+        return False
 
 
 def _station_tz(iata):
@@ -567,6 +634,7 @@ def inbound_topics_for_rows(rows, now_utc):
     # recycelter Worker ~342 LH-Calls am Stück abfeuerte (s. _legs_regs).
     cands = []                       # (frm, dep, roster_tail_or_None, leg_key)
     need = []
+    dep_times = {}                   # leg_key -> Abflug (steuert die Reg-TTL)
     for _tok, s in _iter_sectors(rows):
         nf = _norm_flight(s.get('flight'))
         if not nf or not is_lh_group(nf[0] + nf[1]):
@@ -581,8 +649,14 @@ def inbound_topics_for_rows(rows, now_utc):
             leg_key = (nf[0] + nf[1], dep.date().isoformat(), frm,
                        (s.get('to') or '').strip().upper() or None)
             need.append(leg_key)
+            # Frühester bekannter Abflug gewinnt: derselbe Leg-Key kann aus
+            # mehreren Roster-Zeilen kommen, und eine zu SPÄTE Annahme würde
+            # die Reg über den Gegencheck hinaus festhalten.
+            prev = dep_times.get(leg_key)
+            if prev is None or dep < prev:
+                dep_times[leg_key] = dep
         cands.append((frm, dep, tail, leg_key))
-    regs = _legs_regs(need) if need else {}
+    regs = _legs_regs(need, dep_times=dep_times) if need else {}
     legs = []
     for frm, dep, tail, leg_key in cands:
         reg = tail or (regs.get(leg_key) if leg_key else None)
@@ -780,7 +854,7 @@ def _push_inbound(kind, event_flight, topic_date, facts=None):
         user_flight = nf[0] + nf[1]
         leg_reg = _sector_tail(s) or _cached_leg_reg(
             user_flight, dep.date().isoformat(), frm,
-            (s.get('to') or '').strip().upper() or None)
+            (s.get('to') or '').strip().upper() or None, dep_utc=dep)
         if not leg_reg or str(leg_reg).replace('-', '').upper() != rn:
             continue
         if obs is None:

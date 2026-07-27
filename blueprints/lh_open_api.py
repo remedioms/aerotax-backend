@@ -363,10 +363,31 @@ def last_call_answered():
     return bool(getattr(_call_state, 'answered', False))
 
 
+def last_call_denied():
+    """True, wenn der letzte LH-Versuch dieses Threads am EIGENEN Throttle
+    scheiterte (Stunden-Budget erschöpft oder Over-Rate-Cool-down) — der Call
+    ging also nie raus.
+
+    WARUM getrennt von `last_call_answered` (Messung 27.07.): ein geschlossenes
+    Gate gilt für JEDEN weiteren Call dieser Stunde, ein LH-503 nur für diesen
+    einen Flug. Batch-Aufrufer (`lh_mqtt._legs_regs`) können damit nach dem
+    ersten „Gate zu" abbrechen, statt die restlichen ~320 Legs gegen dieselbe
+    Wand zu feuern — genau der Sturm, der `lhopen_denied` auf 3.901/h trieb."""
+    return bool(getattr(_call_state, 'denied', False))
+
+
+def _note_answer(answered, denied=False):
+    """Zustand des letzten Versuchs setzen. Auch Memo-Treffer sind Antworten —
+    ohne das hier läse ein Aufrufer nach einem Cache-Hit den Zustand eines
+    ganz anderen, längst vergangenen GETs desselben Threads."""
+    _call_state.answered = bool(answered)
+    _call_state.denied = bool(denied)
+
+
 def _get(path, caller=None):
     """Authentifizierter GET → dict oder None. Wirft nie."""
     global _rate_penalty_until
-    _call_state.answered = False
+    _note_answer(False)
     tok = _token()
     if not tok:
         return None
@@ -375,9 +396,15 @@ def _get(path, caller=None):
         # des Owners): `_budget_ok` deckelt bei _HOUR_BUDGET pro Prozess, ein
         # reiner Gesendet-Zähler könnte also NIE über 220×Prozesse steigen.
         # Erst „gewollt = gesendet + abgewiesen" zeigt den echten Bedarf.
-        budget_inc('lhopen_denied',
-                   'rate_penalty' if time.time() < _rate_penalty_until
-                   else 'hour_budget')
+        # Label = GRUND + AUFRUFER: der reine Grund sagte zwar „3.901 mal am
+        # Stunden-Budget abgewiesen", aber nicht von wem — und genau das war
+        # die Frage („endlich sehen was da alles zieht"). Der ':'-Separator
+        # bleibt dem Key-Schema vorbehalten, darum '_' (budget_inc strippt ':'
+        # ohnehin aus dem Label).
+        reason = ('rate_penalty' if time.time() < _rate_penalty_until
+                  else 'hour_budget')
+        budget_inc('lhopen_denied', f'{reason}_{caller or "unknown"}')
+        _note_answer(False, denied=True)
         return None
     budget_inc('lhopen', caller)
     req = urllib.request.Request(
@@ -387,7 +414,7 @@ def _get(path, caller=None):
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.loads(r.read().decode('utf-8'))
-        _call_state.answered = True
+        _note_answer(True)
         return d
     except urllib.error.HTTPError as e:
         if e.code == 403:
@@ -395,7 +422,7 @@ def _get(path, caller=None):
             # jeder weitere Call verbrennt nur Budget gegen dieselbe Wand.
             _rate_penalty_until = time.time() + _RATE_PENALTY_SEC
         if e.code == 404:            # 404 = Flug an dem Tag nicht geflogen (normal)
-            _call_state.answered = True
+            _note_answer(True)
         else:
             log.warning('[lh_open] GET %s -> HTTP %s', path.split('?')[0], e.code)
         return None
@@ -513,6 +540,79 @@ def _leg_to_facts(leg):
     return facts
 
 
+# ── Fakten-TTL nach Abflugnähe (Owner 2026-07-27, „Key wieder überm Limit") ──
+# GEMESSEN, nicht geschätzt: nach dem Reg-Cache-Fix war die obs_*-Familie
+# (obs_merge/obs_overlay + deren warm_-Zwillinge) der nächstgrößte Verbraucher
+# des Open-API-Keys — 397/h in der Stunde 08 UTC, 620/h in der Stunde 07.
+# Ursache ist die FLACHE 120-s-TTL für alles, was „heute" ist. Die 120 s sind
+# nur für EIN Fenster nötig (Gate/Ist-Zeiten; ein Gate wechselt ~40 min vor
+# Abflug) — der Roster-Warmer rechnet aber alle 30 min bis zu 500 Flüge von
+# HEUTE UND MORGEN vor, und deren Abflug liegt meist Stunden weg. Dort kostete
+# jeder Lauf denselben Flug erneut, ohne dass sich ein einziges Feld geändert
+# hätte.
+# Drei Stufen statt einer, alles rein deterministisch aus den Fakten:
+_TTL_OPS = 120                 # Betriebsfenster: unverändert frisch
+_TTL_PLAN = 20 * 60            # heute, aber noch weit vor Abflug (nur Plan)
+_TTL_DONE = 30 * 60            # heute, aber lange gelandet (Ist-Zeiten final)
+_TTL_OTHER_DAY = 6 * 3600      # anderer Tag als heute (unverändert)
+_OPS_LEAD_S = 2 * 3600         # ab hier zählt ein Flug als „operativ"
+# BEWUSST GROSSZÜGIG (2 h statt 30 min): `est_arr` ist mal Actual, mal
+# Estimated — die Fakten sagen nicht, welches von beiden. Eine zu optimistische
+# Schätzung dürfte den Flug sonst als „fertig" einfrieren, während er noch in
+# der Luft ist. Erst 2 h nach der letzten bekannten Ankunftszeit ist das
+# ausgeschlossen; bis dahin bleibt alles beim alten 120-s-Verhalten.
+_OPS_TAIL_S = 2 * 3600
+
+
+def _facts_dt(val):
+    """Offset-ISO aus den Fakten → aware datetime, sonst None. Ein NAIVER
+    String (kein UTC in der LH-Antwort, s. `_offset_iso`) ist bewusst None:
+    ohne Zone ist er nicht mit „jetzt" vergleichbar, und eine falsche Annahme
+    wäre hier eine falsche TTL."""
+    if not val:
+        return None
+    try:
+        from datetime import datetime as _dt
+        d = _dt.fromisoformat(str(val))
+        return d if d.tzinfo is not None else None
+    except Exception:
+        return None
+
+
+def _facts_ttl(date_str, facts, now=None):
+    """Wie lange die Fakten eines Flugs gültig bleiben (Sekunden). Pure.
+
+    Vertrag — im Zweifel IMMER die alte, kurze TTL:
+      • anderer Tag als heute        → 6 h   (wie bisher)
+      • heute, keine/zeitlose Fakten → 120 s (wie bisher)
+      • heute, > 2 h vor dem Abflug  → bis zu 20 min, aber NIE über den Beginn
+        des Betriebsfensters hinaus (Abflug − 2 h) — der erste Read danach
+        holt garantiert frische Gate-/Ist-Daten
+      • heute, > 2 h nach der Ankunft→ 30 min
+      • alles dazwischen             → 120 s (wie bisher)
+    """
+    now = time.time() if now is None else now
+    if (date_str or '') != time.strftime('%Y-%m-%d', time.gmtime(now)):
+        return _TTL_OTHER_DAY
+    if not isinstance(facts, dict) or not facts:
+        return _TTL_OPS
+    dep = _facts_dt(facts.get('est_dep') or facts.get('sched_dep'))
+    arr = _facts_dt(facts.get('est_arr') or facts.get('sched_arr'))
+    if dep is None and arr is None:
+        return _TTL_OPS
+    if arr is not None and now > arr.timestamp() + _OPS_TAIL_S:
+        return _TTL_DONE
+    if dep is not None:
+        lead = dep.timestamp() - _OPS_LEAD_S - now
+        # `max(_TTL_OPS, …)`: kurz VOR dem Betriebsfenster ist der Rest-Abstand
+        # winzig — ohne den Boden käme dort eine TTL von Sekunden heraus, also
+        # MEHR Calls als vorher. Die Überschreitung ins Fenster hinein ist
+        # höchstens so gross wie die Fenster-TTL selbst.
+        if lead > 0:
+            return max(_TTL_OPS, int(min(_TTL_PLAN, lead)))
+    return _TTL_OPS
+
+
 def _norm_reg(reg):
     """'DAIKP' → 'D-AIKP' (heuristisch, verbreitete Präfixe). Unbekanntes bleibt
     unverändert. Nur kosmetisch — der Wert wird als tail durchgereicht."""
@@ -577,9 +677,15 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
         with _facts_lock:
             hit = _facts_memo.get(key)
             if hit and now < hit[0]:
+                # Ein Memo-Treffer IST eine Antwort. Ohne diese Zeile läse ein
+                # Aufrufer wie `_fetch_leg_reg` nach einem Cache-Hit den
+                # answered/denied-Zustand eines völlig anderen, längst
+                # vergangenen GETs desselben Threads.
+                _note_answer(True)
                 return dict(hit[1])
     if cached_only:
         _warm_async(fn, d, dep, arr, caller)
+        _note_answer(False)          # „noch nicht bekannt", kein Fakt
         return {}
 
     data = _get(f'/operations/flightstatus/{urllib.parse.quote(fn)}/{d}',
@@ -616,10 +722,9 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
         log.warning('[lh_open] parse %s/%s: %s', fn, d, type(e).__name__)
         facts = {}
 
-    # TTL: heute kurz (Gate-Wechsel/Ist-Zeiten frisch — ein Gate kann sich
-    # ~40 min vor Abflug ändern), sonst lang (Plan/Historie stabil).
-    today = time.strftime('%Y-%m-%d', time.gmtime())
-    ttl = 120 if d == today else 6 * 3600
+    # TTL nach Abflugnähe (s. `_facts_ttl`): im Betriebsfenster kurz
+    # (Gate-Wechsel/Ist-Zeiten), weit davor bzw. lange danach länger.
+    ttl = _facts_ttl(d, facts, now)
     # CACHE-FRAGMENTIERUNG (2026-07-26): der MQTT-Push-Pfad ruft ohne dep/arr
     # (Key (fn,date,None,None)), die Roster-/Detail-Pfade IMMER mit
     # (fn,date,dep,arr). Derselbe Flug belegte dadurch zwei Einträge und der

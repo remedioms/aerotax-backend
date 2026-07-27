@@ -3,6 +3,7 @@ kein Key nötig: die Parser/Merge-Logik ist pur, HTTP wird gemockt. Fixture-
 Responses sind exakt die verifizierte echte API-Shape (2026-07-21)."""
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -295,7 +296,11 @@ def test_get_books_blocked_calls_as_denied_not_as_sent(monkeypatch):
     # Nicht als gesendet buchen (der Call ging nie raus) — aber als ABGEWIESEN,
     # sonst ist der Bedarf unsichtbar.
     assert [c for c in calls if c[0] == 'lhopen'] == []
-    assert calls == [('lhopen_denied', 'hour_budget')]
+    # Label = GRUND + AUFRUFER (27.07.): „3.901 mal am Stunden-Budget
+    # abgewiesen" sagte nicht, WER den Bedarf erzeugt hat.
+    assert calls == [('lhopen_denied', 'hour_budget_unit')]
+    assert lh.last_call_denied() is True
+    assert lh.last_call_answered() is False
 
 
 def test_facts_memo_alias_defragments_cache(monkeypatch):
@@ -411,3 +416,84 @@ def test_denied_call_is_not_an_answer(monkeypatch):
     monkeypatch.setattr(lh, 'budget_inc', lambda *a, **k: None)
     assert lh._get('/x') is None
     assert lh.last_call_answered() is False
+
+
+# ── Fakten-TTL nach Abflugnähe (Quota-Runde 2 · 2026-07-27) ─────────────────
+# Nach dem Reg-Cache-Fix war die obs_*-Familie der nächstgrösste Verbraucher
+# des Open-API-Keys (397/h in Stunde 08 UTC, 620/h in Stunde 07). Ursache: die
+# FLACHE 120-s-TTL für alles, was „heute" ist — während der Roster-Warmer alle
+# 30 min bis zu 500 Flüge von heute UND morgen vorrechnet, deren Abflug meist
+# Stunden weg ist.
+
+def _ttl(date_str, facts, at='2026-07-27T09:00:00'):
+    import calendar
+    import time as _t
+    now = calendar.timegm(_t.strptime(at, '%Y-%m-%dT%H:%M:%S'))
+    return lh._facts_ttl(date_str, facts, now)
+
+
+def test_facts_ttl_other_day_unchanged():
+    assert _ttl('2026-07-28', {'sched_dep': '2026-07-28T10:00:00+02:00'}) == 6 * 3600
+    assert _ttl('2026-07-26', {'sched_dep': '2026-07-26T10:00:00+02:00'}) == 6 * 3600
+
+
+def test_facts_ttl_falls_back_to_the_old_120s_when_in_doubt():
+    """Keine Fakten, keine Zeiten, oder eine Zeit OHNE Zone (LH lieferte kein
+    UTC → `_offset_iso` gibt naives Lokal zurück, das nicht mit „jetzt"
+    vergleichbar ist) → unverändertes Altverhalten."""
+    assert _ttl('2026-07-27', {}) == 120
+    assert _ttl('2026-07-27', {'gate': 'A1'}) == 120
+    assert _ttl('2026-07-27', {'sched_dep': '2026-07-27T17:00:00'}) == 120
+
+
+def test_facts_ttl_inside_the_operating_window_stays_short():
+    """Ab 2 h vor Abflug bis 2 h nach Ankunft bleibt alles wie bisher — genau
+    hier wechseln Gate und Ist-Zeiten."""
+    ops = {'sched_dep': '2026-07-27T10:00:00+00:00',
+           'sched_arr': '2026-07-27T12:00:00+00:00'}
+    assert _ttl('2026-07-27', ops) == 120
+    # 1 h nach der Ankunft: immer noch operativ (est_arr kann eine zu
+    # optimistische SCHÄTZUNG sein, der Flug also noch in der Luft).
+    landed = {'sched_dep': '2026-07-27T06:00:00+00:00',
+              'est_arr': '2026-07-27T08:00:00+00:00'}
+    assert _ttl('2026-07-27', landed) == 120
+
+
+def test_facts_ttl_far_before_departure_never_outlives_the_window_start():
+    """Weit vor dem Abflug länger halten — aber NIE über den Beginn des
+    Betriebsfensters (Abflug − 2 h) hinaus, damit der erste Read danach
+    garantiert frische Gate-/Ist-Daten holt."""
+    far = {'sched_dep': '2026-07-27T17:00:00+00:00'}     # +8 h
+    assert _ttl('2026-07-27', far) == 20 * 60
+    near = {'sched_dep': '2026-07-27T11:10:00+00:00'}    # +2 h 10 min
+    assert _ttl('2026-07-27', near) == 10 * 60           # exakt bis 09:10 +2h
+    # Kurz VOR dem Fenster darf die TTL nie UNTER die Fenster-TTL rutschen —
+    # sonst wären es mehr Calls als vorher, nicht weniger.
+    assert _ttl('2026-07-27', {'sched_dep': '2026-07-27T11:00:30+00:00'}) == 120
+
+
+def test_facts_ttl_long_after_arrival():
+    """Erst 2 h nach der letzten bekannten Ankunftszeit gilt ein Flug als
+    fertig — dann sind die Ist-Zeiten final."""
+    done = {'sched_dep': '2026-07-27T04:00:00+00:00',
+            'est_arr': '2026-07-27T06:00:00+00:00'}
+    assert _ttl('2026-07-27', done) == 30 * 60
+
+
+def test_memo_hit_counts_as_an_answer(monkeypatch):
+    """Ein Memo-Treffer IST eine Antwort. Ohne das läse ein Aufrufer wie
+    `lh_mqtt._fetch_leg_reg` nach einem Cache-Hit den answered/denied-Zustand
+    eines längst vergangenen GETs desselben Threads."""
+    monkeypatch.setattr(lh, '_KEY', 'k')
+    monkeypatch.setattr(lh, '_SECRET', 's')
+    monkeypatch.setattr(lh, '_get', lambda *a, **k: None)
+    lh._facts_memo.clear()
+    lh._facts_memo[('LH400', '2026-07-27', 'FRA', 'JFK')] = (
+        time.time() + 600, {'reg': 'D-AIKP'})
+    lh._call_state.answered = False
+    lh._call_state.denied = True
+    out = lh.lh_flight_facts('LH400', '2026-07-27', 'FRA', 'JFK', caller='unit')
+    assert out == {'reg': 'D-AIKP'}
+    assert lh.last_call_answered() is True
+    assert lh.last_call_denied() is False
+    lh._facts_memo.clear()
