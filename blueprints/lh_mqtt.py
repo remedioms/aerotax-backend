@@ -66,6 +66,45 @@ _topics_lock = threading.Lock()
 _topics_memo = {'ts': 0.0, 'topics': []}
 _TOPICS_TTL_S = 240
 
+# ── Warum hier mehr steht als ein Memo (Messung 27.07.: 16,7 s Schnitt, 37 s max)
+#
+# Die Rechnung ist teuer, weil `inbound_topics_for_rows` → `_legs_regs` für
+# jedes noch unbekannte Leg EINEN blockierenden HTTP-Call gegen die LH-Open-API
+# macht — sequentiell, 10 s Timeout pro Call. Drei Fehler kamen zusammen:
+#
+#   1. Das Memo lief mit 240 s ab, der Daemon fragt aber alle 300 s
+#      (lh_mqtt_daemon.py `_REFRESH_S`). Das Memo war also bei JEDEM Poll
+#      schon tot — es hat nie getroffen.
+#   2. Der Lock deckte nur Lesen und Schreiben ab, nicht die Rechnung dazwischen.
+#      Kalte Aufrufer rechneten deshalb parallel dieselbe Rechnung.
+#   3. Der Daemon bricht nach 30 s ab und wiederholt nach 20 s (`refresh_ok`
+#      false). Jeder Wiederholer traf wieder auf ein kaltes Memo — dreimal
+#      dieselbe Rechnung, live beobachtet.
+#
+# Antwort auf alle drei: der Aufrufer bekommt IMMER sofort den letzten
+# Schnappschuss (stale-while-revalidate), die Erneuerung läuft im Hintergrund,
+# und es rechnet immer nur EINER (`_topics_build_lock` = Single-Flight). Die
+# allererste Rechnung eines Prozesses hat keinen Schnappschuss — die bekommt
+# ein Zeitbudget, damit sie garantiert unter den 30 s des Daemons bleibt.
+_topics_build_lock = threading.Lock()
+_topics_state = {'refreshing': False}
+_TOPICS_BUILD_BUDGET_S = 18.0
+_TOPICS_RETRY_AFTER_S = 20.0
+
+# Obergrenze für „alt, aber wir liefern es trotzdem sofort aus".
+#
+# Wichtig, weil produktiv DREI Gunicorn-Worker laufen und der Daemon alle 300 s
+# fragt: ein einzelner Worker wird im Schnitt nur alle ~900 s getroffen. Würde
+# jeder Treffer bedingungslos den alten Stand ausliefern, wäre die Topic-Liste
+# im Mittel eine Viertelstunde alt — schlechter als vorher —, und die drei
+# Worker würden auseinanderlaufen. Da der Daemon sich von allem abmeldet, was
+# in der Antwort fehlt, führte das zu flatternden Abos.
+#
+# Deshalb: bis _TOPICS_MAX_STALE_S alt sofort ausliefern und im Hintergrund
+# erneuern; darüber hinaus wird gerechnet — unter Budget und Single-Flight,
+# also weiterhin garantiert unter dem 30-s-Timeout des Daemons.
+_TOPICS_MAX_STALE_S = 600
+
 # Diagnose (pro Gunicorn-Worker — Status zeigt die Sicht EINES Workers)
 _stat_lock = threading.Lock()
 _stats = {'events': 0, 'pushes': 0, 'last_events': []}
@@ -465,9 +504,17 @@ def _cached_leg_reg(flight_disp, date, dep, arr, dep_utc=None):
                       dep_times={leg: dep_utc} if dep_utc else None).get(leg)
 
 
-def _legs_regs(legs, dep_times=None):
+def _legs_regs(legs, dep_times=None, deadline=None):
     """Regs für viele Legs: Prozess-Memo → geteilter Cache (EIN Batch-Read) →
     LH nur für den Rest. Returns {(flight,date,dep,arr): reg-or-None}.
+
+    `deadline` (monotone time.time()-Marke, optional): ab hier keine weiteren
+    LH-Calls mehr. Jeder Call ist ein blockierender HTTP-Request mit 10 s
+    Timeout, und die Schleife ist sequenziell — ohne Bremse konnte ein kalter
+    Aufbau beliebig lang laufen (gemessen 37 s, während der MQTT-Daemon nach
+    30 s längst aufgegeben hatte). Übriggebliebene Legs gelten als „Lücke,
+    kein Fakt" — dieselbe kurze, NICHT geteilte TTL wie bei einer
+    unbeantworteten Anfrage, damit der nächste Lauf sie sofort neu versucht.
 
     Der Batch ist der Punkt: vorher stand pro Leg ein potenzieller LH-Call, und
     ein frisch recycelter Worker feuerte alle auf einmal.
@@ -506,7 +553,12 @@ def _legs_regs(legs, dep_times=None):
 
     fresh = []
     gate_shut = False
+    budget_hit = 0
     for leg, key in misses:
+        if not gate_shut and deadline and time.time() >= deadline:
+            gate_shut = True
+        if gate_shut and deadline:
+            budget_hit += 1     # wie viele Legs das Budget wirklich gekostet hat
         if gate_shut:
             # GATE ZU: der eigene Throttle hat schon abgewiesen, das gilt für
             # jeden weiteren Call dieser Stunde. Die restlichen Legs gar nicht
@@ -529,6 +581,9 @@ def _legs_regs(legs, dep_times=None):
         fresh.append((key, reg, ttl))
     if fresh:
         _reg_cache_write(fresh)
+    if budget_hit:
+        log.info('[lh_mqtt] leg-reg Zeitbudget erreicht — %d von %d Legs auf '
+                 'den naechsten Lauf vertagt', budget_hit, len(misses))
     return out
 
 
@@ -621,7 +676,7 @@ def _best_inbound_for_leg(arr_rows, frm, reg, dep_utc):
     return best
 
 
-def inbound_topics_for_rows(rows, now_utc):
+def inbound_topics_for_rows(rows, now_utc, deadline=None):
     """Topics der Maschinen-Zubringer: pro Leg (Abflug −1h…+16h) die LH-
     autoritative Reg holen, am Abflug-Airport die letzte ARR-Board-Ankunft
     dieser Reg finden → deren Flug subscriben (Topic-Datum = Board-Service-
@@ -656,7 +711,8 @@ def inbound_topics_for_rows(rows, now_utc):
             if prev is None or dep < prev:
                 dep_times[leg_key] = dep
         cands.append((frm, dep, tail, leg_key))
-    regs = _legs_regs(need, dep_times=dep_times) if need else {}
+    regs = (_legs_regs(need, dep_times=dep_times, deadline=deadline)
+            if need else {})
     legs = []
     for frm, dep, tail, leg_key in cands:
         reg = tail or (regs.get(leg_key) if leg_key else None)
@@ -686,29 +742,141 @@ def inbound_topics_for_rows(rows, now_utc):
     return topics
 
 
-@lh_mqtt_bp.route('/api/internal/lh-mqtt/topics', methods=['GET'])
-def lh_mqtt_topics():
-    if not _secret_ok():
-        return jsonify({'ok': False, 'error': 'forbidden'}), 403
-    now = time.time()
+def _topics_snapshot():
+    """(ts, topics) des letzten Schnappschusses. ts=0.0 ⇒ noch keiner da."""
     with _topics_lock:
-        if now - _topics_memo['ts'] < _TOPICS_TTL_S:
-            return jsonify({'ok': True, 'topics': _topics_memo['topics'],
-                            'count': len(_topics_memo['topics']), 'memo': True})
+        return _topics_memo['ts'], list(_topics_memo['topics'])
+
+
+def _topics_compute(budget_s=None):
+    """Die eigentliche Rechnung. Returns (topics, vollstaendig).
+
+    `budget_s` begrenzt den LH-Call-Anteil, damit ein kalter Aufbau nicht in
+    den 30-s-Timeout des Daemons läuft. Das Budget wird VOR dem ersten teuren
+    Schritt gesetzt, nicht erst vor dem Zubringer-Teil — der paginierte
+    Roster-Fetch gehört mit unter die Schranke.
+
+    `vollstaendig=False` heisst: es fehlen Zubringer-Topics, weil das Budget
+    griff oder der Roster-Fetch scheiterte. Der Aufrufer darf so ein Ergebnis
+    NICHT als vollen Stand ablegen — s. _topics_build_and_store."""
+    deadline = (time.time() + budget_s) if budget_s else None
     now_utc = datetime.now(timezone.utc)
     dates = [(now_utc.date() + timedelta(days=off)).isoformat()
              for off in (-1, 0, 1, 2)]
     rows = _sector_rows(dates)
+    if not rows:
+        # _sector_rows schluckt Fehler und liefert dann []. Ein leerer
+        # Roster-Fetch ist nicht von „niemand fliegt" zu unterscheiden — und
+        # „niemand fliegt" gibt es bei 200+ verbundenen Crews nicht. Als
+        # unvollständig behandeln, sonst würde ein Supabase-Aussetzer eine
+        # leere Topic-Liste als gültigen Stand ablegen.
+        return [], False
     tset = set(topics_for_rows(rows, now_utc))
+    complete = True
     try:
-        tset |= inbound_topics_for_rows(rows, now_utc)
+        tset |= inbound_topics_for_rows(rows, now_utc, deadline=deadline)
+        if deadline is not None and time.time() >= deadline:
+            complete = False
     except Exception as e:
         log.warning('[lh_mqtt] inbound topics fail: %s', type(e).__name__)
-    topics = sorted(tset)
+        complete = False
+    return sorted(tset), complete
+
+
+def _topics_build_and_store(budget_s=None):
+    """Rechnet und legt den Schnappschuss ab. Nur EINER rechnet gleichzeitig;
+    wer wartet und danach einen frischen Schnappschuss vorfindet, nimmt den.
+
+    Ein UNVOLLSTÄNDIGES Ergebnis wird mit dem bisherigen Stand vereinigt statt
+    ihn zu ersetzen. Grund: der Daemon rechnet `unsub = aktuell − ziel` und
+    meldet sich von allem ab, was in der Antwort fehlt (lh_mqtt_daemon.py).
+    Eine gekürzte Liste als vollen Stand auszuliefern hiesse also, laufende
+    Flug-Abos zu kündigen — bei QoS 0 ohne Nachlieferung ein echtes Loch in
+    den Pushes. Vor dieser Änderung lief eine überlange Rechnung in den
+    Timeout; der Daemon behielt dann seine alten Topics. Dieses fail-safe-
+    Verhalten muss erhalten bleiben.
+
+    Ausserdem bekommt ein unvollständiger Stand einen ALTEN Zeitstempel: er
+    gilt sofort als erneuerungsbedürftig, statt _TOPICS_TTL_S lang als frisch
+    durchzugehen."""
+    with _topics_build_lock:
+        ts, topics = _topics_snapshot()
+        if ts and (time.time() - ts) < _TOPICS_TTL_S:
+            return topics, True          # jemand anders war schneller
+        fresh, complete = _topics_compute(budget_s=budget_s)
+        if complete:
+            merged = fresh
+            stamp = time.time()
+        else:
+            merged = sorted(set(fresh) | set(topics))
+            # sofort wieder erneuerungsfähig, aber nicht „nie dagewesen"
+            stamp = time.time() - _TOPICS_TTL_S + _TOPICS_RETRY_AFTER_S
+            log.warning('[lh_mqtt] unvollstaendiger Topic-Aufbau (%d neu, %d '
+                        'behalten) — Stand wird vereinigt, nicht ersetzt',
+                        len(fresh), len(merged) - len(fresh))
+        with _topics_lock:
+            _topics_memo['ts'] = stamp
+            _topics_memo['topics'] = merged
+        return merged, False
+
+
+def _topics_kick_refresh():
+    """Hintergrund-Erneuerung anstossen. Immer höchstens eine gleichzeitig."""
     with _topics_lock:
-        _topics_memo['ts'] = now
-        _topics_memo['topics'] = topics
-    return jsonify({'ok': True, 'topics': topics, 'count': len(topics)})
+        if _topics_state['refreshing']:
+            return
+        _topics_state['refreshing'] = True
+
+    def _work():
+        try:
+            _topics_build_and_store()
+        except Exception as e:
+            log.warning('[lh_mqtt] topics refresh fail: %s: %s',
+                        type(e).__name__, str(e)[:160])
+        finally:
+            with _topics_lock:
+                _topics_state['refreshing'] = False
+            try:
+                from app import _close_current_thread_supabase_client
+                _close_current_thread_supabase_client()
+            except Exception:
+                pass
+
+    try:
+        threading.Thread(target=_work, daemon=True,
+                         name='lhmqtt-topics-refresh').start()
+    except Exception as e:
+        # Ohne das bliebe das Flag bei einem fehlgeschlagenen Thread-Start für
+        # immer True — dieser Worker würde nie wieder erneuern und bis in alle
+        # Ewigkeit denselben alten Stand ausliefern.
+        with _topics_lock:
+            _topics_state['refreshing'] = False
+        log.warning('[lh_mqtt] topics refresh thread start fail: %s',
+                    type(e).__name__)
+
+
+@lh_mqtt_bp.route('/api/internal/lh-mqtt/topics', methods=['GET'])
+def lh_mqtt_topics():
+    if not _secret_ok():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    ts, topics = _topics_snapshot()
+    age = time.time() - ts if ts else None
+    if ts and age < _TOPICS_TTL_S:
+        return jsonify({'ok': True, 'topics': topics, 'count': len(topics),
+                        'memo': True, 'age_s': int(age)})
+    if ts and age < _TOPICS_MAX_STALE_S:
+        # Schnappschuss ist alt, aber brauchbar: sofort ausliefern, im
+        # Hintergrund erneuern. Der Daemon wartet nie auf die Rechnung.
+        _topics_kick_refresh()
+        return jsonify({'ok': True, 'topics': topics, 'count': len(topics),
+                        'memo': 'stale', 'age_s': int(age)})
+    # Kaltstart oder zu alt zum Ausliefern → jetzt rechnen, aber unter Budget
+    # und Single-Flight (parallele Aufrufer warten auf denselben Lauf statt
+    # jeder seine eigene LH-Call-Kette abzufeuern).
+    topics, coalesced = _topics_build_and_store(budget_s=_TOPICS_BUILD_BUDGET_S)
+    return jsonify({'ok': True, 'topics': topics, 'count': len(topics),
+                    'memo': 'coalesced' if coalesced else False,
+                    'age_s': int(age) if ts else None})
 
 
 # ── Event-Verarbeitung ───────────────────────────────────────────────────────

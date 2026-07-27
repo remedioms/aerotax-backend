@@ -10374,7 +10374,11 @@ def test_v11_friendly_reject_when_only_dp_uploaded():
     """Wenn User Flugstundenübersicht hochlädt aber kein CAS → freundliche Reject-Message."""
     src = _read_backend()
     idx = src.find("@app.route('/api/process'")
-    block = src[idx:idx + 6000]
+    # Fenster 27.07. von 6000 auf 9000 erweitert: der Prüfpunkt liegt bei ~6819
+    # Zeichen, seit der calc-worker-Riegel VOR den Zahlungs-Consume gezogen
+    # wurde. Das Fenster ist nur eine Suchgrenze — es soll den Handler abdecken,
+    # nicht seine Länge einfrieren.
+    block = src[idx:idx + 9000]
     assert "files.get('dp') and not files.get('cas')" in block, \
         'DP-only-Pfad muss erkannt werden'
     assert 'Flugstundenübersicht wird im neuen Ablauf nicht mehr benötigt' in block, \

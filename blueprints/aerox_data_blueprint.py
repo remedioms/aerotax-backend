@@ -86,10 +86,26 @@ def _ensure_db():
         if not os.path.exists(_DB_PATH):
             if not os.path.exists(_GZ):
                 return None
-            tmp = _DB_PATH + '.part'
-            with gzip.open(_GZ, 'rb') as f_in, open(tmp, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-            os.replace(tmp, _DB_PATH)
+            # Der Temp-Name MUSS pro Prozess eindeutig sein. `_conn_lock` deckt
+            # nur die Threads EINES Workers ab — produktiv laufen aber drei
+            # Gunicorn-Worker, und die entpackten nach einem Containerstart
+            # alle in dieselbe `.part`-Datei: der eine schrieb noch hinein,
+            # während der andere sie per os.replace wegzog. Der Verlierer
+            # bekam FileNotFoundError, also genau einen 500er pro
+            # Containerstart, der sich beim nächsten Request selbst heilte.
+            # Eigene Datei je Prozess + atomares os.replace: der letzte
+            # gewinnt, jede Kopie ist vollständig, niemand sieht einen Fehler.
+            tmp = f'{_DB_PATH}.part.{os.getpid()}'
+            try:
+                with gzip.open(_GZ, 'rb') as f_in, open(tmp, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                os.replace(tmp, _DB_PATH)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
         uri = f'file:{urllib.parse.quote(_DB_PATH)}?mode=ro&immutable=1'
         _conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
         _conn.row_factory = sqlite3.Row

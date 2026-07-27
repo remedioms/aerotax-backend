@@ -428,7 +428,7 @@ def test_refresh_fatal_marks_relogin_and_pushes_once(monkeypatch):
     import time as _t
     saves = []
     monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)   # kein echtes Warten im Test
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
     monkeypatch.setattr(fo, '_refresh', lambda r: (
@@ -443,7 +443,7 @@ def test_refresh_fatal_marks_relogin_and_pushes_once(monkeypatch):
     assert flagged.get('needs_relogin') is True and 'access' not in flagged
     assert pushes == ['AT-U']
     # needs_relogin → connected False + kein weiterer Refresh-Versuch
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: dict(flagged))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: dict(flagged))
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
         AssertionError('toter Grant darf nicht weiter refreshen')))
     assert fo.flightops_connected('AT-U') is False
@@ -464,7 +464,7 @@ def test_refresh_fatal_race_loser_does_not_kill_winner(monkeypatch):
         {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10},   # im Lock
         {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}, # Grace-Reload
     ]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
 
     def _save_only_guard(tok, t):
         # Erlaubt ist NUR der Cross-Container-Guard-Save (Tokens identisch,
@@ -482,7 +482,7 @@ def test_refresh_fatal_race_loser_does_not_kill_winner(monkeypatch):
 
 def test_refresh_transient_keeps_tokens(monkeypatch):
     saved = []
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'access': 'OLD', 'refresh': 'R', 'expires_at': 0})
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saved.append(t) or True)
     monkeypatch.setattr(fo, '_refresh', lambda r: (
@@ -509,7 +509,7 @@ def test_refresh_guard_loser_adopts_winner_without_lh_call(monkeypatch):
                'refresh_guard': {'rt8': fo._rt8('R'), 'ts': _t.time()}}
     states = [dict(guarded), dict(guarded),                             # vor/im Lock
               {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
         AssertionError('Guard-Verlierer darf nichts zurückschreiben')))
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
@@ -527,7 +527,7 @@ def test_refresh_claim_rpc_loser_adopts_winner(monkeypatch):
     old = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
     states = [dict(old), dict(old),
               {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 999}]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
         AssertionError('Claim-Verlierer darf nichts zurückschreiben')))
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
@@ -540,7 +540,7 @@ def test_refresh_claim_rpc_winner_skips_guard_save(monkeypatch):
     zusätzlicher Soft-Guard-Save; einziger Save sind die rotierten Tokens."""
     saves = []
     monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'access': 'OLD', 'refresh': 'R', 'expires_at': 0})
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
     monkeypatch.setattr(fo, '_refresh', lambda r: (
@@ -558,7 +558,7 @@ def test_refresh_claim_rpc_still_foreign_gives_up(monkeypatch):
     monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: False)
     old = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
     states = [dict(old), dict(old), dict(old)]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: states.pop(0))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: states.pop(0))
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
         AssertionError('kein Save ohne Claim')))
     monkeypatch.setattr(fo, '_refresh', lambda r: (_ for _ in ()).throw(
@@ -573,7 +573,7 @@ def test_refresh_guard_stale_does_not_block(monkeypatch):
     dauerhaft blockieren — nach _REFRESH_GUARD_SEC wird normal refresht."""
     import time as _t
     saves = []
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'access': 'OLD', 'refresh': 'R', 'expires_at': 0,
         'refresh_guard': {'rt8': fo._rt8('R'), 'ts': _t.time() - 9999}})
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
@@ -587,7 +587,7 @@ def test_refresh_guard_stale_does_not_block(monkeypatch):
 
 def test_refresh_rotation_persists_new_keeps_old(monkeypatch):
     saved = {}
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'access': 'OLD', 'refresh': 'R1', 'expires_at': 0})
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saved.update(t) or True)
     monkeypatch.setattr(fo, '_refresh', lambda r: (
@@ -665,7 +665,7 @@ def test_crew_cache_put_get_lru(monkeypatch):
 
 
 def test_status_reports_needs_relogin(monkeypatch):
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: {
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'refresh': 'R', 'needs_relogin': True, 'scope': 's'})
     import app as backend
     d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
@@ -896,7 +896,7 @@ def test_refresh_fatal_race_guard_skips_flag_when_rotated(monkeypatch):
     stale = {'access': 'OLD', 'refresh': 'R1', 'expires_at': 0}
     fresh = {'access': 'NEWACC', 'refresh': 'R2', 'expires_at': _t.time() + 3000}
     loads = [dict(stale), dict(fresh)]
-    monkeypatch.setattr(fo, '_tokens_load', lambda tok: loads.pop(0))
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: loads.pop(0))
     monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: (_ for _ in ()).throw(
         AssertionError('Race darf nichts speichern/flaggen')))
     monkeypatch.setattr(fo, '_refresh', lambda r: (

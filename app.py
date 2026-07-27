@@ -868,6 +868,67 @@ def _public_cache_headers(response):
     return response
 
 
+def _etag_json(payload, cache_control='private, no-cache'):
+    """JSON-Antwort mit Inhalts-ETag; passendes `If-None-Match` → 304 ohne Body.
+
+    Für Endpunkte, die der Client häufig pollt, obwohl sich selten etwas
+    ändert (`/api/forum/<tok>/threads`: 684 Aufrufe in 10 min gemessen).
+
+    Der ETag ist der SHA-256 über eine kanonische Serialisierung GENAU DER
+    Nutzlast, die dieser Aufrufer bekäme — `sort_keys` macht ihn unabhängig
+    von der Dict-Reihenfolge, also stabil, solange der Inhalt stabil ist.
+
+    Zur Sicherheit — die Antwort ist token-gebunden, ein geteilter ETag wäre
+    ein Datenleck. Zwei Punkte tragen das:
+      1. Der ETag leitet sich AUSSCHLIESSLICH aus der fertig personalisierten
+         Nutzlast ab (inkl. `liked_by_me`/`is_mine` und der bereits nach
+         Block-Liste und Airline-Scope gefilterten Menge). Gleicher ETag ist
+         daher gleichbedeutend mit Byte-gleichem Inhalt — ein 304 gibt dem
+         Aufrufer nur frei, seine EIGENE Kopie zu verwenden, die identisch
+         ist. Es gibt keinen Weg, über einen ETag an Inhalt zu kommen, den
+         man nicht ohnehin ausgeliefert bekommen hätte.
+      2. `Cache-Control: private, no-cache` — kein geteilter Cache und kein
+         CDN darf die Antwort ablegen oder ohne Rückfrage wiederverwenden.
+         (Der aerox-cdn-Worker cached nach `public, max-age`; `private` ist
+         sein dokumentierter Opt-out.)
+    """
+    try:
+        canon = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                           separators=(',', ':'), default=str)
+        etag = '"' + hashlib.sha256(canon.encode('utf-8')).hexdigest()[:32] + '"'
+    except Exception:
+        # Lässt sich die Nutzlast nicht kanonisieren, gibt es eben keinen ETag.
+        # Die Antwort geht raus wie vor dieser Änderung — der ETag-Pfad kann
+        # damit nie die Ursache eines Fehlers sein, den es vorher nicht gab.
+        # (In der Praxis kaum erreichbar: jsonify sortiert die Keys selbst und
+        # scheitert an denselben Nutzlasten. Der Zweig ist die Garantie, nicht
+        # der Normalfall.)
+        resp = jsonify(payload)
+        resp.headers['Cache-Control'] = cache_control
+        return resp
+    inm = (request.headers.get('If-None-Match') or '').strip()
+    # Mehrere ETags und das schwache Präfix `W/` sind laut RFC 9110 erlaubt.
+    if inm:
+        for cand in inm.split(','):
+            cand = cand.strip()
+            if cand.startswith('W/'):
+                cand = cand[2:].strip()
+            if cand == etag or cand == '*':
+                # mimetype explizit: sonst erbt der 304er Flasks HTML-Default,
+                # _security_headers klebt eine HTML-CSP dran, und NSURLCache
+                # merged die Header in den gespeicherten JSON-Eintrag — der
+                # damit als HTML markiert dastünde.
+                resp = app.response_class(status=304,
+                                          mimetype='application/json')
+                resp.headers['ETag'] = etag
+                resp.headers['Cache-Control'] = cache_control
+                return resp
+    resp = jsonify(payload)
+    resp.headers['ETag'] = etag
+    resp.headers['Cache-Control'] = cache_control
+    return resp
+
+
 @app.after_request
 def _security_headers(response):
     """Security-Header (Audit 2026-07-01). setdefault-Semantik: setzt NUR wenn
@@ -2418,6 +2479,85 @@ def _start_calc_worker():
     print("[queue] Worker-Thread + Restart-Recovery gestartet (async)")
 
 
+def _running_under_gunicorn():
+    """True nur im echten Server-Prozess. pytest, `python3 app.py`, Skripte und
+    reine Importe sollen von der Boot-Assertion unten NICHT betroffen sein."""
+    try:
+        import sys as _sys
+        if 'gunicorn' in (_sys.argv[0] or '').lower():
+            return True
+        return (os.environ.get('SERVER_SOFTWARE') or '').lower().startswith('gunicorn')
+    except Exception:
+        return False
+
+
+def _assert_calc_worker_sane():
+    """Schutzplanke: ein Prozess, der bezahlte Auswertungen ANNEHMEN kann, muss
+    sie auch RECHNEN können. Sonst lieber gar nicht starten.
+
+    Warum das eine eigene Assertion verdient: `AEROTAX_DISABLE_BG_THREADS=1`
+    sieht nach einem harmlosen Sparschalter aus, ist im Thread-Modus aber ein
+    STILLER Datenverlust. `_calc_queue` ist eine prozesslokale `queue.Queue`
+    (s. oben) — ohne den `calc-worker`-Thread nimmt `/api/process` den Auftrag
+    an, antwortet `queued`, legt ihn in eine Queue, die niemand leert, und der
+    bezahlte Auftrag verschwindet klanglos. Dasselbe gilt für die
+    `cleanup-loop`, die hängende Jobs überhaupt erst als gescheitert markiert:
+    ohne sie bleibt ein Job für immer „läuft".
+
+    Ein lauter Startfehler ist dem vorzuziehen: er fällt in derselben Minute
+    auf, ein verlorener Auftrag erst über die Support-Mail des Kunden.
+
+    Ausnahme für Sidecars, die nachweislich keine Aufträge annehmen (der
+    aerotax-poll-Container fährt nur Cron-Endpunkte): dort
+    `AEROTAX_ALLOW_NO_CALC_WORKER=1` setzen. Damit dieses Zugeständnis nicht
+    zur selben stillen Falle wird, weist `/api/process` in so einem Prozess
+    eingehende Aufträge sichtbar ab (503), statt sie ins Leere zu legen.
+    """
+    if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
+        return
+    if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
+        return   # Aufträge laufen synchron über /api/internal/process-job
+    if os.environ.get('AEROTAX_ALLOW_NO_CALC_WORKER') == '1':
+        print('[boot] WARNUNG: kein calc-worker (AEROTAX_ALLOW_NO_CALC_WORKER=1). '
+              'Dieser Prozess weist Rechen-Auftraege mit 503 ab.')
+        return
+    if not _running_under_gunicorn():
+        return   # Tests/Importe/CLI
+    raise RuntimeError(
+        'FATAL: AEROTAX_DISABLE_BG_THREADS=1 bei AEROTAX_EXECUTION_MODE='
+        f'{AEROTAX_EXECUTION_MODE!r}. In diesem Modus ist die prozesslokale '
+        '_calc_queue der EINZIGE Weg, auf dem eine bezahlte Auswertung '
+        'gerechnet wird — ohne den calc-worker-Thread nimmt /api/process den '
+        'Auftrag an und verliert ihn lautlos; ohne cleanup-loop wird kein '
+        'haengender Job je als gescheitert markiert. Entweder '
+        'AEROTAX_DISABLE_BG_THREADS entfernen, oder — falls dieser Prozess '
+        'bewusst keine Auftraege rechnen soll (Cron-Sidecar) — zusaetzlich '
+        'AEROTAX_ALLOW_NO_CALC_WORKER=1 setzen; dann lehnt er Auftraege '
+        'sichtbar mit 503 ab.')
+
+
+def _calc_worker_available():
+    """False ⇒ dieser Prozess darf keine Rechen-Auftraege annehmen.
+
+    Prüft die Konfiguration, nicht die Lebendigkeit des Threads: „Worker per
+    Env abgeschaltet" wird erkannt, „Worker-Thread gestorben" nicht. Für den
+    zweiten Fall ist die cleanup-loop zuständig, die haengende Jobs als
+    gescheitert markiert.
+
+    Dieselbe Server-Schranke wie in `_assert_calc_worker_sane`: ausserhalb
+    eines echten Gunicorn-Prozesses (pytest, CLI, Importe) gilt der alte
+    Zustand. Die Testsuite setzt AEROTAX_DISABLE_BG_THREADS=1 zur Isolation
+    und treibt die Queue selbst — dort ist ein 503 kein Schutz, sondern nur
+    kaputt."""
+    if AEROTAX_EXECUTION_MODE == 'cloud_tasks':
+        return True
+    if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
+        return True
+    return not _running_under_gunicorn()
+
+
+_assert_calc_worker_sane()
+
 # Worker beim App-Init starten (bei Render-Worker-Start).
 # Tests/Imports können die Threads deaktivieren, damit Unit-Tests wirklich isoliert bleiben.
 if os.environ.get('AEROTAX_DISABLE_BG_THREADS') != '1':
@@ -3023,6 +3163,22 @@ def process_real():
             return jsonify({
                 'error': 'Zu viele Versuche von dieser Verbindung. Bitte warte ca. 1 Stunde und versuche es dann erneut.'
             }), 429
+        # Kann dieser Prozess überhaupt rechnen? (s. _assert_calc_worker_sane)
+        # MUSS ganz vorne stehen — VOR dem Einlösen des Payment-Intents, vor dem
+        # Verbrauch eines Free-Retry-Tokens und vor dem Markieren der Uploads.
+        # Ein 503 weiter unten hätte das Geld genommen und nichts dafür
+        # geliefert; der Payment-Intent wäre für immer als verbraucht markiert.
+        # Hier hängt noch nichts daran: die Prüfung liest nur Prozess-Env.
+        if not _calc_worker_available():
+            app.logger.error(
+                '[process] abgelehnt: dieser Prozess hat keinen calc-worker '
+                '(AEROTAX_DISABLE_BG_THREADS=1). Nichts verbraucht.')
+            return jsonify({
+                'error': 'Die Auswertung ist gerade nicht verfügbar. Bitte in '
+                         'ein paar Minuten erneut versuchen. Es wurde nichts '
+                         'berechnet und nichts verbraucht.',
+                'reason_code': 'NO_CALC_WORKER',
+            }), 503
         anreise = request.form.get('anreise', 'auto')
         # Robuste Number-Casts mit Fallback bei fehlerhaftem Input
         def _safe_int(v, default):
@@ -3442,6 +3598,8 @@ def process_real():
             })
 
         # ── Thread-Mode (Default / Legacy) ──────────────────────────────
+        # Dass hier ein Worker existiert, ist ganz oben geprüft — VOR jedem
+        # Verbrauch von Zahlung/Retry-Token (s. dort).
         _calc_queue.put((job_id, form, files))
         queue_pos = _get_queue_position(job_id) or 1
         # Echten Status anhand Position setzen
@@ -9703,6 +9861,13 @@ def _profile_metadata_merge_sb(token, patch):
     read-merge-upsert-Pfad (legt auch die Row neu an, best-effort)."""
     if not patch:
         return True
+    # Auch dieser Pfad ist ein Profil-Schreibvorgang und wird direkt aufgerufen
+    # (set_crew_note, _punct_persist_me) — nicht nur über
+    # _profile_save_to_supabase. Ohne die Invalidierung hier stimmt die
+    # Read-after-write-Zusage des Request-Memos für genau diese Aufrufer nicht.
+    _profile_memo_invalidate(token)
+    if any(k in patch for k in ('avatar_url', 'avatar_dir_key')):
+        _avatar_cache_invalidate(token)
     ok, data = _social_rpc_call('profile_metadata_merge',
                                 {'p_token': token, 'p_patch': patch})
     if not ok:
@@ -9722,6 +9887,12 @@ def _profile_metadata_merge_sb(token, patch):
 
 def _profile_save_to_supabase(token, profile):
     """Upsert einer Profile-Row. True/False für Erfolg."""
+    # Invalidieren, BEVOR irgendein Ausstieg greift. Sonst bleibt der Memo bei
+    # `SB_AVAILABLE=False` stehen — genau im degradierten Betrieb, in dem
+    # `_profile_save` gleich danach auf Disk schreibt und ein Folge-Read im
+    # selben Request den Stand von VOR dem Schreiben sähe.
+    _profile_memo_invalidate(token)
+    _avatar_cache_invalidate(token)
     if not SB_AVAILABLE or not token:
         return False
     profile = profile or {}
@@ -9786,9 +9957,78 @@ def _profile_load_from_disk(token):
         return {'token': token, 'profile': {}}
 
 
-def _profile_load(token):
+# ── Request-Memo für _profile_load ──────────────────────────────────────────
+# _profile_load kostet pro Aufruf EINEN Supabase-Round-Trip PLUS einen Disk-
+# Read. `GET /api/user/briefing/<tok>` rief es für ein und denselben Token
+# 2–3× hintereinander auf, bevor überhaupt ein Briefing gelesen war:
+# _maybe_refresh_calendar_feed → _flightops_active (→ _tokens_load →
+# _profile_load), dann _profile_load für den calendar_feed, dann
+# _maybe_refresh_flightops → _flightops_active nochmal. Identische Abfrage,
+# identisches Ergebnis, dreifach bezahlt.
+#
+# Der Memo lebt NUR innerhalb eines Requests (flask.g) — kein prozessweiter
+# Cache, damit kein Request je das Profil eines vorherigen sieht und
+# Schreibvorgänge anderer Prozesse sofort sichtbar bleiben. Ausserhalb eines
+# Request-Kontexts (Hintergrund-Threads, Worker) ist er inaktiv.
+def _profile_memo_get(token):
+    """Kopie des gemerkten Profils — NIE das Original. Ohne die Kopie teilten
+    sich alle Aufrufer eines Requests ein Dict, und der verbreitete Pfad
+    `p = _profile_load(t)['profile']; p['x'] = …; _profile_save(t, p)` würde
+    seine Zwischenstände an jeden anderen Leser desselben Requests
+    durchreichen. Vorher gab jeder Aufruf ein frisches Objekt zurück; genau
+    das bleibt so."""
+    try:
+        from flask import g as _g, has_request_context
+        if not has_request_context():
+            return None
+        memo = getattr(_g, '_profile_memo', None)
+        if not isinstance(memo, dict):
+            return None
+        hit = memo.get(token)
+        if hit is None:
+            return None
+        import copy as _copy
+        return _copy.deepcopy(hit)
+    except Exception:
+        return None
+
+
+def _profile_memo_put(token, value):
+    try:
+        from flask import g as _g, has_request_context
+        if not has_request_context():
+            return
+        import copy as _copy
+        memo = getattr(_g, '_profile_memo', None)
+        if not isinstance(memo, dict):
+            memo = {}
+            _g._profile_memo = memo
+        memo[token] = _copy.deepcopy(value)
+    except Exception:
+        pass
+
+
+def _profile_memo_invalidate(token):
+    try:
+        from flask import g as _g, has_request_context
+        if not has_request_context():
+            return
+        memo = getattr(_g, '_profile_memo', None)
+        if isinstance(memo, dict):
+            memo.pop(token, None)
+    except Exception:
+        pass
+
+
+def _profile_load(token, fresh=False):
     """SB primary, Disk fallback. Lazy-migriert disk→SB beim ersten Read wenn
     SB-Row fehlt aber Disk-Daten existieren.
+
+    `fresh=True` umgeht den Request-Memo. Das ist KEINE Optimierungs-Option,
+    sondern eine Korrektheits-Option: wer absichtlich ein zweites Mal liest,
+    um eine Änderung aus einem ANDEREN Prozess zu sehen (LH-FlightOps-
+    Token-Rotation, `_valid_access`), muss den durablen Stand bekommen und
+    nicht die Kopie vom Anfang desselben Requests.
     Returns gleiche Shape wie früher: {token, profile, [_updated_at, ...]} — d.h.
     SB-Daten werden in den 'profile'-Subkey gewrappt damit alle bestehenden
     Caller (`(json.load() or {}).get('profile', {})`) ohne Änderung weiterlaufen.
@@ -9797,12 +10037,17 @@ def _profile_load(token):
     """
     if not token:
         return {'token': token, 'profile': {}}
+    if not fresh:
+        memoized = _profile_memo_get(token)
+        if memoized is not None:
+            return memoized
     sb_prof = _profile_load_from_supabase(token)
     if sb_prof is not None:
         disk_full = _profile_load_from_disk(token)
         out = {k: v for k, v in (disk_full or {}).items() if k not in ('token', 'profile')}
         out['token'] = token
         out['profile'] = sb_prof
+        _profile_memo_put(token, out)
         return out
     # SB-Miss: disk-Fallback + lazy-Migration wenn SB up
     disk_full = _profile_load_from_disk(token)
@@ -9810,6 +10055,7 @@ def _profile_load(token):
     if SB_AVAILABLE and disk_prof:
         app.logger.info(f'[profile] lazy-migrate tok={token[:8]} disk→supabase')
         _profile_save_to_supabase(token, disk_prof)
+    _profile_memo_put(token, disk_full)
     return disk_full
 
 
@@ -9909,6 +10155,98 @@ def _profiles_load_bulk(tokens, include_metadata=False):
         if dp or not sb_ok:
             out[t] = dp
     return out
+
+
+# ── Autor-Avatare: ein Batch-Lookup statt N+1 ───────────────────────────────
+# Die Social-Listen (Forum-Threads, Replies, Wall, Kommentare) lösten den
+# Avatar je Autor einzeln per _profile_load auf — pro Antwort also so viele
+# Supabase-Round-Trips wie es verschiedene Autoren gab. Bei /api/forum/<tok>/
+# threads war das der grösste Einzelposten (Profil-Messung 27.07.: 684 Aufrufe
+# in 10 min, ~971 ms Schnitt, 23,3 % der Backend-Arbeitszeit).
+#
+# Zwei Hebel: (1) EIN `in_('token', …)`-Query für alle Autoren (_profiles_load_bulk),
+# (2) prozessweiter TTL-Cache. Ein Avatar ist eine Upload-eindeutige URL, die
+# sich höchstens ändert, wenn der Nutzer ein neues Foto setzt — 5 min Nachlauf
+# sind dort unsichtbar, im Gegensatz zum Thread-Inhalt selbst, der bewusst
+# NICHT gecacht wird (ein neuer Post muss sofort erscheinen).
+_AVATAR_URL_TTL_S = 300
+_avatar_url_cache = {}          # token → (ts, avatar_url|None)
+_avatar_url_cache_lock = _req_threading.Lock()
+
+
+def _author_avatar_urls(tokens):
+    """{token: avatar_url|None} für viele Autoren. Cache-Treffer kosten nichts,
+    der Rest geht in EINEM Supabase-Query raus. Wirft nie."""
+    out = {}
+    toks = [t for t in dict.fromkeys(tokens or []) if t]
+    if not toks:
+        return out
+    now = time.time()
+    missing = []
+    try:
+        with _avatar_url_cache_lock:
+            for t in toks:
+                hit = _avatar_url_cache.get(t)
+                if hit is not None and (now - hit[0]) < _AVATAR_URL_TTL_S:
+                    out[t] = hit[1]
+                else:
+                    missing.append(t)
+    except Exception:
+        missing = list(toks)
+    if not missing:
+        return out
+    try:
+        profs = _profiles_load_bulk(missing) or {}
+    except Exception as e:
+        app.logger.warning(
+            f'[avatar] bulk_fail n={len(missing)} err={type(e).__name__}: {str(e)[:120]}')
+        # Degradiert: keine Avatare statt kaputter Antwort. NICHT cachen —
+        # sonst friert ein einzelner SB-Aussetzer 5 min lang leere Avatare ein.
+        for t in missing:
+            out.setdefault(t, None)
+        return out
+    fresh = {}
+    for t in missing:
+        av = None
+        try:
+            av = (profs.get(t) or {}).get('avatar_url') or None
+        except Exception:
+            av = None
+        out[t] = av
+        fresh[t] = (now, av)
+    try:
+        with _avatar_url_cache_lock:
+            _avatar_url_cache.update(fresh)
+            # Unbegrenztes Wachstum verhindern (ein Prozess sieht über Wochen
+            # viele Autoren): bei Überlauf erst die abgelaufenen Einträge
+            # räumen — und wenn das nichts bringt (mehr als 5000 verschiedene
+            # Autoren INNERHALB einer TTL-Spanne), die ältesten wegwerfen.
+            # Sonst wäre das Aufräumen genau dann wirkungslos, wenn es nötig
+            # ist.
+            if len(_avatar_url_cache) > 5000:
+                for k, v in list(_avatar_url_cache.items()):
+                    if (now - v[0]) >= _AVATAR_URL_TTL_S:
+                        _avatar_url_cache.pop(k, None)
+                if len(_avatar_url_cache) > 5000:
+                    for k, _v in sorted(_avatar_url_cache.items(),
+                                        key=lambda kv: kv[1][0])[:1000]:
+                        _avatar_url_cache.pop(k, None)
+    except Exception:
+        pass
+    return out
+
+
+def _avatar_cache_invalidate(token):
+    """Nach einem Avatar-Wechsel den TTL-Eintrag fallen lassen — im EIGENEN
+    Prozess. Produktiv laufen drei Gunicorn-Worker; die beiden anderen zeigen
+    das alte Foto noch bis zum TTL-Ablauf. Bewusst so: ein neues Profilfoto ein
+    paar Minuten später in einer Thread-Liste zu sehen ist folgenlos, ein
+    prozessübergreifender Invalidierungs-Kanal dafür wäre es nicht."""
+    try:
+        with _avatar_url_cache_lock:
+            _avatar_url_cache.pop(token, None)
+    except Exception:
+        pass
 
 
 def _profile_save(token, profile, full_disk_payload=None):
@@ -18278,6 +18616,14 @@ def save_crewlog(token):
     return jsonify({'ok': True})
 
 
+# Obergrenze für die Serve-Time-Live-Anreicherung in get_briefings. Gemessen
+# 27.07. über 178 Aufrufe: p50 = 473 ms, p90 = 4,3 s, p99 = 20,4 s, max 23,9 s.
+# Die Spitze entsteht NICHT durch den Feed-Import (der läuft längst im
+# Hintergrund-Thread), sondern durch synchron nachgeladene Airport-Boards auf
+# einem kalten Worker. 3 s liegen weit über p90 — der Normalfall merkt nichts.
+_BRIEFING_ENRICH_BUDGET_S = 3.0
+
+
 @app.route('/api/user/briefing/<token>', methods=['GET'])
 def get_briefings(token):
     """Alle Briefing-Items (key: Datum) für User.
@@ -18351,6 +18697,9 @@ def get_briefings(token):
         _today = _bd.today()
         _live_days = {_today.isoformat(), (_today + _btd2(days=1)).isoformat()}
         _hb = None   # lazy: nur laden, wenn wirklich Sektoren angereichert werden
+        # EIN gemeinsames Budget über beide Tage — sonst könnte jeder Tag es
+        # einzeln ausschöpfen und die Antwort trotzdem doppelt so lange dauern.
+        _enrich_deadline = time.time() + _BRIEFING_ENRICH_BUDGET_S
         for _k in list(_live_days):
             _day = data.get(_k)
             if isinstance(_day, dict) and isinstance(_day.get('ical_sectors'), list):
@@ -18360,7 +18709,8 @@ def get_briefings(token):
                 if _hb is None:
                     _hb = _profile_homebase_cached(token) or ''
                 _enrich_leg_delays(_day['ical_sectors'], _k,
-                                   homebase=(_hb or None))
+                                   homebase=(_hb or None),
+                                   deadline=_enrich_deadline)
     except Exception:
         pass
     datum = request.args.get('datum')
@@ -23316,19 +23666,12 @@ def forum_list_threads(token):
     likes = _forum_load_likes(token)
     # author_avatar LIVE auflösen (wie im Wall-Feed): der am Thread gespeicherte
     # Snapshot kann veraltet/leer sein (Thread vor dem Avatar-Feature erstellt,
-    # oder User hat sein Foto nachträglich gesetzt). Pro Author 1× cachen.
-    _av_cache = {}
-    def _resolve_av(tok):
-        if not tok:
-            return None
-        if tok in _av_cache:
-            return _av_cache[tok]
-        try:
-            av = ((_profile_load(tok) or {}).get('profile', {}) or {}).get('avatar_url')
-        except Exception:
-            av = None
-        _av_cache[tok] = av
-        return av
+    # oder User hat sein Foto nachträglich gesetzt).
+    # EIN Batch-Lookup für ALLE Autoren statt einer Supabase-Abfrage je Autor.
+    # Anonyme Threads bleiben aussen vor — für sie wird der Avatar bewusst NIE
+    # aufgelöst, also darf ihr Token auch nicht im Batch landen.
+    _av = _author_avatar_urls([t.get('author_token') for t in threads
+                               if not t.get('is_anonymous')])
     for t in threads:
         t['liked_by_me'] = t.get('id') in likes['threads']
         t['is_mine'] = (t.get('author_token') == token)
@@ -23345,14 +23688,14 @@ def forum_list_threads(token):
                        'author_homebase', 'author_avatar', 'author_short'):
                 t.pop(_k, None)
         else:
-            av = _resolve_av(t.get('author_token'))
+            av = _av.get(t.get('author_token'))
             if av:
                 t['author_avatar'] = av
             elif not t.get('author_avatar'):
                 t.pop('author_avatar', None)
         # Strip author_token from public response
         t.pop('author_token', None)
-    return jsonify({'count': len(threads), 'threads': threads})
+    return _etag_json({'count': len(threads), 'threads': threads})
 
 
 @app.route('/api/forum/<token>/threads', methods=['POST'])
@@ -34497,7 +34840,7 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
 
 
 def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
-                       past_horizon_h=30):
+                       past_horizon_h=30, deadline=None):
     """Reichert die Pro-Leg-Sektoren EINES Roster-Tages (ical_sectors[]) IN PLACE
     um Live-/Warehouse-Delay-Felder an (Owner 2026-07-04 „alle Live-Sachen an-
     binden", Serve-Time-Enrichment — NICHT im iCal-Sync eingefroren).
@@ -34505,6 +34848,12 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
     `homebase` (optional, Audit 2026-07-05): echte Profil-Homebase für die
     Tail-Turnaround-Weitergabe — der Duty-Origin-Proxy versagt am Rückreisetag
     (sectors[0].from = Outstation), s. _carry_forward_turnaround_tails.
+
+    `deadline` (optional, absolute time.time()-Marke, Latenz-Sweep 27.07.):
+    obere Schranke für die Anreicherung. Default None = unverändertes
+    Verhalten für alle bestehenden Aufrufer. Wer sie setzt, tauscht im
+    seltenen Kaltfall ein paar Live-Felder gegen eine Antwort in endlicher
+    Zeit — nie einen falschen Wert gegen einen richtigen.
 
     Pro Sektor-dict (braucht flight/from/to):
       (a) Flugnummer via `_fn_norm` normalisieren (LH839 == LH0839),
@@ -34543,9 +34892,24 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
     _strip_inferred_tails(sectors)
     now = datetime.now(timezone.utc)
     cs_map = None
+    _budget_stopped = 0
+    _enriched_upto = 0      # wie viele Sektoren die Schleife wirklich erreicht hat
     for s in sectors:
         if not isinstance(s, dict):
             continue
+        # ── Zeitbudget (optional, s. Docstring) ──────────────────────────────
+        # Die Anreicherung ist rein additiv: ein nicht angereicherter Sektor
+        # ist exakt der Zustand von vor diesem Aufruf, kein falscher Wert. Ein
+        # kalter Worker konnte hier aber synchron ein komplettes Airport-Board
+        # nachladen (Fraport bis 20 Seiten) und den Request minutenlang
+        # aufhalten — gemessen p99 = 20,4 s, max 23,9 s auf
+        # /api/user/briefing/<tok>. Ab dem Budget wird abgebrochen; die
+        # angefangenen Board-/Obs-Memos sind gefüllt, der nächste Aufruf
+        # (Client pollt ohnehin) reichert den Rest aus dem warmen Memo an.
+        if deadline is not None and time.time() >= deadline:
+            _budget_stopped += 1
+            break
+        _enriched_upto += 1
         raw_fn = str(s.get('flight') or '').strip()
         frm = str(s.get('from') or '').strip().upper()
         to = str(s.get('to') or '').strip().upper()
@@ -35222,7 +35586,22 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
     # Rückflug-Turnaround erbt den Tail — mit ECHTER Homebase, wo der Caller sie
     # kennt (Audit 2026-07-05: Proxy allein ließ am Rückreisetag einen Homebase-
     # Hub-Turnaround durch, vom Owner explizit verboten).
-    _carry_forward_turnaround_tails(sectors, homebase=homebase)
+    # Turnaround-Weitergabe NUR über die Sektoren, die die Schleife wirklich
+    # erreicht hat. Sonst würde sie einem abgeschnittenen Leg ein Kennzeichen
+    # ANDICHTEN, das nie gegen ein Board geprüft wurde: die Weitergabe leitet
+    # den Tail vom Vor-Leg ab (`tail_inferred=True`), und die Board-Beobachtung,
+    # die eine Maschinen-Umbuchung aufgedeckt hätte, ist genau die, die dem
+    # Budget zum Opfer fiel. „Board schlägt Inferenz" (Owner 2026-07-09) gilt
+    # auch dann, wenn das Board gar nicht erst geholt wurde — dann gibt es
+    # eben keinen Tail. Ein fehlendes Feld ist ehrlich, ein falsches nicht.
+    _carry_forward_turnaround_tails(
+        sectors if not _budget_stopped else sectors[:_enriched_upto],
+        homebase=homebase)
+    if _budget_stopped:
+        app.logger.info(
+            f'[enrich] Zeitbudget erreicht bei {date} nach {_enriched_upto} '
+            f'von {len(sectors)} Sektoren — Rest bleibt unangereichert '
+            '(naechster Aufruf holt ihn aus dem warmen Memo)')
     return sectors
 
 

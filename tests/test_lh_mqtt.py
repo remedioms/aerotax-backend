@@ -414,7 +414,7 @@ def test_inbound_topics_subscribe_feeder_flight(monkeypatch):
     # Die Topics-Rechnung löst Regs seit 2026-07-27 im BATCH auf (_legs_regs),
     # nicht mehr pro Leg — der Mock muss die echte Form spiegeln.
     monkeypatch.setattr(lh_mqtt, '_legs_regs',
-                        lambda legs, dep_times=None:
+                        lambda legs, dep_times=None, deadline=None:
                         {leg_key: 'D-AIKP' for leg_key in legs})
     monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: board)
     topics = lh_mqtt.inbound_topics_for_rows(_rows([leg]), now)

@@ -194,11 +194,18 @@ def _flow_rm(state):
 
 
 # ── Per-Crew-Token-Store (durable Profil-Mirror + Disk) ─────────────────────
-def _tokens_load(user_token):
-    """FlightOps-Tokens {access, refresh, expires_at, scope} für einen AeroX-User."""
+def _tokens_load(user_token, fresh=False):
+    """FlightOps-Tokens {access, refresh, expires_at, scope} für einen AeroX-User.
+
+    `fresh=True` für die absichtlichen Zweit-Lesungen in `_valid_access`: dort
+    ist der ganze Zweck, den Stand zu sehen, den ein ANDERER Prozess gerade
+    geschrieben hat (Token-Rotation). Ein Request-Memo darf da nicht
+    dazwischen — sonst stirbt der Grant-Race-Schutz still und der Verlierer
+    schreibt seinen verbrannten Refresh über den frischen des Gewinners."""
     try:
         import app as _app
-        prof = ((_app._profile_load(user_token) or {}).get('profile') or {})
+        prof = ((_app._profile_load(user_token, fresh=fresh) or {})
+                .get('profile') or {})
         t = prof.get('flightops_tokens')
         return dict(t) if isinstance(t, dict) else {}
     except Exception:
@@ -348,8 +355,9 @@ def _valid_access(user_token):
     with _user_refresh_lock(user_token):
         # Doppel-Check im Lock: ein paralleler Thread kann eben rotiert haben
         # → dessen frische Tokens nutzen statt den verbrannten nochmal zu
-        # verheizen.
-        t = _tokens_load(user_token)
+        # verheizen. fresh=True: am Request-Memo vorbei, sonst sieht der
+        # Doppel-Check genau den Stand, den er widerlegen soll.
+        t = _tokens_load(user_token, fresh=True)
         if t.get('needs_relogin') or not t.get('refresh'):
             return None
         if t.get('access') and time.time() < (t.get('expires_at') or 0):
@@ -374,7 +382,7 @@ def _valid_access(user_token):
             lost = not claimed
         if lost:
             time.sleep(_GUARD_WAIT_SEC)
-            cur = _tokens_load(user_token)
+            cur = _tokens_load(user_token, fresh=True)
             if cur.get('needs_relogin'):
                 return None
             if cur.get('access') and time.time() < (cur.get('expires_at') or 0):
@@ -407,7 +415,7 @@ def _valid_access(user_token):
             # durablen Stand neu laden. Refresh dort schon ein ANDERER
             # → wir waren nur der Race-Verlierer, Grant lebt: nichts flaggen.
             time.sleep(_FATAL_GRACE_SEC)
-            cur = _tokens_load(user_token)
+            cur = _tokens_load(user_token, fresh=True)
             if (cur.get('refresh') or '') != (t.get('refresh') or ''):
                 if cur.get('access') and time.time() < (cur.get('expires_at') or 0):
                     return cur['access']
