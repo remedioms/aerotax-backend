@@ -19236,6 +19236,97 @@ def _roster_snapshot_read(token):
     return payload or {}
 
 
+# ── Roster-Verlauf (pending/history): Supabase-first mit Disk-Fallback ──────
+# Owner 2026-07-27 („beides ultra wichtig … 3k Nutzer"): der Änderungs-Verlauf
+# lag NUR im ungemounteten Container-Layer → JEDER Deploy wischte pending +
+# history. Sichtbare Folgen: „Push bekommen, aber in der App keine Änderung
+# gefunden" (Julia — der Deploy kam ihr zuvor) und ein leerer Verlauf nach
+# jedem Server-Update. Gleiches Muster wie roster_snapshots: Write-Through
+# nach SB + Disk, Read SB-first; fehlt die Tabelle (Migration
+# supabase_migrations/20260727_roster_changes.sql), degradiert alles sauber
+# auf Disk-only — kein Hard-Fail, kein Client-Update nötig (reine Server-
+# Speicherfrage, Endpoint-Shape unverändert).
+_ROSTER_CHANGES_HISTORY_CAP = 500   # wie der decide-Bulk-Deckel
+
+
+def _sb_roster_changes_upsert(token, data):
+    """Best-effort Write-Through nach Supabase. True bei Erfolg."""
+    if not (SB_AVAILABLE and token and isinstance(data, dict)):
+        return False
+    try:
+        def _do():
+            return sb.table('roster_changes').upsert({
+                'token': token,
+                'payload': data,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            }, on_conflict='token').execute()
+        _supabase_execute_with_timeout('roster_changes_upsert', _do)
+        return True
+    except Exception:
+        return False  # Tabelle fehlt / SB down → Disk bleibt die Quelle
+
+
+def _sb_roster_changes_load(token):
+    """Liest den Verlauf aus Supabase. None wenn nicht vorhanden/erreichbar."""
+    if not (SB_AVAILABLE and token):
+        return None
+    try:
+        def _do():
+            return sb.table('roster_changes').select('payload').eq(
+                'token', token).limit(1).execute()
+        r, _timed_out = _supabase_execute_with_timeout('roster_changes_load', _do)
+        rows = getattr(r, 'data', None) or []
+        if rows:
+            p = rows[0].get('payload')
+            if isinstance(p, dict):
+                return p
+    except Exception:
+        return None
+    return None
+
+
+def _roster_changes_read(token):
+    """Verlauf lesen: SB-first, Disk-Fallback. None wenn NIRGENDS etwas liegt
+    (Caller unterscheiden „nie Changes gehabt" von „leere Listen")."""
+    data = _sb_roster_changes_load(token)
+    if isinstance(data, dict):
+        return data
+    cp = _roster_changes_path(token)
+    if cp and os.path.exists(cp):
+        try:
+            with open(cp) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                # Lazy-Migration: Disk-Bestand einmalig nach SB heben, damit
+                # er den NÄCHSTEN Deploy überlebt (best-effort, still).
+                _sb_roster_changes_upsert(token, d)
+                return d
+        except Exception:
+            pass
+    return None
+
+
+def _roster_changes_save(token, data):
+    """Verlauf schreiben: SB + Disk (Write-Through). History gedeckelt.
+    True wenn mindestens ein Ziel geklappt hat."""
+    if not isinstance(data, dict):
+        return False
+    hist = data.get('history')
+    if isinstance(hist, list) and len(hist) > _ROSTER_CHANGES_HISTORY_CAP:
+        data['history'] = hist[-_ROSTER_CHANGES_HISTORY_CAP:]
+    sb_ok = _sb_roster_changes_upsert(token, data)
+    disk_ok = False
+    cp = _roster_changes_path(token)
+    if cp:
+        try:
+            with open(cp, 'w') as f:
+                json.dump(data, f, ensure_ascii=False)
+            disk_ok = True
+        except Exception:
+            pass
+    return sb_ok or disk_ok
+
+
 def _rc_norm_cmp(v):
     """Vergleichs-Normalform für Freitext-Felder (routing/layover/Zeiten):
     Case-fold + ALLE Whitespaces entfernt. So zählt reine Formatierung/
@@ -19564,20 +19655,18 @@ def take_roster_snapshot(token):
         rebuild_overlap_edges(token, new_tage)
     except Exception as _cg_e:
         app.logger.warning(f'[crew-graph] snapshot_rebuild_fail {type(_cg_e).__name__}: {str(_cg_e)[:120]}')
-    # Append diff to changes log
-    cp = _roster_changes_path(token)
+    # Append diff to changes log (SB-first + Disk — deploy-persistent seit
+    # 2026-07-27; vorher wischte jeder Deploy pending/history).
     try:
-        try:
-            with open(cp) as f: existing = json.load(f)
-        except FileNotFoundError:
-            existing = {'pending': [], 'history': []}
+        existing = _roster_changes_read(token) or {'pending': [], 'history': []}
         pending = existing.get('pending') or []
         for ch in diff:
             ch['detected_at'] = datetime.now().isoformat()
             ch['status'] = 'pending'
             pending.append(ch)
         existing['pending'] = pending
-        with open(cp, 'w') as f: json.dump(existing, f, ensure_ascii=False)
+        if not _roster_changes_save(token, existing):
+            raise IOError('roster_changes_persist_failed')
     except Exception as e:
         print(f'[take_roster_snapshot] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
@@ -20105,12 +20194,9 @@ def _rc_marker_short(day):
 def get_roster_changes(token):
     """Liste aller pending + history Roster-Änderungen — jede mit einem kurzen
     `summary` („WAS hat sich geändert", aus old/new abgeleitet)."""
-    cp = _roster_changes_path(token)
-    if not cp: return jsonify({'error': 'invalid token'}), 400
-    try:
-        with open(cp) as f: data = json.load(f)
-    except FileNotFoundError:
-        data = {'pending': [], 'history': []}
+    if not _roster_changes_path(token):
+        return jsonify({'error': 'invalid token'}), 400
+    data = _roster_changes_read(token) or {'pending': [], 'history': []}
 
     def _slim(entries):
         out = []
@@ -20143,11 +20229,10 @@ def decide_roster_change(token):
     decision = (body.get('decision') or '').lower()
     if decision not in ('accept', 'reject'):
         return jsonify({'ok': False, 'error': 'invalid_decision'}), 400
-    cp = _roster_changes_path(token)
-    if not cp: return jsonify({'ok': False, 'error': 'invalid token'}), 400
-    try:
-        with open(cp) as f: data = json.load(f)
-    except FileNotFoundError:
+    if not _roster_changes_path(token):
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    data = _roster_changes_read(token)
+    if data is None:
         return jsonify({'ok': False, 'error': 'no_changes'}), 404
     pending = data.get('pending') or []
     # BULK (User 2026-06-29: „alle auf einmal akzeptieren oder ablehnen, sonst
@@ -20161,10 +20246,8 @@ def decide_roster_change(token):
         history = (data.get('history') or []) + pending
         data['pending'] = []
         data['history'] = history[-500:]   # history deckeln, sonst wächst sie ewig
-        try:
-            with open(cp, 'w') as f: json.dump(data, f, ensure_ascii=False)
-        except Exception as e:
-            print(f'[decide_roster_change] error: {type(e).__name__}: {str(e)[:300]}')
+        if not _roster_changes_save(token, data):
+            print('[decide_roster_change] error: persist_failed (bulk)')
             return jsonify({'ok': False, 'error': 'internal_error'}), 500
         return jsonify({'ok': True, 'decided': len(pending), 'pending_remaining': 0})
     matched = next((c for c in pending if c.get('datum') == datum), None)
@@ -20177,10 +20260,8 @@ def decide_roster_change(token):
     history = data.get('history') or []
     history.append(matched)
     data['history'] = history
-    try:
-        with open(cp, 'w') as f: json.dump(data, f, ensure_ascii=False)
-    except Exception as e:
-        print(f'[decide_roster_change] error: {type(e).__name__}: {str(e)[:300]}')
+    if not _roster_changes_save(token, data):
+        print('[decide_roster_change] error: persist_failed')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
     # Snapshot-Baseline aktualisieren — sonst würde der nächste Snapshot den
     # gleichen Diff erneut als "pending" detektieren. Bei 'accept' nehmen wir
@@ -30134,6 +30215,11 @@ def auth_delete_account():
             ('trade_posts',             'author_token'),       # .eq('author_token', token)
             ('user_flight_ops',         'token'),              # upsert on_conflict='token,datum'
             ('user_voice_notes',        'token'),              # upsert on_conflict='token,day_key'
+            # 2026-07-27: beide Roster-Persistenz-Tabellen (PII: kompletter
+            # Dienstplan bzw. Änderungs-Verlauf) — roster_snapshots fehlte
+            # hier bisher komplett, roster_changes ist neu (Verlauf-Migration).
+            ('roster_snapshots',        'token'),              # on_conflict='token'
+            ('roster_changes',          'token'),              # on_conflict='token'
         ]
         for _tbl, _col in _cascade:
             try:

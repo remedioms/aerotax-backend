@@ -155,15 +155,29 @@ Der Nutzer will **autonom** arbeiten lassen außer bei großen Änderungen.
 
 ## Deploy-Workflow (Hetzner — einzige Produktionswahrheit)
 
+**Seit 2026-07-27 (Deploy-Gates): der EINE empfohlene Weg ist**
+
 1. `make verify` muss grün sein.
-2. Ein eindeutiges Artifact-Registry-Image bauen, z.B.
-   `gcloud builds submit --tag europe-west3-docker.pkg.dev/aerotax-prod/cloud-run-source-deploy/aerotax-backend:<tag> .`
-3. Genau dieses Image ausrollen:
-   `~/aerox-oracle-prep/deploy-hetzner.sh <vollständige-image-ref>`.
-   Das Script pullt auf Hetzner, aktualisiert `/opt/aerox/compose.yaml`, prüft
-   `/api/health` und rollt bei Fehler automatisch zurück.
-4. Erfolg am öffentlichen Ingress und am geänderten Endpoint messen. **NIE
-   `git push` oder `gcloud run deploy` als Produktions-Deploy behandeln.**
+2. Committen (main).
+3. `~/aerox-oracle-prep/deploy-hetzner.sh --from-git` — baut das Image
+   `main-<shortsha>` aus einem SAUBEREN Worktree von HEAD und rollt es aus
+   (Health-Check + Auto-Rollback wie gehabt).
+
+Das Script erzwingt drei Gates (Vorfall 27.07.: HEAD-Deploy rollte den live
+laufenden, erst später committeten Ein-Refresher 4 h zurück; parallele
+Sessions überschrieben sich):
+- **Lease:** nur ein Deploy gleichzeitig (andere Session wartet sichtbar).
+- **Ancestor:** der Host merkt sich den deployten Commit
+  (`/var/lib/aerox-deployed-sha`); ein neues Image muss ihn ENTHALTEN, sonst
+  Abbruch „ROLLBACK-GEFAHR" (`FORCE_ROLLBACK=1` übersteuert bewusst).
+- **Clean-Tree:** der Alt-Pfad (`deploy-hetzner.sh <image-ref>`) verweigert
+  dirty Trees (`FORCE_DIRTY=1` + `DEPLOY_SHA=<sha>` als Ausnahme-Pfad).
+
+`DRY_RUN=1` durchläuft alle Gates ohne Build/Deploy (zum Testen).
+Konsequenz: **Prod läuft IMMER genau einen committeten main-Stand** — nie
+wieder „Image aus dirty Tree" als Normalfall. Erfolg am öffentlichen Ingress
+und am geänderten Endpoint messen. **NIE `git push` oder `gcloud run deploy`
+als Produktions-Deploy behandeln.**
 
 Hetzner-Compose-/Env-Änderungen sind produktive Konfigurationsänderungen und
 brauchen vorherige Zustimmung. Der alte Cloud-Run-Incident vom 2026-05-12
