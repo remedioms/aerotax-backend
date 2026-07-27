@@ -2434,3 +2434,41 @@ def test_refresh_all_exit_drain_sets_drain_and_joins(monkeypatch):
     fo._refresh_all_exit_drain()
     fo._refresh_all_thread[0] = None
     fo._refresh_all_state.update(running=False, drain=False)
+
+
+def test_relogin_watch_boot_grace_no_false_alarm(monkeypatch, tmp_path):
+    """BOOT-KARENZ (Fehlalarm 27.07. 21:07): Wächter-Cron traf 38 s nach dem
+    Containerstart — last_tick war noch 0.0 und „now − 0 > 15 min" meldete
+    „Refresher-Loop steht", obwohl der Loop frisch aktiv war. Regel: ohne
+    JEMALS einen Tick gibt es erst nach >10 min aktiver Laufzeit einen Grund;
+    ein echter nie-tickender Loop alarmiert weiterhin."""
+    import time as _time
+    import app as backend
+    monkeypatch.setattr(fo, '_RELOGIN_WATCH_STATE',
+                        str(tmp_path / 'watch.json'))
+    monkeypatch.delenv('ADSB_POLL_SECRET', raising=False)
+    monkeypatch.setenv('LH_FLIGHTOPS_REFRESHER', '1')
+    mails = []
+    monkeypatch.setattr(fo, '_fo_watch_alert_mail',
+                        lambda reasons, cnt, delta: mails.append(reasons) or True)
+    monkeypatch.setattr(fo, '_relogin_count', lambda: 253)
+    c = backend.app.test_client()
+
+    # Frisch gebootet: aktiv seit 38 s, noch kein Tick ⇒ KEIN Grund, keine Mail.
+    fo._refresher_state.update(active=True, drain=False, busy=False,
+                               last_tick=0.0,
+                               active_since=_time.time() - 38)
+    d1 = c.post('/api/internal/flightops/relogin-watch').get_json()
+    assert d1['reasons'] == []
+    assert not mails
+
+    # >10 min aktiv und IMMER NOCH nie getickt ⇒ ehrlicher Alarm.
+    fo._refresher_state.update(active_since=_time.time() - 11 * 60)
+    d2 = c.post('/api/internal/flightops/relogin-watch').get_json()
+    assert any('NIE getickt' in r for r in d2['reasons'])
+
+    # Normalfall: echter alter Tick > 15 min ⇒ „steht"-Grund unverändert.
+    fo._refresher_state.update(last_tick=_time.time() - 16 * 60)
+    d3 = c.post('/api/internal/flightops/relogin-watch').get_json()
+    assert any('steht' in r for r in d3['reasons'])
+    fo._refresher_state.update(active=False, last_tick=0.0, active_since=0.0)

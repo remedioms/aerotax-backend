@@ -3112,7 +3112,7 @@ _REFRESHER_TICK_S = 60           # Scan-Takt (drain-aware, 1-s-Granularität)
 _REFRESHER_GRANT_GAP_S = 1.0     # Mindestabstand zwischen zwei Rotationen
 _REFRESHER_LOCKFILE = '/tmp/lh_flightops_refresher.lock'
 _refresher_state = {'active': False, 'drain': False, 'busy': False,
-                    'last_tick': 0.0, 'last': None}
+                    'last_tick': 0.0, 'last': None, 'active_since': 0.0}
 _refresher_thread = [None]
 _refresher_lock_fh = [None]      # offenes flock-Handle (hält den Lock am Leben)
 
@@ -3222,6 +3222,7 @@ def _refresher_main():
     _refresher_lock_fh[0] = fh
     _REFRESHER_THREAD_ID[0] = threading.get_ident()
     _refresher_state['active'] = True
+    _refresher_state['active_since'] = time.time()
     log.info('[fo-refresher] aktiv pid=%s — einziger RT-Rotierer des Systems',
              os.getpid())
     try:
@@ -3378,6 +3379,17 @@ def flightops_relogin_watch():
         if not _refresher_state.get('active'):
             reasons.append('Refresher-Loop NICHT aktiv (konfiguriert, aber '
                            'kein Thread/Lock) — niemand rotiert')
+        elif not _refresher_state.get('last_tick'):
+            # BOOT-KARENZ (Fehlalarm 27.07. 21:07: Wächter-Cron traf 38 s nach
+            # dem pushprefs-Containerstart — last_tick war noch 0.0 und
+            # „now − 0 > 15 min" meldete „steht", obwohl der Loop gerade erst
+            # startete; Pass lief danach 7/7 sauber durch). Ohne JEMALS einen
+            # Tick gab es nichts zu vergleichen: erst meckern, wenn der Loop
+            # seit >10 min aktiv ist und immer noch nie getickt hat
+            # (Takt ist 60 s — 10 min sind >Erst-Pass, kein echtes Loch).
+            if now - (_refresher_state.get('active_since') or now) > 10 * 60:
+                reasons.append('Refresher-Loop hat seit Boot NIE getickt '
+                               '(>10min aktiv ohne ersten Pass)')
         elif now - (_refresher_state.get('last_tick') or 0) > 15 * 60:
             reasons.append('Refresher-Loop steht (>15min kein Tick)')
     elif flightops_configured():
