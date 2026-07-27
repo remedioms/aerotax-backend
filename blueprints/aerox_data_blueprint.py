@@ -1311,22 +1311,30 @@ def _budget_key_inc(key, units=1):
     """Increment eines beliebigen Budget-Keys — bevorzugt ATOMAR via
     ax_budget_increment-RPC (s. _budget_rpc_add), sonst Upsert-Fallback.
     Identische Semantik wie _paid_budget_inc, nur key-parametrisiert.
-    Wirft NIE."""
+    Wirft NIE.
+
+    Returns den prozess-ÜBERGREIFENDEN Gesamtstand des Keys (int), wenn der
+    atomare RPC ihn geliefert hat, sonst None. Das ist die einzige Stelle, an
+    der ein Prozess erfährt, was die ANDEREN Prozesse verbraucht haben —
+    `lh_open_api._budget_ok` gated darauf (die LH-Quota gilt pro KEY, die
+    lokalen Zähler aber pro Prozess). Bestandsaufrufer ignorieren den Rückgabe-
+    wert; die Signatur bleibt kompatibel."""
     used = _MEM_BUDGET.get(key, 0) + max(1, int(units))
     _MEM_BUDGET[key] = used          # In-Memory IMMER zählen (Safety-Net)
     sb = _sb()
     if sb is None:
-        return
+        return None
     n = _budget_rpc_add(key, units)
     if n is not None:
         _MEM_BUDGET[key] = max(used, n)
-        return
+        return n
     try:
         sb.table('ax_api_budget').upsert(
             {'month': key, 'n': max(used, _budget_key_used(key)),
              'updated_at': _iso_now()}).execute()
     except Exception:
         pass
+    return None
 
 
 def lh_quota_snapshot(hours=6):

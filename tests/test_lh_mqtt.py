@@ -5,6 +5,7 @@ gemonkeypatcht. Topic-/Payload-Shapes sind die LIVE verifizierten
 (Broker-Smoke-Test 2026-07-22)."""
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -410,8 +411,10 @@ def test_inbound_topics_subscribe_feeder_flight(monkeypatch):
     board = [{'airport': 'FRA#ARR', 'flight': 'LH123', 'reg': 'D-AIKP',
               'sched': None, 'esti': arr_local.strftime('%H:%M'),
               'date': arr_local.date().isoformat()}]
-    monkeypatch.setattr(lh_mqtt, '_cached_leg_reg',
-                        lambda *a, **k: 'D-AIKP')
+    # Die Topics-Rechnung löst Regs seit 2026-07-27 im BATCH auf (_legs_regs),
+    # nicht mehr pro Leg — der Mock muss die echte Form spiegeln.
+    monkeypatch.setattr(lh_mqtt, '_legs_regs',
+                        lambda legs: {leg_key: 'D-AIKP' for leg_key in legs})
     monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: board)
     topics = lh_mqtt.inbound_topics_for_rows(_rows([leg]), now)
     d0 = arr_local.date()
@@ -485,3 +488,131 @@ def test_sector_rows_paginates_past_postgrest_1000_cap(monkeypatch):
     monkeypatch.setattr(lh_mqtt, '_sb', lambda: _FakeSB())
     got = lh_mqtt._sector_rows(['2026-07-22'])
     assert len(got) == 2500
+
+
+# ── Live-Activity-Fanout (P7-Verdrahtung 2026-07-27) ─────────────────────────
+# Ersetzt den Tripwire-Platzhalter in tests/test_live_activity.py: der Hook
+# `push_for_affected` ist jetzt in `lh_mqtt_event` angeschlossen — NUR für
+# wirklich betroffene Crews (affected non-empty). Der Inbound-Watch-Pfad
+# (Zubringer-Maschinen ohne Roster-Crew) bleibt Live-Activity-frei UND
+# behält ausdrücklich KEIN Betroffenheits-Gate (Quota-Runden-Befund).
+
+def test_event_triggers_live_activity_for_affected(client, monkeypatch):
+    from blueprints import live_activity as LA
+    calls = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
+                        lambda dates, c, n: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {
+        'dep_delay_min': 35, 'est_dep': '2026-07-22T17:45:00+02:00',
+        'sched_dep': '2026-07-22T17:10:00+02:00'})
+    monkeypatch.setattr(lh_mqtt, '_do_push', lambda *a, **k: True)
+    monkeypatch.setattr(LA, 'push_for_affected',
+                        lambda affected, kind, flight_disp, topic_date,
+                        facts=None: calls.append(
+                            (affected, kind, flight_disp, topic_date, facts))
+                        or 1)
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('New Estimated Departure')).get_json()
+    assert d['la_sent'] == 1
+    assert len(calls) == 1
+    affected, kind, flight_disp, topic_date, facts = calls[0]
+    assert kind == 'est_dep' and flight_disp == 'LH400'
+    assert topic_date == '2026-07-22'
+    assert [tok for tok, _s in affected] == ['user0']
+    assert facts.get('dep_delay_min') == 35   # frische Fakten reisen mit
+
+
+def test_inbound_path_never_calls_live_activity(client, monkeypatch):
+    # Zubringer-Szenario: KEIN Roster trägt den Flug (affected leer), aber der
+    # Inbound-Watch pusht. Live-Activity darf hier NICHT feuern — und der
+    # Inbound-Pfad darf umgekehrt nie auf „nur wenn betroffen" gegated werden.
+    from blueprints import live_activity as LA
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
+    monkeypatch.setattr(lh_mqtt, '_push_inbound',
+                        lambda kind, disp, date, facts=None: 1)
+    monkeypatch.setattr(LA, 'push_for_affected',
+                        lambda *a, **k: pytest.fail(
+                            'Live-Activity ohne betroffene Crew verboten'))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed')).get_json()
+    assert d['kind'] == 'departed'
+    assert d['pushed'] == 1        # Inbound-Watch lief trotz affected == []
+    assert d['la_sent'] == 0
+
+
+# ── Reg-Cache: Prozess-Memo → geteilter Cache → LH (Quota-Fix 2026-07-27) ────
+# Hintergrund: `mqtt_leg_reg` war mit 73 % der grösste LH-Verbraucher, weil das
+# Reg-Memo ein In-Process-dict war — 3× fragmentiert und bei jedem
+# gunicorn-Recycle (~alle 37 min) weg. Diese Tests nageln die drei Eigenschaften
+# fest, die das behoben haben.
+
+@pytest.fixture(autouse=False)
+def _clean_reg(monkeypatch):
+    lh_mqtt._reg_memo.clear()
+    monkeypatch.setattr(lh_mqtt, '_sb', lambda: None)   # kein Supabase im Test
+    return lh_mqtt._reg_memo
+
+
+def test_legs_regs_dedupes_same_flight_across_users(_clean_reg, monkeypatch):
+    """Ein Flug mit N Crews darf EINEN LH-Call kosten, nicht N."""
+    calls = []
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: calls.append(a) or {'reg': 'D-AIKP'})
+    leg = ('LH400', '2026-07-22', 'FRA', 'JFK')
+    out = lh_mqtt._legs_regs([leg, leg, leg, leg])
+    assert out == {leg: 'D-AIKP'}
+    assert len(calls) == 1
+
+
+def test_legs_regs_memo_hit_costs_nothing(_clean_reg, monkeypatch):
+    calls = []
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: calls.append(a) or {'reg': 'D-AIKP'})
+    leg = ('LH400', '2026-07-22', 'FRA', 'JFK')
+    lh_mqtt._legs_regs([leg])
+    lh_mqtt._legs_regs([leg])
+    assert len(calls) == 1
+
+
+def test_lh_outage_is_not_cached_as_missing_reg(_clean_reg, monkeypatch):
+    """LH-503/Throttle-Abweisung ist „wir wissen es nicht" — darf NICHT 30 min
+    als „hat keine Reg" gelten. Vorher tat es das und verlängerte jeden
+    LH-Ausfall um eine halbe Stunde."""
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
+    import blueprints.lh_open_api as lho
+    monkeypatch.setattr(lho, 'last_call_answered', lambda: False)
+    leg = ('LH400', '2026-07-22', 'FRA', 'JFK')
+    assert lh_mqtt._legs_regs([leg]) == {leg: None}
+    key = lh_mqtt._reg_cache_key(*leg)
+    expiry, _val = lh_mqtt._reg_memo[key]
+    assert expiry - time.time() <= lh_mqtt._REG_UNKNOWN_TTL_S + 1
+
+
+def test_real_no_reg_answer_is_cached_long(_clean_reg, monkeypatch):
+    """Eine ECHTE Antwort ohne Reg (LH kennt den Flug, hat aber keine Maschine
+    zugeteilt) darf sehr wohl negativ gecacht werden."""
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
+    import blueprints.lh_open_api as lho
+    monkeypatch.setattr(lho, 'last_call_answered', lambda: True)
+    leg = ('LH400', '2026-07-22', 'FRA', 'JFK')
+    assert lh_mqtt._legs_regs([leg]) == {leg: None}
+    key = lh_mqtt._reg_cache_key(*leg)
+    expiry, _val = lh_mqtt._reg_memo[key]
+    assert expiry - time.time() > lh_mqtt._REG_UNKNOWN_TTL_S + 1
+
+
+def test_shared_cache_hit_skips_lh_entirely(monkeypatch):
+    """Der Punkt der ganzen Übung: ein frisch recycelter Worker (leeres Memo)
+    zieht die Regs aus dem geteilten Cache statt sie neu zu kaufen."""
+    lh_mqtt._reg_memo.clear()
+    calls = []
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: calls.append(a) or {'reg': 'X'})
+    leg = ('LH400', '2026-07-22', 'FRA', 'JFK')
+    key = lh_mqtt._reg_cache_key(*leg)
+    monkeypatch.setattr(lh_mqtt, '_reg_cache_read', lambda keys: {key: 'D-AIKP'})
+    monkeypatch.setattr(lh_mqtt, '_reg_cache_write', lambda items: None)
+    monkeypatch.setattr(lh_mqtt, '_sb', lambda: object())
+    assert lh_mqtt._legs_regs([leg]) == {leg: 'D-AIKP'}
+    assert not calls

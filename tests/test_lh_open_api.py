@@ -317,3 +317,97 @@ def test_facts_memo_alias_defragments_cache(monkeypatch):
     assert ('LH400', '2026-07-26', None, None) in lh._facts_memo
     assert ('LH400', '2026-07-26', 'FRA', 'JFK') in lh._facts_memo
     lh._facts_memo.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROZESS-ÜBERGREIFENDER GATE (2026-07-27) — Owner: drei Stunden über 1.000/h.
+# Der Zähler von 26.07. machte den Verbrauch nur SICHTBAR; gedrosselt wurde
+# weiter pro Prozess (220 × 4 Prozesse = 880/h Decke, und kein Prozess wusste
+# von den anderen). Jetzt gated `_budget_ok` zusätzlich auf den Gesamtstand,
+# den der ohnehin laufende 30-s-Flusher vom atomaren RPC zurückbekommt.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reset_global_gate():
+    lh._global_hour = 0
+    lh._global_count = 0
+    lh._global_local_since = 0
+    lh._global_warned_hour = -1
+
+
+def test_global_gate_blocks_when_other_processes_used_the_quota():
+    import time as _t
+    _reset_global_gate()
+    h = _t.strftime('%Y%m%d%H', _t.gmtime())
+    # Dieser Prozess hat selbst noch NICHTS verbraucht — die anderen aber fast
+    # alles. Genau der Fall, den der Pro-Prozess-Zähler nie sehen konnte.
+    lh.note_global_budget(h, lh._GLOBAL_HOUR_BUDGET)
+    assert lh._global_budget_check(_t.time()) is False
+    _reset_global_gate()
+
+
+def test_global_gate_counts_own_calls_between_flushes():
+    import time as _t
+    _reset_global_gate()
+    h = _t.strftime('%Y%m%d%H', _t.gmtime())
+    lh.note_global_budget(h, lh._GLOBAL_HOUR_BUDGET - 2)
+    now = _t.time()
+    assert lh._global_budget_check(now) is True
+    lh._global_budget_commit()
+    assert lh._global_budget_check(now) is True
+    lh._global_budget_commit()
+    # Jetzt ist die Decke rechnerisch erreicht, obwohl seit dem Flush kein
+    # neuer Gesamtstand kam — sonst überzieht jeder Prozess 30 s lang blind.
+    assert lh._global_budget_check(now) is False
+    _reset_global_gate()
+
+
+def test_global_gate_fails_open_without_shared_number():
+    """Ohne Supabase-Stand (frischer Prozess) darf der Gate NICHT dichtmachen —
+    dann bleibt `_HOUR_BUDGET` pro Prozess die Bremse. Lieber die alte Decke
+    als LH-Enrichment komplett aus."""
+    import time as _t
+    _reset_global_gate()
+    assert lh._global_budget_check(_t.time()) is True
+    _reset_global_gate()
+
+
+def test_flush_feeds_global_gate_from_rpc_total(monkeypatch):
+    import time as _t
+    from blueprints import aerox_data_blueprint as adb
+    _reset_global_gate()
+    monkeypatch.setattr(adb, '_budget_key_inc',
+                        lambda key, units=1: 777 if key.count(':') == 1 else None)
+    lh._budget_buf.clear()
+    lh.budget_inc('lhopen', 'mqtt_leg_reg')
+    lh.budget_flush()
+    assert lh._global_count == 777      # Gesamtstand ALLER Prozesse übernommen
+    lh._budget_buf.clear()
+    _reset_global_gate()
+
+
+def test_last_call_answered_separates_outage_from_answer(monkeypatch):
+    """404 = „gibt es nicht" (Antwort). 503/Throttle = „wir wissen es nicht".
+    Der Unterschied entscheidet, ob ein leeres Ergebnis negativ gecacht
+    werden darf."""
+    import urllib.error
+    monkeypatch.setattr(lh, '_token', lambda: 'tok')
+    monkeypatch.setattr(lh, '_budget_ok', lambda: True)
+    monkeypatch.setattr(lh, 'budget_inc', lambda *a, **k: None)
+
+    def _raise(code):
+        def _open(req, timeout=10):
+            raise urllib.error.HTTPError(req.full_url, code, 'x', {}, None)
+        return _open
+
+    monkeypatch.setattr(lh.urllib.request, 'urlopen', _raise(404))
+    assert lh._get('/x') is None and lh.last_call_answered() is True
+    monkeypatch.setattr(lh.urllib.request, 'urlopen', _raise(503))
+    assert lh._get('/x') is None and lh.last_call_answered() is False
+
+
+def test_denied_call_is_not_an_answer(monkeypatch):
+    monkeypatch.setattr(lh, '_token', lambda: 'tok')
+    monkeypatch.setattr(lh, '_budget_ok', lambda: False)
+    monkeypatch.setattr(lh, 'budget_inc', lambda *a, **k: None)
+    assert lh._get('/x') is None
+    assert lh.last_call_answered() is False

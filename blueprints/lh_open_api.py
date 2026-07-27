@@ -79,6 +79,77 @@ _hour_window = 0               # aktuelle Stunde (epoch // 3600)
 _hour_count = 0
 _budget_warned_hour = -1
 
+# ── Prozess-ÜBERGREIFENDER Stunden-Gate ─────────────────────────────────────
+# WARUM (Owner 2026-07-27, drei Stunden über 1.000/h): `_HOUR_BUDGET` oben
+# zählt pro Prozess. 3 Backend-Worker + 1 Poll-Worker × 220 = 880/h Decke, und
+# weil die Prozesse voneinander nichts wissen, hilft ein Senken des Werts nur
+# um den Preis, dass ein einzelner Prozess unnötig früh dichtmacht.
+# Gemeinsame Wahrheit ist der Zähler `lhopen:<YYYYMMDDHH>` in ax_api_budget.
+# Der Flusher schreibt ihn ohnehin alle 30 s und bekommt vom atomaren RPC den
+# neuen GESAMTSTAND zurück — den übernehmen wir hier, ohne einen einzigen
+# zusätzlichen Netz-Call.
+# 850 statt 1.000: zwischen zwei Flushes liegen bis zu 30 s, in denen alle
+# Prozesse zusammen (~4,4 Calls/s, s. _MIN_INTERVAL) noch überziehen können.
+_GLOBAL_HOUR_BUDGET = 850
+_global_lock = threading.Lock()
+_global_hour = 0               # Stunde, auf die sich _global_count bezieht
+_global_count = 0              # Gesamtstand ALLER Prozesse beim letzten Flush
+_global_local_since = 0        # was DIESER Prozess seither noch drauflegte
+_global_warned_hour = -1
+
+
+def note_global_budget(hour_key, total):
+    """Vom Flusher aufgerufen, sobald der atomare RPC den echten Gesamtstand
+    für `lhopen:<hour>` geliefert hat. Setzt den lokalen Seit-Flush-Zähler
+    zurück — ab hier ist `total` die Wahrheit. Wirft nie."""
+    global _global_hour, _global_count, _global_local_since
+    try:
+        h = int(hour_key)
+        with _global_lock:
+            if h < _global_hour:
+                return                     # veralteter Flush, ignorieren
+            if h > _global_hour:
+                _global_hour = h
+                _global_local_since = 0
+            _global_count = max(0, int(total))
+            _global_local_since = 0
+    except Exception:
+        pass
+
+
+def _global_budget_check(now):
+    """False, wenn der GANZE Key sein Stundenkontingent ausgeschöpft hat.
+    Schätzung = letzter bekannter Gesamtstand + was dieser Prozess seit dem
+    Flush selbst verbraucht hat. Prüft NUR — gebucht wird in
+    `_global_budget_commit`, erst wenn der Call auch wirklich rausgeht.
+    Fail-OPEN: ohne Supabase-Stand (frischer Prozess, RPC-Fallback) bleibt der
+    Prozess-Gate `_HOUR_BUDGET` die Bremse — lieber die alte Decke als
+    LH-Enrichment komplett aus."""
+    global _global_hour, _global_count, _global_local_since, _global_warned_hour
+    hour = int(time.strftime('%Y%m%d%H', time.gmtime(now)))
+    with _global_lock:
+        if hour != _global_hour:
+            _global_hour = hour
+            _global_count = 0
+            _global_local_since = 0
+            return True
+        est = _global_count + _global_local_since
+        if est >= _GLOBAL_HOUR_BUDGET:
+            if _global_warned_hour != hour:
+                log.warning('[lh_open] GLOBALES Stunden-Budget %d erreicht '
+                            '(geschätzt %d über alle Prozesse) — Fallback-Tiers',
+                            _GLOBAL_HOUR_BUDGET, est)
+                _global_warned_hour = hour
+            return False
+        return True
+
+
+def _global_budget_commit():
+    """Einen tatsächlich abgesetzten Call auf den globalen Schätzer buchen."""
+    global _global_local_since
+    with _global_lock:
+        _global_local_since += 1
+
 # ── Fakten-Cache ─────────────────────────────────────────────────────────────
 _facts_lock = threading.Lock()
 _facts_memo = {}               # key -> (expires_at, facts_dict)
@@ -153,6 +224,8 @@ def _budget_ok():
     now = time.time()
     if now < _rate_penalty_until:
         return False               # Over-Rate-Cool-down aktiv → Fallback-Tiers
+    if not _global_budget_check(now):
+        return False               # ganzer Key ausgeschöpft (alle Prozesse)
     hour = int(now // 3600)
     wait = 0.0
     with _rate_lock:
@@ -169,6 +242,7 @@ def _budget_ok():
         wait = _MIN_INTERVAL - (now - _last_call_ts)
         _last_call_ts = now + max(0.0, wait)   # Slot reservieren
         _hour_count += 1
+    _global_budget_commit()        # erst buchen, wenn der Slot wirklich steht
     if wait > 0:
         time.sleep(wait)
     return True
@@ -215,7 +289,14 @@ def budget_flush():
     try:
         from blueprints.aerox_data_blueprint import _budget_key_inc
         for k, u in list(pending.items()):
-            _budget_key_inc(k, u)
+            total = _budget_key_inc(k, u)
+            # Der bare Stunden-Key (ohne :<caller>) ist die gemeinsame Wahrheit
+            # für den prozess-übergreifenden Gate — der RPC liefert hier den
+            # Stand ALLER Prozesse zurück, sonst weiß niemand voneinander.
+            if total is not None and k.startswith('lhopen:'):
+                parts = k.split(':')
+                if len(parts) == 2:
+                    note_global_budget(parts[1], total)
             pending.pop(k, None)
             done += 1
     except Exception:
@@ -263,9 +344,29 @@ def budget_inc(key_prefix, caller=None, units=1):
         pass
 
 
+# ── „leer" ≠ „unbekannt" ────────────────────────────────────────────────────
+# Ein leeres Ergebnis hat DREI sehr verschiedene Ursachen: (a) LH sagt sauber
+# „diesen Flug gibt es an dem Tag nicht" (HTTP 404), (b) der Call wurde vom
+# eigenen Throttle abgewiesen, (c) LH war kaputt (403/503/Timeout). Nur (a) ist
+# eine ANTWORT und darf negativ gecacht werden; (b) und (c) sind „wir wissen es
+# nicht" und würden als Negativ-Cache einen Ausfall verlängern.
+# MESSUNG 2026-07-27: in der Stichprobe waren alle Reg-Fehlschläge HTTP-503 —
+# die landeten bisher 30 min lang als „hat keine Reg" im Memo.
+# Thread-local, weil Gunicorn hier mit --threads 8 fährt.
+_call_state = threading.local()
+
+
+def last_call_answered():
+    """True, wenn der letzte LH-GET dieses Threads eine ECHTE Antwort bekam
+    (HTTP 200 oder 404). False bei Throttle-Abweisung, 403/5xx, Netzfehler —
+    dann ist ein leeres Ergebnis kein Fakt, sondern eine Lücke."""
+    return bool(getattr(_call_state, 'answered', False))
+
+
 def _get(path, caller=None):
     """Authentifizierter GET → dict oder None. Wirft nie."""
     global _rate_penalty_until
+    _call_state.answered = False
     tok = _token()
     if not tok:
         return None
@@ -285,13 +386,17 @@ def _get(path, caller=None):
                  'Accept': 'application/json'})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode('utf-8'))
+            d = json.loads(r.read().decode('utf-8'))
+        _call_state.answered = True
+        return d
     except urllib.error.HTTPError as e:
         if e.code == 403:
             # „Developer Over Rate": kurzer Voll-Stopp statt 403-Salve —
             # jeder weitere Call verbrennt nur Budget gegen dieselbe Wand.
             _rate_penalty_until = time.time() + _RATE_PENALTY_SEC
-        if e.code not in (404,):     # 404 = Flug an dem Tag nicht geflogen (normal)
+        if e.code == 404:            # 404 = Flug an dem Tag nicht geflogen (normal)
+            _call_state.answered = True
+        else:
             log.warning('[lh_open] GET %s -> HTTP %s', path.split('?')[0], e.code)
         return None
     except Exception as e:

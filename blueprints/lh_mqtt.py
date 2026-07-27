@@ -271,32 +271,208 @@ def _sector_tail(s):
     return None
 
 
+# ── Reg-Cache: Prozess-Memo → Supabase → LH ─────────────────────────────────
 # Reg-Memo entkoppelt vom 120s-Facts-Memo: Maschinen-Zuteilung ändert sich
-# intraday kaum — 3h TTL hält den LH-Budget-Verbrauch der Topics-Rechnung
-# klein (Quota-Lehre 22.07.: pro-Key-Limit, pro-Prozess-Zähler ×3 Worker —
-# jede Verlängerung hier wirkt dreifach).
+# intraday kaum — 3h TTL hält den LH-Budget-Verbrauch der Topics-Rechnung klein.
+#
+# WARUM DAS MEMO ALLEIN NICHT REICHTE (Owner 2026-07-27, drei Stunden über
+# 1.000/h; `mqtt_leg_reg` war mit 73 % der mit Abstand größte Verbraucher):
+# ein `dict` im Prozess wird gleich ZWEIMAL entwertet —
+#   1. FRAGMENTIERUNG: der Daemon pollt /topics alle 300 s, gunicorn verteilt
+#      round-robin auf 3 Worker. Jeder pflegt sein eigenes Memo, derselbe Flug
+#      wird also dreifach bei LH gekauft.
+#   2. RECYCLING (der eigentliche Verstärker): bei ~24.600 req/h und
+#      `--max-requests 5000` recycelt jeder Worker etwa alle 37 min — gemessen
+#      8 Boots in 82 min. Jeder Neustart löscht das Memo, der nächste
+#      Topics-Poll kauft ALLE ~342 Legs erneut. Rechnung: 5,9 Recycles/h ×
+#      342 = ~2.000 Calls/h gewollt; genau das zeigte `lhopen_denied`.
+# MESSUNG, die die naheliegende Alternative ausschließt: LH liefert die Reg
+# auch 12–16 h vor Abflug (Stichprobe 32/32) — das Fenster zu kürzen wäre also
+# reiner Feature-Verlust am Inbound-Watch, keine Ersparnis. Der Bedarf ist
+# nicht zu hoch, der Cache war zu flüchtig.
+#
+# Persistenz-Ebene ist `ax_paid_call_cache` (provider='lhopen'): call_key-PK,
+# result jsonb, result_until/negative_until — exakt die gebrauchte Semantik,
+# inkl. opportunistischem Prune. KEINE neue Tabelle, kein Migrations-Schritt.
+# Der Name der Tabelle sagt „paid"; sie ist faktisch der generische
+# API-Call-Cache (Spalte `provider` ist genau dafür da).
 _reg_lock = threading.Lock()
 _reg_memo = {}
 _REG_TTL_S = 3 * 3600
 _REG_NEG_TTL_S = 1800
+# Transportfehler/Throttle-Abweisung sind KEIN „hat keine Reg" — nur kurz
+# zurückhalten, damit ein LH-503 nicht 30 min als Fakt gilt (in der Stichprobe
+# vom 27.07. waren ALLE Fehlschläge 503er).
+_REG_UNKNOWN_TTL_S = 120
+_REG_CACHE_PROVIDER = 'lhopen'
+_REG_KEY_CHUNK = 80            # PostgREST-URL-Länge: in_() nicht überdehnen
 
 
-def _cached_leg_reg(flight_disp, date, dep, arr):
-    key = (flight_disp, date, dep, arr)
-    now = time.time()
+def _reg_cache_key(flight_disp, date, dep, arr):
+    return f'lhreg:{flight_disp}:{date}:{dep or ""}:{arr or ""}'
+
+
+def _reg_memo_get(key, now):
     with _reg_lock:
         hit = _reg_memo.get(key)
         if hit and now < hit[0]:
-            return hit[1]
-    reg = (lh_flight_facts(flight_disp, date, dep, arr,
-                           caller='mqtt_leg_reg') or {}).get('reg')
+            return True, hit[1]
+    return False, None
+
+
+def _reg_memo_put(key, reg, ttl, now):
     with _reg_lock:
-        _reg_memo[key] = (now + (_REG_TTL_S if reg else _REG_NEG_TTL_S), reg)
+        _reg_memo[key] = (now + ttl, reg)
         if len(_reg_memo) > 3000:
             items = sorted(_reg_memo.items(), key=lambda kv: kv[1][0])
             for k, _v in items[:len(items) // 4 or 1]:
                 _reg_memo.pop(k, None)
-    return reg
+
+
+def _reg_cache_read(cache_keys):
+    """Batch-Read aus dem geteilten Cache → {call_key: reg-or-None} für die
+    Einträge, die noch gültig sind. Ein Query je 80 Keys statt eines RPCs pro
+    Key. Wirft nie — bei SB-Problemen einfach leer (dann greift LH)."""
+    client = _sb()
+    if client is None or not cache_keys:
+        return {}
+    keys = sorted(set(cache_keys))
+    out = {}
+    now = datetime.now(timezone.utc)
+    for i in range(0, len(keys), _REG_KEY_CHUNK):
+        chunk = keys[i:i + _REG_KEY_CHUNK]
+        try:
+            r = (client.table('ax_paid_call_cache')
+                 .select('call_key,result,result_until,negative_until')
+                 .in_('call_key', chunk).execute())
+        except Exception as e:
+            log.warning('[lh_mqtt] reg-cache read fail: %s', type(e).__name__)
+            continue
+        for row in (r.data or []):
+            # Zeitstempel PARSEN, nicht als String vergleichen: lexikografisch
+            # stimmt nur, solange PostgREST exakt dieses Format liefert — ein
+            # 'Z' statt '+00:00' würde den Cache still komplett entwerten.
+            if _ts_after(row.get('result_until'), now):
+                out[row.get('call_key')] = (row.get('result') or {}).get('reg')
+            elif _ts_after(row.get('negative_until'), now):
+                out[row.get('call_key')] = None
+    return out
+
+
+def _ts_after(val, now):
+    """True, wenn der ISO-Zeitstempel `val` noch in der Zukunft liegt.
+    Unbekanntes/kaputtes Format → False (Cache-Miss, nie ein falscher Hit)."""
+    if not val:
+        return False
+    try:
+        d = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d > now
+    except Exception:
+        return False
+
+
+def _reg_cache_write(items):
+    """items = [(call_key, reg_or_None)] → Upsert in den geteilten Cache.
+    Wirft nie. Ein negativer Eintrag (reg=None) wird bewusst MITgeschrieben:
+    „dieser Flug hat bei LH keine Reg" ist eine Antwort und spart die nächsten
+    Aufrufe. Nicht geschrieben werden Lücken (LH kaputt) — die kommen hier
+    gar nicht erst an."""
+    client = _sb()
+    if client is None or not items:
+        return
+    now = datetime.now(timezone.utc)
+    rows = []
+    for key, reg in items:
+        pos = reg is not None
+        rows.append({
+            'call_key': key,
+            'provider': _REG_CACHE_PROVIDER,
+            'result': {'reg': reg} if pos else None,
+            'result_until': (now + timedelta(seconds=_REG_TTL_S)).isoformat()
+                            if pos else None,
+            'negative_reason': None if pos else 'no_reg',
+            'negative_until': None if pos else
+                              (now + timedelta(seconds=_REG_NEG_TTL_S)).isoformat(),
+            'updated_at': now.isoformat(),
+        })
+    try:
+        client.table('ax_paid_call_cache').upsert(
+            rows, on_conflict='call_key').execute()
+    except Exception as e:
+        log.warning('[lh_mqtt] reg-cache write fail: %s', type(e).__name__)
+
+
+def _fetch_leg_reg(flight_disp, date, dep, arr):
+    """EIN LH-Lookup. Returns (reg, answered) — `answered=False` heißt „wir
+    wissen es nicht" (Throttle-Abweisung oder LH-Fehler) und darf NICHT als
+    Negativ-Ergebnis gecacht werden."""
+    facts = lh_flight_facts(flight_disp, date, dep, arr,
+                            caller='mqtt_leg_reg') or {}
+    reg = facts.get('reg')
+    if reg:
+        return reg, True
+    try:
+        from blueprints.lh_open_api import last_call_answered
+        return None, bool(last_call_answered())
+    except Exception:
+        return None, False
+
+
+def _cached_leg_reg(flight_disp, date, dep, arr):
+    """Reg EINES Legs über alle drei Ebenen. Für Einzelabfragen
+    (`_push_inbound`); die Topics-Rechnung nutzt `_legs_regs` (Batch)."""
+    return _legs_regs([(flight_disp, date, dep, arr)]).get(
+        (flight_disp, date, dep, arr))
+
+
+def _legs_regs(legs):
+    """Regs für viele Legs: Prozess-Memo → geteilter Cache (EIN Batch-Read) →
+    LH nur für den Rest. Returns {(flight,date,dep,arr): reg-or-None}.
+
+    Der Batch ist der Punkt: vorher stand pro Leg ein potenzieller LH-Call, und
+    ein frisch recycelter Worker feuerte alle auf einmal."""
+    now = time.time()
+    out = {}
+    todo = []
+    # DEDUPE ist Pflicht, nicht Kosmetik: ein Flug mit 8 AeroX-Crews steht 8×
+    # in `rows`. Ohne das hier wäre jeder Doppelte ein eigener LH-Call, weil
+    # das Memo erst NACH dem Sammeln gefüllt wird.
+    for leg in dict.fromkeys(legs):
+        key = _reg_cache_key(*leg)
+        found, val = _reg_memo_get(key, now)
+        if found:
+            out[leg] = val
+        else:
+            todo.append((leg, key))
+    if not todo:
+        return out
+
+    shared = _reg_cache_read([k for _leg, k in todo])
+    misses = []
+    for leg, key in todo:
+        if key in shared:
+            reg = shared[key]
+            out[leg] = reg
+            _reg_memo_put(key, reg,
+                          _REG_TTL_S if reg else _REG_NEG_TTL_S, now)
+        else:
+            misses.append((leg, key))
+
+    fresh = []
+    for leg, key in misses:
+        reg, answered = _fetch_leg_reg(*leg)
+        out[leg] = reg
+        if not answered:
+            # Lücke, kein Fakt: nur kurz zurückhalten, NICHT teilen.
+            _reg_memo_put(key, None, _REG_UNKNOWN_TTL_S, now)
+            continue
+        _reg_memo_put(key, reg, _REG_TTL_S if reg else _REG_NEG_TTL_S, now)
+        fresh.append((key, reg))
+    if fresh:
+        _reg_cache_write(fresh)
+    return out
 
 
 def _station_tz(iata):
@@ -386,7 +562,11 @@ def inbound_topics_for_rows(rows, now_utc):
     starteten)."""
     lo = now_utc - timedelta(hours=1)
     hi = now_utc + timedelta(hours=_INBOUND_DEP_WINDOW_H)
-    legs = []
+    # ERST alle Kandidaten sammeln, DANN die Regs in EINEM Rutsch auflösen —
+    # per-Leg-Auflösung in dieser Schleife war der Pfad, über den ein frisch
+    # recycelter Worker ~342 LH-Calls am Stück abfeuerte (s. _legs_regs).
+    cands = []                       # (frm, dep, roster_tail_or_None, leg_key)
+    need = []
     for _tok, s in _iter_sectors(rows):
         nf = _norm_flight(s.get('flight'))
         if not nf or not is_lh_group(nf[0] + nf[1]):
@@ -395,9 +575,17 @@ def inbound_topics_for_rows(rows, now_utc):
         frm = (s.get('from') or '').strip().upper()
         if dep is None or len(frm) != 3 or not (lo <= dep <= hi):
             continue
-        reg = _sector_tail(s) or _cached_leg_reg(
-            nf[0] + nf[1], dep.date().isoformat(), frm,
-            (s.get('to') or '').strip().upper() or None)
+        tail = _sector_tail(s)
+        leg_key = None
+        if not tail:
+            leg_key = (nf[0] + nf[1], dep.date().isoformat(), frm,
+                       (s.get('to') or '').strip().upper() or None)
+            need.append(leg_key)
+        cands.append((frm, dep, tail, leg_key))
+    regs = _legs_regs(need) if need else {}
+    legs = []
+    for frm, dep, tail, leg_key in cands:
+        reg = tail or (regs.get(leg_key) if leg_key else None)
         if reg:
             legs.append((frm, str(reg).replace('-', '').upper(), dep))
     if not legs:
