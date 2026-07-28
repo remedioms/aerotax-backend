@@ -2737,3 +2737,373 @@ def test_relogin_watch_boot_grace_no_false_alarm(monkeypatch, tmp_path):
     d3 = c.post('/api/internal/flightops/relogin-watch').get_json()
     assert any('steht' in r for r in d3['reasons'])
     fo._refresher_state.update(active=False, last_tick=0.0, active_since=0.0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GETEILTER Crew-Cache + Prefetch (Owner 2026-07-28: „Crew-Liste alles laden
+# wenn verbunden, cachen und im Backend speichern. Crew mit dem gleichen Flug
+# hat die Liste im Backend.")
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_crew_shared_ttl_staffel():
+    """TTL-Staffel nach SCHADEN: Flugtag streng (45 min), künftiger Tag locker
+    (6 h, dort handelt niemand danach), vergangener Tag praktisch dauerhaft
+    (LH löscht die Liste nach dem Flug — der Cache IST dann die Wahrheit)."""
+    import datetime as _d
+    today = _d.date(2026, 7, 28)
+    assert fo._crew_shared_ttl_s('2026-07-28', today) == fo._CREW_SHARED_TTL_TODAY_S
+    assert fo._crew_shared_ttl_s('2026-07-30', today) == fo._CREW_SHARED_TTL_FUTURE_S
+    assert fo._crew_shared_ttl_s('2026-07-27', today) == fo._CREW_SHARED_TTL_PAST_S
+    # Unparsbares Datum ⇒ strengste Regel, nie die lockerste.
+    assert fo._crew_shared_ttl_s('kaputt', today) == fo._CREW_SHARED_TTL_TODAY_S
+    now = 1_000_000.0
+    assert fo._crew_shared_fresh('2026-07-28', now - 600, now, today) is True
+    assert fo._crew_shared_fresh('2026-07-28', now - 3600, now, today) is False
+    assert fo._crew_shared_fresh('2026-07-30', now - 3600, now, today) is True
+    assert fo._crew_shared_fresh('2026-07-27', now - 5 * 86400, now, today) is True
+    # Ohne cached_at gibt es keine Frische-Aussage ⇒ kein Shortcut.
+    assert fo._crew_shared_fresh('2026-07-28', None, now, today) is False
+
+
+def test_crew_pick_best_prefers_exact_date_then_newest():
+    """Exaktes Flugdatum schlägt die ±1-Tag-Toleranz; innerhalb des Datums
+    gewinnt die jüngste Zeile — egal von welchem User."""
+    rows = [
+        {'token': 'A', 'flight_date': '2026-07-28', 'crew': [{'name': 'ALT'}],
+         'cached_at': 100.0},
+        {'token': 'B', 'flight_date': '2026-07-28', 'crew': [{'name': 'NEU'}],
+         'cached_at': 900.0},
+        {'token': 'C', 'flight_date': '2026-07-29', 'crew': [{'name': 'PLUS1'}],
+         'cached_at': 9999.0},
+    ]
+    best = fo._crew_pick_best(rows, '2026-07-28')
+    assert best['token'] == 'B' and best['crew'][0]['name'] == 'NEU'
+    # Kein Eintrag am gefragten Tag ⇒ Toleranz greift auf den Nachbartag.
+    assert fo._crew_pick_best(rows, '2026-07-30')['token'] == 'C'
+    assert fo._crew_pick_best(rows, '2026-08-05') is None
+
+
+def _shared_setup(monkeypatch, rows, links=True):
+    """Tabelle mit fremden/eigenen Zeilen + verbundener User + Berechtigung."""
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    tbl = _crew_tbl(monkeypatch, rows)
+    monkeypatch.setattr(
+        fo, '_links_load',
+        lambda tok: fo.extract_duty_links(DUTY_LINKS) if links else [])
+    return tbl
+
+
+def test_crewlist_shared_hit_serves_without_lh_call(monkeypatch):
+    """DER Owner-Fall: Kollege A hat LH400 schon geholt, Kollege B tippt auf
+    den Crew-Button → Antwort aus dem Backend, KEIN LH-Call."""
+    import time as _t
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-24',
+         'crew': [{'name': 'MUSTERMANN, MAX', 'pk': '095599C'},
+                  {'name': 'ZWEITE, ZOE', 'pk': '111'}],
+         'cached_at': _t.time() - 60}])
+    # Vergangenes Flugdatum ⇒ PAST-TTL, die Zeile ist frisch genug.
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('geteilter Cache muss den LH-Call sparen')))
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {
+        '095599C': {'token': 'AT-MAX', 'name': 'Max Mustermann',
+                    'airline': 'Lufthansa', 'homebase': 'FRA',
+                    'position': 'CP', 'avatar_url': None}})
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/AT-ICH',
+                                       headers={'Authorization': 'Bearer AT-ICH'},
+                                       json={'flight': 'LH400',
+                                             'date': '2026-07-24'})
+    d = r.get_json()
+    assert r.status_code == 200 and d['ok'] is True
+    assert d['cached'] is True and d['shared'] is True
+    assert [m['name'] for m in d['crew']] == ['MUSTERMANN, MAX', 'ZWEITE, ZOE']
+    # Anreicherung wird PRO VIEWER neu gerechnet, nicht mitgeliefert.
+    assert d['crew'][0]['aerox']['token'] == 'AT-MAX'
+    assert 'aerox' not in d['crew'][1]
+
+
+def test_crewlist_shared_hit_reenriches_and_drops_cached_aerox(monkeypatch):
+    """Die gecachte Zeile trägt eine ALTE aerox-Verknüpfung. Ausgeliefert wird
+    ausschliesslich das frisch gematchte Ergebnis (kein Fremd-Snapshot)."""
+    import time as _t
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-24',
+         'crew': [{'name': 'MUSTERMANN, MAX', 'pk': '095599C',
+                   'aerox': {'token': 'AT-VERALTET', 'name': 'Alt'}}],
+         'cached_at': _t.time() - 60}])
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('kein LH-Call erwartet')))
+    seen = []
+    monkeypatch.setattr(fo, '_match_aerox_profiles',
+                        lambda members: seen.append(members) or {})
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': '2026-07-24'}).get_json()
+    assert 'aerox' not in d['crew'][0]
+    # Der Re-Match sieht die ROHE Liste, nicht die fremde Anreicherung.
+    assert seen and 'aerox' not in seen[0][0]
+
+
+def test_crewlist_shared_hit_needs_entitlement(monkeypatch):
+    """SICHERHEIT: ohne eigene Cache-Zeile UND ohne eigenen crewlist-Link gibt
+    es keinen Shortcut — sonst könnte jeder mit {flight,date} die Klarnamen
+    einer fremden Crew abrufen. Der Request läuft den normalen Weg (hier:
+    kein accessCode auflösbar ⇒ 404)."""
+    import time as _t
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-24',
+         'crew': [{'name': 'GEHEIM, GERD'}], 'cached_at': _t.time() - 60}],
+        links=False)
+    monkeypatch.setattr(fo, 'duty_events',
+                        lambda tok, fd, td, interactive=False: None)
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/AT-FREMD',
+                                       headers={'Authorization': 'Bearer AT-FREMD'},
+                                       json={'flight': 'LH400',
+                                             'date': '2026-07-24'})
+    assert r.status_code == 404 and r.get_json()['error'] == 'no_access_code'
+
+
+def test_crewlist_stale_shared_entry_is_not_served(monkeypatch):
+    """Flugtag + 2 h alte Zeile ⇒ über der 45-min-TTL ⇒ es wird live geholt."""
+    import datetime as _d
+    import time as _t
+    today = _d.date.today().isoformat()
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': today,
+         'crew': [{'name': 'VERALTET, VERA'}], 'cached_at': _t.time() - 7200}])
+    calls = []
+    monkeypatch.setattr(fo, '_resolve_link_params', lambda *a, **k: {
+        'accessCode': 'S', 'departureAirport': 'FRA', 'arrivalAirport': 'JFK'})
+    monkeypatch.setattr(fo, 'crew_list',
+                        lambda *a, **k: calls.append(a) or {'crewMembers': []})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'FRISCH, FRIDA'}])
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {})
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': today}).get_json()
+    assert calls, 'stale ⇒ LH-Call'
+    assert d['crew'][0]['name'] == 'FRISCH, FRIDA' and 'shared' not in d
+
+
+def test_crewlist_force_bypasses_shared_cache(monkeypatch):
+    """Pull-to-Refresh: `force:true` holt trotz frischer Zeile live."""
+    import time as _t
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-24',
+         'crew': [{'name': 'CACHE, CARLA'}], 'cached_at': _t.time() - 60}])
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: {'crewMembers': []})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'LIVE, LARS'}])
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {})
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': '2026-07-24', 'force': True}).get_json()
+    assert d['crew'][0]['name'] == 'LIVE, LARS'
+
+
+def test_crewlist_solo_paths_unchanged_without_table(monkeypatch):
+    """REGRESSION: ohne Cache-Tabelle (SB weg / Migration fehlt) verhält sich
+    der Endpoint exakt wie vorher — toter Grant + kein Cache = 401."""
+    import app as backend
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', False)
+    monkeypatch.setattr(fo, '_valid_access', lambda tok: None)
+    monkeypatch.setattr(fo, '_crew_cache_get', lambda tok, f, d: None)
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
+                                       json={'flight': 'LH582',
+                                             'date': '2026-07-26'})
+    assert r.status_code == 401 and r.get_json()['error'] == 'not_connected'
+
+
+# ── Prefetch ────────────────────────────────────────────────────────────────
+
+def test_crew_prefetch_legs_uses_duty_links_only():
+    """Die Legs kommen aus den crewlist-_links der Duty-Events-Response — die
+    tragen accessCode/dep/arr fertig mit ⇒ KEIN Extra-Duty-Events-Call."""
+    legs = fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-24')
+    assert legs == [{'flight': 'LH400', 'date': '2026-07-24', 'dep': 'FRA',
+                     'arr': 'JFK', 'access': 'SECRET42'}]
+    # Ausserhalb des Horizonts (Flug liegt in der Vergangenheit) ⇒ nichts.
+    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-25') == []
+    # Weit vor dem Flug (> 7 Tage) ⇒ ebenfalls nichts.
+    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-01') == []
+
+
+def test_crew_prefetch_legs_dedupes_and_caps():
+    """Doppelte Links zählen einmal, die Kappe hält die Kosten pro Import fest."""
+    def _leg(n, day):
+        return {'eventType': 'FLIGHT', '_links': {'crewList': {'href':
+                _L + f'/COMMON_CREWLIST?flightDesignator=LH{n}&flightDate='
+                f'2026-07-{day}Z&departureAirport=FRA&arrivalAirport=MUC'
+                '&accessCode=A' + str(n)}}}
+    evs = []
+    for i in range(fo._CREW_PREFETCH_MAX_LEGS + 4):
+        evs.append(_leg(500 + i, '%02d' % (24 + (i % 3))))
+        evs.append(_leg(500 + i, '%02d' % (24 + (i % 3))))     # Duplikat
+    legs = fo._crew_prefetch_legs({'rosterDays': [{'day': 'x', 'events': evs}]},
+                                  today='2026-07-24')
+    assert len(legs) == fo._CREW_PREFETCH_MAX_LEGS
+    assert len({(l['flight'], l['date']) for l in legs}) == len(legs)
+    assert legs == sorted(legs, key=lambda x: (x['date'], x['flight']))
+
+
+def _prefetch_env(monkeypatch, rows=None, hour=0, day=0):
+    tbl = _crew_tbl(monkeypatch, rows)
+    monkeypatch.setattr(fo, '_rot_hour_used', lambda: hour)
+    monkeypatch.setattr(fo, '_lhfo_day_used', lambda: day)
+    monkeypatch.setattr(fo, '_CREW_PREFETCH_SLEEP_S', 0.0)
+    fo._refresh_all_state['drain'] = False
+    return tbl
+
+
+def test_crew_prefetch_warms_upcoming_legs(monkeypatch):
+    """Nach dem Verbinden liegen die Crew-Listen der nächsten Legs im Backend —
+    der Crew-Button ist warm, bevor der User ihn drückt."""
+    tbl = _prefetch_env(monkeypatch)
+    seen = []
+    monkeypatch.setattr(fo, 'crew_list',
+                        lambda tok, f, d, dep, arr, ac, interactive=False:
+                        seen.append((f, d, ac, interactive)) or {'x': 1})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'CREW'}])
+    legs = [{'flight': 'LH400', 'date': '2026-07-29', 'dep': 'FRA',
+             'arr': 'JFK', 'access': 'A1'},
+            {'flight': 'LH401', 'date': '2026-07-31', 'dep': 'JFK',
+             'arr': 'FRA', 'access': 'A2'}]
+    assert fo._crew_prefetch_run('AT-U', legs)['prefetched'] == 2
+    # HINTERGRUND-Priorität — der Prefetch darf interaktive Taps nie verdrängen.
+    assert [s[3] for s in seen] == [False, False]
+    assert sorted(r['flight'] for r in tbl.rows) == ['LH400', 'LH401']
+    assert fo._crew_cache_get('AT-U', 'LH401', '2026-07-31')['crew'][0]['name'] == 'CREW'
+
+
+def test_crew_prefetch_skips_leg_already_fresh_in_shared_cache(monkeypatch):
+    """Der Kollegen-Effekt: was ein anderer User heute schon geholt hat, wird
+    NICHT nochmal von LH geholt — genau das amortisiert die Quota über die
+    ganze Crew."""
+    import time as _t
+    _prefetch_env(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-29',
+         'crew': [{'name': 'SCHON DA'}], 'cached_at': _t.time() - 3600}])
+    calls = []
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: calls.append(a) or {'x': 1})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'NEU'}])
+    legs = [{'flight': 'LH400', 'date': '2026-07-29', 'dep': 'FRA',
+             'arr': 'JFK', 'access': 'A1'},
+            {'flight': 'LH401', 'date': '2026-07-29', 'dep': 'JFK',
+             'arr': 'FRA', 'access': 'A2'}]
+    r = fo._crew_prefetch_run('AT-U', legs)
+    assert r == {'prefetched': 1, 'skipped': 1, 'failed': 0}
+    assert [c[1] for c in calls] == ['LH401']
+
+
+def test_crew_prefetch_stops_at_own_budget_ceiling(monkeypatch):
+    """Eigener, TIEFERER Deckel als das reguläre Hintergrund-Gate: der Prefetch
+    hört als ERSTES auf, damit der Roster nie an einer Zugabe verhungert."""
+    _prefetch_env(monkeypatch, hour=fo._CREW_PREFETCH_HOUR_CEILING)
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('Prefetch darf über dem Deckel nicht mehr rufen')))
+    legs = [{'flight': 'LH400', 'date': '2026-07-29', 'dep': 'FRA',
+             'arr': 'JFK', 'access': 'A1'}]
+    assert fo._crew_prefetch_run('AT-U', legs) == {'prefetched': 0, 'skipped': 0,
+                                                   'failed': 0}
+    # Tagesdeckel wirkt genauso.
+    _prefetch_env(monkeypatch, day=fo._CREW_PREFETCH_DAY_CEILING)
+    assert fo._crew_prefetch_run('AT-U', legs)['prefetched'] == 0
+
+
+def test_crew_prefetch_survives_api_gate_refusal(monkeypatch):
+    """_api_get verweigert den Hintergrund-Call (Stundenbudget voll) → crew_list
+    gibt None. Der Prefetch zählt das als verpasste Zugabe und schreibt NICHTS
+    Falsches in den Cache."""
+    tbl = _prefetch_env(monkeypatch)
+    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_rot_hour_used', lambda: 0)   # Prefetch-Deckel frei
+    calls = []
+
+    def _gate(tok, path, params=None, interactive=False):
+        calls.append((path, interactive))
+        return None                       # exakt das Verhalten des Budget-Gates
+    monkeypatch.setattr(fo, '_api_get', _gate)
+    legs = [{'flight': 'LH400', 'date': '2026-07-29', 'dep': 'FRA',
+             'arr': 'JFK', 'access': 'A1'}]
+    assert fo._crew_prefetch_run('AT-U', legs) == {'prefetched': 0, 'skipped': 0,
+                                                   'failed': 1}
+    assert calls == [('/COMMON_CREWLIST', False)]
+    assert tbl.rows == []
+
+
+def test_crew_prefetch_stops_on_deploy_drain(monkeypatch):
+    """Deploy-Drain (Grant-Burn-Lehre): kein neuer LH-Call, sobald gedrained
+    wird."""
+    _prefetch_env(monkeypatch)
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('drain ⇒ kein Call')))
+    fo._refresh_all_state['drain'] = True
+    try:
+        assert fo._crew_prefetch_run('AT-U', [{'flight': 'LH400',
+                                               'date': '2026-07-29',
+                                               'access': 'A1'}])['prefetched'] == 0
+    finally:
+        fo._refresh_all_state['drain'] = False
+
+
+def test_crew_prefetch_kick_runs_once_per_cooldown(monkeypatch):
+    """Der Kick läuft im Hintergrund (blockiert den Import nie) und ist pro
+    Token durch den Cooldown gedeckelt — refresh-all alle 2 h startet ihn
+    nicht bei jedem Lauf neu."""
+    import time as _t
+    fo._crew_prefetch_seen.clear()
+    fo._crew_prefetch_active[0] = 0
+    runs = []
+    monkeypatch.setattr(fo, '_crew_prefetch_run',
+                        lambda tok, legs, **k: runs.append((tok, legs)) or {})
+    monkeypatch.setattr(fo, '_crew_prefetch_legs',
+                        lambda resp, today=None: [{'flight': 'LH400',
+                                                   'date': '2026-07-29',
+                                                   'access': 'A1'}])
+    assert fo._crew_prefetch_kick('AT-U', DUTY_LINKS) is True
+    for _ in range(200):                  # Thread abwarten (max 2 s)
+        if runs:
+            break
+        _t.sleep(0.01)
+    assert runs and runs[0][0] == 'AT-U'
+    # Zweiter Import binnen der Cooldown-Zeit ⇒ kein zweiter Lauf.
+    assert fo._crew_prefetch_kick('AT-U', DUTY_LINKS) is False
+    assert len(runs) == 1
+    fo._crew_prefetch_seen.clear()
+
+
+def test_import_kicks_prefetch_after_success(monkeypatch):
+    """VERDRAHTUNG: der erfolgreiche Roster-Import wärmt die Crew-Listen —
+    „alles laden, wenn verbunden". Der Prefetch bekommt die ECHTE
+    Duty-Events-Response (die crewlist-_links stecken schon darin)."""
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    monkeypatch.setattr(fo, 'duty_events',
+                        lambda tok, fd, td, interactive=False: DUTY_LINKS)
+    monkeypatch.setattr(fo, 'pickup_rotation_ids', lambda resp: [])
+    monkeypatch.setattr(fo, 'duty_events_to_ics', lambda resp, pickups=None: 'ICS')
+    monkeypatch.setattr(fo, 'apply_ical_pickup_fallback',
+                        lambda tok, ics, url=None: ics)
+    import app as backend
+    monkeypatch.setattr(backend, 'import_calendar_feed',
+                        lambda tok: backend.jsonify({'ok': True, 'events_count': 1}))
+    kicked = []
+    monkeypatch.setattr(fo, '_crew_prefetch_kick',
+                        lambda tok, resp: kicked.append((tok, resp)) or True)
+    r = backend.app.test_client().post('/api/lh/flightops/import/AT-U',
+                                       headers={'Authorization': 'Bearer AT-U'},
+                                       json={})
+    assert r.status_code == 200 and r.get_json()['source'] == 'flightops'
+    assert kicked and kicked[0][0] == 'AT-U'
+    assert fo._crew_prefetch_legs(kicked[0][1], today='2026-07-24')[0]['access'] \
+        == 'SECRET42'

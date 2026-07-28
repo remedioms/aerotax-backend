@@ -492,7 +492,9 @@ def _refresh(refresh_token):
     # MIT ZÄHLEN (2026-07-26): der Refresh ist ein echter HTTP-Call gegen LH
     # und lief im `refresh-all`-Cron bis zu 1× pro User und Lauf — er war im
     # Zähler unsichtbar und hätte das FlightOps-Volumen fast verdoppelt.
-    _flightops_budget_inc('/oauth_refresh')
+    # api=False: Token-Endpoint ist oauth.lufthansa.com, NICHT das quotierte
+    # Gateway — nicht mehr in die Gate-Zähler buchen (s. _flightops_budget_inc).
+    _flightops_budget_inc('/oauth_refresh', api=False)
     return _token_request(body)
 
 
@@ -835,7 +837,7 @@ def flightops_connected(user_token):
 
 
 # ── Mock-API-Call ────────────────────────────────────────────────────────────
-def _flightops_budget_inc(path):
+def _flightops_budget_inc(path, api=True):
     """LH-FlightOps-Call im PROZESS-ÜBERGREIFENDEN Stundenzähler buchen.
     (Sichtbarkeit statt Schätzen — Owner 2026-07-26: „erst messen".) Der
     FlightOps-Key ist ein EIGENER LH-Key, darum eigener Schlüssel-Präfix
@@ -847,12 +849,24 @@ def _flightops_budget_inc(path):
     Stundenlimit ein Tageskontingent (6.000 lt. Owner) — ohne Tages-Sicht ist
     ein Dauerlauf knapp unter der Stundengrenze rechnerisch bei 16.800/Tag und
     reißt das Tageslimit lange vor der Stunde. budget_inc hängt die STUNDE
-    automatisch an, deshalb hier der Key-genaue Zwilling budget_inc_key."""
+    automatisch an, deshalb hier der Key-genaue Zwilling budget_inc_key.
+
+    `api=False` (seit 2026-07-28 abends, Owner „refresh token without using
+    APIs?"): der TOKEN-Endpoint ist `oauth.lufthansa.com` — ein ANDERER Host
+    als das quotierte Gateway `api.lufthansa.com`. oauth_refresh wurde bisher
+    trotzdem in die Gate-Zähler gebucht und fraß so bis zu ~5k Calls/Tag vom
+    SELBSTGEBAUTEN Budget, ohne (nach allem, was messbar ist) LH-Gateway-Quote
+    zu kosten — genau das ließ interaktive Reconnects verhungern. Refreshes
+    laufen jetzt in EIGENE Sichtbarkeits-Zähler (`lhfoR`/`lhfoRD:`), nicht in
+    die Gates. VERSICHERUNG, falls LH Token-Calls doch aufs Tageslimit zählt:
+    die Deckel sind zeitgleich um je ~200-300 gesenkt (s. Ceiling-Konstanten)."""
     try:
         from blueprints.lh_open_api import budget_inc, budget_inc_key
         svc = re.sub(r'[^A-Za-z_]', '', (path or '').lstrip('/'))[:40] or 'unknown'
-        budget_inc('lhfo', svc)
-        budget_inc_key('lhfoD:' + time.strftime('%Y%m%d', time.gmtime()))
+        prefix = 'lhfo' if api else 'lhfoR'
+        budget_inc(prefix, svc)
+        budget_inc_key(('lhfoD:' if api else 'lhfoRD:')
+                       + time.strftime('%Y%m%d', time.gmtime()))
     except Exception:
         pass
 
@@ -872,8 +886,13 @@ def _flightops_budget_inc(path):
 # Roster-Frische; ~170/h passen in den Headroom). Zähler-Memo ist 60 s
 # (_rot_budget_memo) — Überschwinger ≤ ~85 Calls (0,7-s-Takt) sind in den
 # Puffern (950+85+Refresher < 1000 knapp; 700er-Grenze völlig entspannt).
-_LHFO_HOUR_BACKGROUND_CEILING = 700
-_LHFO_HOUR_INTERACTIVE_CEILING = 950
+# Seit 28.07. abends zählen oauth_refreshes NICHT mehr in diese Zähler
+# (eigener Host, s. _flightops_budget_inc api=False) — die Deckel sind dafür
+# um die frühere Refresher-Marge gesenkt: die Gates messen jetzt NUR echte
+# Gateway-Calls, schützen aber dieselbe 1.000/h-Grenze inkl. Sicherheitsband,
+# falls LH Token-Calls wider Erwarten doch mitzählt.
+_LHFO_HOUR_BACKGROUND_CEILING = 650
+_LHFO_HOUR_INTERACTIVE_CEILING = 900
 
 # ── TAGES-DECKEL (Quota-Diät 2026-07-28) ────────────────────────────────────
 # Der Key hat zusätzlich ein TAGESkontingent von 6.000 Calls (Owner). Das
@@ -883,8 +902,10 @@ _LHFO_HOUR_INTERACTIVE_CEILING = 950
 # „Jetzt aktualisieren", Re-Login-Heilung). Auch hier gilt: VORHER stoppen,
 # denn die 403s des Gateways zählen selbst aufs Kontingent und verlängern
 # die Sperre nur.
-_LHFO_DAY_BACKGROUND_CEILING = 5200
-_LHFO_DAY_INTERACTIVE_CEILING = 5800
+# Analog zum Stunden-Gate um die Refresher-Marge gesenkt (Tageslimit 6.000;
+# Lazy-Rotation-Refreshes ≈ wenige hundert/Tag laufen separat in lhfoRD:).
+_LHFO_DAY_BACKGROUND_CEILING = 5000
+_LHFO_DAY_INTERACTIVE_CEILING = 5600
 
 # Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
 # Supabase, der Tagesstand ändert sich träge — 120 s reichen für einen
@@ -2814,6 +2835,12 @@ def flightops_import(token):
         return jsonify({'ok': False, 'error': 'pipeline_failed'}), 500
     if status == 200 and payload.get('ok'):
         payload['source'] = 'flightops'
+        # „Crew-Liste: alles laden, wenn verbunden" (Owner 2026-07-28) — die
+        # Crew-Listen der nächsten Legs im Hintergrund vorwärmen, damit der
+        # Crew-Button nach dem Verbinden sofort (und offline) gefüllt ist.
+        # Fire-and-forget mit eigenem, tieferem Budget-Deckel; siehe Banner
+        # über _crew_prefetch_kick. Nie eine Vorbedingung für den Import.
+        _crew_prefetch_kick(token, resp)
     return jsonify(payload), status
 
 
@@ -3195,6 +3222,347 @@ def _crew_cache_put(token, flight, date, crew):
     _crew_cache_put_profile(token, flight, date, crew)
 
 
+# ── GETEILTER Cache über User-Grenzen hinweg ────────────────────────────────
+# Owner 2026-07-28: „Crew mit dem gleichen Flug hat die Liste im Backend."
+# COMMON_CREWLIST ist FLUG-bezogen, nicht personenbezogen: die Antwort hängt
+# ausschliesslich an flightDesignator/flightDate/dep/arr — der accessCode ist
+# reine BERECHTIGUNG, kein Filter. Die Liste für LH454/2026-07-28/FRA-SFO ist
+# für jedes Mitglied dieselbe. Also darf der Tap von Kollege B mit der Zeile
+# bedient werden, die Kollege A (oder dessen Prefetch) geschrieben hat — ohne
+# EINEN LH-Call.
+#
+# BERECHTIGUNG (Sicherheits-Kern, nicht wegoptimieren): der accessCode ist der
+# Beweis „dieses Leg steht in MEINEM Roster". Ohne ihn dürfte sonst jeder
+# AeroX-User mit geratenem {flight,date} die Klarnamen einer fremden Crew
+# abrufen — die Tabelle ist PII. Der Shortcut verlangt deshalb einen von zwei
+# Nachweisen, die BEIDE ohne LH-Call auskommen:
+#   (1) eine EIGENE Cache-Zeile für dieses Leg — die entsteht nur nach einem
+#       accessCode-geprüften Abruf bzw. dem eigenen Prefetch, oder
+#   (2) ein Treffer im lokalen Link-Cache (_links_load, gefüllt aus den EIGENEN
+#       Duty-Events).
+# Fehlt beides, läuft der Request unverändert den alten Weg (Link auflösen →
+# LH). Der Shortcut verschenkt dann nichts, er greift nur nicht.
+#
+# FRISCHE — nach SCHADEN gestaffelt, nicht nach Volatilität. Was der Code
+# WIRKLICH weiss, ist das Flugdatum (keine Abflugzeit ohne Extra-Call), also
+# staffeln wir daran:
+#   • Flugtag (== heute): 45 min. Hier ist die Liste operativ relevant (man
+#     trifft diese Leute gleich) und genau hier passieren die Last-Minute-
+#     Wechsel (Krankmeldung, Reserve rückt nach). 45 min begrenzt den Irrtum
+#     und amortisiert trotzdem: eine 12-köpfige Crew, die im Briefing-Fenster
+#     nachschaut, kostet EINEN Call statt zwölf.
+#   • Künftiger Tag: 6 h. Die Liste ist dort provisorisch und ändert sich öfter
+#     — aber niemand HANDELT danach, es ist Vorfreude-Blättern. Bewusst LÄNGER
+#     als am Flugtag: die Staffel folgt dem Schaden einer falschen Zeile, nicht
+#     ihrer Wahrscheinlichkeit. Wer es exakt braucht, bekommt es am Flugtag.
+#   • Vergangener Tag: 30 Tage. Der Flug ist gelaufen, die Liste ist
+#     Geschichte — LH RÄUMT sie nach dem Flug sogar weg, die gecachte Zeile ist
+#     dann die beste existierende Wahrheit („mit wem war ich unterwegs").
+# `force:true` im Body übergeht den Shortcut (Pull-to-Refresh) — der Weg
+# darunter ist weiterhin budget-gegatet.
+_CREW_SHARED_TTL_TODAY_S = 45 * 60
+_CREW_SHARED_TTL_FUTURE_S = 6 * 3600
+_CREW_SHARED_TTL_PAST_S = 30 * 86400
+# Wieviele Zeilen der flug-weite Select höchstens zieht (3 Datums-Kandidaten ×
+# Crew-Grösse; 60 deckt auch einen A380 mit vielen verbundenen Usern).
+_CREW_SHARED_SCAN_LIMIT = 60
+
+
+def _crew_shared_ttl_s(flight_date, today=None):
+    """Erlaubtes Cache-Alter für dieses Flugdatum (Begründung im Banner)."""
+    d = str(flight_date or '')[:10]
+    today = today or _dt.date.today()
+    try:
+        fd = _dt.date.fromisoformat(d)
+    except Exception:
+        return _CREW_SHARED_TTL_TODAY_S      # unklar ⇒ strengste Regel
+    if fd < today:
+        return _CREW_SHARED_TTL_PAST_S
+    if fd == today:
+        return _CREW_SHARED_TTL_TODAY_S
+    return _CREW_SHARED_TTL_FUTURE_S
+
+
+def _crew_shared_fresh(flight_date, cached_at, now=None, today=None):
+    """Darf diese Zeile OHNE LH-Call ausgeliefert werden? Pure/testbar."""
+    try:
+        ts = float(cached_at or 0)
+    except Exception:
+        return False
+    if ts <= 0:
+        return False
+    return ((now or time.time()) - ts) < _crew_shared_ttl_s(flight_date, today)
+
+
+def _crew_cache_scan(flight, date):
+    """ALLE Cache-Zeilen (jeder User) zu diesem Leg — [] bei Miss/ohne Tabelle.
+
+    Der Select filtert NUR auf flight + flight_date, nicht auf den Token. Dafür
+    gibt es den Index aus supabase_migrations/20260729_crew_cache_shared.sql;
+    fehlt die Migration, liefert derselbe Select dasselbe Ergebnis, nur über
+    einen Seq-Scan — langsamer, nie falsch. Degradiert wie der Rest des Caches
+    lautlos auf [] (dann bleibt es beim alten Verhalten: LH-Call)."""
+    if not _crew_tbl_ok():
+        return []
+    f, _d = _crew_key(flight, date)
+    if not f:
+        return []
+    cands = _crew_date_candidates(date)
+    try:
+        import app as _app
+        r = (_app.sb.table(_CREW_CACHE_TABLE)
+             .select('token,flight,flight_date,crew,cached_at')
+             .eq('flight', f).in_('flight_date', cands)
+             .limit(_CREW_SHARED_SCAN_LIMIT).execute())
+        _crew_tbl_state[1] = True
+        rows = getattr(r, 'data', None) or []
+    except Exception as e:
+        _crew_tbl_fail(e)
+        return []
+    return [x for x in rows if isinstance(x, dict) and x.get('crew')]
+
+
+def _crew_pick_best(rows, date):
+    """Beste Zeile aus dem Scan: exaktes Flugdatum schlägt die ±1-Tag-Toleranz
+    (wie im Einzel-Getter), innerhalb desselben Datums gewinnt die JÜNGSTE
+    Zeile — egal von welchem User sie stammt. Pure/testbar."""
+    for cand in _crew_date_candidates(date):
+        same = [r for r in rows or []
+                if str(r.get('flight_date') or '')[:10] == cand]
+        if not same:
+            continue
+
+        def _ts(r):
+            try:
+                return float(r.get('cached_at') or 0)
+            except Exception:
+                return 0.0
+        return sorted(same, key=_ts)[-1]
+    return None
+
+
+def _crew_reenrich(crew):
+    """Gecachte Liste → Kopie mit FRISCH gematchten AeroX-Profilen.
+
+    VERIFIZIERT 2026-07-28: `_match_aerox_profiles` ist VIEWER-UNABHÄNGIG — sie
+    nimmt nur die Crew-Mitglieder, sucht über lh_pk_number/Name in
+    user_profiles und gibt ausschliesslich die Public-Shape zurück
+    (token/name/airline/homebase/position/avatar_url, Family-Accounts nie).
+    Kein Viewer-Token, kein Freundes-/Sichtbarkeits-Filter. In einer geteilten
+    Zeile steckt also NICHTS Viewer-Spezifisches.
+    Trotzdem wird hier neu gematcht, aus zwei Gründen:
+      (a) Beleg-und-Gürtel: würde die Verknüpfung je viewer-abhängig (z. B.
+          „nur Freunde zeigen"), servierte der geteilte Cache sonst fremde
+          Sicht — dieser Re-Match verhindert das strukturell.
+      (b) Frische: wer nach dem Cache-Schreiben zu AeroX gekommen ist,
+          erscheint sofort. Kostet nur Supabase-Reads, KEINEN LH-Call."""
+    out = []
+    for m in crew or []:
+        out.append({k: v for k, v in m.items() if k != 'aerox'}
+                   if isinstance(m, dict) else m)
+    try:
+        matches = _match_aerox_profiles([m for m in out if isinstance(m, dict)])
+    except Exception:
+        matches = {}
+    for m in out:
+        if not isinstance(m, dict):
+            continue
+        p = matches.get(str(m.get('pk') or m.get('name') or ''))
+        if p:
+            m['aerox'] = p
+    return out
+
+
+def _crew_shared_serve(token, flight, date, dep=None, arr=None, now=None):
+    """Flask-Antwort aus dem geteilten Cache — oder None (⇒ normaler LH-Weg).
+    Wirft nie: jeder Fehler bedeutet „kein Shortcut", nicht „kein Crew"."""
+    try:
+        rows = _crew_cache_scan(flight, date)
+        if not rows:
+            return None
+        own = any(str(r.get('token') or '') == token for r in rows)
+        if not own and not _links_find(_links_load(token), 'crewlist',
+                                       flight, date, dep, arr):
+            return None                  # kein Berechtigungs-Nachweis
+        best = _crew_pick_best(rows, date)
+        if not best or not _crew_shared_fresh(best.get('flight_date'),
+                                              best.get('cached_at'), now):
+            return None
+        crew = _crew_reenrich(best.get('crew') or [])
+        if not crew:
+            return None
+        shared = str(best.get('token') or '') != token
+        if shared:
+            log.info('[lh_flightops] crewlist %s/%s aus GETEILTEM Cache '
+                     '(kein LH-Call)', flight, str(date or '')[:10])
+        return jsonify({'ok': True, 'crew': crew, 'cached': True,
+                        'shared': shared, 'cached_at': best.get('cached_at')})
+    except Exception as e:
+        log.warning('[lh_flightops] shared_serve: %s', type(e).__name__)
+        return None
+
+
+# ── PREFETCH: „alles laden, wenn verbunden" (Owner 2026-07-28) ──────────────
+# Nach jedem erfolgreichen Roster-Import werden die Crew-Listen der nächsten
+# Legs im Hintergrund vorgewärmt, damit der Crew-Button sofort (und offline)
+# gefüllt ist. Quelle sind die crewlist-_links, die in der Duty-Events-Response
+# OHNEHIN schon stecken (accessCode/dep/arr fertig) — der Prefetch kostet also
+# KEINEN Duty-Events-Call extra, nur den COMMON_CREWLIST je Leg.
+#
+# QUOTA-RECHNUNG (ehrlich, Key: 1.000/h · ~6.000/Tag):
+#   • ~130 verbundene User. Bestandslast heute: refresh-all alle 2 h mit
+#     Kadenz-Gate (3,5 h / 11,5 h) ⇒ ~4 Duty-Events-Calls pro User und Tag
+#     (~520) + Rotations-Pickups (~300–400) + interaktive Flows.
+#   • Prefetch-Deckel: 8 Legs pro Import, Horizont 7 Tage, und ein Leg wird nur
+#     angefasst, wenn KEINE Zeile (egal welcher User) jünger als 20 h ist.
+#     Ein Leg kostet damit ≤ 1 Call/Tag — für die ganze Crew zusammen, sobald
+#     zwei AeroX-User denselben Flug haben.
+#   • Worst Case: 130 User × 8 Legs × 1×/20 h ≈ 1.040 Calls/Tag. Realistisch
+#     deutlich weniger (Freitage, überlappende Crews, Kurzstrecken-Legs
+#     desselben Tages). Zusammen mit der Bestandslast bleibt der Tag klar unter
+#     dem Hintergrund-Deckel 5.200.
+#   • Gegenrechnung: der geteilte Cache SPART interaktive Calls (jeder Tap
+#     innerhalb der TTL ist gratis, statt 1–2 Calls). Netto ist das Paket
+#     quotenneutraler, als der Prefetch allein aussieht.
+# NOTBREMSE: Prefetch hört als ERSTES auf — eigene, tiefere Deckel (550/h,
+# 3.800/Tag) ÜBER dem regulären Hintergrund-Gate in _api_get. Der Roster darf
+# nie an einer Zugabe verhungern (gleiche Logik wie _ROT_LHFO_HOUR_CEILING).
+_CREW_PREFETCH_DAYS = 7
+_CREW_PREFETCH_MAX_LEGS = 8
+_CREW_PREFETCH_MIN_AGE_S = 20 * 3600
+_CREW_PREFETCH_HOUR_CEILING = 550
+_CREW_PREFETCH_DAY_CEILING = 3800
+# Pro Token höchstens alle 6 h vorwärmen (refresh-all läuft alle 2 h und
+# importiert denselben User mehrfach am Tag — der Prefetch muss nicht mit).
+_CREW_PREFETCH_COOLDOWN_S = 6 * 3600
+# Gleichzeitige Prefetch-Threads im Prozess (refresh-all iteriert 130 User;
+# ohne Deckel stapeln sich die Threads).
+_CREW_PREFETCH_MAX_THREADS = 2
+# QPS-Schonung zwischen zwei Legs (wie im refresh-all-Loop).
+_CREW_PREFETCH_SLEEP_S = 0.7
+_crew_prefetch_seen = {}                 # token → ts des letzten Prefetch-Starts
+_crew_prefetch_lock = threading.Lock()
+_crew_prefetch_active = [0]
+
+
+def _crew_prefetch_legs(resp, today=None):
+    """Duty-Events-Response → Legs, deren Crew-Liste vorgewärmt werden soll
+    (nächste _CREW_PREFETCH_DAYS Tage, dedupliziert, früheste zuerst, gekappt).
+    Pure/testbar."""
+    t = str(today or _dt.date.today().isoformat())[:10]
+    try:
+        hi = (_dt.date.fromisoformat(t)
+              + _dt.timedelta(days=_CREW_PREFETCH_DAYS)).isoformat()
+    except Exception:
+        return []
+    out, seen = [], set()
+    for l in extract_duty_links(resp) or []:
+        if not isinstance(l, dict) or l.get('service') != 'crewlist':
+            continue
+        p = l.get('params') or {}
+        f = (p.get('flightDesignator') or '').upper().replace(' ', '')
+        d = str(p.get('flightDate') or '')[:10]
+        acc = (p.get('accessCode') or '').strip()
+        if not (f and len(d) == 10 and acc and t <= d <= hi):
+            continue
+        if (f, d) in seen:
+            continue
+        seen.add((f, d))
+        out.append({'flight': f, 'date': d,
+                    'dep': (p.get('departureAirport') or '').upper(),
+                    'arr': (p.get('arrivalAirport') or '').upper(),
+                    'access': acc})
+    out.sort(key=lambda x: (x['date'], x['flight']))
+    return out[:_CREW_PREFETCH_MAX_LEGS]
+
+
+def _crew_prefetch_run(token, legs, now=None):
+    """Legs vorwärmen. HINTERGRUND-Priorität (interactive=False) + eigene,
+    tiefere Deckel. Gibt Zähler zurück, wirft nie.
+
+    Absichtlich OHNE AeroX-Anreicherung: die kostet pro Leg bis zu ~25
+    Supabase-Reads, und der Auslieferungs-Pfad matcht ohnehin frisch
+    (_crew_reenrich). Der Prefetch schreibt die rohe Liste — das ist genau
+    das, was geteilt wird."""
+    done = skipped = failed = 0
+    for leg in legs or []:
+        try:
+            if _refresh_all_state.get('drain'):
+                break                     # Deploy läuft — kein neuer LH-Call
+            if (_rot_hour_used() >= _CREW_PREFETCH_HOUR_CEILING
+                    or _lhfo_day_used() >= _CREW_PREFETCH_DAY_CEILING):
+                log.info('[lh_flightops] crew-prefetch pausiert (Budget) — '
+                         '%d Legs offen', len(legs) - done - skipped - failed)
+                break
+            best = _crew_pick_best(_crew_cache_scan(leg['flight'], leg['date']),
+                                   leg['date'])
+            if best:
+                try:
+                    age = (now or time.time()) - float(best.get('cached_at') or 0)
+                except Exception:
+                    age = 0.0
+                if 0 <= age < _CREW_PREFETCH_MIN_AGE_S:
+                    skipped += 1          # jemand hat dieses Leg schon geholt
+                    continue
+            resp = crew_list(token, leg['flight'], leg['date'], leg.get('dep'),
+                             leg.get('arr'), leg.get('access'),
+                             interactive=False)
+            if not isinstance(resp, dict) or resp.get('processingErrors'):
+                failed += 1               # Budget-Gate/LH-Fehler → nur eine
+                continue                  # verpasste Zugabe, kein Fehlerfall
+            crew = parse_crew_list(resp)
+            if not crew:
+                failed += 1               # LH füllt erst kurz vor Abflug
+                continue
+            _crew_cache_put(token, leg['flight'], leg['date'], crew)
+            done += 1
+            time.sleep(_CREW_PREFETCH_SLEEP_S)
+        except Exception as e:
+            failed += 1
+            log.warning('[lh_flightops] crew-prefetch %s: %s',
+                        (leg or {}).get('flight'), type(e).__name__)
+    return {'prefetched': done, 'skipped': skipped, 'failed': failed}
+
+
+def _crew_prefetch_kick(token, resp):
+    """Fire-and-forget nach erfolgreichem Import. Blockiert die Import-Antwort
+    NICHT (eigener Daemon-Thread), respektiert Cooldown und Thread-Deckel und
+    wirft nie. True = ein Lauf wurde gestartet."""
+    try:
+        now = time.time()
+        with _crew_prefetch_lock:
+            if (now - _crew_prefetch_seen.get(token, 0.0)) < _CREW_PREFETCH_COOLDOWN_S:
+                return False
+            if _crew_prefetch_active[0] >= _CREW_PREFETCH_MAX_THREADS:
+                return False
+            legs = _crew_prefetch_legs(resp)
+            if not legs:
+                return False
+            _crew_prefetch_seen[token] = now
+            if len(_crew_prefetch_seen) > 4000:
+                for k in sorted(_crew_prefetch_seen,
+                                key=_crew_prefetch_seen.get)[:2000]:
+                    _crew_prefetch_seen.pop(k, None)
+            _crew_prefetch_active[0] += 1
+
+        def _work():
+            try:
+                r = _crew_prefetch_run(token, legs)
+                log.info('[lh_flightops] crew-prefetch tok=%s legs=%d %s',
+                         (token or '')[:8], len(legs), r)
+            except Exception as e:
+                log.warning('[lh_flightops] crew-prefetch: %s', type(e).__name__)
+            finally:
+                with _crew_prefetch_lock:
+                    _crew_prefetch_active[0] = max(0, _crew_prefetch_active[0] - 1)
+
+        threading.Thread(target=_work, daemon=True).start()
+        return True
+    except Exception as e:
+        log.warning('[lh_flightops] crew-prefetch-kick: %s', type(e).__name__)
+        return False
+
+
 @lh_flightops_bp.route('/api/lh/flightops/crewlist/<token>', methods=['POST'])
 def flightops_crewlist(token):
     """„Wer fliegt mit" für ein Leg (COMMON_CREWLIST → normalisiert). Body
@@ -3206,6 +3574,12 @@ def flightops_crewlist(token):
     durabel persistiert (Tabelle flightops_crew_cache, siehe oben). Ist der
     Grant tot (needs_relogin), der accessCode nicht auflösbar oder LH down,
     kommt die LETZTE Liste mit `cached:true` statt eines Fehlers.
+
+    GETEILT SEIT 2026-07-28: liegt eine FRISCHE Zeile dieses Legs im Backend —
+    auch die eines Kollegen derselben Crew —, antwortet der Endpoint daraus
+    (`cached:true`, `shared:true`) OHNE LH-Call. Berechtigungs-Nachweis und
+    TTL-Staffel siehe Banner über _crew_shared_serve; `force:true` im Body
+    erzwingt den Live-Abruf.
 
     STATUS-CODES (die App unterscheidet sie, siehe FlightCrewSheet):
       401 not_connected          — Grant tot/nie da ⇒ App bietet „Mit
@@ -3238,6 +3612,14 @@ def flightops_crewlist(token):
                                       'error': 'token_refresh_pending'}), 503)
     if _st != 'ok':
         return _cached() or (jsonify({'ok': False, 'error': 'not_connected'}), 401)
+    # GETEILTER CACHE (Owner 2026-07-28): liegt die Liste dieses Legs schon
+    # frisch im Backend — egal ob von diesem User oder einem Kollegen derselben
+    # Crew —, wird sie ohne LH-Call ausgeliefert. Berechtigung und TTL-Regeln
+    # siehe Banner über _crew_shared_serve; `force:true` übergeht den Shortcut.
+    if not b.get('force'):
+        _shared = _crew_shared_serve(token, flight, date, dep, arr)
+        if _shared is not None:
+            return _shared
     access = (b.get('access') or '').strip()
     if not access:
         p = _resolve_link_params(token, 'crewlist', flight, date, dep, arr,
