@@ -195,23 +195,29 @@ def test_whitelist_pu_geaendert_pusht_praesenz_flip_nicht():
     mit = _flug_tag(pickup='06:40')
     assert A._roster_change_is_push_worthy(_mod(ohne, mit)) is False
     assert A._roster_change_is_push_worthy(_mod(mit, ohne)) is False
-    # Eine echte PU-VERSCHIEBUNG (beidseitig gefüllt, ≥ 5 min) pusht weiterhin.
+    # Eine echte PU-VERSCHIEBUNG (beidseitig gefüllt, ≥ 5 min) bleibt eine
+    # Verlauf-Änderung — GATE 4 (2026-07-28) hält sie aber vom Push fern:
+    # dieselben Legs, dieselbe Route, nur eine andere Uhrzeit.
     frueher = _flug_tag(pickup='07:10')
     spaeter = _flug_tag(pickup='07:40')
-    assert A._roster_change_is_push_worthy(_mod(frueher, spaeter)) is True
-    # Minuten-Korrektur darunter nicht.
+    assert A._rc_meaningfully_modified(frueher, spaeter) is True
+    assert A._roster_change_is_push_worthy(_mod(frueher, spaeter)) is False
+    # Minuten-Korrektur darunter ist schon im Verlauf keine Änderung.
     assert A._roster_change_is_push_worthy(
         _mod(frueher, _flug_tag(pickup='07:13'))) is False
 
 
-def test_whitelist_erster_abflug_pusht_blockzeiten_nicht():
+def test_whitelist_erster_abflug_im_verlauf_blockzeiten_nicht():
     old = _flug_tag()
-    # Nur arr_iso/end_time gedriftet → still.
+    # Nur arr_iso/end_time gedriftet → weder Verlauf noch Push.
     drift = _flug_tag(end='18:52', arr='2026-08-02T18:52:00Z')
+    assert A._rc_meaningfully_modified(old, drift) is False
     assert A._roster_change_is_push_worthy(_mod(old, drift)) is False
-    # Erster Abflug verschoben (station-lokal andere HH:MM) → Push.
+    # Erster Abflug um 75 min verschoben → Verlauf ja; der Push seit GATE 4
+    # erst ab 3 h Verschiebung UND nur vor Dienstantritt.
     dep_shift = _flug_tag(dep='2026-08-02T09:15:00Z')
-    assert A._roster_change_is_push_worthy(_mod(old, dep_shift)) is True
+    assert A._rc_meaningfully_modified(old, dep_shift) is True
+    assert A._roster_change_is_push_worthy(_mod(old, dep_shift)) is False
 
 
 def test_whitelist_klasse_routing_layover_pushen():
@@ -243,9 +249,12 @@ def test_whitelist_loch_b_tag_ohne_sektoren():
     endpflege = {'datum': '2026-08-02', 'klass': 'Standby', 'routing': '',
                  'reader_facts': {'start_time': '08:00', 'end_time': '16:04'}}
     assert A._roster_change_is_push_worthy(_mod(old, endpflege)) is False
+    # Der Standby-BEGINN-Shift landet im Verlauf; gepusht wird er seit GATE 4
+    # nicht mehr — der Dienst selbst (Standby) ist unverändert.
     shift = {'datum': '2026-08-02', 'klass': 'Standby', 'routing': '',
              'reader_facts': {'start_time': '10:00', 'end_time': '18:00'}}
-    assert A._roster_change_is_push_worthy(_mod(old, shift)) is True
+    assert A._rc_meaningfully_modified(old, shift) is True
+    assert A._roster_change_is_push_worthy(_mod(old, shift)) is False
 
 
 def test_whitelist_neuer_und_entfallener_tag_pushen():
@@ -312,13 +321,17 @@ def test_endpoint_loch_a_weder_verlauf_noch_push(tmp_path):
     assert push.call_count == 0
 
 
-def test_endpoint_erster_abflug_pusht(tmp_path):
+def test_endpoint_erster_abflug_im_verlauf_ohne_push(tmp_path):
+    # 75-min-Abflug-Shift: Verlauf ja, Push nein (GATE 4, ab 3 h und nur vor
+    # Dienstantritt). Der 4-h-Fall steht in test_roster_push_gates.py.
     old = _future_flug_tag()
     new = _future_flug_tag()
     new['ical_sectors'][0]['dep_iso'] = new['ical_sectors'][0]['dep_iso'].replace('08:00', '09:15')
-    r, push, _cf = _post(tmp_path, old=[old], new=[new])
+    r, push, changes_file = _post(tmp_path, old=[old], new=[new])
     assert r.status_code == 200
-    assert push.call_count == 1                   # echter Abflug-Shift → Push
+    assert r.get_json()['changes_count'] == 1     # in-App-Liste bleibt komplett
+    assert len(json.loads(changes_file.read_text())['pending']) == 1
+    assert push.call_count == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -441,13 +454,15 @@ def test_pickup_normalfaelle_unveraendert():
 
 # ── P7-Review-Nachbesserungen (2026-07-27) ───────────────────────────────────
 
-def test_whitelist_meldezeit_shift_ohne_pickup_pusht():
+def test_whitelist_meldezeit_shift_ohne_pickup_nur_im_verlauf():
     # Review-Fund E1: Sektor-Tag OHNE Pickup-Quelle (Homebase-Report) — eine
-    # vorgezogene Meldezeit (Security/De-Icing/Sonder-Briefing) muss pushen,
-    # auch wenn der erste Abflug unverändert bleibt.
+    # vorgezogene Meldezeit bleibt eine Verlauf-Änderung. GATE 4 (2026-07-28,
+    # Owner + Forum-Thread „Sa 08.08: Briefing 00:35 → 01:05") nimmt sie aus
+    # dem Push: Legs, Route und Ziel sind identisch.
     old = _flug_tag(pickup='', start='07:10')
     new = _flug_tag(pickup='', start='06:30')
-    assert A._roster_change_is_push_worthy(_mod(old, new)) is True
+    assert A._rc_meaningfully_modified(old, new) is True
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
     # MIT unveränderter PU bleibt die PU die tragende Zeit → Briefing-Drift
     # ohne Abflug-Shift bleibt still.
     old_pu = _flug_tag(pickup='06:40', start='07:10')

@@ -20039,6 +20039,11 @@ def take_roster_snapshot(token):
         #   2) SUBSTANZ-GATE (`_roster_change_is_push_worthy` →
         #      `_rc_meaningfully_modified`): Sektor/Dienst kommt-geht, Abflug-,
         #      Melde- oder Pickup-Zeit ≥ 5 min. Alles andere still.
+        #   2b) DIENST-SUBSTANZ-GATE 4 (`_rc_push_duty_substance_changed`,
+        #      2026-07-28): von den unter 2) übrig gebliebenen 'modified'
+        #      pusht nur noch, was den DIENST ändert (andere Legs/Route/
+        #      Layover/Dienstzustand) — plus ≥ 3 h Verspätung VOR Dienstantritt.
+        #      Reine Zeit-Verschiebungen bleiben im Verlauf, klingeln nicht.
         #   3) FLIP-FLOP-HYSTERESE: derselbe Tag, der binnen 24 h in einen
         #      bereits gepushten Zustand zurückkippt, pusht kein zweites Mal.
         #      Der Zustand lebt im selben `roster_changes`-Payload und ist
@@ -20197,6 +20202,188 @@ def _rc_sector_structure(day):
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GATE 4 — „nur die DIENST-Substanz pusht" (Owner-Entscheid 2026-07-28)
+# ══════════════════════════════════════════════════════════════════════════════
+# Owner, wörtlich: „Das Einzige, was aufpoppen darf, ist wirklich, wenn ich einen
+# komplett neuen Flug habe — keine Verspätungen, keine Gate-Wechsel, keine
+# Briefing-/Abflugzeit-Verschiebungen. Uns interessiert nur, ob sich der DIENST
+# geändert hat: wenn ich San Francisco hatte und jetzt LA habe, ist das wichtig.
+# Oder eine riesige Verspätung (~4 h), WENN ich meinen Dienst noch nicht
+# angetreten habe. Alles andere muss still sein."
+#
+# Anlass (beides live am 28.07. belegt):
+#   · PING-PONG: „Di 28.07: LH454 Abflug 10:55 → 10:25" und 30 Sekunden später
+#     „LH454 Abflug 10:25 → 10:55" — dieselbe Zelle, zwei Pushes, null Substanz.
+#   · Forum-Thread voller Crews zu Briefing-Minuten („Sa 08.08: Briefing
+#     00:35 → 01:05") — Zeitenpflege, die als „Dienstplan-Änderung" erschreckt.
+#
+# Gate 4 sitzt AUSSCHLIESSLICH im Push-Pfad (`_roster_change_is_push_worthy`).
+# Der Verlauf (`roster_changes`, in-App-Liste) bleibt VOLLSTÄNDIG — genauso wie
+# Gate 3 (Blockzeiten-Drift) es seit dem 24.07. handhabt: der User kann jede
+# Minutenpflege nachlesen, sie klingelt nur nicht mehr.
+#
+# Ping-Pong braucht dadurch KEINE eigene Dedup-Logik mehr: A→B und B→A sind
+# beide reine Zeit-Änderungen und damit beide still.
+_RC_HUGE_DELAY_MIN = 180
+
+
+def _rc_iso_utc(v):
+    """UTC-ISO-String → aware datetime (UTC) oder None. Wirft nie."""
+    try:
+        s = str(v or '').strip()
+        if not s:
+            return None
+        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    except Exception:
+        return None
+
+
+def _rc_first_dep_utc(day):
+    """FRÜHESTER Abflug eines Roster-Tags als absoluter UTC-Zeitpunkt (oder
+    None). Absolut statt lokal, damit ein DST-/Zonen-Sprung nie als Verspätung
+    zählt. Wirft nie."""
+    try:
+        best = None
+        for s in ((day or {}).get('ical_sectors') or []):
+            if not isinstance(s, dict):
+                continue
+            dt = _rc_iso_utc(s.get('dep_iso'))
+            if dt is not None and (best is None or dt < best):
+                best = dt
+        return best
+    except Exception:
+        return None
+
+
+def _rc_day_station(day):
+    """Abflug-Station des ersten Sektors („FRA") — Zeitzonen-Anker für die
+    HH:MM-Felder des Tages. '' wenn keine Sektoren. Wirft nie."""
+    try:
+        for s in ((day or {}).get('ical_sectors') or []):
+            if isinstance(s, dict) and str(s.get('from') or '').strip():
+                return str(s.get('from')).strip().upper()
+    except Exception:
+        pass
+    return ''
+
+
+def _rc_duty_start_utc(day):
+    """ABSOLUTER Dienstbeginn eines Roster-Tags (UTC) — die Frage „hat der
+    Dienst schon angefangen?" braucht einen Zeitpunkt, keine HH:MM.
+
+    Quellen in dieser Reihenfolge:
+      1. `reader_facts.start_time` bzw. — wenn die fehlt — die explizite
+         Briefing- oder Pickup-Zeit, jeweils auf `datum` in der ORTSZEIT der
+         ersten Abflug-Station (Fallback Europe/Berlin) gelegt.
+      2. Sonst der früheste Abflug selbst: der ist der SPÄTESTMÖGLICHE
+         Dienstbeginn und damit die konservative Untergrenze.
+
+    Plausi-Guard: liegt der so gebaute Beginn NACH dem ersten Abflug (Red-Eye,
+    dessen Briefing am Vortag liegt, oder ein Datums-Rollover im Feed), ist die
+    HH:MM-Projektion unbrauchbar → es gilt der Abflug. None wenn gar nichts
+    auflösbar ist. Wirft nie."""
+    try:
+        d = day if isinstance(day, dict) else {}
+        dep = _rc_first_dep_utc(d)
+        rf = d.get('reader_facts') or {}
+        hhmm = (_rc_norm_cmp(rf.get('start_time'))
+                or _rc_briefing_hhmm(d) or _rc_pickup_hhmm(d))
+        mins = _rc_hhmm_minutes(hhmm)
+        ymd = str(d.get('datum') or '')[:10]
+        if mins is not None and len(ymd) == 10:
+            try:
+                from zoneinfo import ZoneInfo as _ZI
+                st = _rc_day_station(d)
+                ap = _DE_ICAO_TO_IATA.get(st, st)
+                tzname = ('Europe/Berlin' if ap in ('FRA', 'EDDF', '')
+                          else airport_tz(ap)) or 'Europe/Berlin'
+                loc = datetime.fromisoformat(
+                    f'{ymd}T{mins // 60:02d}:{mins % 60:02d}:00'
+                ).replace(tzinfo=_ZI(tzname))
+                start = loc.astimezone(timezone.utc)
+                if dep is None or start <= dep:
+                    return start
+            except Exception:
+                pass
+        return dep
+    except Exception:
+        return None
+
+
+def _rc_huge_delay_before_duty(a, b, now=None, tol=_RC_HUGE_DELAY_MIN):
+    """AUSNAHME von Gate 4: der erste Abflug des Tages verschiebt sich um
+    ≥ `tol` Minuten (default 3 h) UND der Dienst hat laut ALTEM Stand noch
+    nicht begonnen.
+
+    Beides muss gelten: eine 4-h-Verschiebung, die eine Crew erst im Dienst
+    (oder gar im Layover) erreicht, ändert nichts mehr an ihrer Planung — die
+    steht dann längst am Flughafen und erfährt es dort. Vorher, zu Hause, ist
+    genau das die eine Zeit-Änderung, die zählt.
+
+    Die Richtung ist egal: 3 h FRÜHER ist für die Anreise noch kritischer als
+    3 h später. Fehlt auf einer Seite der Abflug, ist das eine Quellen-Lücke
+    und keine Verspätung („Lücke ≠ Fakt"). Wirft nie."""
+    try:
+        da, db = _rc_first_dep_utc(a), _rc_first_dep_utc(b)
+        if da is None or db is None:
+            return False
+        if abs((db - da).total_seconds()) < tol * 60:
+            return False
+        start = _rc_duty_start_utc(a)      # der URSPRÜNGLICHE Dienstbeginn
+        if start is None:
+            return False
+        n = now or datetime.now(timezone.utc)
+        if getattr(n, 'tzinfo', None) is None:
+            n = n.replace(tzinfo=timezone.utc)
+        return n < start
+    except Exception:
+        return False
+
+
+def _rc_push_duty_substance_changed(a, b, now=None):
+    """GATE 4 (nur Push) — „hat sich der DIENST geändert?", nicht „hat sich
+    irgendeine Zeit geändert?".
+
+    True (= Push erlaubt) nur bei:
+      1. **Dienst kommt/geht** — `_rc_duty_state_changed` (Frei↔Dienst, Flug-
+         Beleg verschwindet in einen positiv dokumentierten Tag). Das ist
+         dieselbe klass-Auswertung wie im Verlauf; ein reines STBY↔RES-Kippen
+         war schon vorher kein Dienstwechsel.
+      2. **Andere Legs** — Sektor-STRUKTUR (`_rc_sector_structure`:
+         Flugnummer + Stationen, OHNE Zeiten), beidseitig belegt und
+         verschieden. „SFO war's, jetzt ist es LAX."
+      3. **Routing / Layover-Ort** — beidseitig gefüllt und verschieden; trägt
+         die Zielinformation bei Feeds ohne `ical_sectors`.
+      4. **Riesen-Verspätung vor Dienstantritt** — `_rc_huge_delay_before_duty`.
+
+    STILL sind damit ALLE reinen Zeit-Änderungen bei identischer Struktur:
+    Briefing-/Melde-Shift, Pickup-Shift, Abflug-Shift < 3 h, Ankunft/Block-/
+    Ist-Zeiten, Gate, Dienstende. Sie stehen weiterhin VOLLSTÄNDIG im Verlauf
+    (`_rc_meaningfully_modified` entscheidet dort unverändert) — Gate 4
+    filtert ausschließlich die Push-Zustellung.
+
+    Wirft nie; im Fehlerfall fail-open (lieber ein Push zu viel als eine echte
+    Dienständerung still), konsistent mit `_roster_change_is_push_worthy`."""
+    try:
+        a = a if isinstance(a, dict) else {}
+        b = b if isinstance(b, dict) else {}
+        arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
+        if _rc_duty_state_changed(a, b):
+            return True           # 1) Dienst kommt/geht
+        sa_, sb_ = _rc_sector_structure(a), _rc_sector_structure(b)
+        if sa_ and sb_ and sa_ != sb_:
+            return True           # 2) andere Flüge/Stationen
+        for af, bf in ((a.get('routing'), b.get('routing')),
+                       (arf.get('layover_ort'), brf.get('layover_ort'))):
+            if _rc_field_changed(af, bf):
+                return True       # 3) Route/Layover-Ort
+        return _rc_huge_delay_before_duty(a, b, now=now)   # 4) Riesen-Delay
+    except Exception:
+        return True
+
+
 def _roster_change_is_past(change, today_ymd, now_hhmm=None):
     """VERGANGENHEITS-GATE (Flo Z 2026-07-20: „Push kommt auch, wenn die Tour
     vorbei ist"): Änderungen an Tagen VOR heute (Homebase-lokal) sind für den
@@ -20231,8 +20418,9 @@ def _roster_change_is_past(change, today_ymd, now_hhmm=None):
         return False
 
 
-def _roster_change_is_push_worthy(change):
-    """PUSH-GATE — dünne Hülle über `_rc_meaningfully_modified`.
+def _roster_change_is_push_worthy(change, now=None):
+    """PUSH-GATE — `_rc_meaningfully_modified` UND (seit 2026-07-28) Gate 4
+    `_rc_push_duty_substance_changed`.
 
     HISTORIE: Florians Whitelist (2026-07-26) ersetzte die Blacklist aus
     `_roster_change_is_pickup_prune` + `_roster_change_is_blocktime_drift`,
@@ -20249,11 +20437,20 @@ def _roster_change_is_push_worthy(change):
       · Loch B (Tage ohne Sektoren) → `_rc_report_moved` gilt uniform,
       · P7-Fund E1 (Meldezeit-Shift ohne Pickup) → `_rc_report_moved` feuert.
 
-    Damit gilt: **was nicht in den Verlauf kommt, pusht auch nicht — und was
-    pusht, steht auch im Verlauf.** Zusätzlich pushen added/removed nur mit
-    BELEGTEM Dienst — ein Leer-Tag ohne Klasse/Sektoren/Marker ist eine
-    Quellen-Lücke. Wirft nie; bei unbekanntem `kind` fail-open (lieber ein
-    Push zu viel als eine echte Änderung still)."""
+    Damit gilt: **was nicht in den Verlauf kommt, pusht auch nicht.** Die
+    Umkehrung gilt seit Gate 4 NICHT mehr: der Verlauf ist bewusst REICHER als
+    der Push. Zusätzlich pushen added/removed nur mit BELEGTEM Dienst — ein
+    Leer-Tag ohne Klasse/Sektoren/Marker ist eine Quellen-Lücke. Wirft nie; bei
+    unbekanntem `kind` fail-open (lieber ein Push zu viel als eine echte
+    Änderung still).
+
+    GATE 4 (2026-07-28, Owner: „Das Einzige, was aufpoppen darf, ist wirklich,
+    wenn ich einen komplett neuen Flug habe"): für 'modified' muss ZUSÄTZLICH
+    die Dienst-Substanz gekippt sein (`_rc_push_duty_substance_changed` —
+    Legs/Routing/Layover/Dienstzustand oder ≥ 3 h Verspätung vor Dienstantritt).
+    Reine Zeit-Änderungen (Briefing, Melde-, Pickup-, Abflug-, Block-, Endzeit)
+    landen weiterhin im Verlauf, klingeln aber nicht mehr. `now` ist nur für
+    Tests da (Default: Wanduhr in UTC)."""
     try:
         kind = (change or {}).get('kind')
         if kind in ('added', 'removed'):
@@ -20263,7 +20460,9 @@ def _roster_change_is_push_worthy(change):
             return True           # Unbekanntes: fail-open
         a = change.get('old') if isinstance(change.get('old'), dict) else {}
         b = change.get('new') if isinstance(change.get('new'), dict) else {}
-        return _rc_meaningfully_modified(a, b)
+        if not _rc_meaningfully_modified(a, b):
+            return False          # Verlauf-Regel: gar keine Änderung
+        return _rc_push_duty_substance_changed(a, b, now=now)   # Gate 4
     except Exception:
         return True
 
