@@ -19354,6 +19354,332 @@ def _rc_field_changed(av, bv):
 # leer). STBY/RES/OFFICE sind DIENST und stehen bewusst NICHT hier.
 _RC_OFF_DUTY_KLASS = frozenset({'frei', 'urlaub', 'krank'})
 
+# Minuten-Toleranz für ALLE Zeit-Vergleiche im Roster-Diff (Owner 2026-07-28:
+# „ich habe einen Kalender-Push für den 30ten bekommen obwohl nichts neues.
+# das ist nervig und stressig für Crews"). Unter dieser Schwelle ist eine
+# Zeitverschiebung LH-Zeitenpflege (Block-/Ist-Zeiten, Sekunden-Rundung,
+# Re-Parse), keine Änderung, auf die eine Crew reagieren müsste.
+_RC_TIME_TOL_MIN = 5
+
+
+def _rc_hhmm_minutes(v):
+    """„HH:MM" → Minuten seit Mitternacht, sonst None. Wirft nie."""
+    try:
+        m = re.match(r'^(\d{1,2}):(\d{2})$', str(v or '').strip())
+        if not m:
+            return None
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh * 60 + mm
+    except Exception:
+        pass
+    return None
+
+
+def _rc_time_moved(av, bv, tol=_RC_TIME_TOL_MIN):
+    """True NUR wenn BEIDE Seiten eine auflösbare „HH:MM"-Zeit tragen und sie
+    sich um mindestens `tol` Minuten unterscheiden (Mitternachts-Wrap wird als
+    kürzester Abstand gerechnet: 23:58 → 00:03 sind 5 min, nicht 1435).
+
+    Fehlt eine Seite, ist das eine QUELLEN-LÜCKE und keine Änderung
+    (Adversarial-Review-Regel „Lücke ≠ Fakt", Welle c30469f). Wirft nie."""
+    ma, mb = _rc_hhmm_minutes(av), _rc_hhmm_minutes(bv)
+    if ma is None or mb is None:
+        return False
+    d = abs(ma - mb)
+    return min(d, 1440 - d) >= tol
+
+
+def _rc_iso_moved(av, bv, tol=_RC_TIME_TOL_MIN):
+    """Wie `_rc_time_moved`, aber für absolute UTC-ISO-Zeitstempel (dep_iso/
+    arr_iso). Beidseitig parsebar UND |Δ| ≥ tol Minuten. Wirft nie."""
+    try:
+        sa, sb_ = str(av or '').strip(), str(bv or '').strip()
+        if not sa or not sb_:
+            return False
+        da = datetime.fromisoformat(sa.replace('Z', '+00:00'))
+        db = datetime.fromisoformat(sb_.replace('Z', '+00:00'))
+        if da.tzinfo is None:
+            da = da.replace(tzinfo=timezone.utc)
+        if db.tzinfo is None:
+            db = db.replace(tzinfo=timezone.utc)
+        return abs((db - da).total_seconds()) >= tol * 60
+    except Exception:
+        return False
+
+
+def _rc_flight_evidence(day):
+    """True wenn der Tag einen BELEG für Flugdienst trägt: ical_sectors, legs,
+    Routing oder einen Layover-Ort. Wirft nie."""
+    try:
+        d = day if isinstance(day, dict) else {}
+        rf = d.get('reader_facts') or {}
+        return bool(d.get('ical_sectors') or d.get('legs')
+                    or str(d.get('routing') or '').strip()
+                    or str(rf.get('layover_ort') or '').strip())
+    except Exception:
+        return False
+
+
+def _rc_duty_state(day):
+    """DIENST-ZUSTAND eines Roster-Tags als eine von DREI Stufen:
+
+      · `'duty'`    — belegter Dienst: Flug-Beleg (`_rc_flight_evidence`),
+                      ein Ground-Duty-Marker (`_summary_has_ground_duty`) oder
+                      eine explizite Nicht-Frei-Klasse (STBY/RES/OFFICE/…).
+      · `'off'`     — explizit dienstfrei (FREI/Urlaub/Krank) OHNE jeden
+                      Dienst-Beleg.
+      · `'unknown'` — GAR KEIN Beleg: keine Klasse, keine Sektoren, kein
+                      Routing, kein Marker. Das ist eine Quellen-Lücke.
+
+    WARUM DREI STUFEN (Owner 2026-07-28, Kalender-Push-Flut): `klass` wurde im
+    Diff EXAKT verglichen — auch leer↔gefüllt. Fleet-Messung über 24 h auf
+    `roster_changes`: **107 von 219 'modified'-Einträgen wurden AUSSCHLIESSLICH
+    von `klass` ausgelöst, 101 davon bei byte-identischen Legs, Routing UND
+    Meldezeit.** Die Treiber waren ausnahmslos Backend-Rauschen, nie ein
+    LH-Dienstplan-Wechsel:
+      · `'STBY' → 'RES'` (27×) — die Reserve≠Standby-Neuklassifikation vom
+        27.07. mintete denselben Tag anders.
+      · `leer → Urlaub/RES/FREI/STBY` (52×) — Anreicherung beim Nachladen.
+      · `RES/Urlaub/STBY/OFFICE → leer` (27×) — degradierter Import: die
+        Klasse VERSCHWAND. Lücke ≠ Fakt.
+      · echte Dienständerung: genau EINE (`FREI → Flug`).
+
+    Der Zustands-Wechsel (`_rc_duty_state_changed`) ersetzt darum den rohen
+    klass-Vergleich: nur ein Wechsel zwischen zwei BELEGTEN Stufen ist eine
+    Änderung. Wirft nie."""
+    try:
+        d = day if isinstance(day, dict) else {}
+        rf = d.get('reader_facts') or {}
+        if _rc_flight_evidence(d):
+            return 'duty'
+        marker = ' · '.join(str(x) for x in (d.get('marker'), rf.get('marker_raw'),
+                                             d.get('ical_summary'), d.get('summary'))
+                            if x)
+        if marker and _summary_has_ground_duty(marker.upper()):
+            return 'duty'
+        k = _rc_norm_cmp(d.get('klass'))
+        if k in _RC_OFF_DUTY_KLASS:
+            return 'off'
+        if k:
+            return 'duty'
+        return 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def _rc_duty_state_changed(a, b):
+    """True NUR wenn eine der beiden BELEGTEN Dienst-Aussagen kippt:
+
+      (a) Frei ↔ Dienst (`_rc_duty_state`, beide Seiten ≠ 'unknown'), oder
+      (b) der FLUG-BELEG verschwindet (Sektoren/Routing/Layover weg), während
+          der Tag auf der neuen Seite POSITIV als etwas anderes dokumentiert
+          ist (explizite Klasse/Marker, also nicht 'unknown') — „Flug wird
+          Standby/Frei". Verschwindet der Flug-Beleg dagegen in ein leeres
+          Nichts, ist das ein degradierter Import und KEINE Änderung.
+
+    Das reine Auftauchen eines Flug-Belegs (leer → gefüllt) ist Anreicherung
+    und feuert NICHT — sonst hätte jeder Nachlade-Sync gepusht. Wirft nie."""
+    try:
+        sa, sb_ = _rc_duty_state(a), _rc_duty_state(b)
+        if sa != 'unknown' and sb_ != 'unknown' and sa != sb_:
+            return True
+        if _rc_flight_evidence(a) and not _rc_flight_evidence(b) \
+                and sb_ != 'unknown':
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _rc_pickup_moved(a, b, tol=_RC_TIME_TOL_MIN):
+    """True NUR wenn BEIDE Tage eine Pickup-Zeit tragen und diese sich um ≥ tol
+    Minuten verschoben hat.
+
+    Das PRÄSENZ-FLIPPEN der Pickup-Zeit (mal da, mal weg) ist AUSDRÜCKLICH
+    keine Änderung — es ist die Signatur des bewiesenen Flip-Flops (Owner-Fall
+    30.07.2026: identisches Leg LH455 SFO-FRA, nur der Marker gewann/verlor
+    „12:40 LT Pickup SFO"). Wirft nie."""
+    pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
+    return bool(pa) and bool(pb) and _rc_time_moved(pa, pb, tol)
+
+
+_RC_BRIEFING_RES = (
+    re.compile(r'(\d{1,2}:\d{2})\s*(?:LT|LOCAL)?\s*BRIEFING', re.I),
+    re.compile(r'BRIEFING[^\d]{0,12}(\d{1,2}:\d{2})', re.I),
+    re.compile(r'BRIEFING[^\d]{0,12}(\d{3,4})\b', re.I),
+)
+
+
+def _rc_briefing_hhmm(day):
+    """EXPLIZITE Briefing-/Report-Zeit aus den Marker-Freitexten („05:50 LT
+    Briefing MUC" — der kanonische Marker seit dem Briefing-Fix vom 24.07.),
+    als „HH:MM" oder ''. Wirft nie.
+
+    Warum eine eigene Quelle statt `reader_facts.start_time`: `start_time` ist
+    aus `ical_start` ABGELEITET, und `ical_start` ist die früheste Zeit des
+    Tages — also mal die Briefing-, mal die Pickup-, mal die Abflugzeit, je
+    nachdem welche VEVENTs die Quelle gerade liefert. Live gemessen:
+    ein Swiss-Tag pendelte 04:29 ↔ 11:35 (7 h!), weil der Marker das Element
+    „18:35 LT Briefing NRT" verlor und wiederbekam — der Dienst selbst
+    (LX161 NRT-ZRH) war beide Male identisch."""
+    try:
+        for src in ((day or {}).get('marker'),
+                    ((day or {}).get('reader_facts') or {}).get('marker_raw'),
+                    (day or {}).get('ical_summary'), (day or {}).get('summary')):
+            s = str(src or '')
+            if 'briefing' not in s.lower():
+                continue
+            for rx in _RC_BRIEFING_RES:
+                m = rx.search(s)
+                if not m:
+                    continue
+                t = m.group(1)
+                hh, mm = (t.split(':', 1) if ':' in t else (t[:-2], t[-2:]))
+                hh, mm = int(hh), int(mm)
+                if 0 <= hh <= 23 and 0 <= mm <= 59:
+                    return f'{hh:02d}:{mm:02d}'
+    except Exception:
+        pass
+    return ''
+
+
+def _rc_marker_elements(day):
+    """Der Marker eines Roster-Tags als MENGE seiner ' · '-Elemente, nur
+    Case/Whitespace-normalisiert. Leere Menge ohne Marker. Wirft nie.
+
+    Das „(Tag n/m)"-Fortsetzungs-Suffix bleibt BEWUSST Teil der Signatur: es
+    ist eine abgeleitete Größe des Tour-Splittings, und wenn es kippt, kippt
+    `ical_start` mit (live: „Layover [KRK]" ↔ „Layover [KRK] (Tag 2/2)" schob
+    start_time um 13 h bei identischen Flügen). Es soll den start_time-Kanal
+    also gerade stumm schalten, nicht wegnormalisiert werden. Auf die
+    ENTSCHEIDUNGSRELEVANTEN Regeln (Legs, Abflüge, Routing, Pickup, Briefing)
+    hat der Marker keinen Einfluss."""
+    try:
+        d = day if isinstance(day, dict) else {}
+        raw = (d.get('marker') or (d.get('reader_facts') or {}).get('marker_raw')
+               or d.get('ical_summary') or d.get('summary') or '')
+        return frozenset(p for p in (_rc_norm_cmp(x) for x in str(raw).split('·'))
+                         if p)
+    except Exception:
+        return frozenset()
+
+
+def _rc_report_moved(a, b, tol=_RC_TIME_TOL_MIN):
+    """True NUR wenn sich die Melde-/Briefing-Zeit (`reader_facts.start_time`)
+    beidseitig-belegt um ≥ tol Minuten verschoben hat UND dieser Shift NICHT
+    durch ein Pickup-Präsenz-Flip erklärt ist.
+
+    `start_time` wird aus `ical_start` abgeleitet, und `ical_start` SAUGT die
+    Pickup-Zeit auf. Taucht der Pickup auf oder verschwindet er, springt
+    `start_time` um den Pickup-Vorlauf (Owner-Fall 30.07.: 23:40 → 21:40 = 2 h,
+    obwohl der Flug LH455 auf die Sekunde identisch blieb). Dieser Sprung ist
+    ein Artefakt der Quelle, keine neue Meldezeit.
+
+    Zweitens (P7-Entscheid 2026-07-27, hier bewahrt): trägt der Tag beidseitig
+    eine UNVERÄNDERTE Pickup-Zeit, ist die PU die tragende Zeit der Crew — eine
+    Briefing-Minuten-Drift darunter ändert nichts am Tagesablauf und bleibt
+    still.
+
+    Drittens: liegt eine EXPLIZITE Briefing-Zeit im Marker vor
+    (`_rc_briefing_hhmm`), entscheidet SIE — sie ist die echte Meldezeit,
+    während `start_time` nur die früheste Tageszeit spiegelt. Flippt der
+    Briefing-Marker seine Präsenz, ist der `start_time`-Sprung erneut ein
+    Quellen-Artefakt (live: 04:29 ↔ 11:35 bei identischem LX161 NRT-ZRH).
+    Wirft nie."""
+    try:
+        ba, bb = _rc_briefing_hhmm(a), _rc_briefing_hhmm(b)
+        if bool(ba) != bool(bb):
+            return False          # Briefing-Marker kommt/geht → Artefakt
+        if ba and bb:
+            return _rc_time_moved(ba, bb, tol)   # echte Meldezeit entscheidet
+        arf = (a.get('reader_facts') or {})
+        brf = (b.get('reader_facts') or {})
+        if not _rc_time_moved(arf.get('start_time'), brf.get('start_time'), tol):
+            return False
+        pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
+        if bool(pa) != bool(pb):
+            return False          # Pickup-Präsenz-Flip erklärt den Shift
+        if pa and pb and not _rc_time_moved(pa, pb, tol):
+            return False          # PU trägt den Tag und steht → still
+        # Viertens: `start_time` ist die schwächste, am stärksten ABGELEITETE
+        # Größe (Projektion von `ical_start` = früheste Tageszeit). Ändert sich
+        # die MARKER-MENGE des Tages, ist der Sprung durch ein kommendes/
+        # gehendes Marker-Element erklärt und kein neuer Report.
+        # Live gemessen: ein „· X ·"-Element schob start_time um exakt ±30 min
+        # (23 Fälle), ein kommendes/gehendes „(Tag 2/2)" um 5–13 h (11 Fälle) —
+        # bei jeweils unveränderten Flügen. Echte Änderungen sind längst durch
+        # Regel 1–4/6 abgedeckt; bleibt die Markermenge gleich UND springt die
+        # Zeit, ist es ein echter Report-Shift und feuert.
+        ma, mb = _rc_marker_elements(a), _rc_marker_elements(b)
+        if (ma or mb) and ma != mb:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _rc_leg_departures_moved(a, b, tol=_RC_TIME_TOL_MIN):
+    """True wenn EIN gemeinsames Leg (gematcht über Flugnummer+Stationen) seine
+    ABFLUGZEIT um ≥ tol Minuten verschoben hat.
+
+    Bewusst NUR Abflüge: die Ankunfts-/Blockzeiten pflegt LH permanent nach
+    (Florians Blockzeiten-Drift-Gate 2026-07-24 — „nur wenn sich die PU-Zeit
+    oder die Abflugzeit vom ersten Flug des Tages ändert, liegen definitiv
+    Änderungen vor"). Gegenüber dem abgelösten `_rc_first_dep_local_hhmm` ist
+    das eine VERSCHÄRFUNG (alle Legs statt nur das erste, absolute
+    UTC-Differenz statt lokaler HH:MM-Stringvergleich) UND eine Beruhigung
+    (Minuten-Toleranz statt 1-Minuten-Auflösung). Wirft nie."""
+    try:
+        def _by_key(day):
+            out = {}
+            for s in ((day or {}).get('ical_sectors') or []):
+                if not isinstance(s, dict):
+                    continue
+                k = (_rc_flight_norm(s.get('flight')),
+                     str(s.get('from') or '').upper(),
+                     str(s.get('to') or '').upper())
+                out.setdefault(k, []).append(str(s.get('dep_iso') or ''))
+            return out
+        ka, kb = _by_key(a), _by_key(b)
+        for k, deps_a in ka.items():
+            deps_b = kb.get(k)
+            if not deps_b:
+                continue          # Leg fehlt auf einer Seite → Struktur-Regel
+            for da, db in zip(deps_a, deps_b):
+                if _rc_iso_moved(da, db, tol):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _rc_state_sig(day):
+    """Stabile Kurz-Signatur des ENTSCHEIDUNGSRELEVANTEN Zustands eines Tags —
+    Grundlage der Flip-Flop-Hysterese. Enthält genau die Felder, die laut
+    Push-Regeln überhaupt einen Push auslösen können; Marker-Text, Formatierung
+    und Blockzeiten sind bewusst NICHT drin. `None` (Tag existiert nicht) hat
+    die feste Signatur '∅'. Wirft nie."""
+    try:
+        if not isinstance(day, dict):
+            return '∅'
+        rf = day.get('reader_facts') or {}
+        payload = json.dumps({
+            's': _rc_duty_state(day),
+            'l': _rc_sector_structure(day),
+            'd': sorted(str((x or {}).get('dep_iso') or '')
+                        for x in (day.get('ical_sectors') or [])
+                        if isinstance(x, dict)),
+            'r': _rc_norm_cmp(day.get('routing')),
+            'o': _rc_norm_cmp(rf.get('layover_ort')),
+            't': _rc_norm_cmp(rf.get('start_time')),
+            'b': _rc_briefing_hhmm(day),
+            'p': _rc_pickup_hhmm(day),
+        }, sort_keys=True, ensure_ascii=False)
+        return _hashlib.sha256(payload.encode()).hexdigest()[:16]
+    except Exception:
+        return ''
+
 
 def _rc_day_is_off_duty(day):
     """True NUR bei einem eindeutig dienstfreien Roster-Tag (Frei/Urlaub/Krank).
@@ -19372,67 +19698,76 @@ def _rc_day_is_off_duty(day):
     Flug-/Layover-Tagen der Normalfall), ist der Tag NICHT off-duty. Zusätzlich
     schlagen echte Dienst-Belege die Klasse: Sektoren, Routing, Layover-Ort oder
     ein Boden-Dienst-Segment im gemergten Marker („Off Day (OF) · B4",
-    `_summary_has_ground_duty`, iOS-Spiegel hasGroundDutyEvidence). Wirft nie."""
-    try:
-        d = day if isinstance(day, dict) else {}
-        if _rc_norm_cmp(d.get('klass')) not in _RC_OFF_DUTY_KLASS:
-            return False
-        if d.get('ical_sectors') or d.get('legs'):
-            return False
-        rf = d.get('reader_facts') or {}
-        if str(d.get('routing') or '').strip():
-            return False
-        if str(rf.get('layover_ort') or '').strip():
-            return False
-        marker = ' · '.join(str(x) for x in (d.get('marker'), rf.get('marker_raw'),
-                                             d.get('ical_summary'), d.get('summary'))
-                            if x)
-        if marker and _summary_has_ground_duty(marker.upper()):
-            return False
-        return True
-    except Exception:
-        return False
+    `_summary_has_ground_duty`, iOS-Spiegel hasGroundDutyEvidence). Wirft nie.
+
+    Seit 2026-07-28 nur noch die Projektion von `_rc_duty_state` (EINE Quelle
+    der Wahrheit für „ist an diesem Tag Dienst") — Verhalten unverändert."""
+    return _rc_duty_state(day) == 'off'
 
 
 def _rc_meaningfully_modified(a, b):
-    """Substanz-Check zweier Roster-Tage (Kern von _compute_roster_diff,
-    modul-weit hoisted damit das Pickup-Rauschen-Gate ihn wiederverwenden kann).
+    """SUBSTANZ-GATE zweier Roster-Tage — die EINE Wahrheit für „ist das eine
+    Dienstplan-Änderung?". Speist gleichermaßen den Verlauf-Eintrag
+    (`_compute_roster_diff`) UND den Push (`_roster_change_is_push_worthy`).
 
-    ERWEITERT (Florian-Whitelist 2026-07-27): Vorher lösten Sektor-Änderungen
-    für sich allein GAR KEINEN Change aus — ein reiner Erst-Abflug-Shift oder
-    ein PU-Wechsel ohne begleitende start_time-/routing-Änderung war für Diff,
-    Liste UND Push unsichtbar. Jetzt zählen zusätzlich: Leg-Struktur
-    (Flugnummern+Stationen, ohne Zeiten), die station-lokale Abflugzeit des
-    ERSTEN Legs (nur wenn beidseitig auflösbar) und die Pickup-Zeit (nur
-    gefüllt↔gefüllt bzw. neu — reines PU-Löschen bleibt hier draußen, das ist
-    LH-Hygiene). Bewusst NICHT dabei: arr_iso/Zwischen-Leg-Zeiten
-    (Blockzeiten-Pflege wäre sonst wieder eine Diff-Flut)."""
-    arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
-    # klass: Case/Whitespace-normalisiert (auch leer↔gefüllt): ein Tag wird
-    # Tour / verliert Tour. „Z76" == „z76", aber Tour↔Frei bleibt echt.
-    if _rc_norm_cmp(a.get('klass')) != _rc_norm_cmp(b.get('klass')):
-        return True
-    for af, bf in ((a.get('routing'), b.get('routing')),
-                   (arf.get('start_time'), brf.get('start_time')),
-                   (arf.get('end_time'), brf.get('end_time')),
-                   (arf.get('layover_ort'), brf.get('layover_ort'))):
-        if _rc_field_changed(af, bf):
-            return True
+    NEUFASSUNG 2026-07-28 (Owner: „ich habe einen Kalender-Push für den 30ten
+    bekommen obwohl nichts neues. das ist nervig und stressig für Crews"). Die
+    alte Fassung war eine ODER-Kette über Rohfelder und feuerte bei jedem
+    Quellen-Zucken. Fleet-Messung über 24 h auf `roster_changes` (188 User,
+    270 Einträge): **212 von 219 'modified' hätten gepusht, 51 von 52
+    mehrfach-belegten Tag-Zellen oszillierten nachweislich A→B→A**.
+
+    Es feuert jetzt AUSSCHLIESSLICH, was eine Crew wirklich betrifft:
+      1. **Dienst kommt/geht** — `_rc_duty_state_changed` (Frei↔Dienst bzw.
+         Flug-Beleg verschwindet in einen positiv dokumentierten Tag). Reines
+         klass-Kippen zwischen zwei gleichwertigen Dienst-Zuständen (STBY↔RES)
+         und jedes leer↔gefüllt ist still.
+      2. **Sektor kommt/geht** — Leg-Struktur (Flugnummer+Stationen) ändert
+         sich, beidseitig belegt. Leer↔gefüllt ist Anreicherung/Degradation,
+         nie eine Änderung.
+      3. **Routing/Layover-Ort** — beidseitig gefüllt und verschieden
+         (`_rc_field_changed`); trägt die Sektor-Information bei Feeds ohne
+         `ical_sectors`.
+      4. **Abflugzeit ≥ 5 min** — `_rc_leg_departures_moved`, über ALLE
+         gemeinsamen Legs.
+      5. **Report-/Briefing-Zeit ≥ 5 min** — `_rc_report_moved`.
+      6. **Pickup-Zeit ≥ 5 min verschoben** — `_rc_pickup_moved`.
+
+    STILL sind ab jetzt (jeweils live als Rauschen belegt):
+      · Pickup-PRÄSENZ-Flip ohne Zeitänderung (Owner-Fall 30.07.),
+      · der davon abgeleitete `start_time`-Sprung (`ical_start` saugt die
+        Pickup-Zeit auf → 23:40 ↔ 21:40 bei identischem Flug),
+      · klass-Kippen ohne Dienständerung (107/219 der Live-Einträge),
+      · `end_time`/Blockzeiten-/Ankunfts-Pflege (Florians Drift-Gate bleibt
+        damit als Regel erhalten, statt parallel neu gebaut zu werden),
+      · Marker-/Summary-Varianten, Reihenfolge, Formatierung,
+      · JEDES Feld, das nur auf EINER Seite existiert — eine Quelle, die
+        degradiert, erzeugt eine Lücke, und Lücke ≠ Fakt
+        (Adversarial-Review-Regel der c30469f-Welle).
+
+    Wirft nie."""
     try:
+        a = a if isinstance(a, dict) else {}
+        b = b if isinstance(b, dict) else {}
+        arf, brf = (a.get('reader_facts') or {}), (b.get('reader_facts') or {})
+        if _rc_duty_state_changed(a, b):
+            return True           # 1) Dienst kommt/geht
         sa_, sb_ = _rc_sector_structure(a), _rc_sector_structure(b)
         if sa_ and sb_ and sa_ != sb_:
-            return True           # Legs kommen/gehen bzw. andere Flüge
-            # (leer↔gefüllt zählt NICHT — das ist Sektoren-Anreicherung beim
-            # ersten Sync nach einem Backend-Parse-Upgrade, keine Änderung)
-        da, db = _rc_first_dep_local_hhmm(a), _rc_first_dep_local_hhmm(b)
-        if da and db and da != db:
-            return True           # erster Abflug verschoben
-        pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
-        if pb and pa != pb:
-            return True           # Pickup neu oder verschoben
+            return True           # 2) Sektor kommt/geht bzw. andere Flüge
+        for af, bf in ((a.get('routing'), b.get('routing')),
+                       (arf.get('layover_ort'), brf.get('layover_ort'))):
+            if _rc_field_changed(af, bf):
+                return True       # 3) Route/Layover-Ort
+        if _rc_leg_departures_moved(a, b):
+            return True           # 4) Abflug ≥ 5 min
+        if _rc_report_moved(a, b):
+            return True           # 5) Meldezeit ≥ 5 min
+        if _rc_pickup_moved(a, b):
+            return True           # 6) Pickup ≥ 5 min verschoben
+        return False
     except Exception:
-        pass
-    return False
+        return False
 
 
 def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
@@ -19466,8 +19801,13 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
        (`_rc_day_is_off_duty`); sobald EINE Seite Dienst ist, bleibt alles wie
        gehabt.
 
-    Feld-Vergleichslogik lebt modul-weit in _rc_norm_cmp/_rc_field_changed/
-    _rc_meaningfully_modified (geteilt mit dem Push-Pickup-Gate).
+    4) DEGRADIERTE IMPORTE (2026-07-28): verschwinden viele Tage auf einmal,
+       ist das ein abgeschnittener Import, keine Massen-Streichung → alle
+       'removed' des Diffs fallen weg (siehe Guard am Ende der Funktion).
+
+    Die Substanz-Regel selbst lebt in `_rc_meaningfully_modified` — dieselbe
+    Funktion entscheidet auch über den Push (`_roster_change_is_push_worthy`),
+    es gibt nur noch EINE Wahrheit.
     """
     old_by = {t.get('datum'): t for t in (old_tage or []) if isinstance(t, dict)}
     new_by = {t.get('datum'): t for t in (new_tage or []) if isinstance(t, dict)}
@@ -19496,12 +19836,18 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
             #    Dienst" und der User sieht eine Änderung für einen Tag, an dem
             #    er gar nicht arbeitet. Still. (Wird der Tag später ein echter
             #    Dienst, greift der 'modified'-Zweig unten.)
-            if _added_is_near(k) and not _rc_day_is_off_duty(b):
+            #    VERSCHÄRFT 2026-07-28: gemeldet wird nur ein Tag mit BELEGTEM
+            #    Dienst (`_rc_duty_state` == 'duty'). Ein Tag ohne jeden
+            #    Beleg ('unknown' — keine Klasse, keine Sektoren, kein Marker)
+            #    ist eine Quellen-Lücke, kein neuer Dienst; live oszillierten
+            #    genau solche Leer-Tage 4×/24 h zwischen added und removed.
+            if _added_is_near(k) and _rc_duty_state(b) == 'duty':
                 changes.append({'datum': k, 'kind': 'added', 'new': b})
         elif b is None and a is not None:
-            # Analog: verschwindet ein Frei-/Urlaubs-/Kranktag aus dem Feed,
-            # ist das kein „Dienst entfernt".
-            if not _rc_day_is_off_duty(a):
+            # Analog: verschwindet ein Frei-/Urlaubs-/Kranktag (oder ein Tag
+            # ohne jeden Dienst-Beleg) aus dem Feed, ist das kein
+            # „Dienst entfernt".
+            if _rc_duty_state(a) == 'duty':
                 changes.append({'datum': k, 'kind': 'removed', 'old': a})
         elif a and b and _rc_meaningfully_modified(a, b):
             # Frei → Frei (z.B. „Off Day" → „Off Day (FREE) · Off Day (==)",
@@ -19511,6 +19857,26 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
             if not (_rc_day_is_off_duty(a) and _rc_day_is_off_duty(b)):
                 changes.append({'datum': k, 'kind': 'modified',
                                 'old': a, 'new': b})
+
+    # 4) DEGRADATIONS-GUARD (2026-07-28): verschwinden auf einen Schlag viele
+    #    Tage, ist das ein abgeschnittener/halb geladener Import und KEINE
+    #    Massen-Streichung von Diensten. Live gemessen: von 38 'removed' in
+    #    24 h entfielen 32 auf EINEN User in EINER Sekunde und 5 auf einen
+    #    zweiten — drei User insgesamt. Ein Push „Dienst entfernt (+31
+    #    weitere)" ist genau das, was Crews in Panik versetzt.
+    #    Lücke ≠ Fakt → die 'removed' fliegen komplett raus, 'added'/'modified'
+    #    desselben Diffs bleiben (die tragen echte neue Information).
+    removed = [c for c in changes if c.get('kind') == 'removed']
+    if removed and (len(removed) >= 10
+                    or (len(removed) >= 5
+                        and len(removed) >= 0.25 * max(1, len(old_by)))):
+        try:
+            app.logger.warning(
+                f'[roster-diff] degraded_import_suppressed removed='
+                f'{len(removed)} of old_days={len(old_by)}')
+        except Exception:
+            pass
+        changes = [c for c in changes if c.get('kind') != 'removed']
     return changes
 
 
@@ -19657,6 +20023,7 @@ def take_roster_snapshot(token):
         app.logger.warning(f'[crew-graph] snapshot_rebuild_fail {type(_cg_e).__name__}: {str(_cg_e)[:120]}')
     # Append diff to changes log (SB-first + Disk — deploy-persistent seit
     # 2026-07-27; vorher wischte jeder Deploy pending/history).
+    push_diff = []
     try:
         existing = _roster_changes_read(token) or {'pending': [], 'history': []}
         pending = existing.get('pending') or []
@@ -19665,30 +20032,39 @@ def take_roster_snapshot(token):
             ch['status'] = 'pending'
             pending.append(ch)
         existing['pending'] = pending
-        if not _roster_changes_save(token, existing):
-            raise IOError('roster_changes_persist_failed')
-    except Exception as e:
-        print(f'[take_roster_snapshot] error: {type(e).__name__}: {str(e)[:300]}')
-        return jsonify({'ok': False, 'error': 'internal_error'}), 500
-    if diff:
-        try:
-            # PUSH-GATES — die in-App-Liste behält ALLE Changes (oben schon
-            # persistiert), nur der Push wird gefiltert:
-            #   1) Vergangenheit (Tag < heute Homebase-lokal, inkl. Ist-Zeiten-
-            #      Nachtrag nach Dienstende): Tour vorbei → still.
-            #   2) WHITELIST (Florian 2026-07-26, ersetzt die alten Gates 2+3):
-            #      Push NUR bei PU-Zeit neu/geändert, erstem Abflug, Klasse,
-            #      Routing/Legs, Layover-Ort oder Tag neu/entfallen — reine
-            #      Blockzeiten-Pflege und reines PU-Löschen bleiben still.
+        # PUSH-GATES — die in-App-Liste behält ALLE Changes, nur der Push wird
+        # zusätzlich gefiltert:
+        #   1) Vergangenheit (Tag < heute Homebase-lokal, inkl. Ist-Zeiten-
+        #      Nachtrag nach Dienstende): Tour vorbei → still.
+        #   2) SUBSTANZ-GATE (`_roster_change_is_push_worthy` →
+        #      `_rc_meaningfully_modified`): Sektor/Dienst kommt-geht, Abflug-,
+        #      Melde- oder Pickup-Zeit ≥ 5 min. Alles andere still.
+        #   3) FLIP-FLOP-HYSTERESE: derselbe Tag, der binnen 24 h in einen
+        #      bereits gepushten Zustand zurückkippt, pusht kein zweites Mal.
+        #      Der Zustand lebt im selben `roster_changes`-Payload und ist
+        #      damit deploy-fest (SB-first + Disk-Write-Through).
+        if diff:
             _now_hhmm = None
             try:
                 _now_hhmm = (_airport_local_now(_hb).strftime('%H:%M')
                              if _hb else datetime.now().strftime('%H:%M'))
             except Exception:
                 _now_hhmm = datetime.now().strftime('%H:%M')
-            push_diff = [c for c in diff
-                         if not _roster_change_is_past(c, _today_ymd, _now_hhmm)
-                         and _roster_change_is_push_worthy(c)]
+            _cand = [c for c in diff
+                     if not _roster_change_is_past(c, _today_ymd, _now_hhmm)
+                     and _roster_change_is_push_worthy(c)]
+            _hyst = existing.get('push_state')
+            if not isinstance(_hyst, dict):
+                _hyst = {}
+            push_diff = _rc_hysteresis_filter(_hyst, _cand)
+            existing['push_state'] = _hyst
+        if not _roster_changes_save(token, existing):
+            raise IOError('roster_changes_persist_failed')
+    except Exception as e:
+        print(f'[take_roster_snapshot] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
+    if push_diff:
+        try:
             n = len(push_diff)
             # PUSH-INHALT: konkrete erste Änderung („Di 22.07.: LH440 FRA-IAH
             # neu" / „Mo 21.07.: Briefing 09:40 → 10:15") + „(+N weitere)".
@@ -19810,8 +20186,8 @@ def _rc_flight_norm(v):
 
 
 def _rc_sector_structure(day):
-    """Struktur-Fingerprint der Flüge OHNE Zeiten (Flugnummer + Stationen) —
-    fürs Blockzeiten-Drift-Gate: gleiche Legs, nur Zeiten gedriftet."""
+    """Struktur-Fingerprint der Flüge OHNE Zeiten (Flugnummer + Stationen):
+    „sind es dieselben Legs?" — Zeiten-Drift bleibt dadurch unsichtbar."""
     out = []
     for s in ((day or {}).get('ical_sectors') or []):
         if isinstance(s, dict):
@@ -19819,61 +20195,6 @@ def _rc_sector_structure(day):
                         str(s.get('from') or '').upper(),
                         str(s.get('to') or '').upper()))
     return out
-
-
-def _rc_first_dep_local_hhmm(day):
-    """Station-lokale Abflugzeit („HH:MM") des ERSTEN Flug-Sektors eines
-    Roster-Tags, '' wenn nicht auflösbar. Wirft nie."""
-    try:
-        for s in ((day or {}).get('ical_sectors') or []):
-            if isinstance(s, dict) and str(s.get('dep_iso') or '').strip():
-                return _rc_local_hhmm(s.get('dep_iso'), s.get('from'))
-    except Exception:
-        pass
-    return ''
-
-
-def _roster_change_is_blocktime_drift(change):
-    """BLOCKZEITEN-RAUSCHEN-GATE (Florian 2026-07-24: „Derzeit wird jede
-    Änderung von MyTime angezeigt … auch wenn die Blockzeiten aktualisiert
-    werden. Nur wenn sich die PU-Zeit oder die Abflugzeit vom ersten Flug des
-    Tages ändert, liegen definitiv Änderungen vor"): True für einen
-    'modified'-Change, bei dem NUR Zeiten im Tagesverlauf gedriftet sind
-    (LH-Blockzeiten-/Ist-Zeiten-Pflege, typisch end_time/Zwischen-Leg-Minuten),
-    während alles Entscheidungsrelevante unverändert blieb:
-      · gleiche Legs (Flugnummern + Stationen, Zeiten bewusst ausgenommen),
-      · gleiche klass/Route/Layover-Ort,
-      · gleiches Briefing (start_time),
-      · gleiche Pickup-Zeit,
-      · gleicher ERSTER Abflug (station-lokal; nur wenn beidseitig auflösbar).
-    Ändert sich irgendetwas davon → False (Push bleibt). Nur der Push wird
-    gefiltert — die in-App-Liste zeigt weiterhin ALLE Changes. Wirft nie."""
-    try:
-        if (change or {}).get('kind') != 'modified':
-            return False
-        a = change.get('old') if isinstance(change.get('old'), dict) else {}
-        b = change.get('new') if isinstance(change.get('new'), dict) else {}
-        sa, sb = _rc_sector_structure(a), _rc_sector_structure(b)
-        if not sa or sa != sb:
-            return False          # Legs geändert / keine Legs → kein Drift-Fall
-        if _rc_norm_cmp(a.get('klass')) != _rc_norm_cmp(b.get('klass')):
-            return False
-        arf = (a.get('reader_facts') or {})
-        brf = (b.get('reader_facts') or {})
-        for af, bf in ((a.get('routing'), b.get('routing')),
-                       (arf.get('layover_ort'), brf.get('layover_ort')),
-                       (arf.get('start_time'), brf.get('start_time'))):
-            if _rc_field_changed(af, bf):
-                return False      # Route/Layover/Briefing geändert → echt
-        if _rc_pickup_hhmm(a) != _rc_pickup_hhmm(b):
-            return False          # PU neu/geändert/weg → echt (Wegfall deckt
-                                  # separat das Pickup-Prune-Gate ab)
-        da, db = _rc_first_dep_local_hhmm(a), _rc_first_dep_local_hhmm(b)
-        if da and db and da != db:
-            return False          # erster Abflug geändert → definitiv echt
-        return True               # übrig: reine Blockzeiten-/Endzeit-Pflege
-    except Exception:
-        return False
 
 
 def _roster_change_is_past(change, today_ymd, now_hhmm=None):
@@ -19910,107 +20231,113 @@ def _roster_change_is_past(change, today_ymd, now_hhmm=None):
         return False
 
 
-def _roster_change_is_pickup_prune(change):
-    """PICKUP-RAUSCHEN-GATE (Flo Z 2026-07-20): LH räumt die Pickup-/PU-Zeit
-    nach der Tour aus MyTime ab — reine Hygiene, keine Dienständerung. True
-    wenn ein 'modified'-Change NUR das Verschwinden der Pickup-Zeit ist:
-    Pickup in old vorhanden, in new weg, Flüge (Legs) identisch und — nachdem
-    der Pickup-Effekt auf die Startzeit neutralisiert wurde (Start fiel von der
-    Pickup- auf die Briefing-Zeit zurück) — keine substanzielle Änderung übrig.
-    NEUE/GEÄNDERTE Pickup-Zeit (old leer/anders, new gefüllt) bleibt
-    push-würdig → hier immer False. Wirft nie."""
-    try:
-        if (change or {}).get('kind') != 'modified':
-            return False
-        a = change.get('old') if isinstance(change.get('old'), dict) else {}
-        b = change.get('new') if isinstance(change.get('new'), dict) else {}
-        pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
-        if not pa or pb:
-            return False          # kein Pickup weggefallen → Gate greift nicht
-        if _rc_sector_fingerprint(a) != _rc_sector_fingerprint(b):
-            return False          # Legs geändert → echte Änderung
-        arf = dict(a.get('reader_facts') or {})
-        if _rc_norm_cmp(arf.get('start_time')) == _rc_norm_cmp(pa):
-            # Startzeit WAR die Pickup-Zeit → ihr Wegfall erklärt den Shift.
-            brf = (b.get('reader_facts') or {})
-            arf['start_time'] = brf.get('start_time')
-        a_neutral = dict(a)
-        a_neutral['reader_facts'] = arf
-        return not _rc_meaningfully_modified(a_neutral, b)
-    except Exception:
-        return False
-
-
 def _roster_change_is_push_worthy(change):
-    """PUSH-WHITELIST (Florian 2026-07-26: „Derzeit wird jede Änderung von
-    MyTime angezeigt … Besser: nur wenn sich die PU-Zeit oder die Abflugzeit
-    vom ersten Flug des Tages ändert"). Ersetzt die alte BLACKLIST aus
-    `_roster_change_is_pickup_prune` + `_roster_change_is_blocktime_drift` im
-    Push-Pfad (die Funktionen bleiben für die in-App-Diff-Semantik erhalten,
-    werden im Push aber nicht mehr benutzt). Die Blacklist hatte zwei Löcher:
-      A) „PU gelöscht UND Ist-Zeiten nachgetragen im selben Update" (der
-         LH-Normalfall) passierte BEIDE Gates — das Prune-Gate stieg am
-         Zeiten-Fingerprint aus, das Drift-Gate am PU-Wegfall.
-      B) Tage OHNE ical_sectors (Standby/Ground) wurden nie unterdrückt —
-         dort pushte jede end_time-Minutenpflege.
-    Ein Push geht NUR raus, wenn mindestens eines zutrifft:
-      · Tag entsteht oder verschwindet (kind added/removed),
-      · Klasse (`klass`) ändert sich,
-      · Routing: Legs kommen/gehen bzw. Flugnummern/Stationen ändern sich
-        (`_rc_sector_structure`, bewusst OHNE Zeiten) oder das
-        `routing`-Freitextfeld ändert sich,
-      · Layover-Ort ändert sich,
-      · Pickup-Zeit NEU oder GEÄNDERT (reines PU-Löschen = LH-Hygiene → still),
-      · Abflugzeit des ersten Legs (station-lokal, nur wenn beidseitig
-        auflösbar),
-      · Loch-B-Analog: an Tagen OHNE Legs ist `start_time` die tragende Zeit
-        (Standby-Beginn/Meldezeit) — ihre Änderung pusht; end_time-Pflege
-        bleibt auch dort still.
-    Reine end_time-/Blockzeiten-/Zwischen-Leg-Zeiten-Pflege: KEIN Push. Die
-    in-App-Änderungsliste behält weiterhin ALLE Changes. Wirft nie — im
-    Fehlerfall True (lieber ein Push zu viel als eine echte Änderung still)."""
+    """PUSH-GATE — dünne Hülle über `_rc_meaningfully_modified`.
+
+    HISTORIE: Florians Whitelist (2026-07-26) ersetzte die Blacklist aus
+    `_roster_change_is_pickup_prune` + `_roster_change_is_blocktime_drift`,
+    führte dabei aber eine ZWEITE, leicht abweichende Kopie der Feldregeln —
+    drei Implementierungen derselben Frage, die sich gegenseitig widersprachen
+    (ein Change konnte im Verlauf landen, den der Push anders bewertete, und
+    umgekehrt). Seit 2026-07-28 (Owner-Fall 30.07.) gibt es nur noch EINE
+    Regel: `_rc_meaningfully_modified`. Die beiden alten Gate-Funktionen sind
+    ersatzlos entfallen, ihre Fälle sind dort aufgegangen:
+      · Blockzeiten-Drift (Florian) → `_rc_leg_departures_moved` sieht nur
+        Abflüge, `end_time`/Ankünfte sind gar keine Substanz mehr,
+      · Pickup-Abbau (Flo Z) → Pickup-PRÄSENZ-Flip ist beidseitig still,
+      · Loch A (PU gelöscht + Ist-Zeiten nachgetragen) → beides still,
+      · Loch B (Tage ohne Sektoren) → `_rc_report_moved` gilt uniform,
+      · P7-Fund E1 (Meldezeit-Shift ohne Pickup) → `_rc_report_moved` feuert.
+
+    Damit gilt: **was nicht in den Verlauf kommt, pusht auch nicht — und was
+    pusht, steht auch im Verlauf.** Zusätzlich pushen added/removed nur mit
+    BELEGTEM Dienst — ein Leer-Tag ohne Klasse/Sektoren/Marker ist eine
+    Quellen-Lücke. Wirft nie; bei unbekanntem `kind` fail-open (lieber ein
+    Push zu viel als eine echte Änderung still)."""
     try:
         kind = (change or {}).get('kind')
+        if kind in ('added', 'removed'):
+            day = (change.get('new') if kind == 'added' else change.get('old'))
+            return _rc_duty_state(day) == 'duty'
         if kind != 'modified':
-            return True           # added/removed (und Unbekanntes): immer Push
+            return True           # Unbekanntes: fail-open
         a = change.get('old') if isinstance(change.get('old'), dict) else {}
         b = change.get('new') if isinstance(change.get('new'), dict) else {}
-        if _rc_norm_cmp(a.get('klass')) != _rc_norm_cmp(b.get('klass')):
-            return True           # Klassenwechsel (Flug↔Standby↔Frei …)
-        sa, sb_ = _rc_sector_structure(a), _rc_sector_structure(b)
-        if sa and sb_ and sa != sb_:
-            return True           # Legs kommen/gehen bzw. andere Flüge
-            # (leer↔gefüllt = Sektoren-Anreicherung, keine echte Änderung —
-            # gleiche Semantik wie _rc_field_changed / Diff-Trigger)
-        arf = (a.get('reader_facts') or {})
-        brf = (b.get('reader_facts') or {})
-        if _rc_field_changed(a.get('routing'), b.get('routing')):
-            return True           # Routing-Freitext (auch sektorlose Feeds)
-        if _rc_field_changed(arf.get('layover_ort'), brf.get('layover_ort')):
-            return True           # anderer Layover-Ort
-        pa, pb = _rc_pickup_hhmm(a), _rc_pickup_hhmm(b)
-        if pb and pa != pb:
-            return True           # Pickup neu oder verschoben
-        da, db = _rc_first_dep_local_hhmm(a), _rc_first_dep_local_hhmm(b)
-        if da and db and da != db:
-            return True           # erster Abflug verschoben
-        if not sa and not sb_ and _rc_field_changed(arf.get('start_time'),
-                                                    brf.get('start_time')):
-            return True           # Standby-/Meldezeit-Shift ohne Legs
-        if sa and sb_ and not pa and not pb \
-                and _rc_field_changed(arf.get('start_time'),
-                                      brf.get('start_time')):
-            return True           # Meldezeit-Shift an Sektor-Tagen OHNE
-                                  # Pickup-Quelle (Homebase-Report: „Crew muss
-                                  # früher da sein" — Security/De-Icing/Sonder-
-                                  # Briefing; P7-Review-Fund E1). MIT Pickup
-                                  # bleibt die PU die tragende Zeit — und der
-                                  # PU-Abbau-Fall (start_time fällt auf die
-                                  # Briefing-Zeit zurück) bleibt still, weil
-                                  # dort pa gesetzt ist.
-        return False              # Rest = Blockzeiten-/PU-Abbau-Rauschen
+        return _rc_meaningfully_modified(a, b)
     except Exception:
         return True
+
+
+# Flip-Flop-Hysterese: wie lange ein bereits gesehener Tages-Zustand einen
+# erneuten Push auf denselben Tag unterdrückt, und wie viele Zustände je Tag
+# bzw. wie viele Tage insgesamt gemerkt werden (Payload-Deckel).
+_RC_HYST_TTL_SEC = 24 * 3600
+_RC_HYST_PER_DAY = 8
+_RC_HYST_MAX_DAYS = 240
+
+
+def _rc_hysteresis_filter(state, changes, now=None):
+    """FLIP-FLOP-DÄMPFUNG (Owner 2026-07-28: „wenn derselbe Tag innerhalb 24 h
+    mehrfach zwischen zwei Zuständen pendelt, höchstens EIN Push").
+
+    `state` ist das (mutierte) `push_state`-Dict aus dem `roster_changes`-
+    Payload: `{datum: [[state_sig, iso_ts], …]}`. Für jeden Kandidaten wird die
+    Signatur des ZIELZUSTANDS (`_rc_state_sig` von `new`, bei 'removed' die
+    Leer-Signatur) gegen die letzten 24 h desselben Tages geprüft:
+
+      · Signatur NEU  → Push erlaubt, Signatur wird vermerkt.
+      · Signatur SCHON GESEHEN → der Tag ist in einen Zustand zurückgekippt,
+        über den bereits gepusht wurde → STILL. Der Verlauf-Eintrag bleibt.
+
+    Damit kostet ein A→B→A→B-Pendeln genau EINEN Push (für A→B), während eine
+    echte Folge-Änderung (neuer Zustand C) sofort wieder pusht — die Dämpfung
+    verschluckt also nie eine unbekannte Änderung.
+
+    BEWEIS-LAGE: fleet-weit oszillierten 51 von 52 mehrfach belegten
+    Tag-Zellen (13 User) innerhalb von 24 h nachweislich A→B→A, teils mit zwei
+    gegenläufigen Einträgen in DERSELBEN Sekunde — die Signatur zweier
+    konkurrierender Snapshot-Schreiber (iOS ruft `takeRosterSnapshot` aus drei
+    Pfaden: NowView 7647/10731, Stores 922).
+
+    Gibt die erlaubten Changes zurück. Wirft nie — im Fehlerfall die
+    Eingabeliste unverändert (fail-open, lieber ein Push zu viel)."""
+    try:
+        if not isinstance(state, dict) or not changes:
+            return list(changes or [])
+        now = now or datetime.now()
+        cutoff = now.timestamp() - _RC_HYST_TTL_SEC
+        allowed = []
+        for ch in changes:
+            datum = str((ch or {}).get('datum') or '')[:10]
+            sig = ('∅' if ch.get('kind') == 'removed'
+                   else _rc_state_sig(ch.get('new')))
+            if not datum or not sig:
+                allowed.append(ch)            # nicht bewertbar → durchlassen
+                continue
+            seen = [e for e in (state.get(datum) or [])
+                    if isinstance(e, (list, tuple)) and len(e) == 2]
+            fresh = []
+            for s, ts in seen:
+                try:
+                    if datetime.fromisoformat(str(ts)).timestamp() >= cutoff:
+                        fresh.append([s, ts])
+                except Exception:
+                    continue
+            if any(s == sig for s, _ts in fresh):
+                app.logger.info(f'[roster-hyst] flip-flop suppressed '
+                                f'datum={datum} sig={sig[:8]}')
+                state[datum] = fresh[-_RC_HYST_PER_DAY:]
+                continue                      # Rückkipper → still
+            fresh.append([sig, now.isoformat()])
+            state[datum] = fresh[-_RC_HYST_PER_DAY:]
+            allowed.append(ch)
+        # Payload-Deckel: älteste Tage zuerst raus (ISO-Datum sortiert korrekt).
+        if len(state) > _RC_HYST_MAX_DAYS:
+            for k in sorted(state.keys())[:len(state) - _RC_HYST_MAX_DAYS]:
+                state.pop(k, None)
+        return allowed
+    except Exception:
+        return list(changes or [])
 
 
 _RC_WEEKDAYS_DE = ('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So')

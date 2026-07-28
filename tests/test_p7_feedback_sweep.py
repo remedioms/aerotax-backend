@@ -185,13 +185,23 @@ def test_whitelist_reines_pu_loeschen_kein_push():
     assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
-def test_whitelist_pu_neu_oder_geaendert_pusht():
+def test_whitelist_pu_geaendert_pusht_praesenz_flip_nicht():
+    # POLICY-NACHZUG 2026-07-28 (Owner-Fall 30.07.2026, AT-AA10DE7B8DBD45E7):
+    # Der Push kam, weil der Marker „12:40 LT Pickup SFO" AUFTAUCHTE — bei
+    # byte-identischem Leg LH455 SFO-FRA (dep 21:40Z). Das PRÄSENZ-Flippen der
+    # PU ist die Signatur des Flip-Flops (fleet-weit oszillierten 51 von 52
+    # mehrfach belegten Tag-Zellen A→B→A) und darf nicht mehr pushen.
     ohne = _flug_tag(pickup='')
     mit = _flug_tag(pickup='06:40')
-    assert A._roster_change_is_push_worthy(_mod(ohne, mit)) is True
+    assert A._roster_change_is_push_worthy(_mod(ohne, mit)) is False
+    assert A._roster_change_is_push_worthy(_mod(mit, ohne)) is False
+    # Eine echte PU-VERSCHIEBUNG (beidseitig gefüllt, ≥ 5 min) pusht weiterhin.
     frueher = _flug_tag(pickup='07:10')
     spaeter = _flug_tag(pickup='07:40')
     assert A._roster_change_is_push_worthy(_mod(frueher, spaeter)) is True
+    # Minuten-Korrektur darunter nicht.
+    assert A._roster_change_is_push_worthy(
+        _mod(frueher, _flug_tag(pickup='07:13'))) is False
 
 
 def test_whitelist_erster_abflug_pusht_blockzeiten_nicht():
@@ -206,8 +216,15 @@ def test_whitelist_erster_abflug_pusht_blockzeiten_nicht():
 
 def test_whitelist_klasse_routing_layover_pushen():
     old = _flug_tag()
+    # POLICY-NACHZUG 2026-07-28: ein klass-Wechsel bei UNVERÄNDERTEN Sektoren
+    # ist kein Dienstwechsel mehr (live 107/219 'modified' kamen nur von klass,
+    # 101 davon bei byte-identischen Legs). Erst wenn der Flug-Beleg wirklich
+    # verschwindet, ist „Flug wird Standby" eine Änderung.
     klasse = dict(_flug_tag(), klass='Standby')
-    assert A._roster_change_is_push_worthy(_mod(old, klasse)) is True
+    assert A._roster_change_is_push_worthy(_mod(old, klasse)) is False
+    echter_standby = {'datum': '2026-08-02', 'klass': 'Standby', 'routing': '',
+                      'reader_facts': {'start_time': '07:10', 'end_time': '18:30'}}
+    assert A._roster_change_is_push_worthy(_mod(old, echter_standby)) is True
     routing = dict(_flug_tag(), routing='FRA-JFK')
     assert A._roster_change_is_push_worthy(_mod(old, routing)) is True
     neuer_leg = _flug_tag()
@@ -281,15 +298,18 @@ def _future_flug_tag(days_ahead=3, **kw):
     return day
 
 
-def test_endpoint_loch_a_kein_push_aber_gelistet(tmp_path):
+def test_endpoint_loch_a_weder_verlauf_noch_push(tmp_path):
+    # Seit 2026-07-28 (Owner: „Verlauf zeigt immer wieder Änderungen") wird
+    # Rauschen auch nicht mehr in den Verlauf geschrieben — Push-Gate und
+    # Verlauf-Gate sind dieselbe Regel.
     old = _future_flug_tag()
     new = _future_flug_tag(pickup='', end='18:47')
     new['ical_sectors'][0]['arr_iso'] = new['ical_sectors'][0]['arr_iso'].replace('18:30', '18:47')
     r, push, changes_file = _post(tmp_path, old=[old], new=[new])
     assert r.status_code == 200
-    assert r.get_json()['changes_count'] == 1     # in-App-Liste behält alles
-    assert len(json.loads(changes_file.read_text())['pending']) == 1
-    assert push.call_count == 0                   # aber KEIN Push
+    assert r.get_json()['changes_count'] == 0
+    assert json.loads(changes_file.read_text())['pending'] == []
+    assert push.call_count == 0
 
 
 def test_endpoint_erster_abflug_pusht(tmp_path):

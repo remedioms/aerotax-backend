@@ -21,12 +21,61 @@ def test_real_value_change_is_modified():
     d = A._compute_roster_diff(old, new, today=TODAY)
     assert len(d) == 1 and d[0]['kind'] == 'modified'
 
-def test_klass_change_counts_even_empty_to_filled():
-    # Tour wird Frei o.ae. — klass exakt verglichen.
+def test_klass_leer_zu_gefuellt_ist_keine_aenderung():
+    # POLICY-WECHSEL 2026-07-28 (Owner: „Kalender-Push obwohl nichts neues").
+    # Vorher wurde `klass` EXAKT verglichen — auch leer↔gefuellt. Fleet-Messung
+    # ueber 24h auf roster_changes: 107 von 219 'modified' kamen AUSSCHLIESSLICH
+    # von klass, 101 davon bei byte-identischen Legs/Routing/Meldezeit. Treiber
+    # waren Anreicherung (leer->Urlaub/RES/FREI/STBY, 52x), Degradation
+    # (RES/Urlaub/STBY/OFFICE->leer, 27x) und die Reserve!=Standby-Neumintung
+    # (STBY->RES, 27x) — genau EINE echte Dienstaenderung (FREI->Flug).
+    # Ein Tag OHNE jeden Beleg ist 'unknown' — Luecke != Fakt.
     old = [_day('2026-07-18', klass=None)]
     new = [_day('2026-07-18', klass='FREI')]
-    d = A._compute_roster_diff(old, new, today=TODAY)
-    assert len(d) == 1 and d[0]['kind'] == 'modified'
+    assert A._compute_roster_diff(old, new, today=TODAY) == []
+    # Umgekehrt genauso (Klasse verschwindet = degradierte Quelle).
+    assert A._compute_roster_diff(new, old, today=TODAY) == []
+
+
+def test_gleichwertige_dienstklassen_kippen_still():
+    # STBY -> RES bei sonst identischem Tag: kein Dienstzustands-Wechsel.
+    old = [_day('2026-07-18', klass='STBY', start='08:00', end='16:00')]
+    new = [_day('2026-07-18', klass='RES', start='08:00', end='16:00')]
+    assert A._compute_roster_diff(old, new, today=TODAY) == []
+
+
+def test_dienst_kommt_und_geht_wird_weiter_gemeldet():
+    # Frei -> Dienst und Dienst -> Frei bleiben echte Aenderungen.
+    frei = [_off('2026-07-18')]
+    dienst = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')]
+    assert len(A._compute_roster_diff(frei, dienst, today=TODAY)) == 1
+    assert len(A._compute_roster_diff(dienst, frei, today=TODAY)) == 1
+    # Flug wird Standby: der Flug-Beleg verschwindet in einen POSITIV
+    # dokumentierten Tag -> echte Aenderung.
+    standby = [_day('2026-07-18', klass='STBY', start='08:00')]
+    assert len(A._compute_roster_diff(dienst, standby, today=TODAY)) == 1
+    # Verschwindet der Flug-Beleg dagegen ins Nichts (kein klass, kein Marker),
+    # ist das ein degradierter Import und KEINE Aenderung.
+    leer = [_day('2026-07-18')]
+    assert A._compute_roster_diff(dienst, leer, today=TODAY) == []
+
+
+def test_leerer_tag_taucht_auf_oder_verschwindet_still():
+    # Live-Signatur des Flip-Flops: voellig belegfreie Tage oszillierten 4x/24h
+    # zwischen 'added' und 'removed'.
+    old = [_day('2026-07-16', klass='Z72')]
+    leer = old + [{'datum': '2026-07-18', 'reader_facts': {}}]
+    assert A._compute_roster_diff(old, leer, today=TODAY) == []
+    assert A._compute_roster_diff(leer, old, today=TODAY) == []
+
+
+def test_zeit_toleranz_fuenf_minuten():
+    # Unter 5 min = LH-Zeitenpflege, ab 5 min = echte Verschiebung.
+    base = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')]
+    drift = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:03')]
+    echt = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:35')]
+    assert A._compute_roster_diff(base, drift, today=TODAY) == []
+    assert len(A._compute_roster_diff(base, echt, today=TODAY)) == 1
 
 def test_far_future_added_is_suppressed():
     # Neuer Monat veroeffentlicht: Tag 40 Tage entfernt = KEIN 'added'-Eintrag.

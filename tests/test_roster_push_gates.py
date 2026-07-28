@@ -5,13 +5,13 @@ FO, 2026-07-20):
       erste konkrete Änderung („Mi 22.07: LH440 FRA-IAH neu" / „Di 21.07:
       Briefing 09:40 → 10:15") + „(+N weitere)". Formatter:
       _roster_changes_push_body / _roster_change_push_line. Max ~120 Zeichen.
-  (b) „Push kommt auch, wenn die Tour vorbei ist" → zwei Push-Gates in
-      take_roster_snapshot (die in-App-Liste /api/user/roster-changes zeigt die
-      Changes weiterhin):
+  (b) „Push kommt auch, wenn die Tour vorbei ist" → Push-Gates in
+      take_roster_snapshot:
         • _roster_change_is_past: Tage VOR heute (Homebase-lokal) pushen nicht.
-        • _roster_change_is_pickup_prune: NUR-Pickup-Abbau (LH räumt die
-          PU-Zeit nach der Tour aus MyTime) pushed nicht; neue/geänderte
-          Pickup-Zeit bleibt push-würdig.
+        • _roster_change_is_push_worthy → _rc_meaningfully_modified: das EINE
+          Substanz-Gate (2026-07-28). Die früheren Einzelfunktionen
+          _roster_change_is_pickup_prune und _roster_change_is_blocktime_drift
+          sind darin aufgegangen und ersatzlos entfallen.
 
 KEIN echtes APNs/SB: _push_notify_async & Co. werden gemockt (Muster
 test_duty_change_push.py).
@@ -134,7 +134,11 @@ def test_past_gate_defensive_on_missing_data():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Gate 2: Pickup-Abbau (_roster_change_is_pickup_prune)
+# Gate 2: Pickup-Rauschen — jetzt Teil des EINEN Substanz-Gates
+# (_roster_change_is_push_worthy → _rc_meaningfully_modified). Die früheren
+# Einzelfunktionen _roster_change_is_pickup_prune / _..._is_blocktime_drift
+# sind 2026-07-28 ersatzlos entfallen: drei Implementierungen derselben Frage
+# widersprachen sich (Owner-Fall 30.07.).
 # ══════════════════════════════════════════════════════════════════════════════
 def _day_with_pickup(pickup_marker='Pickup 1330', start='13:30',
                      dep='2026-07-22T12:00:00Z'):
@@ -145,48 +149,62 @@ def _day_with_pickup(pickup_marker='Pickup 1330', start='13:30',
                              'layover_ort': 'IAH'}}
 
 
-def test_pickup_prune_only_is_not_pushworthy():
+def _mod(old, new):
+    return {'kind': 'modified', 'datum': '2026-07-22', 'old': old, 'new': new}
+
+
+def test_pickup_abbau_ist_kein_push():
     # LH räumt die PU-Zeit ab: Marker verliert 'Pickup 1330', Start fällt von
     # der Pickup- (13:30) auf die Briefing-Zeit (14:30) zurück — sonst nichts.
     old = _day_with_pickup()
     new = _day_with_pickup(pickup_marker='', start='14:30')
-    assert A._roster_change_is_pickup_prune(
-        {'kind': 'modified', 'old': old, 'new': new}) is True
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
-def test_pickup_prune_with_flight_change_is_pushworthy():
+def test_pickup_abbau_mit_abflug_shift_pusht():
     old = _day_with_pickup()
     new = _day_with_pickup(pickup_marker='', start='14:30',
                            dep='2026-07-22T13:00:00Z')     # Leg verschoben
-    assert A._roster_change_is_pickup_prune(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is True
 
 
-def test_pickup_prune_with_other_time_change_is_pushworthy():
+def test_pickup_abbau_mit_endzeit_pflege_bleibt_still():
+    # `end_time` ist seit 2026-07-28 gar keine Substanz mehr (LH pflegt sie
+    # nach jeder Landung) — zusammen mit dem PU-Abbau also weiterhin still.
     old = _day_with_pickup()
     new = _day_with_pickup(pickup_marker='', start='14:30')
-    new['reader_facts']['end_time'] = '20:15'              # Dienstende geändert
-    assert A._roster_change_is_pickup_prune(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
+    new['reader_facts']['end_time'] = '20:15'
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
+    # Ein anderer Layover-Ort dagegen ist echte Substanz.
+    lay = _day_with_pickup(pickup_marker='', start='14:30')
+    lay['reader_facts'] = dict(lay['reader_facts'], layover_ort='BOS')
+    assert A._roster_change_is_push_worthy(_mod(old, lay)) is True
 
 
-def test_new_or_changed_pickup_stays_pushworthy():
-    # Pickup NEU (kommender Tag): old ohne, new mit → Gate greift NICHT.
-    old = _day_with_pickup(pickup_marker='', start='14:30')
-    new = _day_with_pickup()
-    assert A._roster_change_is_pickup_prune(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
-    # Pickup GEÄNDERT: 13:30 → 14:00 → Gate greift NICHT.
-    assert A._roster_change_is_pickup_prune(
-        {'kind': 'modified', 'old': _day_with_pickup(),
-         'new': _day_with_pickup(pickup_marker='Pickup 1400',
-                                 start='14:00')}) is False
+def test_pickup_praesenz_flip_ist_still_zeitshift_pusht():
+    # OWNER-REGEL 2026-07-28: das Auftauchen/Verschwinden der PU-Zeit ohne
+    # Zeitänderung am Dienst ist STILL (Flip-Flop-Signatur), eine echte
+    # PU-Verschiebung ≥ 5 min pusht weiterhin.
+    ohne = _day_with_pickup(pickup_marker='', start='14:30')
+    mit = _day_with_pickup()
+    assert A._roster_change_is_push_worthy(_mod(ohne, mit)) is False
+    assert A._roster_change_is_push_worthy(_mod(mit, ohne)) is False
+    assert A._roster_change_is_push_worthy(
+        _mod(_day_with_pickup(),
+             _day_with_pickup(pickup_marker='Pickup 1400',
+                              start='14:00'))) is True
+    # … aber eine 3-Minuten-PU-Korrektur nicht (Toleranz _RC_TIME_TOL_MIN).
+    assert A._roster_change_is_push_worthy(
+        _mod(_day_with_pickup(),
+             _day_with_pickup(pickup_marker='Pickup 1333',
+                              start='13:33'))) is False
 
 
-def test_pickup_prune_defensive():
-    assert A._roster_change_is_pickup_prune({'kind': 'added', 'new': {}}) is False
-    assert A._roster_change_is_pickup_prune({}) is False
-    assert A._roster_change_is_pickup_prune(None) is False
+def test_push_worthy_defensive():
+    assert A._roster_change_is_push_worthy({}) is True       # fail-open
+    assert A._roster_change_is_push_worthy(None) is True
+    assert A._roster_change_is_push_worthy(
+        {'kind': 'added', 'datum': '2026-07-22', 'new': {}}) is False
 
 
 def test_rc_pickup_hhmm_sources():
@@ -198,7 +216,7 @@ def test_rc_pickup_hhmm_sources():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Gate 3: Blockzeiten-Drift (_roster_change_is_blocktime_drift, Florian 2026-07-24)
+# Gate 3: Blockzeiten-Drift (Florian 2026-07-24) — als Regel im Substanz-Gate
 # ══════════════════════════════════════════════════════════════════════════════
 def test_blocktime_drift_end_time_only_not_pushworthy():
     # LH pflegt Blockzeiten: Legs/PU/Briefing/erster Abflug identisch, nur das
@@ -206,70 +224,73 @@ def test_blocktime_drift_end_time_only_not_pushworthy():
     old = _day_with_pickup()
     new = _day_with_pickup()
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:12')
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new}) is True
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
 def test_blocktime_drift_arrival_iso_drift_not_pushworthy():
-    # Nur die Ankunfts-ISO des Legs driftet (Struktur + erster Abflug gleich).
+    # Nur die Ankunfts-ISO des Legs driftet (Struktur + Abflug gleich).
     old = _day_with_pickup()
     new = _day_with_pickup()
     new['ical_sectors'] = [_sector(dep='2026-07-22T12:00:00Z',
                                    arr='2026-07-22T18:47:00Z')]
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:17')
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new}) is True
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
 def test_blocktime_drift_first_departure_change_is_pushworthy():
-    # Der ERSTE Abflug verschiebt sich (station-lokal 14:00 → 14:30) →
-    # definitiv echte Änderung, Gate greift NICHT.
+    # Der Abflug verschiebt sich um 30 min → definitiv echte Änderung.
     old = _day_with_pickup()
     new = _day_with_pickup(dep='2026-07-22T12:30:00Z')
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:30')
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is True
+
+
+def test_departure_drift_unter_toleranz_bleibt_still():
+    # 3 Minuten Abflug-Korrektur = Zeitenpflege, kein Push (Owner-Regel:
+    # erst ab 5 min). Vorher feuerte JEDE Minute.
+    old = _day_with_pickup()
+    new = _day_with_pickup(dep='2026-07-22T12:03:00Z')
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
 def test_blocktime_drift_pickup_change_is_pushworthy():
     old = _day_with_pickup()
-    new = _day_with_pickup(pickup_marker='Pickup 1400')
+    new = _day_with_pickup(pickup_marker='Pickup 1400', start='14:00')
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:12')
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is True
 
 
-def test_blocktime_drift_briefing_or_route_change_is_pushworthy():
+def test_blocktime_drift_route_change_is_pushworthy():
     old = _day_with_pickup()
-    new = _day_with_pickup(start='14:00')                  # Briefing geändert
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
     new2 = _day_with_pickup()
     new2['routing'] = 'FRA-MIA'                            # Route geändert
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new2}) is False
+    assert A._roster_change_is_push_worthy(_mod(old, new2)) is True
+
+
+def test_briefing_drift_bei_stehender_pickup_bleibt_still():
+    # P7-Entscheid bewahrt: steht die PU-Zeit, ist SIE die tragende Zeit —
+    # eine Briefing-Minutenpflege darunter ist kein Push.
+    old = _day_with_pickup()
+    new = _day_with_pickup(start='14:00')
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
 def test_blocktime_drift_leg_structure_change_is_pushworthy():
     old = _day_with_pickup()
     new = _day_with_pickup()
     new['ical_sectors'] = [_sector(flight='LH 441')]       # andere Flugnummer
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is True
 
 
-def test_blocktime_drift_requires_sectors_and_modified():
-    # Ohne Legs (Standby/Boden) ist ein Zeit-Shift NICHT als Blockzeiten-Pflege
-    # erkennbar → nie unterdrücken. added/removed nie.
-    old = {'datum': '2026-07-22', 'klass': 'Flug', 'routing': 'FRA-JFK',
+def test_endzeit_pflege_ohne_legs_bleibt_still():
+    # Loch B: auch OHNE Legs (Standby/Boden) ist reine end_time-Pflege still.
+    old = {'datum': '2026-07-22', 'klass': 'Standby',
            'reader_facts': {'start_time': '09:00', 'end_time': '17:00'}}
     new = dict(old, reader_facts={'start_time': '09:00', 'end_time': '18:00'})
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'modified', 'old': old, 'new': new}) is False
-    assert A._roster_change_is_blocktime_drift(
-        {'kind': 'added', 'new': _day_with_pickup()}) is False
-    assert A._roster_change_is_blocktime_drift({}) is False
-    assert A._roster_change_is_blocktime_drift(None) is False
+    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
+    # Der Standby-BEGINN dagegen pusht.
+    shift = dict(old, reader_facts={'start_time': '11:00', 'end_time': '18:00'})
+    assert A._roster_change_is_push_worthy(_mod(old, shift)) is True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -320,27 +341,29 @@ def test_past_change_recorded_but_not_pushed(tmp_path):
     assert push.call_count == 0                   # aber KEIN Push
 
 
-def test_pickup_prune_recorded_but_not_pushed(tmp_path):
+def test_pickup_flip_weder_verlauf_noch_push(tmp_path):
+    # OWNER-REGEL 2026-07-28: Rauschen darf jetzt auch NICHT MEHR in den
+    # Verlauf („Dienstplan → Verlauf zeigt immer wieder Änderungen").
     d = (date.today() + timedelta(days=1)).isoformat()
     old = dict(_day_with_pickup(), datum=d)
     new = dict(_day_with_pickup(pickup_marker='', start='14:30'), datum=d)
     r, push, changes_file = _post(tmp_path, old=[old], new=[new])
     assert r.status_code == 200
-    assert r.get_json()['changes_count'] == 1
-    assert len(json.loads(changes_file.read_text())['pending']) == 1
+    assert r.get_json()['changes_count'] == 0
+    assert json.loads(changes_file.read_text())['pending'] == []
     assert push.call_count == 0
 
 
-def test_blocktime_drift_recorded_but_not_pushed(tmp_path):
+def test_blocktime_drift_weder_verlauf_noch_push(tmp_path):
     d = (date.today() + timedelta(days=2)).isoformat()
     old = dict(_day_with_pickup(), datum=d)
     new = dict(_day_with_pickup(), datum=d)
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:20')
     r, push, changes_file = _post(tmp_path, old=[old], new=[new])
     assert r.status_code == 200
-    assert r.get_json()['changes_count'] == 1     # in-App-Liste behält den Change
-    assert len(json.loads(changes_file.read_text())['pending']) == 1
-    assert push.call_count == 0                   # aber KEIN Push
+    assert r.get_json()['changes_count'] == 0
+    assert json.loads(changes_file.read_text())['pending'] == []
+    assert push.call_count == 0
 
 
 def test_mixed_past_and_future_pushes_only_future(tmp_path):
