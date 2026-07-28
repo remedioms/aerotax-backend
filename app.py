@@ -12526,6 +12526,199 @@ def _pin_not_expired(row):
     return True
 
 
+# ── Hangout-Zielgruppe („Für wen ist das?", Owner 2026-07-28) ───────────────
+# Owner-Wunsch: „Was mich abhält, einen Hangout zu posten, ist dass ich nicht
+# wählen kann, FÜR WEN er ist." v1 filtert ausschliesslich über Profil-Fakten,
+# die es HEUTE schon gibt: airline, homebase, position (→ Cockpit/Kabine).
+# Alter, Geschlecht und Sprache sind BEWUSST NICHT dabei — die stehen in keinem
+# Profil, und für diese Runde wird keine neue sensible Datenerhebung erfunden
+# (Doku: docs/… bzw. Report; Erweiterung = Profilfeld + Einwilligung + eigener
+# Filter-Key hier; das `audience`-Dict ist absichtlich offen für neue Keys).
+#
+# PRIVACY-MODELL: gefiltert wird SERVERSEITIG. Ein Hangout, dessen Zielgruppe
+# ein Viewer nicht trifft, wird gar nicht erst ausgeliefert (nicht clientseitig
+# versteckt). FAIL-CLOSED: fehlt dem VIEWER der Fakt, auf den gefiltert wird
+# (kein airline/homebase/position im Profil), gilt er als NICHT passend und
+# sieht den eingeschränkten Hangout nicht. Lieber ein Hangout zu wenig als
+# einer an die falsche Gruppe. Der Ersteller sieht seinen Hangout IMMER.
+_HANGOUT_AUDIENCE_ROLES = ('cockpit', 'cabin')
+
+# Positions-Klassifikation — Spiegel von CodeTranslations.isCockpitPosition
+# (iOS, AeroTax/Models/CodeTranslations.swift). P1/P2 sind KABINE, SF ist
+# Senior First Officer (LH sagt nicht „SFO").
+_HANGOUT_COCKPIT_CODES = frozenset({
+    'CP', 'CPT', 'FO', 'FC', 'SF', 'SFO', 'RC', 'RP', 'SO', 'COC',
+    'CAPT', 'COM', 'SC', 'PIC', 'CDR', 'FE',
+})
+_HANGOUT_COCKPIT_PROSA = (
+    'CAPT', 'KAPT', 'KAPITAN', 'KAPITAEN',
+    'FIRST OFFICER', '1ST OFFICER', 'ERSTER OFFIZIER',
+    'SECOND OFFICER', '2ND OFFICER', 'F/O',
+    'COMMANDER', 'PILOT', 'COCKPIT',
+    'FLIGHT ENGINEER', 'FLUGINGENIEUR',
+)
+_HANGOUT_CABIN_CODES = frozenset({
+    'FA', 'FB', 'FBM', 'CC', 'CA', 'PU', 'PUR', 'SEN', 'P1', 'P2', 'SP',
+})
+_HANGOUT_CABIN_PROSA = (
+    'FLUGBEGLEIT', 'PURSER', 'CABIN', 'KABINE', 'STEWARD',
+    'FLIGHT ATTENDANT',
+)
+
+
+def _hangout_fold(raw):
+    """UPPER + Diakritika gefaltet (wie die iOS-Seite). '' bei leer."""
+    s = (raw or '').strip()
+    if not s:
+        return ''
+    try:
+        import unicodedata as _ud
+        s = ''.join(c for c in _ud.normalize('NFKD', s)
+                    if not _ud.combining(c))
+    except Exception:
+        pass
+    return s.upper()
+
+
+def _hangout_role_of_position(raw):
+    """'cockpit' | 'cabin' | None. None = unbekannt — NICHT „Kabine".
+
+    Bewusste Asymmetrie (gleiche wie iOS): eine leere/unverständliche Position
+    behauptet nichts. Der Matcher behandelt None fail-closed.
+    """
+    s = _hangout_fold(raw)
+    if not s:
+        return None
+    tokens = set(re.split(r'[^A-Z0-9]+', s)) - {''}
+    if tokens & _HANGOUT_COCKPIT_CODES:
+        return 'cockpit'
+    if any(m in s for m in _HANGOUT_COCKPIT_PROSA):
+        return 'cockpit'
+    if tokens & _HANGOUT_CABIN_CODES:
+        return 'cabin'
+    if any(m in s for m in _HANGOUT_CABIN_PROSA):
+        return 'cabin'
+    return None
+
+
+def _hangout_audience_normalize(raw, owner_profile):
+    """Client-Wunsch → gespeicherte Zielgruppe. None = offen für alle.
+
+    Erwartet {airline: 'same'|'any', base: 'same'|'any', roles: [...],
+    note: str}. „same" wird beim ERSTELLEN gegen das Ersteller-Profil
+    aufgelöst und als konkreter Wert eingefroren (Snapshot) — wechselt der
+    Ersteller später den Arbeitgeber, bleibt „Nur Lufthansa" Lufthansa.
+    Hat der Ersteller den Fakt selbst nicht, fällt die Einschränkung weg
+    (wir können nicht auf etwas filtern, das wir nicht kennen).
+
+    `note` („Wer passt dazu": „sportlich, Lust auf Kanu") ist FREITEXT und
+    filtert NICHT — sie wird nur angezeigt.
+    """
+    if not isinstance(raw, dict):
+        return None
+    prof = owner_profile or {}
+    out = {'v': 1}
+    if str(raw.get('airline') or '').strip().lower() == 'same':
+        key = _canonical_airline_key(prof.get('airline'))
+        if key:
+            out['airline'] = key
+            out['airline_label'] = (prof.get('airline') or '').strip() or key
+    if str(raw.get('base') or '').strip().lower() == 'same':
+        base = (prof.get('homebase') or '').strip().upper()
+        if base:
+            out['base'] = base
+    roles_in = raw.get('roles')
+    if isinstance(roles_in, (list, tuple)):
+        roles = [r for r in _HANGOUT_AUDIENCE_ROLES
+                 if str(r) in {str(x).strip().lower() for x in roles_in}]
+        # Beide Rollen = keine Einschränkung → gar nicht erst speichern.
+        if roles and len(roles) < len(_HANGOUT_AUDIENCE_ROLES):
+            out['roles'] = roles
+    note = (raw.get('note') or '')
+    if isinstance(note, str):
+        note = note.strip()[:120]
+        if note:
+            out['note'] = note
+    return out if len(out) > 1 else None
+
+
+def _hangout_audience_of_row(row):
+    """Zielgruppe aus einer manual_pins-Row — tolerant. None = offen.
+
+    Die Spalte kann fehlen (Migration nicht appliedet), jsonb-Dict oder
+    JSON-Text sein. Alles andere wird ignoriert statt zu werfen.
+    """
+    raw = (row or {}).get('audience')
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _hangout_audience_is_restricted(aud):
+    """True wenn die Zielgruppe wirklich einschränkt (Freitext zählt nicht)."""
+    if not isinstance(aud, dict):
+        return False
+    return bool(aud.get('airline') or aud.get('base') or aud.get('roles'))
+
+
+def _hangout_audience_matches(aud, viewer_profile):
+    """Darf dieser Viewer den Hangout sehen? FAIL-CLOSED bei fehlendem Fakt.
+
+    Kein/leerer Filter (auch: Alt-Hangouts ohne `audience`) → True.
+    """
+    if not _hangout_audience_is_restricted(aud):
+        return True
+    prof = viewer_profile or {}
+    want_airline = aud.get('airline')
+    if want_airline:
+        have = _canonical_airline_key(prof.get('airline'))
+        if not have or have != want_airline:
+            return False
+    want_base = aud.get('base')
+    if want_base:
+        have = (prof.get('homebase') or '').strip().upper()
+        if not have or have != str(want_base).strip().upper():
+            return False
+    want_roles = aud.get('roles') or []
+    if want_roles:
+        role = _hangout_role_of_position(prof.get('position'))
+        if not role or role not in want_roles:
+            return False
+    return True
+
+
+def _hangout_audience_column_missing(err):
+    """True wenn der Insert nur an der fehlenden `audience`-Spalte scheiterte
+    (PostgREST PGRST204). Migrations werden hier manuell appliedet — dieser
+    Fall muss unterscheidbar bleiben von einem echten Insert-Fehler."""
+    msg = str(err or '')
+    return 'PGRST204' in msg or (
+        'audience' in msg and ('column' in msg.lower()
+                               or 'schema cache' in msg.lower()))
+
+
+def _hangout_audience_label(aud):
+    """Eine ruhige Zeile für die Karte: „Nur Lufthansa · Base FRA · Cockpit".
+    None wenn der Hangout offen ist (dann zeigt die Karte gar nichts)."""
+    if not _hangout_audience_is_restricted(aud):
+        return None
+    parts = []
+    if aud.get('airline'):
+        parts.append('Nur ' + (aud.get('airline_label')
+                               or str(aud['airline']).title()))
+    if aud.get('base'):
+        parts.append('Base ' + str(aud['base']).upper())
+    roles = aud.get('roles') or []
+    if 'cockpit' in roles:
+        parts.append('Cockpit')
+    if 'cabin' in roles:
+        parts.append('Kabine')
+    return ' · '.join(parts) or None
+
+
 def _manual_pins_load(token):
     """Eigene Pins (zur Verwaltung). Liste von Row-Dicts."""
     if not token or not SB_AVAILABLE:
@@ -12663,6 +12856,8 @@ def get_crew_at_destination(token):
     my_layovers = _user_future_layovers(token)
     friends = _friends_load(token).get('friends') or []
     friend_set = set(friends)
+    # Eigenes Profil für den Zielgruppen-Filter der Hangout-Pins (Modus B).
+    viewer_prof = (_profile_load(token) or {}).get('profile') or {}
 
     # ── Modus A: Layover-Matches gruppiert nach IATA ──
     by_iata = defaultdict(lambda: {'friends': {}, 'my_dates': set()})
@@ -12756,9 +12951,17 @@ def get_crew_at_destination(token):
         is_public_meetup = (p.get('iata_code') or '').upper() in public_iatas
         if not mine and owner not in friend_set and not is_public_meetup:
             continue  # Privacy: nur mutual ODER öffentlicher Pin an meinem Ziel
+        # ZIELGRUPPE: zweiter Auslieferungsweg für dieselben Hangouts — hier
+        # gilt derselbe serverseitige Filter wie in /api/user/hangouts, sonst
+        # käme ein eingeschränkter Hangout über die Hintertür doch an.
+        aud = _hangout_audience_of_row(p)
+        if not mine and not _hangout_audience_matches(aud, viewer_prof):
+            continue
         oprof = {} if mine else (_owner_profs.get(owner) or {})
         pins_out.append({
             'id': pid,
+            'audience': aud,
+            'audience_label': _hangout_audience_label(aud),
             'iata': p.get('iata_code'),
             'lat': p.get('lat'),
             'lng': p.get('lng'),
@@ -12815,8 +13018,14 @@ def list_hangouts(token):
     und gegenseitige Friends ausgeliefert (DM-Flow). Fremde Hangouts liefern nur
     die opake owner_match_id + owner_name. Die LIVE-Crew-Position bleibt unberührt
     friends-only (separater Endpoint crew-at-destination). Dieser Feed ist ADDITIV.
+
+    ZIELGRUPPE (2026-07-28): Hangouts mit `audience` werden hier SERVERSEITIG
+    gefiltert — ein nicht passender Viewer bekommt die Zeile gar nicht erst
+    (kein clientseitiges Verstecken). Fehlt dem Viewer der Fakt, wird
+    fail-closed nicht ausgeliefert. Eigene Hangouts sieht man immer.
     """
     friend_set = set(_friends_load(token).get('friends') or [])
+    viewer_prof = (_profile_load(token) or {}).get('profile') or {}
     out = []
     _pins = _hangouts_load_all_active()
     # N+1-Fix (2026-07-01): Owner-Namen in EINEM Bulk-Query statt pro Hangout.
@@ -12829,10 +13038,15 @@ def list_hangouts(token):
             continue
         owner = p.get('user_token') or ''
         mine = owner == token
+        aud = _hangout_audience_of_row(p)
+        if not mine and not _hangout_audience_matches(aud, viewer_prof):
+            continue  # Zielgruppe verfehlt → gar nicht erst ausliefern
         is_friend = owner in friend_set
         oprof = {} if mine else (_owner_profs.get(owner) or {})
         out.append({
             'id': pid,
+            'audience': aud,
+            'audience_label': _hangout_audience_label(aud),
             'iata': p.get('iata_code'),
             'lat': p.get('lat'),
             'lng': p.get('lng'),
@@ -13130,14 +13344,23 @@ def list_manual_pins(token):
         'lat': p.get('lat'), 'lng': p.get('lng'),
         'date': str(p.get('pin_date')) if p.get('pin_date') else None,
         'note': p.get('note'),
+        'audience': _hangout_audience_of_row(p),
+        'audience_label': _hangout_audience_label(_hangout_audience_of_row(p)),
     } for p in rows]
     return jsonify({'ok': True, 'pins': out})
 
 
 @app.route('/api/user/manual-pins/<token>', methods=['POST'])
 def create_manual_pin(token):
-    """Body: {iata, date (YYYY-MM-DD), note, lat?, lng?}. lat/lng werden aus iata
-    aufgelöst wenn nicht mitgegeben. Token-binding durch _bug004-Gate."""
+    """Body: {iata, date (YYYY-MM-DD), note, lat?, lng?, audience?}. lat/lng
+    werden aus iata aufgelöst wenn nicht mitgegeben. Token-binding durch
+    _bug004-Gate.
+
+    `audience` (optional, Owner 2026-07-28) = {airline:'same'|'any',
+    base:'same'|'any', roles:['cockpit'|'cabin'], note:'Wer passt dazu'}.
+    Wird gegen das Ersteller-Profil aufgelöst und eingefroren gespeichert;
+    die Auslieferung filtert serverseitig (_hangout_audience_matches).
+    """
     import uuid as _uuid
     if not SB_AVAILABLE:
         return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
@@ -13156,27 +13379,43 @@ def create_manual_pin(token):
     pin_date = (body.get('date') or '').strip() or None
     note = (body.get('note') or '').strip()[:280] or None
     pin_id = _uuid.uuid4().hex[:16]
+    audience = _hangout_audience_normalize(
+        body.get('audience'), (_profile_load(token) or {}).get('profile') or {})
     row = {
         'id': pin_id, 'user_token': token, 'iata_code': iata,
         'lat': float(lat), 'lng': float(lng), 'pin_date': pin_date, 'note': note,
         'created_at': datetime.now().isoformat(),
     }
+    if audience:
+        row['audience'] = audience
     try:
         sb.table('manual_pins').insert(row).execute()
     except Exception as e:
         app.logger.warning(f'[crew-dest] pin_insert_fail err={type(e).__name__}: {str(e)[:120]}')
+        # Fehlt die audience-Spalte (Migration 20260728_hangout_audience.sql
+        # noch nicht appliedet), wird der Hangout BEWUSST NICHT ohne seine
+        # Zielgruppe gespeichert — sonst stünde ein „nur meine Airline"-Treff
+        # plötzlich für alle offen. Offene Hangouts bleiben unbetroffen.
+        if audience and _hangout_audience_column_missing(e):
+            return jsonify({'ok': False, 'error': 'audience_unsupported'}), 503
         return jsonify({'ok': False, 'error': 'insert_failed'}), 500
     # Best-effort Geo-Push an AeroX-User im ~100-km-Umkreis (nach dem Commit,
     # try/except intern — bricht NIE den Erstell-Response). Sendet nur wenn
     # HANGOUT_GEO_PUSH aktiv; sonst nur count-Logging. Deep-Link auf den Hangout.
-    try:
-        _hangout_notify_nearby(token, lat, lng, iata,
-                               title=(note or iata), pin_id=pin_id)
-    except Exception:
-        pass
+    # EINGESCHRÄNKTE Hangouts pushen NICHT: der Geo-Fanout kennt die Zielgruppe
+    # nicht und würde Titel + Ort an genau die Crew tragen, die den Hangout im
+    # Feed bewusst nicht sieht. Lieber kein Push als der falsche.
+    if not _hangout_audience_is_restricted(audience):
+        try:
+            _hangout_notify_nearby(token, lat, lng, iata,
+                                   title=(note or iata), pin_id=pin_id)
+        except Exception:
+            pass
     return jsonify({'ok': True, 'pin': {
         'id': pin_id, 'iata': iata, 'lat': lat, 'lng': lng,
-        'date': pin_date, 'note': note}})
+        'date': pin_date, 'note': note,
+        'audience': audience,
+        'audience_label': _hangout_audience_label(audience)}})
 
 
 @app.route('/api/user/manual-pins/<token>/<pin_id>/delete', methods=['POST'])

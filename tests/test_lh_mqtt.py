@@ -542,6 +542,61 @@ def test_inbound_path_never_calls_live_activity(client, monkeypatch):
     assert d['la_sent'] == 0
 
 
+def test_departed_event_refreshes_facts_for_live_activity(client, monkeypatch):
+    # Owner 2026-07-28 („arrival time was wrong the whole time"): beim
+    # departed-Event lief vorher KEIN Fakten-Refresh → der Fanout fiel auf die
+    # Roster-SOLL-Ankunft zurück. Jetzt reisen frische est_arr-Fakten mit.
+    from blueprints import live_activity as LA
+    seen = {}
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
+                        lambda dates, c, n: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: (seen.__setitem__('force', k.get('force')),
+                                         {'est_arr': '2026-07-22T23:58:00+02:00'})[1])
+    monkeypatch.setattr(lh_mqtt, '_push_inbound',
+                        lambda kind, disp, date, facts=None: 0)
+    monkeypatch.setattr(LA, 'push_for_affected',
+                        lambda affected, kind, flight_disp, topic_date,
+                        facts=None: (seen.__setitem__('facts', facts), 1)[1])
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed')).get_json()
+    assert d['kind'] == 'departed' and d['la_sent'] == 1
+    assert seen['force'] is True
+    assert seen['facts'].get('est_arr') == '2026-07-22T23:58:00+02:00'
+    # departed erzeugt weiterhin KEINEN Alert-Push an die Direkt-Crew.
+    assert d['pushed'] == 0
+
+
+def test_est_arr_event_reaches_live_activity(client, monkeypatch):
+    from blueprints import live_activity as LA
+    calls = []
+    lh_mqtt._facts_force_last.clear()
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
+                        lambda dates, c, n: _rows([LH400]))
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {
+        'est_arr': '2026-07-22T23:41:00+02:00'})
+    monkeypatch.setattr(LA, 'push_for_affected',
+                        lambda affected, kind, flight_disp, topic_date,
+                        facts=None: calls.append(kind) or 1)
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('New Estimated Arrival')).get_json()
+    assert d['kind'] == 'est_arr'
+    assert d['la_sent'] == 1 and calls == ['est_arr']
+    # est_arr pusht keinen Alert (nur die Lockscreen-Karte) — Owner-Regel
+    # „keine Zeit-Pushes".
+    assert d['pushed'] == 0
+
+
+def test_est_arr_force_is_throttled_per_flight():
+    # ACARS-ETA kann minütlich ticken; Force max. 1×/10 min pro Flug+Datum.
+    lh_mqtt._facts_force_last.clear()
+    assert lh_mqtt._facts_force_ok('LH454', '2026-07-28', now=1000.0) is True
+    assert lh_mqtt._facts_force_ok('LH454', '2026-07-28', now=1300.0) is False
+    # Anderer Flug ist unabhängig; nach Ablauf der Sperre wieder frei.
+    assert lh_mqtt._facts_force_ok('LH455', '2026-07-28', now=1300.0) is True
+    assert lh_mqtt._facts_force_ok('LH454', '2026-07-28', now=1601.0) is True
+
+
 # ── Reg-Cache: Prozess-Memo → geteilter Cache → LH (Quota-Fix 2026-07-27) ────
 # Hintergrund: `mqtt_leg_reg` war mit 73 % der grösste LH-Verbraucher, weil das
 # Reg-Memo ein In-Process-dict war — 3× fragmentiert und bei jedem

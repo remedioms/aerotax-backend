@@ -919,8 +919,16 @@ _MQTT_PHASE_KICKER = {
     'cancelled': ('briefing', 'GESTRICHEN'),
     'diverted':  ('inFlight', 'UMLEITUNG'),
     'departed':  ('inFlight', 'GESTARTET'),
+    # est_arr fehlte hier KOMPLETT (Owner 2026-07-28: „arrival time was wrong
+    # the whole time, animation not flowing") — LHs ACARS-ETA-Updates während
+    # des Flugs wurden verworfen, die Karte zählte bis zur beim Abflug
+    # eingefrorenen (oft: Roster-SOLL-)Ankunft herunter.
+    'est_arr':   ('inFlight', 'ANKUNFT'),
     'arrived':   ('turnaround', 'GELANDET'),
 }
+
+# Event-Arten, deren Karten-Zeitpunkt die ANKUNFT ist (nicht der Abflug).
+_MQTT_ARRIVAL_KINDS = ('departed', 'diverted', 'est_arr', 'arrived')
 
 
 def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
@@ -960,9 +968,12 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             'stateVersion': 2,
             'phase': phase,
             'kicker': kicker,
-            # mainTime = der Moment, auf den die Karte zeigt.
-            'mainTime': est_arr if kind in ('departed', 'diverted') else est_dep,
-            'countdownTarget': (est_arr if kind in ('departed', 'diverted')
+            # mainTime = der Moment, auf den die Karte zeigt. Ab dem Abflug
+            # (und für jedes ETA-Update) ist das die ANKUNFT — mit frisch
+            # geforcten `facts` (lh_mqtt) also die echte LH-Schätzung, nicht
+            # mehr die beim Abflug eingefrorene Plan-Zeit.
+            'mainTime': est_arr if kind in _MQTT_ARRIVAL_KINDS else est_dep,
+            'countdownTarget': (est_arr if kind in _MQTT_ARRIVAL_KINDS
                                 else est_dep),
             'route': f'{frm}–{to}' if frm and to else None,
             'deltaMin': delta if isinstance(delta, int) else None,

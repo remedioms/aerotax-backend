@@ -902,6 +902,48 @@ def test_push_for_affected_ignores_irrelevant_kinds(sb, auth, apns):
     assert apns['client'].sent == []
 
 
+def test_push_for_affected_est_arr_updates_arrival_countdown(sb, auth, apns):
+    # Owner 2026-07-28 („arrival time was wrong the whole time"): est_arr-
+    # Events wurden verworfen — jetzt aktualisieren sie die Karte, und der
+    # Countdown zeigt auf die ANKUNFT, nicht den Abflug.
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2026-07-28T08:25:00Z',
+              'arr_iso': '2026-07-28T19:40:00Z'}
+    facts = {'est_dep': '2026-07-28T08:40:00Z',
+             'sched_arr': '2026-07-28T19:40:00Z',
+             'est_arr': '2026-07-28T19:58:00Z'}
+    sent = LA.push_for_affected([(TOKEN, sector)], 'est_arr', 'LH454',
+                                '2026-07-28', facts=facts)
+    assert sent == 1
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['phase'] == 'inFlight' and cs['kicker'] == 'ANKUNFT'
+    # mainTime/countdownTarget = die FRISCHE est_arr, nicht sched/est_dep.
+    assert cs['mainTime'] == cs['estArr'] == cs['countdownTarget']
+    assert cs['estArr'] != cs['schedArr']
+
+
+def test_push_for_affected_departed_counts_down_to_arrival(sb, auth, apns):
+    # Beim Abflug zählt die Karte ab sofort zur Ankunft — mit den (in lh_mqtt
+    # jetzt auch für departed geforcten) LH-Fakten, nicht der Roster-SOLL-Zeit.
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2026-07-28T08:25:00Z',
+              'arr_iso': '2026-07-28T19:40:00Z'}
+    facts = {'est_dep': '2026-07-28T08:40:00Z',
+             'est_arr': '2026-07-28T19:55:00Z'}
+    LA.push_for_affected([(TOKEN, sector)], 'departed', 'LH454',
+                         '2026-07-28', facts=facts)
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['countdownTarget'] == cs['estArr']
+
+
 def test_push_for_affected_skips_sector_without_times(sb, auth, apns):
     sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
                 'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,

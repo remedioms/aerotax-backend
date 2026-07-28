@@ -905,6 +905,27 @@ def classify_message(message):
     return 'other'
 
 
+# Force-Drossel für est_arr-Fakten-Refreshes: ACARS-ETA-Updates können auf
+# Langstrecke minütlich ticken; jeder Force = echte LH-Open-API-Calls (Key
+# hat Stunden-Quote + 403-Penalty). Pro Flug+Datum max. 1 Force / 10 min —
+# dazwischen läuft lh_flight_facts ungeforced (Memo-TTL-frisch reicht dann).
+_FACTS_FORCE_MIN_GAP_S = 600
+_facts_force_last = {}
+
+
+def _facts_force_ok(flight_disp, topic_date, now=None):
+    now = now if now is not None else time.time()
+    key = f'{flight_disp}:{topic_date}'
+    last = _facts_force_last.get(key, 0)
+    if (now - last) < _FACTS_FORCE_MIN_GAP_S:
+        return False
+    # Memo klein halten (ein Tag Flugbetrieb ≈ wenige hundert Keys).
+    if len(_facts_force_last) > 2000:
+        _facts_force_last.clear()
+    _facts_force_last[key] = now
+    return True
+
+
 def _hhmm(iso_str):
     """'2026-07-22T17:45:00+02:00' → '17:45' (station-lokal, wie geliefert)."""
     try:
@@ -1127,12 +1148,25 @@ def lh_mqtt_event():
     # so das frische Gate). Leg-Wahl über den ersten betroffenen Sektor.
     facts = {}
     pushed = 0
-    if kind in ('gate', 'est_dep', 'cancelled', 'diverted') and affected:
+    # FAKTEN-REFRESH auch für departed/est_arr/arrived (Owner 2026-07-28
+    # „arrival time was wrong the whole time"): vorher lief der Force-Refresh
+    # NUR für gate/est_dep/cancelled/diverted — beim Abflug-Event war `facts`
+    # leer und der Live-Activity-Fanout fiel auf die ROSTER-SOLL-Ankunft
+    # (`sector.arr_iso`) zurück; est_arr-Events wurden ganz verworfen. Damit
+    # zeigte die Lockscreen-Karte den ganzen Flug die Plan-Ankunft und der
+    # Rückblick nie die echte Landung. est_arr kann während eines Langstrecken-
+    # flugs oft ticken → pro Flug gedrosselt forcen (LH-Open-API-Key-Schonung,
+    # vgl. 403-Penalty-Kette 24.07.); departed/arrived sind Einzel-Events.
+    facts_kinds = ('gate', 'est_dep', 'cancelled', 'diverted',
+                   'departed', 'est_arr', 'arrived')
+    if kind in facts_kinds and affected:
         s0 = affected[0][1]
+        force = kind != 'est_arr' or _facts_force_ok(flight_disp, topic_date)
         facts = lh_flight_facts(flight_disp, topic_date,
                                 (s0.get('from') or '').strip().upper() or None,
                                 (s0.get('to') or '').strip().upper() or None,
-                                force=True, caller='mqtt_event') or {}
+                                force=force, caller='mqtt_event') or {}
+    if kind in ('gate', 'est_dep', 'cancelled', 'diverted') and affected:
         for tok, sector in affected:
             built = _build_push(kind, flight_disp, topic_date, facts, sector)
             if not built:
