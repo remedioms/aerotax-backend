@@ -591,6 +591,69 @@ def _refresh_wanted_drain():
     return s
 
 
+# ── DEMAND-SET der LAZY ROTATION (Quota-Diät 2026-07-28) ─────────────────────
+# Seit der Lazy-Rotation ist »der AT läuft gleich ab« ALLEIN kein Grund mehr zu
+# rotieren (siehe _refresher_due). Rotiert wird, wenn jemand den Grant WIRKLICH
+# braucht — genau das steht hier drin. Befüllt von (a) flightops_import, wenn
+# ein User-Request auf einen abgelaufenen AT läuft (direkt im selben Prozess +
+# best-effort Cross-Container-Poke, s. _rotate_poke_remote), (b) der
+# Demand-Vorlauf-Phase in _refresh_all_work.
+#
+# THREAD-SAFETY: `set.add`/`set.discard`/`in` sind unter dem GIL atomar; ein
+# zusätzliches Lock brächte nichts, weil hier nie ein zusammengesetzter
+# Read-Modify-Write nötig ist (anders als bei _refresh_wanted, das komplett
+# geleert wird). Der Deckel schützt gegen einen entarteten Poker (kaputter
+# Client, Angreifer mit Poll-Secret): bei Überlauf wird der Poke IGNORIERT —
+# nicht geleert, sonst würde ein Flood die echten Demands verdrängen. Der
+# Refresher räumt jeden rotierten Token wieder heraus, ein voller Deckel ist
+# also selbstheilend.
+_refresher_demand = set()
+_REFRESHER_DEMAND_CAP = 500
+
+
+def _refresher_demand_add(user_token):
+    """Grant als »wird jetzt gebraucht« vormerken. Wirft nie."""
+    try:
+        if user_token and len(_refresher_demand) < _REFRESHER_DEMAND_CAP:
+            _refresher_demand.add(user_token)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Der Refresher lebt NUR im Poll-Container — ein Demand aus dem Web-Container
+# (dort landen die User-Requests) muss also über das interne Netz. Default-URL
+# ist der Compose-Servicename; per Env überschreibbar.
+_POLL_INTERNAL_URL = (os.environ.get('AEROX_POLL_INTERNAL_URL')
+                      or 'http://aerotax-poll:8081').rstrip('/')
+_ROTATE_POKE_TIMEOUT_S = 2.0
+
+
+def _rotate_poke_remote(user_token):
+    """Best-effort Cross-Container-Poke an den Refresher (POST rotate-poke).
+    STRENG optional: schlägt er fehl (kein Poll-Container, DNS, Timeout,
+    Secret falsch), bleibt alles wie vorher — der User bekommt weiter seine
+    503-Antwort und der nächste Retry bzw. der Keepalive heilt. Wirft nie und
+    blockiert den Request maximal _ROTATE_POKE_TIMEOUT_S."""
+    try:
+        body = json.dumps({'token': user_token}).encode()
+        headers = {'Content-Type': 'application/json'}
+        secret = (os.environ.get('ADSB_POLL_SECRET') or '').strip()
+        if secret:
+            headers['X-Poll-Secret'] = secret
+        req = urllib.request.Request(
+            _POLL_INTERNAL_URL + '/api/internal/flightops/rotate-poke',
+            data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=_ROTATE_POKE_TIMEOUT_S) as r:
+            r.read()
+        return True
+    except Exception as e:
+        log.info('[lh_flightops] rotate-poke best-effort fehlgeschlagen: %s',
+                 type(e).__name__)
+        return False
+
+
 def _access_state(user_token):
     """(state, access) — state ∈ 'ok' | 'pending' | 'disconnected'.
 
@@ -776,11 +839,19 @@ def _flightops_budget_inc(path):
     (Sichtbarkeit statt Schätzen — Owner 2026-07-26: „erst messen".) Der
     FlightOps-Key ist ein EIGENER LH-Key, darum eigener Schlüssel-Präfix
     `lhfo:`; zweiter Schlüssel je Service für die Verbraucher-Aufschlüsselung.
-    Wirft nie und darf den API-Pfad niemals blockieren."""
+    Wirft nie und darf den API-Pfad niemals blockieren.
+
+    ZUSÄTZLICH seit 2026-07-28 (Quota-Diät): derselbe Call wird in einem
+    TAGES-Zähler `lhfoD:<YYYYMMDD>` gebucht. Der FlightOps-Key hat neben dem
+    Stundenlimit ein Tageskontingent (6.000 lt. Owner) — ohne Tages-Sicht ist
+    ein Dauerlauf knapp unter der Stundengrenze rechnerisch bei 16.800/Tag und
+    reißt das Tageslimit lange vor der Stunde. budget_inc hängt die STUNDE
+    automatisch an, deshalb hier der Key-genaue Zwilling budget_inc_key."""
     try:
-        from blueprints.lh_open_api import budget_inc
+        from blueprints.lh_open_api import budget_inc, budget_inc_key
         svc = re.sub(r'[^A-Za-z_]', '', (path or '').lstrip('/'))[:40] or 'unknown'
         budget_inc('lhfo', svc)
+        budget_inc_key('lhfoD:' + time.strftime('%Y%m%d', time.gmtime()))
     except Exception:
         pass
 
@@ -803,6 +874,38 @@ def _flightops_budget_inc(path):
 _LHFO_HOUR_BACKGROUND_CEILING = 700
 _LHFO_HOUR_INTERACTIVE_CEILING = 950
 
+# ── TAGES-DECKEL (Quota-Diät 2026-07-28) ────────────────────────────────────
+# Der Key hat zusätzlich ein TAGESkontingent von 6.000 Calls (Owner). Das
+# Stunden-Gate allein schützt davor NICHT: 700/h Hintergrund sind 16.800/Tag.
+# Gleiche Zwei-Stufen-Logik wie stündlich — Hintergrund stoppt früher und
+# lässt den Rest als Headroom für interaktive Flows (Connect-Erstimport,
+# „Jetzt aktualisieren", Re-Login-Heilung). Auch hier gilt: VORHER stoppen,
+# denn die 403s des Gateways zählen selbst aufs Kontingent und verlängern
+# die Sperre nur.
+_LHFO_DAY_BACKGROUND_CEILING = 5200
+_LHFO_DAY_INTERACTIVE_CEILING = 5800
+
+# Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
+# Supabase, der Tagesstand ändert sich träge — 120 s reichen für einen
+# Deckel, der erst ab ~87% des Kontingents greift.
+_lhfo_day_memo = [0.0, 0]        # (ts, used)
+_LHFO_DAY_MEMO_S = 120.0
+
+
+def _lhfo_day_used():
+    """Aktueller lhfo-TAGESstand (memoisiert) oder 0, wenn nicht ermittelbar."""
+    now = time.time()
+    if (now - _lhfo_day_memo[0]) < _LHFO_DAY_MEMO_S:
+        return _lhfo_day_memo[1]
+    try:
+        from blueprints.aerox_data_blueprint import _budget_key_used
+        used = int(_budget_key_used(
+            'lhfoD:' + time.strftime('%Y%m%d', time.gmtime())) or 0)
+    except Exception:
+        used = 0
+    _lhfo_day_memo[0], _lhfo_day_memo[1] = now, used
+    return used
+
 
 def _api_get(user_token, path, params=None, interactive=False):
     access = _valid_access(user_token)
@@ -814,6 +917,14 @@ def _api_get(user_token, path, params=None, interactive=False):
     if _used >= _ceiling:
         log.warning('[lh_flightops] lhfo-Stundenbudget %s >= %s — %s-Call %s '
                     'übersprungen', _used, _ceiling,
+                    'interaktiver' if interactive else 'Hintergrund', path)
+        return None
+    _dused = _lhfo_day_used()
+    _dceiling = (_LHFO_DAY_INTERACTIVE_CEILING if interactive
+                 else _LHFO_DAY_BACKGROUND_CEILING)
+    if _dused >= _dceiling:
+        log.warning('[lh_flightops] lhfo-Tagesbudget %s >= %s — %s-Call %s '
+                    'übersprungen', _dused, _dceiling,
                     'interaktiver' if interactive else 'Hintergrund', path)
         return None
     _flightops_budget_inc(path)
@@ -2611,6 +2722,16 @@ def flightops_import(token):
         # Grant lebt, nur der Access-Token ist gerade abgelaufen: der
         # zentrale Refresher rotiert in Kürze. Transiente Antwort — der
         # Status-Endpoint bleibt connected, iOS zeigt KEINE Relogin-Karte.
+        #
+        # DEMAND-POKE (Lazy Rotation, 2026-07-28): seit der Quota-Diät rotiert
+        # der Refresher nicht mehr auf Verdacht, sondern auf Bedarf — und
+        # DAS hier ist der Bedarf. Lokal eintragen (falls dieser Prozess der
+        # Poll-Container ist) UND best-effort über das interne Netz poken
+        # (Regelfall: der Request läuft im Web-Container, wo kein Refresher
+        # lebt). Antwort-Shape bleibt unverändert — der iOS-Retry-Weg ist der,
+        # der die frischen Daten holt.
+        _refresher_demand_add(token)
+        _rotate_poke_remote(token)
         return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
     if _st != 'ok':
         return jsonify({'ok': False, 'error': 'not_connected'}), 401
@@ -3038,11 +3159,178 @@ def _connected_tokens(limit=2000):
         return []
 
 
-def _refresh_all_work(tokens):
-    ok = fail = skipped = 0
+# ── ADAPTIVE SYNC-KADENZ (Quota-Diät 2026-07-28) ────────────────────────────
+# Der Host-Cron ruft refresh-all weiter alle 2 h (unverändert) — aber nicht
+# mehr jeder Lauf synct jeden User. Wer in den nächsten 48 h Dienst hat, wird
+# eng getaktet (≈alle 4 h), alle anderen locker (≈alle 12 h). Ein Roster ohne
+# anstehenden Dienst ändert sich selten und der User schaut auch nicht drauf;
+# ein Roster mit Dienst morgen ist das Kernprodukt.
+_FO_SYNC_NEAR_S = 3.5 * 3600
+_FO_SYNC_FAR_S = 11.5 * 3600
+_FO_DUTY_NEAR_S = 48 * 3600
+# Letzter Sync je Token — bewusst PROZESS-LOKAL (der refresh-all-Lauf lebt
+# ohnehin nur im Poll-Container). Nach einem Neustart/Deploy ist die Map leer
+# ⇒ jeder Token ist einmal fällig. Das ist gewollt: nach einem Deploy einmal
+# alle synchronisieren ist billig (1 Lauf) und stellt Frische her.
+_fo_last_sync = {}
+_FO_LAST_SYNC_CAP = 8000
+# Demand-Vorlauf: wie lange ein Lauf auf die Rotation abgelaufener Grants
+# wartet, bevor er sie überspringt (Refresher-Tick ist 60 s).
+_FO_DEMAND_WAIT_S = 120
+_FO_DEMAND_WAIT_STEP_S = 5
+
+
+def _fo_day_has_duty(ev):
+    """Trägt dieser Briefing-Tag Flug-/Dienst-Evidenz? Nutzt AUSSCHLIESSLICH
+    Felder, die die Briefing-Row wirklich führt (ical_sectors, ical_klass,
+    ical_summary) — nichts Erfundenes. Wirft nie."""
+    if not isinstance(ev, dict):
+        return False
+    secs = ev.get('ical_sectors')
+    if isinstance(secs, list) and secs:
+        return True                       # echte Legs = Dienst, fertig
+    klass = str(ev.get('ical_klass') or '').strip().lower()
+    if klass in ('hotel_layover', 'standby'):
+        return True                       # unterwegs bzw. Bereitschaft
+    try:
+        from blueprints.crew_live_state import duty_from_roster_day
+        d = duty_from_roster_day(ev.get('ical_klass'), ev.get('ical_summary'))
+    except Exception:
+        d = None
+    # 'free'/'vacation'/'visa' sind explizit KEIN Dienst; None heißt „nicht
+    # erkannt" und gilt hier als kein Nachweis (die Kadenz fällt dann auf die
+    # lockere Regel zurück — sie verschiebt nur, sie verliert nichts).
+    return d in ('standby', 'reserve')
+
+
+def _fo_duty_within(token, now=None, horizon_s=_FO_DUTY_NEAR_S):
+    """Hat dieser User innerhalb des Horizonts (Default 48 h) Dienst?
+    Kleinstes Briefing-Datum ≥ heute mit Dienst-Evidenz; verglichen wird
+    dessen Tagesbeginn (UTC) — der Dienst kann also frühestens dann
+    beginnen. Kein Treffer / keine Daten ⇒ False („kein Dienst bekannt").
+    Wirft nie."""
+    now = now or time.time()
     try:
         import app as _app
-        for tok in tokens:
+        briefs = _app._ical_briefings_load(token) or {}
+    except Exception:
+        return False
+    from datetime import datetime as _d, timezone as _tz
+    today = _d.fromtimestamp(now, _tz.utc).strftime('%Y-%m-%d')
+    best = None
+    for datum, ev in (briefs.items() if isinstance(briefs, dict) else []):
+        ds = str(datum)[:10]
+        if len(ds) != 10 or ds < today:
+            continue
+        if best is not None and ds >= best:
+            continue
+        if _fo_day_has_duty(ev):
+            best = ds
+    if not best:
+        return False
+    try:
+        start = _d.strptime(best, '%Y-%m-%d').replace(
+            tzinfo=_tz.utc).timestamp()
+    except Exception:
+        return False
+    return (start - now) < horizon_s
+
+
+def _fo_should_sync(token, now=None):
+    """(bool, grund) — synct DIESER refresh-all-Lauf diesen Token?
+    Erst-Kontakt immer; sonst 3,5 h bei Dienst in Sicht, 11,5 h sonst.
+    Die Briefings werden nur im Graubereich dazwischen gelesen (spart den
+    Supabase-Read für die klaren Fälle)."""
+    now = now or time.time()
+    last = _fo_last_sync.get(token)
+    if last is None:
+        return True, 'first'
+    age = now - last
+    if age >= _FO_SYNC_FAR_S:
+        return True, 'far_due'
+    if age < _FO_SYNC_NEAR_S:
+        return False, 'too_soon'
+    if _fo_duty_within(token, now):
+        return True, 'duty_near'
+    return False, 'no_duty_near'
+
+
+def _fo_mark_synced(token, now=None):
+    """Sync-Versuch stempeln. Bewusst beim VERSUCH, nicht erst beim Erfolg:
+    der LH-Call ist raus und hat Kontingent gekostet — ein 502 darf nicht dazu
+    führen, dass derselbe Token in jedem 2-h-Lauf erneut dagegenläuft."""
+    try:
+        _fo_last_sync[token] = now or time.time()
+        if len(_fo_last_sync) > _FO_LAST_SYNC_CAP:
+            for k in sorted(_fo_last_sync,
+                            key=lambda k: _fo_last_sync[k])[:_FO_LAST_SYNC_CAP // 2]:
+                _fo_last_sync.pop(k, None)
+    except Exception:
+        pass
+
+
+def _fo_demand_prephase(tokens):
+    """Demand-Vorlauf vor der Import-Schleife: alle Tokens, deren Access-Token
+    abgelaufen ist, beim Refresher anmelden und ihm kurz Zeit geben.
+
+    WARUM: seit der Lazy Rotation hält der Refresher ATs nicht mehr auf Vorrat
+    frisch — ohne diesen Vorlauf würde der 2-h-Lauf reihenweise 'pending' sehen
+    und die Roster gar nicht erst holen. Der Refresher tickt alle 60 s im
+    SELBEN Container, 120 s Wartezeit decken also einen vollen Tick plus
+    Rotationsdauer ab. Drain-aware (Deploy killt uns sonst mitten drin).
+    Returns Anzahl der noch immer abgelaufenen Grants."""
+    pend = []
+    for tok in tokens:
+        try:
+            if _access_state(tok)[0] == 'pending':
+                _refresher_demand_add(tok)
+                # Best-effort auch übers Netz — falls refresh-all je aus einem
+                # Container ohne Refresher angestoßen wird.
+                _rotate_poke_remote(tok)
+                pend.append(tok)
+        except Exception:
+            pass
+    if not pend:
+        return 0
+    log.info('[flightops-refresh-all] demand-vorlauf: %d abgelaufene Grants '
+             'angemeldet, warte max %ds', len(pend), _FO_DEMAND_WAIT_S)
+    waited = 0
+    while waited < _FO_DEMAND_WAIT_S and pend:
+        if _refresh_all_state.get('drain'):
+            break
+        time.sleep(_FO_DEMAND_WAIT_STEP_S)
+        waited += _FO_DEMAND_WAIT_STEP_S
+        # Zustand nur alle 15 s nachlesen — jeder Check ist ein Profil-Read
+        # pro Token, ein 5-s-Takt wäre reine Supabase-Last.
+        if waited % 15:
+            continue
+        try:
+            pend = [t for t in pend if _access_state(t)[0] == 'pending']
+        except Exception:
+            break
+    if pend:
+        log.info('[flightops-refresh-all] demand-vorlauf: %d Grants weiter '
+                 'pending -> werden übersprungen', len(pend))
+    return len(pend)
+
+
+def _refresh_all_work(tokens):
+    ok = fail = skipped = deferred = 0
+    try:
+        import app as _app
+        # KADENZ-PLANUNG vor allem anderen: was dieser Lauf ohnehin nicht
+        # synct, braucht auch keinen Demand-Vorlauf und keine Rotation.
+        _now0 = time.time()
+        plan = []
+        for _tok in tokens:
+            _do, _why = _fo_should_sync(_tok, _now0)
+            if _do:
+                plan.append(_tok)
+            else:
+                deferred += 1
+        if plan and not _refresh_all_state.get('drain'):
+            _fo_demand_prephase(plan)
+        for tok in plan:
             # DEPLOY-DRAIN (Grant-Burn #3, 2026-07-26): dieser Daemon-Thread
             # wurde beim Container-Recreate HART gekillt — traf der Kill das
             # Fenster zwischen LH-Rotation und _tokens_save, war der neue
@@ -3055,7 +3343,7 @@ def _refresh_all_work(tokens):
             if _refresh_all_state.get('drain'):
                 log.info('[flightops-refresh-all] drain angefordert — '
                          'Abbruch nach %d/%d Grants', ok + fail + skipped,
-                         len(tokens))
+                         len(plan))
                 break
             try:
                 _st, _acc = _access_state(tok)
@@ -3072,6 +3360,11 @@ def _refresh_all_work(tokens):
                 status = rv[1] if isinstance(rv, tuple) else 200
                 if status == 200:
                     ok += 1
+                    # NUR Erfolg stempelt den Sync (Review-Fund 2026-07-28):
+                    # ein LH-Schluckauf darf den User nicht 3,5–11,5 h ohne
+                    # Retry lassen — Fehlläufe bleiben fällig für den
+                    # nächsten 2-h-Cron-Lauf.
+                    _fo_mark_synced(tok)
                 else:
                     fail += 1
             except Exception as e:
@@ -3086,9 +3379,11 @@ def _refresh_all_work(tokens):
             _refresh_all_state['running'] = False
             _refresh_all_state['last'] = {
                 'ts': time.time(), 'users': len(tokens),
-                'ok': ok, 'fail': fail, 'skipped': skipped}
-        log.info('[flightops-refresh-all] done users=%d ok=%d fail=%d skipped=%d',
-                 len(tokens), ok, fail, skipped)
+                'ok': ok, 'fail': fail, 'skipped': skipped,
+                'deferred': deferred}
+        log.info('[flightops-refresh-all] done users=%d ok=%d fail=%d '
+                 'skipped=%d deferred=%d',
+                 len(tokens), ok, fail, skipped, deferred)
 
 
 @lh_flightops_bp.route('/api/internal/flightops/refresh-drain', methods=['POST'])
@@ -3107,6 +3402,21 @@ def flightops_refresh_drain():
     running = running or bool(_refresher_state.get('busy'))
     return jsonify({'ok': True, 'running': running,
                     'refresher_active': bool(_refresher_state.get('active'))})
+
+
+@lh_flightops_bp.route('/api/internal/flightops/rotate-poke', methods=['POST'])
+def flightops_rotate_poke():
+    """Cross-Container-Demand für die Lazy Rotation: der Web-Container meldet
+    hier »dieser Grant wird JETZT gebraucht« an den Poll-Container, in dem der
+    einzige Refresher lebt. Setzt NUR ein Flag — rotiert selbst NICHTS (das
+    Choke-Point-Gate in _refresh bleibt unangetastet). Auth wie poll-boards."""
+    if not _internal_secret_ok():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    tok = ((request.get_json(silent=True) or {}).get('token') or '').strip()
+    if not tok:
+        return jsonify({'ok': False, 'error': 'no_token'}), 400
+    queued = _refresher_demand_add(tok)
+    return jsonify({'ok': True, 'queued': bool(queued)})
 
 
 @lh_flightops_bp.route('/api/internal/flightops/refresh-all', methods=['POST'])
@@ -3187,25 +3497,72 @@ def _refresher_scan():
     return out
 
 
-def _refresher_due(scan, now=None):
+# Keepalive-Abstand der Lazy-Rotation: JEDER gesunde Grant rotiert mindestens
+# einmal in diesem Fenster, auch ohne jeden Bedarf — der LH-Refresh-Token darf
+# nicht idle sterben (Lebensdauer LH-seitig UNDOKUMENTIERT, deshalb bewusst
+# konservativ deutlich unter 24 h).
+_REFRESHER_KEEPALIVE_S = 20 * 3600
+# Angenommene AT-Lebensdauer für die Rückrechnung des letzten Rotations-
+# Zeitpunkts (s. _refresher_due). LH liefert expires_in=3600, _token_request
+# speichert expires_at = now + (expires_in − 60).
+_REFRESHER_AT_LIFETIME_S = 3600
+# Rotations-Status, nach denen der Demand-Eintrag STEHEN bleibt (der Versuch
+# ist vertagt, nicht erledigt). Alle anderen quittiert der Refresher.
+_REFRESHER_DEMAND_RETRY_STATES = frozenset((
+    'transient', 'skipped_claim_unavailable', 'skipped_claim_foreign',
+    'refused', 'error', 'save_pending'))
+
+
+def _refresher_due(scan, now=None, demand=None):
     """Fällige Grants, am knappsten ablaufende zuerst. needs_relogin und
     Grants ohne RT fallen raus; geparkte behandelt _refresher_refresh_grant
-    selbst (nur Nachsave, keine Rotation)."""
+    selbst (nur Nachsave, keine Rotation).
+
+    LAZY ROTATION (Quota-Diät 2026-07-28) — der große Kostenblock: ATs leben
+    ~1 h, der Vorlauf ist 15 min, also war JEDER Grant bisher rund 32×/Tag
+    fällig (gemessen 5.381 oauth_refresh/Tag) — Dauerfrische für Roster, die
+    zwölfmal am Tag angefasst werden. »Läuft bald ab« ist deshalb nur noch die
+    NOTWENDIGE Bedingung; zusätzlich muss EINES gelten:
+
+      a) DEMAND — jemand braucht den Grant JETZT (User-Import auf abgelaufenem
+         AT bzw. Demand-Vorlauf des Sync-Laufs, s. _refresher_demand).
+      b) KEEPALIVE — die letzte Rotation ist länger als _REFRESHER_KEEPALIVE_S
+         her. Damit rotiert jeder gesunde Grant garantiert ~1×/20 h und der RT
+         kann nicht idle ablaufen.
+
+    EHRLICHE ABLEITUNG von `last_rotated`: es gibt KEINEN rotated_at-Stempel im
+    Token-Dict. Da der Refresher der einzige Schreiber von expires_at ist und
+    _token_request expires_at = now + (expires_in−60) setzt, gilt
+    last_rotated ≈ expires_at − _REFRESHER_AT_LIFETIME_S. Der Fehler ist die
+    60-s-Sicherheitsmarge (die Schätzung liegt ~1 min ZU FRÜH ⇒ minimal
+    eifriger, nie zu spät). Fehlt expires_at ganz (0), ist der Grant nach
+    dieser Rechnung uralt ⇒ keepalive-fällig — die sichere Richtung."""
     now = now or time.time()
+    demand = _refresher_demand if demand is None else demand
     due = []
     for tok, t in scan:
         if t.get('needs_relogin') or not t.get('refresh'):
             continue
         exp = t.get('expires_at') or 0
-        if exp - now < _REFRESH_AHEAD_S:
-            due.append((exp, tok))
+        if exp - now >= _REFRESH_AHEAD_S:
+            continue
+        last_rotated = exp - _REFRESHER_AT_LIFETIME_S
+        if not (tok in demand
+                or (now - last_rotated) > _REFRESHER_KEEPALIVE_S):
+            continue
+        due.append((exp, tok))
     due.sort()
     return [tok for _exp, tok in due]
 
 
 def _refresher_tick():
+    # Die Vormerkliste ist echte Nachfrage: sie füllt sich nur, wenn ein
+    # Consumer IN DIESEM Prozess auf einen abgelaufenen AT gelaufen ist.
+    # Deshalb zählt sie (wie bisher für die Reihenfolge) jetzt auch als
+    # Demand-Quelle für die Fällig-Entscheidung.
     wanted = _refresh_wanted_drain()
-    due = _refresher_due(_refresher_scan())
+    due = _refresher_due(_refresher_scan(),
+                         demand=set(_refresher_demand) | wanted)
     # Vorgemerkte (ein Worker sah einen abgelaufenen AT) zuerst — aber nur,
     # wenn der durable Stand die Fälligkeit bestätigt; sonst war die
     # Vormerkung stale und wird verworfen.
@@ -3225,6 +3582,11 @@ def _refresher_tick():
         finally:
             _refresher_state['busy'] = False
         stats[st] = stats.get(st, 0) + 1
+        # Demand quittieren — außer bei den Status, die exakt „nochmal
+        # versuchen" bedeuten (Claim-Infra weg, LH transient): dort bleibt der
+        # Bedarf stehen, sonst müsste der User erneut anklopfen.
+        if st not in _REFRESHER_DEMAND_RETRY_STATES:
+            _refresher_demand.discard(tok)
         # QPS-Schonung + Jitter: Rotationen entzerren sich selbst, statt
         # stündliche Refresh-Wellen zu bilden.
         time.sleep(_REFRESHER_GRANT_GAP_S + secrets.randbelow(600) / 1000.0)

@@ -2315,7 +2315,14 @@ def test_generic_profile_save_cannot_clobber_tokens(monkeypatch):
 
 def test_refresher_due_selection_orders_by_expiry():
     """Fällig-Auswahl: nur Grants mit RT, ohne needs_relogin, innerhalb des
-    Vorlaufs — knappste zuerst (planbare, entzerrte Rotationen)."""
+    Vorlaufs — knappste zuerst (planbare, entzerrte Rotationen).
+
+    POLICY-UPDATE 2026-07-28 (Quota-Diät, Lazy Rotation): »läuft bald ab« ist
+    nur noch die NOTWENDIGE Bedingung — rotiert wird bei Bedarf (Demand) oder
+    Keepalive (>20 h ohne Rotation). Deshalb wird hier Demand für die beiden
+    fälligen Grants gesetzt; die geprüfte Zusage dieses Tests (Auswahl +
+    Reihenfolge) ist unverändert. Die Lazy-Regel selbst prüft
+    tests/test_lhfo_quota_diet.py."""
     now = 1000000.0
     scan = [
         ('AT-FRESH', {'refresh': 'R', 'expires_at': now + 7200}),
@@ -2325,7 +2332,9 @@ def test_refresher_due_selection_orders_by_expiry():
                      'expires_at': now - 50}),
         ('AT-NORT', {'expires_at': now - 50}),
     ]
-    assert fo._refresher_due(scan, now=now) == ['AT-EXPIRED', 'AT-SOON']
+    demand = {'AT-FRESH', 'AT-SOON', 'AT-EXPIRED', 'AT-DEAD', 'AT-NORT'}
+    assert fo._refresher_due(scan, now=now,
+                             demand=demand) == ['AT-EXPIRED', 'AT-SOON']
 
 
 def test_refresher_exit_drain_sets_drain_and_joins(monkeypatch):

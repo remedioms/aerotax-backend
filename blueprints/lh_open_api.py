@@ -344,6 +344,27 @@ def budget_inc(key_prefix, caller=None, units=1):
         pass
 
 
+def budget_inc_key(key, units=1):
+    """Wie budget_inc, aber mit VOLLSTÄNDIG vorgegebenem Schlüssel — ohne die
+    automatische `:<YYYYMMDDHH>`-Anhängung und ohne Aufrufer-Label.
+
+    Gebraucht seit dem lhfo-TAGES-Deckel (2026-07-28): der FlightOps-Key hat
+    neben dem Stundenlimit ein TAGESkontingent, der Zähler dafür heißt
+    `lhfoD:<YYYYMMDD>` und passt damit nicht in das stundenbasierte
+    Schlüssel-Layout von budget_inc. Gleicher Puffer, gleicher Flusher, gleiche
+    `_budget_key_used`-Lesbarkeit — nur der Schlüssel kommt vom Aufrufer.
+    Wirft nie."""
+    try:
+        k = str(key or '').strip()
+        if not k:
+            return
+        with _budget_buf_lock:
+            _budget_buf[k] = _budget_buf.get(k, 0) + max(1, int(units))
+        _budget_thread_start()
+    except Exception:
+        pass
+
+
 # ── „leer" ≠ „unbekannt" ────────────────────────────────────────────────────
 # Ein leeres Ergebnis hat DREI sehr verschiedene Ursachen: (a) LH sagt sauber
 # „diesen Flug gibt es an dem Tag nicht" (HTTP 404), (b) der Call wurde vom
