@@ -271,7 +271,8 @@ def test_all_9_services_have_client_methods():
 def test_client_methods_build_correct_paths(monkeypatch):
     calls = []
     monkeypatch.setattr(fo, '_api_get',
-                        lambda tok, path, params=None: calls.append((path, params)) or {})
+                        lambda tok, path, params=None, interactive=False:
+                        calls.append((path, params)) or {})
     fo.crew_list('T', 'LH400', '2016-10-01', 'FRA', 'JFK', 'AC1')
     fo.crew_rotation('T', '12345')
     fo.landing_report('T', 'LH400', '2016-10-01', 'FRA')
@@ -714,7 +715,7 @@ def test_crewlist_dead_grant_without_cache_stays_401(monkeypatch):
 
 
 def test_crewlist_success_populates_cache(monkeypatch):
-    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
     monkeypatch.setattr(fo, '_resolve_link_params', lambda *a, **k: {
         'accessCode': 'SECRET42', 'departureAirport': 'FRA',
         'arrivalAirport': 'CAI'})
@@ -734,9 +735,12 @@ def test_crewlist_success_populates_cache(monkeypatch):
 
 
 def test_crew_cache_put_get_lru(monkeypatch):
-    """Cache-Helper direkt: Put/Get über den Profil-Mirror + LRU-Kappung."""
+    """LEGACY-Pfad (Tabelle fehlt/SB weg): Put/Get über den Profil-Mirror
+    inkl. der 8er-Kappung. Genau diese Kappung war die Owner-Wurzel — sie
+    bleibt nur noch als Notnagel für den Migrations-Zeitraum bestehen."""
     store = {}
     import app as backend
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', False)   # → Tabelle aus
     monkeypatch.setattr(backend, '_profile_load',
                         lambda tok: {'profile': dict(store)})
     monkeypatch.setattr(backend, '_profile_save',
@@ -749,6 +753,255 @@ def test_crew_cache_put_get_lru(monkeypatch):
     assert fo._crew_cache_get('AT-U', 'LH0', '2026-07-26') is None  # rausgealtert
     hit = fo._crew_cache_get('AT-U', f'LH{fo._CREW_CACHE_MAX + 2}', '2026-07-26')
     assert hit and hit['crew'][0]['name'] == f'N{fo._CREW_CACHE_MAX + 2}'
+
+
+# ── Crew-Cache in eigener Tabelle (Owner-Bug 2026-07-28) ────────────────────
+# Bewiesene Wurzel: NICHT die Durabilität (der Profil-Mirror überlebte alle
+# Deploys), sondern der 8er-Deckel — ein frisch angesehenes Leg verdrängte ein
+# künftiges. Diese Tests halten das Gegenteil fest.
+
+class _CrewTbl:
+    """Minimal-Supabase für flightops_crew_cache (PK token,flight,date)."""
+
+    def __init__(self, rows=None):
+        self.rows = list(rows or [])
+        self.deletes = []
+        self.fail = False
+
+    # sb.table(name) → self
+    def table(self, name):
+        assert name == fo._CREW_CACHE_TABLE, name
+        self._f, self._op = {}, None
+        self._in = None
+        return self
+
+    def select(self, *_a, **_k):
+        self._op = 'select'
+        return self
+
+    def upsert(self, row, on_conflict=None):
+        self._op, self._row, self._conflict = 'upsert', row, on_conflict
+        return self
+
+    def delete(self):
+        self._op = 'delete'
+        return self
+
+    def eq(self, col, val):
+        self._f[col] = val
+        return self
+
+    def lt(self, col, val):
+        self._f['<' + col] = val
+        return self
+
+    def in_(self, col, vals):
+        self._in = (col, list(vals))
+        return self
+
+    def limit(self, _n):
+        return self
+
+    def execute(self):
+        if self.fail:
+            raise RuntimeError('PGRST205 table not found')
+        if self._op == 'upsert':
+            assert self._conflict == 'token,flight,flight_date'
+            key = (self._row['token'], self._row['flight'],
+                   self._row['flight_date'])
+            self.rows = [r for r in self.rows
+                         if (r['token'], r['flight'], r['flight_date']) != key]
+            self.rows.append(dict(self._row))
+            return type('R', (), {'data': [dict(self._row)]})()
+        if self._op == 'delete':
+            self.deletes.append(dict(self._f))
+            keep, gone = [], []
+            for r in self.rows:
+                if (r['token'] == self._f.get('token')
+                        and r['flight_date'] < self._f.get('<flight_date', '')):
+                    gone.append(r)
+                else:
+                    keep.append(r)
+            self.rows = keep
+            return type('R', (), {'data': gone})()
+        out = [r for r in self.rows
+               if all(r.get(k) == v for k, v in self._f.items())]
+        if self._in:
+            col, vals = self._in
+            out = [r for r in out if r.get(col) in vals]
+        return type('R', (), {'data': [dict(r) for r in out]})()
+
+
+def _crew_tbl(monkeypatch, rows=None):
+    import app as backend
+    tbl = _CrewTbl(rows)
+    monkeypatch.setattr(backend, 'sb', tbl)
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(fo, '_crew_tbl_state', [0.0, True])
+    monkeypatch.setattr(fo, '_crew_prune_seen', {})
+    # Legacy-Profil leer: die Tabelle ist die einzige Wahrheit im Test.
+    monkeypatch.setattr(backend, '_profile_load', lambda tok: {'profile': {}})
+    return tbl
+
+
+def test_crew_cache_table_has_no_eviction_cap(monkeypatch):
+    """DIE Regression: 30 Legs cachen, ALLE bleiben abrufbar. Vorher hätte
+    Leg 9 das erste (typischerweise ein künftiges) verdrängt."""
+    _crew_tbl(monkeypatch)
+    for i in range(30):
+        fo._crew_cache_put('AT-U', f'LH{400 + i}', '2026-08-%02d' % (i + 1),
+                           [{'name': f'N{i}'}])
+    for i in range(30):
+        hit = fo._crew_cache_get('AT-U', f'LH{400 + i}', '2026-08-%02d' % (i + 1))
+        assert hit and hit['crew'][0]['name'] == f'N{i}', i
+
+
+def test_crew_cache_survives_new_write_of_other_leg(monkeypatch):
+    """Owner-Szenario 1:1 — der Live-Abruf des Hinflugs darf den gecachten
+    RÜCKFLUG nicht rauswerfen."""
+    _crew_tbl(monkeypatch)
+    fo._crew_cache_put('AT-U', 'LH455', '2026-07-30', [{'name': 'RUECK'}])
+    fo._crew_cache_put('AT-U', 'LH454', '2026-07-28', [{'name': 'HIN'}])
+    assert fo._crew_cache_get('AT-U', 'LH455', '2026-07-30')['crew'][0]['name'] == 'RUECK'
+
+
+def test_crew_cache_date_slack_one_day(monkeypatch):
+    """Red-Eye/Z-vs-LT: ±1 Tag trifft, exaktes Datum gewinnt."""
+    _crew_tbl(monkeypatch)
+    fo._crew_cache_put('AT-U', 'LH455', '2026-07-30', [{'name': 'EXAKT'}])
+    fo._crew_cache_put('AT-U', 'LH455', '2026-07-31', [{'name': 'PLUS1'}])
+    assert fo._crew_cache_get('AT-U', 'LH455', '2026-07-30')['crew'][0]['name'] == 'EXAKT'
+    assert fo._crew_cache_get('AT-U', 'LH455', '2026-07-31')['crew'][0]['name'] == 'PLUS1'
+    # 29.07. hat keinen eigenen Eintrag → Toleranz greift auf den 30.
+    assert fo._crew_cache_get('AT-U', 'LH455', '2026-07-29')['crew'][0]['name'] == 'EXAKT'
+    # 3 Tage daneben ist KEIN Treffer (die Toleranz bleibt eng).
+    assert fo._crew_cache_get('AT-U', 'LH455', '2026-08-03') is None
+
+
+def test_crew_cache_prunes_only_old_flight_dates(monkeypatch):
+    tbl = _crew_tbl(monkeypatch)
+    old = (fo._dt.date.today()
+           - fo._dt.timedelta(days=fo._CREW_CACHE_KEEP_DAYS + 5)).isoformat()
+    tbl.rows.append({'token': 'AT-U', 'flight': 'LH1', 'flight_date': old,
+                     'crew': [{'name': 'ALT'}], 'cached_at': 1.0})
+    fo._crew_cache_put('AT-U', 'LH2', '2026-08-01', [{'name': 'NEU'}])
+    assert [r['flight'] for r in tbl.rows] == ['LH2']
+    # Zweiter Put in derselben Stunde räumt NICHT nochmal (ein DELETE reicht).
+    fo._crew_cache_put('AT-U', 'LH3', '2026-08-02', [{'name': 'NEU2'}])
+    assert len(tbl.deletes) == 1
+
+
+def test_crew_cache_falls_back_to_profile_when_table_missing(monkeypatch):
+    """Migration noch nicht angewandt → alter Profil-Cache, kein Hard-Fail."""
+    tbl = _crew_tbl(monkeypatch)
+    tbl.fail = True
+    store = {}
+    import app as backend
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda tok: {'profile': dict(store)})
+    monkeypatch.setattr(backend, '_profile_save',
+                        lambda tok, prof: store.update(prof) or True)
+    fo._crew_cache_put('AT-U', 'LH582', '2026-07-26', [{'name': 'MAX'}])
+    assert store['flightops_crew_cache'][0]['crew'][0]['name'] == 'MAX'
+    assert fo._crew_cache_get('AT-U', 'LH582', '2026-07-26')['crew'][0]['name'] == 'MAX'
+
+
+def test_crew_cache_lazy_migrates_legacy_profile(monkeypatch):
+    """Alt-Bestand wandert beim ersten Read in die Tabelle, der Profil-Key
+    wird geleert (der Blob liegt im Hot-Path von _profile_load)."""
+    tbl = _crew_tbl(monkeypatch)
+    store = {'flightops_crew_cache': [
+        {'flight': 'LH582', 'date': '2026-07-26', 'crew': [{'name': 'A'}],
+         'cached_at': 1.0},
+        {'flight': 'LH583', 'date': '2026-07-26', 'crew': [{'name': 'B'}],
+         'cached_at': 2.0},
+    ]}
+    import app as backend
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda tok: {'profile': dict(store)})
+    monkeypatch.setattr(backend, '_profile_save',
+                        lambda tok, prof: store.update(prof) or True)
+    hit = fo._crew_cache_get('AT-U', 'LH582', '2026-07-26')
+    assert hit['crew'][0]['name'] == 'A'
+    assert sorted(r['flight'] for r in tbl.rows) == ['LH582', 'LH583']
+    assert store['flightops_crew_cache'] == []
+    # Danach kommt alles aus der Tabelle — auch der zweite Alt-Eintrag.
+    assert fo._crew_cache_get('AT-U', 'LH583', '2026-07-26')['crew'][0]['name'] == 'B'
+
+
+def test_crewlist_pending_refresh_is_503_not_relogin(monkeypatch):
+    """Abgelaufener AT + laufender Refresher ist KEIN „neu verbinden"-Fall —
+    sonst schickt die App den User grundlos in den LH-Login."""
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('pending', None))
+    monkeypatch.setattr(fo, '_crew_cache_get', lambda tok, f, d: None)
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
+                                       json={'flight': 'LH582', 'date': '2026-07-26'})
+    assert r.status_code == 503
+    assert r.get_json()['error'] == 'token_refresh_pending'
+
+
+def test_crewlist_empty_live_list_keeps_last_good(monkeypatch):
+    """LH räumt die Liste nach dem Flug weg. Eine leere Live-Antwort darf die
+    letzte gute nicht verdrängen (sonst ist das Nachschlagen im Logbuch tot)."""
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    monkeypatch.setattr(fo, '_resolve_link_params',
+                        lambda *a, **k: {'accessCode': 'S', 'departureAirport': 'FRA',
+                                         'arrivalAirport': 'CAI'})
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: {'crewMembers': []})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [])
+    monkeypatch.setattr(fo, '_crew_cache_get', lambda tok, f, d: {
+        'flight': 'LH582', 'date': '2026-07-26',
+        'crew': [{'name': 'MAX'}], 'cached_at': 9.0})
+    puts = []
+    monkeypatch.setattr(fo, '_crew_cache_put',
+                        lambda *a: puts.append(a))
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
+                                       json={'flight': 'LH582', 'date': '2026-07-26'})
+    d = r.get_json()
+    assert r.status_code == 200 and d['cached'] is True
+    assert d['crew'][0]['name'] == 'MAX'
+    assert puts == []            # leere Liste wird NIE gecached
+
+
+def test_crewlist_uses_interactive_key_budget(monkeypatch):
+    """Der Crew-Button ist nutzerausgelöst → 950/h statt 700/h. Unter dem
+    Hintergrund-Deckel fielen Taps in vollen Stunden als 502/404 aus
+    (Prod-Log 2026-07-28 06:00/06:52/06:56)."""
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    seen = {}
+    monkeypatch.setattr(fo, '_resolve_link_params',
+                        lambda *a, **k: seen.update(links=k.get('interactive'))
+                        or {'accessCode': 'S'})
+    monkeypatch.setattr(fo, 'crew_list',
+                        lambda *a, **k: seen.update(crew=k.get('interactive'))
+                        or {'crewMembers': []})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'MAX'}])
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda crew: {})
+    monkeypatch.setattr(fo, '_crew_cache_put', lambda *a: None)
+    import app as backend
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
+                                       json={'flight': 'LH582', 'date': '2026-07-26'})
+    assert r.status_code == 200
+    assert seen == {'links': True, 'crew': True}
+
+
+def test_crewlist_background_callers_stay_on_background_budget():
+    """Gegenprobe: das Briefing (Hintergrund) darf den Interaktiv-Headroom
+    NICHT anfassen — crew_list/_resolve_link_params defaulten auf False."""
+    import inspect
+    assert inspect.signature(fo.crew_list).parameters['interactive'].default is False
+    assert inspect.signature(
+        fo._resolve_link_params).parameters['interactive'].default is False
+
+
+def test_crew_cache_table_in_delete_cascade():
+    """PII (Klarnamen fremder Crew) muss bei der Kontolöschung mitgehen."""
+    import pathlib
+    import app as backend
+    txt = pathlib.Path(backend.__file__).read_text()
+    assert "('flightops_crew_cache',    'token')" in txt
 
 
 def test_status_reports_needs_relogin(monkeypatch):
@@ -811,7 +1064,8 @@ def test_resolve_link_params_live_fallback(monkeypatch, tmp_path):
     # Cache leer → Tages-Fenster wird live geladen und gecacht
     calls = []
     monkeypatch.setattr(fo, 'duty_events',
-                        lambda tok, fd, td: calls.append((fd, td)) or DUTY_LINKS)
+                        lambda tok, fd, td, interactive=False:
+                        calls.append((fd, td)) or DUTY_LINKS)
     p = fo._resolve_link_params('AT-U', 'crewlist', 'LH400', '2026-07-24')
     assert p['accessCode'] == 'SECRET42'
     assert calls == [('2026-07-24', '2026-07-24')]
@@ -844,12 +1098,12 @@ def _pass_auth_gate(monkeypatch):
 def test_crewlist_endpoint_resolves_access_from_links(monkeypatch):
     _pass_auth_gate(monkeypatch)
     monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
-    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
     monkeypatch.setattr(fo, '_links_load',
                         lambda tok: fo.extract_duty_links(DUTY_LINKS))
     got = {}
     monkeypatch.setattr(fo, 'crew_list',
-                        lambda tok, f, d, dep, arr, ac:
+                        lambda tok, f, d, dep, arr, ac, **k:
                         got.update(ac=ac, dep=dep, arr=arr) or REAL_CREWLIST)
     import app as backend
     r = backend.app.test_client().post('/api/lh/flightops/crewlist/AT-U',
@@ -864,9 +1118,10 @@ def test_crewlist_endpoint_resolves_access_from_links(monkeypatch):
 def test_crewlist_endpoint_404_without_access(monkeypatch):
     _pass_auth_gate(monkeypatch)
     monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
-    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
     monkeypatch.setattr(fo, '_links_load', lambda tok: [])
-    monkeypatch.setattr(fo, 'duty_events', lambda tok, fd, td: None)
+    monkeypatch.setattr(fo, 'duty_events',
+                        lambda tok, fd, td, interactive=False: None)
     import app as backend
     r = backend.app.test_client().post('/api/lh/flightops/crewlist/AT-U',
                                        headers={'Authorization': 'Bearer AT-U'},
@@ -1006,11 +1261,11 @@ def test_crewlist_endpoint_attaches_aerox_profiles(monkeypatch):
     LH-Personalnummer."""
     _pass_auth_gate(monkeypatch)
     monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
-    monkeypatch.setattr(fo, '_valid_access', lambda tok: 'ACC')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
     monkeypatch.setattr(fo, '_links_load',
                         lambda tok: fo.extract_duty_links(DUTY_LINKS))
     monkeypatch.setattr(fo, 'crew_list',
-                        lambda tok, f, d, dep, arr, ac: REAL_CREWLIST)
+                        lambda tok, f, d, dep, arr, ac, **k: REAL_CREWLIST)
     monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {
         '095599C': {'token': 'AT-SOEREN', 'name': 'Soeren Roenelt',
                     'airline': 'Lufthansa', 'homebase': 'FRA',

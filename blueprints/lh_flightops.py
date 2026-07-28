@@ -31,6 +31,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import logging
+import datetime as _dt
 
 from flask import Blueprint, jsonify, request, redirect
 
@@ -1000,12 +1001,18 @@ def is_mock():
 # Duty Events = Roster (oben). Die weiteren Services füttern bestehende
 # AeroX-Features: Landing Report → Flugbuch-Landungen, Flight Leg Details →
 # Flug-Fakten, Crew List → Crew-Feed, Crew Hotel → Hotel-Verzeichnis, Rotation.
-def crew_list(user_token, flight, date, dep, arr, access_code):
-    """COMMON_CREWLIST — wer fliegt mit (crewMembers[])."""
+def crew_list(user_token, flight, date, dep, arr, access_code,
+              interactive=False):
+    """COMMON_CREWLIST — wer fliegt mit (crewMembers[]).
+
+    `interactive=True` = der User hat gerade den Crew-Button gedrückt → höhere
+    Budget-Grenze im Key-Gate (siehe _api_get). Hintergrund-Nutzer (Briefing)
+    bleiben beim Default False."""
     return _api_get(user_token, '/COMMON_CREWLIST', {
         'flightDesignator': (flight or '').upper().replace(' ', ''),
         'flightDate': _date_z(date), 'departureAirport': (dep or '').upper(),
-        'arrivalAirport': (arr or '').upper(), 'accessCode': access_code or ''})
+        'arrivalAirport': (arr or '').upper(), 'accessCode': access_code or ''},
+        interactive=interactive)
 
 
 def crew_rotation(user_token, *rotation_numbers):
@@ -2458,16 +2465,23 @@ def _links_find(links, service, flight, date, dep=None, arr=None):
     return best
 
 
-def _resolve_link_params(user_token, service, flight, date, dep=None, arr=None):
+def _resolve_link_params(user_token, service, flight, date, dep=None, arr=None,
+                         interactive=False):
     """Link-Params aus dem Cache; bei Miss das Tages-Fenster live nachladen
     (1 Duty-Events-Call) und Cache erneuern. None wenn der Flug nicht im
-    eigenen Roster ist (dann gibt es auch keinen accessCode)."""
+    eigenen Roster ist (dann gibt es auch keinen accessCode).
+
+    `interactive=True` reicht bis ins Key-Budget-Gate durch: der Link-Cache
+    liegt auf der ungemounteten Container-Disk (`Mounts: []`) und ist nach
+    JEDEM Deploy leer — ein Crew-Tap braucht dann genau diesen Nachlade-Call.
+    Unter dem Hintergrund-Deckel fiel er in vollen Stunden aus und der User
+    bekam 404 no_access_code (Log 28.07. 06:00:35)."""
     p = _links_find(_links_load(user_token), service, flight, date, dep, arr)
     if p:
         return p
     if not date:
         return None
-    resp = duty_events(user_token, date, date)
+    resp = duty_events(user_token, date, date, interactive=interactive)
     if not isinstance(resp, dict):
         return None
     fresh = extract_duty_links(resp)
@@ -2949,26 +2963,167 @@ def flightops_raw(token):
 
 # ── Crew-Listen Last-Good-Cache (Owner 2026-07-24: „Crew soll gecached
 # bleiben, damit bei totem Grant nichts Leeres dasteht") ─────────────────────
-# Durabel im Profil-Mirror (wie flightops_tokens — überlebt Redeploys, alle
-# Container sehen denselben Stand). LRU-gekappt auf die letzten Legs, damit
-# das Profil nicht wächst; ein Crew-Eintrag ist klein (Name/PK/Kategorie).
+# SPEICHERORT seit 2026-07-28: eigene Supabase-Tabelle `flightops_crew_cache`
+# statt des Profil-Mirrors. Grund — Owner-Befund „der Crew-Cache funktioniert
+# nicht", live am Owner-Token vermessen:
+#
+#   (c) NICHT die Durabilität. Der Profil-Mirror liegt in Supabase; Einträge
+#       vom 24.07. haben die DREI Deploys des 27./28.07. überlebt. („Cache
+#       liegt ephemer im Container" war der Verdacht — er ist widerlegt.)
+#   (a) Das SCHREIBEN klappt ebenfalls: ein Live-Abruf LH454/28.07. landete
+#       binnen Sekunden im Cache.
+#   (b) DIE URSACHE ist der Deckel: `_CREW_CACHE_MAX = 8` Legs, verdrängt in
+#       EINFÜGE-Reihenfolge. Genau jener Abruf schob den RÜCKFLUG
+#       LH455/30.07. aus dem Cache — ein frisch angesehenes Leg löscht ein
+#       künftiges. Bei ~10 angetippten Legs im Monat ist der Miss garantiert,
+#       und ein Miss heißt für den User 401/404/502 mit leerer Fläche.
+#       Zusätzlich war der Key auf das Datum EXAKT — Red-Eyes und der
+#       Z-vs-Lokalzeit-Rollover fielen daneben.
+#
+# Warum nicht einfach höher deckeln: ein Eintrag wiegt ~1,4 KB, und der
+# Profil-Blob wird auf nahezu JEDEM Request gelesen (_profile_load). 60 Legs
+# wären +85 KB pro Request für alle Endpoints — der Cache hätte die App
+# verlangsamt, statt sie zu retten. Die eigene Tabelle wird NUR im
+# Crew-Endpoint gelesen, deckelt nach Datum statt nach Anzahl und ist damit
+# faktisch unbegrenzt.
+#
+# Fehlt die Tabelle (Migration supabase_migrations/20260728_flightops_crew_cache.sql
+# noch nicht angewandt) oder ist SB weg, degradiert alles auf den alten
+# Profil-Cache — kein Hard-Fail, keine Client-Änderung nötig.
+_CREW_CACHE_TABLE = 'flightops_crew_cache'
+# Deckel des LEGACY-Profil-Fallbacks. Bleibt klein — der Blob ist heiß.
 _CREW_CACHE_MAX = 8
+# Tabellen-Deckel: Legs, deren Flugdatum länger als das her ist, fliegen raus.
+_CREW_CACHE_KEEP_DAYS = 120
+# Pro Token höchstens stündlich räumen (ein DELETE je Schreibserie reicht).
+_CREW_CACHE_PRUNE_EVERY_S = 3600.0
+# Datums-Toleranz beim LESEN: Roster-Datum (LT) vs. LH-Flugdatum (Z) können
+# bei Red-Eyes um einen Tag auseinanderliegen.
+_CREW_CACHE_DATE_SLACK = (0, -1, 1)
+
+# (letzter Fehlversuch, Tabelle nutzbar?) — nach einem Fehler 5 min Ruhe,
+# damit ein fehlendes Table/PostgREST-404 nicht jeden Request bezahlt.
+_crew_tbl_state = [0.0, True]
+_CREW_TBL_RETRY_S = 300.0
+_crew_prune_seen = {}            # token → ts des letzten Prunes
 
 
-def _crew_cache_get(token, flight, date):
+def _crew_tbl_ok():
+    """True wenn die Cache-Tabelle gerade als nutzbar gilt."""
     try:
         import app as _app
-        prof = ((_app._profile_load(token) or {}).get('profile') or {})
-        for e in (prof.get('flightops_crew_cache') or []):
-            if (str(e.get('flight') or '') == str(flight or '')
-                    and str(e.get('date') or '')[:10] == str(date or '')[:10]):
-                return e
+        if not getattr(_app, 'SB_AVAILABLE', False):
+            return False
+    except Exception:
+        return False
+    if (not _crew_tbl_state[1]
+            and (time.time() - _crew_tbl_state[0]) < _CREW_TBL_RETRY_S):
+        return False
+    return True
+
+
+def _crew_tbl_fail(exc):
+    _crew_tbl_state[0], _crew_tbl_state[1] = time.time(), False
+    log.warning('[lh_flightops] crew_cache-Tabelle nicht nutzbar (%s) — '
+                'Profil-Fallback bis zur Migration', type(exc).__name__)
+
+
+def _crew_key(flight, date):
+    """(normalisierte Flugnummer, YYYY-MM-DD)."""
+    return (str(flight or '').upper().replace(' ', ''), str(date or '')[:10])
+
+
+def _crew_date_candidates(date):
+    """Exaktes Datum zuerst, dann ±1 Tag (Red-Eye / Z-vs-LT-Rollover)."""
+    d = str(date or '')[:10]
+    out = [d]
+    try:
+        base = _dt.date.fromisoformat(d)
+        for off in _CREW_CACHE_DATE_SLACK[1:]:
+            out.append((base + _dt.timedelta(days=off)).isoformat())
     except Exception:
         pass
+    return out
+
+
+def _crew_cache_get_sb(token, flight, date):
+    """Tabellen-Lesepfad. None bei Miss/nicht verfügbar."""
+    if not (token and _crew_tbl_ok()):
+        return None
+    f, _d = _crew_key(flight, date)
+    if not f:
+        return None
+    cands = _crew_date_candidates(date)
+    try:
+        import app as _app
+        r = (_app.sb.table(_CREW_CACHE_TABLE)
+             .select('flight,flight_date,crew,cached_at')
+             .eq('token', token).eq('flight', f)
+             .in_('flight_date', cands).limit(len(cands)).execute())
+        _crew_tbl_state[1] = True
+        rows = getattr(r, 'data', None) or []
+    except Exception as e:
+        _crew_tbl_fail(e)
+        return None
+    by_date = {str(x.get('flight_date') or '')[:10]: x for x in rows}
+    for cand in cands:              # exaktes Datum schlägt die Toleranz
+        row = by_date.get(cand)
+        if row and row.get('crew'):
+            return {'flight': row.get('flight'), 'date': cand,
+                    'crew': row['crew'], 'cached_at': row.get('cached_at')}
     return None
 
 
-def _crew_cache_put(token, flight, date, crew):
+def _crew_cache_put_sb(token, flight, date, crew):
+    """Tabellen-Schreibpfad. False wenn die Tabelle nicht nutzbar ist."""
+    f, d = _crew_key(flight, date)
+    if not (token and f and d and crew and _crew_tbl_ok()):
+        return False
+    try:
+        import app as _app
+        (_app.sb.table(_CREW_CACHE_TABLE).upsert(
+            {'token': token, 'flight': f, 'flight_date': d,
+             'crew': crew, 'cached_at': time.time()},
+            on_conflict='token,flight,flight_date').execute())
+        _crew_tbl_state[1] = True
+    except Exception as e:
+        _crew_tbl_fail(e)
+        return False
+    _crew_cache_prune(token)
+    return True
+
+
+def _crew_cache_prune(token):
+    """Alte Legs räumen (best-effort, höchstens stündlich pro Token)."""
+    now = time.time()
+    if (now - _crew_prune_seen.get(token, 0.0)) < _CREW_CACHE_PRUNE_EVERY_S:
+        return
+    _crew_prune_seen[token] = now
+    if len(_crew_prune_seen) > 4000:
+        for k in sorted(_crew_prune_seen, key=_crew_prune_seen.get)[:2000]:
+            _crew_prune_seen.pop(k, None)
+    try:
+        import app as _app
+        cutoff = (_dt.date.today()
+                  - _dt.timedelta(days=_CREW_CACHE_KEEP_DAYS)).isoformat()
+        (_app.sb.table(_CREW_CACHE_TABLE).delete()
+         .eq('token', token).lt('flight_date', cutoff).execute())
+    except Exception:
+        pass
+
+
+# ── Legacy-Profil-Cache (Fallback + Alt-Bestand) ────────────────────────────
+def _crew_cache_legacy_entries(token):
+    try:
+        import app as _app
+        prof = ((_app._profile_load(token) or {}).get('profile') or {})
+        lst = prof.get('flightops_crew_cache')
+        return lst if isinstance(lst, list) else []
+    except Exception:
+        return []
+
+
+def _crew_cache_put_profile(token, flight, date, crew):
     try:
         import app as _app
         pf = _app._profile_load(token) or {}
@@ -2984,6 +3139,62 @@ def _crew_cache_put(token, flight, date, crew):
         log.warning('[lh_flightops] crew_cache_put: %s', type(e).__name__)
 
 
+def _crew_cache_migrate_profile(token, entries):
+    """Alt-Bestand EINMALIG in die Tabelle heben und den Profil-Key leeren.
+    Der Key wiegt ~1,4 KB pro Leg in einem Blob, der auf fast jedem Request
+    gelesen wird — nach der Migration ist der Hot-Path wieder schlank.
+    Geleert statt gelöscht: der SB-Profil-Save ist ein `||`-Merge, ein
+    entfernter Key würde in der DB stehen bleiben."""
+    if not entries:
+        return
+    for e in entries:
+        if isinstance(e, dict) and e.get('crew'):
+            if not _crew_cache_put_sb(token, e.get('flight'), e.get('date'),
+                                      e['crew']):
+                return          # Tabelle weg → Alt-Bestand NICHT anfassen
+    try:
+        import app as _app
+        pf = _app._profile_load(token) or {}
+        prof = (pf.get('profile') or {})
+        prof['flightops_crew_cache'] = []
+        _app._profile_save(token, prof)
+    except Exception as e:
+        log.warning('[lh_flightops] crew_cache_migrate: %s', type(e).__name__)
+
+
+def _crew_cache_get(token, flight, date):
+    """Last-Good-Liste für ein Leg — Tabelle zuerst, Legacy-Profil als
+    Fallback (inkl. einmaliger Migration)."""
+    hit = _crew_cache_get_sb(token, flight, date)
+    if hit:
+        return hit
+    entries = _crew_cache_legacy_entries(token)
+    if not entries:
+        return None
+    f, _d = _crew_key(flight, date)
+    out = None
+    for cand in _crew_date_candidates(date):
+        for e in entries:
+            if (isinstance(e, dict) and e.get('crew')
+                    and str(e.get('flight') or '').upper().replace(' ', '') == f
+                    and str(e.get('date') or '')[:10] == cand):
+                out = e
+                break
+        if out:
+            break
+    if _crew_tbl_ok():
+        _crew_cache_migrate_profile(token, entries)
+    return out
+
+
+def _crew_cache_put(token, flight, date, crew):
+    if not crew:
+        return
+    if _crew_cache_put_sb(token, flight, date, crew):
+        return
+    _crew_cache_put_profile(token, flight, date, crew)
+
+
 @lh_flightops_bp.route('/api/lh/flightops/crewlist/<token>', methods=['POST'])
 def flightops_crewlist(token):
     """„Wer fliegt mit" für ein Leg (COMMON_CREWLIST → normalisiert). Body
@@ -2992,10 +3203,24 @@ def flightops_crewlist(token):
     App muss ihn also NICHT kennen. Parser gegen echte Shape verifiziert.
 
     LAST-GOOD-CACHE (Owner 2026-07-24): jede erfolgreiche Liste wird pro Leg
-    im Profil-Mirror persistiert. Ist der Grant tot (needs_relogin), der
-    accessCode nicht auflösbar oder LH down, kommt die LETZTE Liste mit
-    `cached:true` statt eines Fehlers — die Crew-Fläche ist nie leer, ein
-    Relogin fällt im Feature nicht als Loch auf."""
+    durabel persistiert (Tabelle flightops_crew_cache, siehe oben). Ist der
+    Grant tot (needs_relogin), der accessCode nicht auflösbar oder LH down,
+    kommt die LETZTE Liste mit `cached:true` statt eines Fehlers.
+
+    STATUS-CODES (die App unterscheidet sie, siehe FlightCrewSheet):
+      401 not_connected          — Grant tot/nie da ⇒ App bietet „Mit
+                                   Lufthansa verbinden" an. NUR hier!
+      503 token_refresh_pending  — Access-Token abgelaufen, der zentrale
+                                   Refresher ist dran ⇒ „gleich nochmal",
+                                   KEIN Relogin-Angebot (der Grant ist heil).
+      404 no_access_code · 502 crewlist_unavailable — Leg/LH-seitig.
+    Jeder dieser Pfade liefert vorher die Cache-Liste aus, wenn es eine gibt.
+
+    INTERAKTIV: dieser Endpoint hängt am Crew-BUTTON, ist also nutzerausgelöst
+    — LH-Calls laufen mit `interactive=True` (Budget-Gate 950/h statt 700/h).
+    Vorher lief der Tap unter dem Hintergrund-Deckel und wurde in vollen
+    Stunden verworfen (Log 28.07. 06:00/06:52/06:56: „Stundenbudget 748 >= 700
+    — Hintergrund-Call /COMMON_CREWLIST übersprungen" → 502 beim User)."""
     b = request.get_json(silent=True) or {}
     flight, date = b.get('flight'), b.get('date')
     dep, arr = b.get('dep'), b.get('arr')
@@ -3007,21 +3232,32 @@ def flightops_crewlist(token):
                             'cached_at': e.get('cached_at')})
         return None
 
-    if not _valid_access(token):
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        return _cached() or (jsonify({'ok': False,
+                                      'error': 'token_refresh_pending'}), 503)
+    if _st != 'ok':
         return _cached() or (jsonify({'ok': False, 'error': 'not_connected'}), 401)
     access = (b.get('access') or '').strip()
     if not access:
-        p = _resolve_link_params(token, 'crewlist', flight, date, dep, arr) or {}
+        p = _resolve_link_params(token, 'crewlist', flight, date, dep, arr,
+                                 interactive=True) or {}
         access = p.get('accessCode') or ''
         dep = dep or p.get('departureAirport')
         arr = arr or p.get('arrivalAirport')
     if not access:
         # Kein Link = Flug nicht im eigenen Roster → LH würde eh 401/403 geben.
         return _cached() or (jsonify({'ok': False, 'error': 'no_access_code'}), 404)
-    resp = crew_list(token, flight, date, dep, arr, access)
+    resp = crew_list(token, flight, date, dep, arr, access, interactive=True)
     if not isinstance(resp, dict) or resp.get('processingErrors'):
         return _cached() or (jsonify({'ok': False, 'error': 'crewlist_unavailable'}), 502)
     crew = parse_crew_list(resp)
+    if not crew:
+        # LH füllt die Liste erst kurz vor Abflug und räumt sie nach dem Flug
+        # wieder weg. Eine LEERE Live-Antwort darf die letzte gute nicht
+        # verdrängen — sonst steht die Fläche ausgerechnet dann leer, wenn man
+        # nach dem Flug nachschlägt „mit wem war ich unterwegs".
+        return _cached() or jsonify({'ok': True, 'crew': []})
     # AeroX-Profil-Verknüpfung (Owner 2026-07-23): wer aus der Crew ist selbst
     # auf AeroX? → Avatar/Profil direkt aus der Liste öffnen.
     matches = _match_aerox_profiles(crew)
@@ -3029,8 +3265,7 @@ def flightops_crewlist(token):
         p = matches.get(str(m.get('pk') or m.get('name') or ''))
         if p:
             m['aerox'] = p
-    if crew:
-        _crew_cache_put(token, flight, date, crew)
+    _crew_cache_put(token, flight, date, crew)
     return jsonify({'ok': True, 'crew': crew})
 
 

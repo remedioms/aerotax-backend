@@ -30547,6 +30547,10 @@ def auth_delete_account():
             # hier bisher komplett, roster_changes ist neu (Verlauf-Migration).
             ('roster_snapshots',        'token'),              # on_conflict='token'
             ('roster_changes',          'token'),              # on_conflict='token'
+            # 2026-07-28: Last-Good-Crewlisten (PII: Klarnamen fremder
+            # Crew-Mitglieder) — vorher im Profil-Blob, der mit user_profiles
+            # mitging; als eigene Tabelle braucht sie einen eigenen Eintrag.
+            ('flightops_crew_cache',    'token'),              # PK token,flight,flight_date
         ]
         for _tbl, _col in _cascade:
             try:
