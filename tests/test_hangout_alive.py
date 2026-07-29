@@ -180,10 +180,24 @@ def test_liste_liefert_vibes_zeitfenster_und_zusagen_zaehler():
 
 
 def test_liste_ohne_migration_bleibt_ruhig():
-    """Alt-Zeile ohne meta/attendees: keine Fehler, nur ehrliche Nullwerte."""
+    """Alt-Zeile ohne meta/attendees: keine Fehler, nur ehrliche Werte.
+
+    GEÄNDERT 2026-07-29: der ERSTELLER zählt immer mit (er steht als
+    `user_token` auf der Zeile — dafür braucht es die attendees-Spalte nicht).
+    „0 dabei" auf einem Treffpunkt, zu dem jemand eingeladen hat, wäre falsch.
+    Der VIEWER ist hier nicht der Ersteller → `attending` bleibt False.
+    """
     h = _list_hangouts([_pin()], LH_FRA_CABIN)['hangouts'][0]
     assert h['vibes'] == [] and h['meta'] is None
-    assert h['attendee_count'] == 0 and h['attending'] is False
+    assert h['attendee_count'] == 1
+    assert h['attending'] is False and h['is_owner'] is False
+
+
+def test_liste_ersteller_ist_immer_dabei():
+    """Der Ersteller sieht seinen eigenen Treff als „dabei" — ohne je zu tippen."""
+    h = _list_hangouts([_pin()], LH_FRA_CABIN, token=OWNER)['hangouts'][0]
+    assert h['attendee_count'] == 1
+    assert h['attending'] is True and h['is_owner'] is True
 
 
 def test_liste_vibes_oeffnen_keine_hintertuer():
@@ -359,6 +373,130 @@ def test_join_echter_schreibfehler_ist_kein_migrations_hinweis():
     assert status == 500 and payload['error'] == 'join_failed'
 
 
+# ── Der Ersteller ist immer dabei (Owner 2026-07-29) ────────────────────────
+
+def test_ersteller_steht_auch_ohne_gespeicherte_zusage_in_der_liste():
+    """Alt-Zeile ohne attendees-Spalte: der Ersteller zählt trotzdem."""
+    assert A._hangout_attendees_of_row({'user_token': OWNER}) == [OWNER]
+
+
+def test_ersteller_wird_nicht_doppelt_gezaehlt():
+    assert A._hangout_attendees_of_row(
+        {'user_token': OWNER, 'attendees': [VIEWER, OWNER]}) == [OWNER, VIEWER]
+
+
+def test_ersteller_kann_sich_nicht_austragen():
+    """Wer einlädt, ist der Treffpunkt — Austragen wäre eine stille Lüge."""
+    payload, status, box = _join(_pin(attendees=[OWNER]), {'join': False},
+                                 token=OWNER)
+    assert status == 409 and payload['error'] == 'owner_cannot_leave'
+    assert payload['attending'] is True
+    assert box == []           # nichts geschrieben
+
+
+def test_ersteller_zusagen_ist_idempotent_ohne_write():
+    payload, status, box = _join(_pin(), {'join': True}, token=OWNER)
+    assert status == 200 and payload['attending'] is True
+    assert payload['attendee_count'] == 1 and box == []
+
+
+# ── Hangout entfernen: hart löschen vs. weich absagen ───────────────────────
+
+class _FakeMutate:
+    """Sammelt update()/delete()-Aufrufe getrennt ein."""
+
+    def __init__(self, updates, deletes, fail_update=None):
+        self.updates = updates
+        self.deletes = deletes
+        self.fail_update = fail_update
+
+    def update(self, patch_):
+        self.updates.append(patch_)
+        if self.fail_update:
+            raise Exception(self.fail_update)
+        return self
+
+    def delete(self):
+        self.deletes.append(True)
+        return self
+
+    def eq(self, *_a, **_k):
+        return self
+
+    def execute(self):
+        return self
+
+
+def _delete(row, token=OWNER, fail_update=None):
+    updates, deletes = [], []
+
+    class _SB:
+        @staticmethod
+        def table(name):
+            assert name == 'manual_pins'
+            return _FakeMutate(updates, deletes, fail_update)
+
+    with patch.object(A, 'SB_AVAILABLE', True), \
+         patch.object(A, 'sb', _SB()), \
+         patch.object(A, '_hangout_load_one', return_value=row), \
+         A.app.test_request_context(
+             f'/api/user/manual-pins/{token}/h1/delete', method='POST'):
+        resp = A.delete_manual_pin(token, 'h1')
+    payload = resp[0].get_json() if isinstance(resp, tuple) else resp.get_json()
+    status = resp[1] if isinstance(resp, tuple) else 200
+    return payload, status, updates, deletes
+
+
+def test_delete_ohne_zusagen_loescht_hart():
+    payload, status, updates, deletes = _delete(_pin(attendees=[OWNER]))
+    assert status == 200 and payload['cancelled'] is False
+    assert deletes == [True] and updates == []
+
+
+def test_delete_mit_fremden_zusagen_sagt_weich_ab():
+    """Wer zugesagt hat, soll nicht ohne Spur dastehen."""
+    payload, status, updates, deletes = _delete(
+        _pin(attendees=[OWNER, VIEWER]))
+    assert status == 200 and payload['cancelled'] is True
+    assert deletes == []
+    assert updates[0]['meta']['cancelled_at']
+
+
+def test_delete_fremder_hangout_ist_404_und_ruehrt_nichts_an():
+    payload, status, updates, deletes = _delete(_pin(owner=OTHER), token=OWNER)
+    assert status == 404 and payload['error'] == 'not_found'
+    assert updates == [] and deletes == []
+
+
+def test_delete_unbekannte_id_ist_idempotent():
+    payload, status, _, deletes = _delete(None)
+    assert status == 200 and payload['ok'] is True and deletes == []
+
+
+def test_delete_ohne_meta_spalte_faellt_auf_hartes_loeschen_zurueck():
+    """Absage nicht speicherbar → NICHT „abgesagt" behaupten."""
+    payload, status, updates, deletes = _delete(
+        _pin(attendees=[OWNER, VIEWER]),
+        fail_update="PGRST204 Could not find the 'meta' column")
+    assert status == 200 and payload['cancelled'] is False
+    assert updates and deletes == [True]
+
+
+def test_abgesagter_hangout_faellt_aus_den_listen():
+    row = _pin(meta={'v': 1, 'cancelled_at': '2026-07-29T10:00:00+00:00'})
+    assert A._hangout_cancelled_at(row)
+    assert A._hangout_is_listable(row) is False
+    assert _list_hangouts([row], LH_FRA_CABIN)['hangouts'] == []
+
+
+def test_abgesagter_hangout_bleibt_im_detail_erreichbar():
+    """Damit der Gruppenchat der Zugesagten „Abgesagt" zeigt statt eines 404."""
+    row = _pin(attendees=[OWNER, VIEWER],
+               meta={'v': 1, 'cancelled_at': '2026-07-29T10:00:00+00:00'})
+    payload, status = _detail(row, LH_FRA_CABIN)
+    assert status == 200 and payload['hangout']['cancelled'] is True
+
+
 # ── Erstellen ───────────────────────────────────────────────────────────────
 
 class _FakeInsert:
@@ -430,8 +568,10 @@ def test_create_ohne_migration_legt_den_hangout_trotzdem_an():
         fail_first="PGRST204 Could not find the 'meta' column")
     assert status == 200
     assert sorted(payload['pin']['degraded']) == ['attendees', 'audience', 'meta']
-    assert payload['pin']['attendee_count'] == 0
-    assert payload['pin']['attending'] is False
+    # Die Zusage des ERSTELLERS überlebt die fehlende Migration: sie leitet sich
+    # aus `user_token` ab, nicht aus der attendees-Spalte.
+    assert payload['pin']['attendee_count'] == 1
+    assert payload['pin']['attending'] is True
     assert 'meta' not in box[1] and 'attendees' not in box[1]
     assert box[1]['iata_code'] == 'FRA'     # der Hangout selbst ist da
 

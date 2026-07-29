@@ -56,6 +56,54 @@ def test_normalize_same_base():
     assert aud['base'] == 'FRA'
 
 
+# ── KONKRETE Base/Airline (v3, Owner 2026-07-29: „base münchen etc etc") ────
+
+def test_normalize_konkrete_base_auch_ohne_eigene_base():
+    """„Base MUC" behauptet nichts über den Ersteller — es braucht seinen
+    Profil-Fakt also nicht (anders als „same")."""
+    aud = A._hangout_audience_normalize({'base': 'muc'}, EMPTY_PROFILE)
+    assert aud['base'] == 'MUC'
+
+
+def test_normalize_konkrete_base_schlaegt_nicht_die_eigene():
+    aud = A._hangout_audience_normalize({'base': 'MUC'}, LH_FRA_CABIN)
+    assert aud['base'] == 'MUC'
+
+
+def test_normalize_base_freitext_wird_verworfen():
+    """„München" würde gegen die IATA-Homebase nie matchen → lieber gar keine
+    Einschränkung als eine, die niemanden durchlässt."""
+    assert A._hangout_audience_normalize({'base': 'München'},
+                                         LH_FRA_CABIN) is None
+    assert A._hangout_audience_normalize({'base': 'FRAN'}, LH_FRA_CABIN) is None
+
+
+def test_normalize_base_any_bleibt_offen():
+    assert A._hangout_audience_normalize({'base': 'any'}, LH_FRA_CABIN) is None
+
+
+def test_normalize_konkrete_airline_wird_kanonisiert():
+    aud = A._hangout_audience_normalize({'airline': 'LX'}, LH_FRA_CABIN)
+    assert aud['airline'] == 'SWISS'
+    assert aud['airline_label'] == 'LX'
+
+
+def test_konkrete_base_filtert_wie_die_eigene():
+    aud = A._hangout_audience_normalize({'base': 'MUC'}, LH_FRA_CABIN)
+    assert A._hangout_audience_matches(aud, LH_MUC_COCKPIT) is True
+    assert A._hangout_audience_matches(aud, LH_FRA_CABIN) is False
+    # FAIL-CLOSED: ohne eigene Base im Profil sieht man den Hangout nicht.
+    assert A._hangout_audience_matches(aud, EMPTY_PROFILE) is False
+
+
+def test_altbestand_mit_same_herkunft_bleibt_lesbar():
+    """Abwärtskompatibilität: gespeichert wurde schon immer der AUFGELÖSTE
+    Wert — die v3-Erweiterung ändert daran nichts."""
+    alt = {'v': 1, 'base': 'FRA', 'airline': 'LUFTHANSA'}
+    assert A._hangout_audience_matches(alt, LH_FRA_CABIN) is True
+    assert A._hangout_audience_label(alt) == 'Nur Lufthansa · Base FRA'
+
+
 def test_normalize_ohne_ersteller_fakt_faellt_einschraenkung_weg():
     """Wer selbst keine Airline im Profil hat, kann nicht darauf einschränken."""
     aud = A._hangout_audience_normalize(

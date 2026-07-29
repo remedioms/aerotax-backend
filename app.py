@@ -12628,20 +12628,51 @@ def _hangout_audience_normalize(raw, owner_profile, owner_ops=None,
     KREIS (`circle_id`): nur wenn der Ersteller SELBST aktives Mitglied ist —
     sonst könnte man einen Hangout in einen Kreis werfen, zu dem man nicht
     gehört.
+
+    KONKRETE BASE/AIRLINE (v3, Owner 2026-07-29: „zielgruppe hat mehr optionen
+    eig.. base münchen etc etc etc"): `base` und `airline` akzeptieren jetzt
+    zusätzlich einen KONKRETEN Wert — `base: 'MUC'`, `airline: 'SWISS'`. Bisher
+    ging nur „dieselbe wie meine", was einen FRA-Kollegen daran hinderte, einen
+    Treff für die Münchner Crew zu setzen. Ein konkreter Wert braucht KEINEN
+    Ersteller-Fakt (er behauptet nichts über den Ersteller) und wird deshalb
+    auch dann übernommen, wenn dessen Profil leer ist.
+
+    Gespeichert wird in BEIDEN Fällen dasselbe Format wie bisher (`base` =
+    IATA-Grossbuchstaben, `airline` = kanonischer Key + `airline_label`) —
+    bereits gespeicherte Hangouts mit `base: 'same'`-Herkunft bleiben deshalb
+    unverändert lesbar, und die Prüfseite (_hangout_audience_matches) braucht
+    keine Zeile Änderung.
     """
     if not isinstance(raw, dict):
         return None
     prof = owner_profile or {}
     ops = owner_ops if isinstance(owner_ops, dict) else {}
     out = {'v': 1}
-    if str(raw.get('airline') or '').strip().lower() == 'same':
+    airline_in = str(raw.get('airline') or '').strip()
+    if airline_in.lower() == 'same':
         key = _canonical_airline_key(prof.get('airline'))
         if key:
             out['airline'] = key
             out['airline_label'] = (prof.get('airline') or '').strip() or key
-    if str(raw.get('base') or '').strip().lower() == 'same':
+    elif airline_in and airline_in.lower() != 'any':
+        # KONKRETE Airline („SWISS", „Lufthansa", „LX") — durch denselben
+        # Kanonisierer wie das Profil, sonst träfen „LX" und „SWISS" nie
+        # aufeinander.
+        key = _canonical_airline_key(airline_in)
+        if key:
+            out['airline'] = key
+            out['airline_label'] = airline_in[:40]
+    base_in = str(raw.get('base') or '').strip()
+    if base_in.lower() == 'same':
         base = (prof.get('homebase') or '').strip().upper()
         if base:
+            out['base'] = base
+    elif base_in and base_in.lower() != 'any':
+        # KONKRETE Base — nur ein echter 3-Letter-IATA-Code. Freitext („München")
+        # würde gegen `profile.homebase` (IATA) nie matchen; dann lieber gar
+        # keine Einschränkung als eine, die niemanden durchlässt.
+        base = base_in.upper()
+        if re.fullmatch(r'[A-Z]{3}', base):
             out['base'] = base
     roles_in = raw.get('roles')
     if isinstance(roles_in, (list, tuple)):
@@ -12975,6 +13006,37 @@ def _hangout_meta_of_row(row):
     return raw if isinstance(raw, dict) else None
 
 
+# ── ABSAGEN statt hart löschen ──────────────────────────────────────────────
+#
+# Owner 2026-07-29: „hangout löschen auch keine option". Löschen gab es zwar
+# schon (`/manual-pins/<token>/<id>/delete`), aber HART. Sobald jemand zugesagt
+# hat, ist hartes Löschen die falsche Antwort: der Zugesagte stünde ohne Spur da
+# (sein Hangout-Chat zeigte plötzlich einen 404-Kopf statt „Abgesagt"). Deshalb:
+#
+#   * niemand sonst dabei  → hart löschen (nichts geht verloren)
+#   * andere haben zugesagt → WEICH absagen: die Zeile bleibt, `meta.cancelled_at`
+#     wird gesetzt. Der Hangout verschwindet aus allen LISTEN (Karte/Feed) wie
+#     ein abgelaufener, der DETAIL-Endpoint liefert ihn aber weiter aus — damit
+#     der Chat-Kontext-Kopf ehrlich „Abgesagt" sagen kann.
+#
+# Bewusst kein neues Schema: `meta` ist bereits ein offenes jsonb auf derselben
+# Zeile. Fehlt die Spalte (Migration nicht appliedet), fällt der Weg auf hartes
+# Löschen zurück — lieber weg als „abgesagt" behaupten und nichts speichern.
+def _hangout_cancelled_at(row):
+    """ISO-Zeitpunkt der Absage, sonst None. Tolerant (meta darf fehlen)."""
+    meta = _hangout_meta_of_row(row)
+    if not isinstance(meta, dict):
+        return None
+    v = meta.get('cancelled_at')
+    return v if isinstance(v, str) and v.strip() else None
+
+
+def _hangout_is_listable(row):
+    """Gehört diese Pin-Zeile in eine LISTE (Karte/Feed)? Abgelaufen oder
+    abgesagt → nein. EINE Regel für alle drei Loader."""
+    return _pin_not_expired(row) and not _hangout_cancelled_at(row)
+
+
 # ── ZUSAGEN („Bin dabei") ───────────────────────────────────────────────────
 #
 # Bis heute gab es KEINEN Beitritts-Mechanismus: „beitreten" hieß den Chat
@@ -12984,19 +13046,29 @@ _HANGOUT_MAX_ATTENDEES = 200
 
 
 def _hangout_attendees_of_row(row):
-    """Token-Liste der Zusagen — tolerant (Spalte darf fehlen), dedupliziert."""
+    """Token-Liste der Zusagen — tolerant (Spalte darf fehlen), dedupliziert.
+
+    Der ERSTELLER steht IMMER an erster Stelle (Owner 2026-07-29: „1 dabei auf
+    der Karte aber keine Option zu sagen ich bin auch dabei"). Wer einlädt, ist
+    da — „0 dabei" auf dem eigenen Treffpunkt wäre schlicht falsch. Das gilt
+    auch für Alt-Zeilen aus der Zeit vor der `attendees`-Spalte und für Inserts,
+    denen die Migration fehlte: das `user_token` steht immer auf der Zeile, die
+    Zusage des Erstellers braucht also gar keinen gespeicherten Zustand.
+    """
     raw = (row or {}).get('attendees')
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
         except Exception:
-            return []
-    if not isinstance(raw, (list, tuple)):
-        return []
+            raw = None
     out = []
-    for t in raw:
-        if isinstance(t, str) and t and t not in out:
-            out.append(t)
+    owner = (row or {}).get('user_token')
+    if isinstance(owner, str) and owner:
+        out.append(owner)
+    if isinstance(raw, (list, tuple)):
+        for t in raw:
+            if isinstance(t, str) and t and t not in out:
+                out.append(t)
     return out[:_HANGOUT_MAX_ATTENDEES]
 
 
@@ -13038,6 +13110,12 @@ def _hangout_public_fields(row, viewer_token):
         'meta': _hangout_meta_of_row(row),
         'attendee_count': len(att),
         'attending': bool(viewer_token) and viewer_token in att,
+        # Der Ersteller ist immer dabei und kann sich nicht austragen — der
+        # Client soll ihm deshalb erst gar keinen Schalter anbieten.
+        'is_owner': bool(viewer_token) and (row or {}).get('user_token') == viewer_token,
+        # Abgesagt (weicher Lösch-Weg). In Listen kommt das nie vor, im Detail
+        # schon — dort trägt es den ehrlichen „Abgesagt"-Hinweis.
+        'cancelled': bool(_hangout_cancelled_at(row)),
     }
 
 
@@ -13076,7 +13154,7 @@ def _manual_pins_load(token):
     try:
         r = (sb.table('manual_pins').select('*')
              .eq('user_token', token).order('pin_date').limit(500).execute())
-        return [x for x in (r.data or []) if _pin_not_expired(x)]
+        return [x for x in (r.data or []) if _hangout_is_listable(x)]
     except Exception as e:
         app.logger.warning(f'[crew-dest] pins_load_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
@@ -13089,7 +13167,7 @@ def _manual_pins_for_friends(token, friend_tokens):
     try:
         r = (sb.table('manual_pins').select('*')
              .in_('user_token', list(friend_tokens)[:500]).limit(2000).execute())
-        return [x for x in (r.data or []) if _pin_not_expired(x)]
+        return [x for x in (r.data or []) if _hangout_is_listable(x)]
     except Exception as e:
         app.logger.warning(f'[crew-dest] friend_pins_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
@@ -13107,7 +13185,7 @@ def _public_pins_at_iatas(iatas):
     try:
         r = (sb.table('manual_pins').select('*')
              .in_('iata_code', list(set(iatas))[:60]).limit(2000).execute())
-        return [x for x in (r.data or []) if _pin_not_expired(x)]
+        return [x for x in (r.data or []) if _hangout_is_listable(x)]
     except Exception as e:
         app.logger.warning(f'[crew-dest] public_pins_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
@@ -13810,7 +13888,9 @@ def _hangouts_load_all_active():
         r = (sb.table('manual_pins').select('*')
              .or_(f'pin_date.gte.{today},pin_date.is.null')
              .limit(5000).execute())
-        return r.data or []
+        # Abgesagte gehören nicht in den Feed — der Zeitfilter oben kennt sie
+        # nicht, die Absage lebt in `meta.cancelled_at`.
+        return [x for x in (r.data or []) if not _hangout_cancelled_at(x)]
     except Exception as e:
         app.logger.warning(f'[hangouts] load_all_fail err={type(e).__name__}: {str(e)[:120]}')
         return []
@@ -13846,6 +13926,10 @@ def list_hangouts(token):
         [p.get('user_token') for p in _pins
          if p.get('user_token') and p.get('user_token') != token])
     for p in _pins:
+        # Abgesagt (weicher Lösch-Weg) → gehört in keine Liste, auch nicht in
+        # die des Erstellers. Erreichbar bleibt der Hangout nur im Detail.
+        if _hangout_cancelled_at(p):
+            continue
         pid = p.get('id')
         if not pid:
             continue
@@ -13959,6 +14043,13 @@ def join_hangout(token, pin_id):
     want = (request.get_json(silent=True) or {}).get('join')
     join = True if want is None else bool(want)
     att = _hangout_attendees_of_row(row)
+    # Der ERSTELLER kann sich nicht austragen — er IST der Treffpunkt. Statt
+    # still zu ignorieren, sagen wir es ehrlich (der Client zeigt ihm gar keinen
+    # Schalter, siehe `is_owner`); ein 409 macht einen Client-Bug sichtbar.
+    if not join and (row.get('user_token') or '') == token:
+        return jsonify({'ok': False, 'error': 'owner_cannot_leave',
+                        'attending': True, 'attendee_count': len(att),
+                        'attendees': _hangout_people(att, token)}), 409
     if join and token not in att:
         if len(att) >= _HANGOUT_MAX_ATTENDEES:
             return jsonify({'ok': False, 'error': 'attendees_full'}), 409
@@ -14727,8 +14818,13 @@ def create_manual_pin(token):
         'vibes': vibes,
         'vibe_labels': _hangout_vibe_labels(vibes),
         'meta': meta,
-        'attendee_count': 0 if 'attendees' in degraded else 1,
-        'attending': 'attendees' not in degraded,
+        # Der Ersteller ist immer dabei — das leitet sich aus `user_token` ab
+        # und braucht die attendees-Spalte gar nicht (siehe
+        # _hangout_attendees_of_row). Deshalb auch im degraded-Fall ehrlich 1.
+        'attendee_count': 1,
+        'attending': True,
+        'is_owner': True,
+        'cancelled': False,
         # Ehrlichkeit: welche Anzeige-Extras die (noch) fehlende Migration
         # geschluckt hat. Der Client kann das ignorieren; Logs/Tests nicht.
         'degraded': degraded or None}})
@@ -14736,16 +14832,54 @@ def create_manual_pin(token):
 
 @app.route('/api/user/manual-pins/<token>/<pin_id>/delete', methods=['POST'])
 def delete_manual_pin(token, pin_id):
-    """Löscht NUR den eigenen Pin (gezielter Delete, owner-scoped). Token-binding
-    durch _bug004-Gate."""
+    """Hangout entfernen — NUR der eigene (owner-scoped). Token-binding durch
+    das _bug004-Gate, zusätzlich hier gegen `user_token` geprüft.
+
+    Owner 2026-07-29: „hangout löschen auch keine option". Zwei Wege, je nach
+    dem was auf dem Spiel steht (siehe _hangout_cancelled_at):
+
+      * niemand sonst dabei → HART löschen. Es geht nichts verloren.
+      * andere haben zugesagt → WEICH absagen (`meta.cancelled_at`). Der Hangout
+        fällt aus allen Listen, bleibt aber über den Detail-Endpoint erreichbar,
+        damit der Gruppenchat der Zugesagten „Abgesagt" statt eines 404 zeigt.
+
+    Antwort trägt `cancelled`, damit der Client die richtige Bestätigung zeigt
+    („abgesagt" ≠ „gelöscht") — er soll nicht raten müssen.
+    """
     if not SB_AVAILABLE:
         return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    row = _hangout_load_one(pin_id)
+    if row is None:
+        # Idempotent: was nicht (mehr) da ist, ist erledigt.
+        return jsonify({'ok': True, 'cancelled': False})
+    if (row.get('user_token') or '') != token:
+        # Ein Fremder darf einen Hangout niemals entfernen. 404 statt 403 —
+        # sonst verriete der Status die Existenz eines Hangouts, den dieser
+        # Viewer u.U. gar nicht sehen darf.
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    others = [t for t in _hangout_attendees_of_row(row) if t != token]
+    if others:
+        meta = dict(_hangout_meta_of_row(row) or {})
+        meta.setdefault('v', 1)
+        meta['cancelled_at'] = datetime.now(timezone.utc).isoformat()
+        try:
+            (sb.table('manual_pins').update({'meta': meta})
+             .eq('id', pin_id).eq('user_token', token).execute())
+            return jsonify({'ok': True, 'cancelled': True})
+        except Exception as e:
+            app.logger.warning(
+                f'[crew-dest] pin_cancel_fail err={type(e).__name__}: {str(e)[:120]}')
+            # Fehlt die meta-Spalte, können wir die Absage nicht speichern.
+            # Dann NICHT „abgesagt" behaupten, sondern hart löschen — der
+            # Hangout ist so oder so weg, aber die Antwort bleibt ehrlich.
+            if not _pin_optional_column_missing(e):
+                return jsonify({'ok': False, 'error': 'delete_failed'}), 500
     try:
         sb.table('manual_pins').delete().eq('id', pin_id).eq('user_token', token).execute()
     except Exception as e:
         app.logger.warning(f'[crew-dest] pin_delete_fail err={type(e).__name__}: {str(e)[:120]}')
         return jsonify({'ok': False, 'error': 'delete_failed'}), 500
-    return jsonify({'ok': True})
+    return jsonify({'ok': True, 'cancelled': False})
 
 
 @app.route('/api/user/friend-groups/<token>', methods=['GET'])
