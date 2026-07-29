@@ -2933,8 +2933,11 @@ def test_crew_prefetch_legs_uses_duty_links_only():
                      'arr': 'JFK', 'access': 'SECRET42'}]
     # Ausserhalb des Horizonts (Flug liegt in der Vergangenheit) ⇒ nichts.
     assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-25') == []
-    # Weit vor dem Flug (> 7 Tage) ⇒ ebenfalls nichts.
-    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-01') == []
+    # GANZER MONAT (Owner 2026-07-28 „preload the whole month"): 23 Tage vor
+    # dem Flug liegt IM Horizont …
+    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-01') != []
+    # … erst jenseits von 31 Tagen ist Schluss.
+    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-06-20') == []
 
 
 def test_crew_prefetch_legs_dedupes_and_caps():

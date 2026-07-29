@@ -3427,8 +3427,15 @@ def _crew_shared_serve(token, flight, date, dep=None, arr=None, now=None):
 # NOTBREMSE: Prefetch hört als ERSTES auf — eigene, tiefere Deckel (550/h,
 # 3.800/Tag) ÜBER dem regulären Hintergrund-Gate in _api_get. Der Roster darf
 # nie an einer Zugabe verhungern (gleiche Logik wie _ROT_LHFO_HOUR_CEILING).
-_CREW_PREFETCH_DAYS = 7
-_CREW_PREFETCH_MAX_LEGS = 8
+# GANZER MONAT (Owner 2026-07-28 „preload the whole month"): Horizont 31 Tage,
+# Leg-Deckel auf einen vollen Monatsplan ausgelegt. Der Schutz bleibt bei den
+# eigenen Budget-Deckeln (550/h · 3800/Tag) — ein kalter Erst-Warm verteilt
+# sich damit einfach über mehrere Läufe/Tage, statt die Quote zu reißen.
+# Ferne Legs sind bei LH meist noch LEER — dafür schreibt der Prefetch jetzt
+# einen Leer-MARKER (s. _crew_prefetch_run), sonst holt die halbe Crew täglich
+# dieselbe leere Liste.
+_CREW_PREFETCH_DAYS = 31
+_CREW_PREFETCH_MAX_LEGS = 48
 _CREW_PREFETCH_MIN_AGE_S = 20 * 3600
 _CREW_PREFETCH_HOUR_CEILING = 550
 _CREW_PREFETCH_DAY_CEILING = 3800
@@ -3512,7 +3519,14 @@ def _crew_prefetch_run(token, legs, now=None):
                 continue                  # verpasste Zugabe, kein Fehlerfall
             crew = parse_crew_list(resp)
             if not crew:
-                failed += 1               # LH füllt erst kurz vor Abflug
+                # LH füllt erst kurz vor Abflug. LEER-MARKER trotzdem cachen:
+                # der 20h-Amortisierer unterdrückt damit crew-weit die
+                # tägliche Wieder-Abfrage derselben leeren Fern-Liste (beim
+                # 31-Tage-Horizont sonst der größte Kostenblock). Der Serve-
+                # Pfad liefert leere Zeilen NIE aus (_crew_shared_serve) —
+                # ein interaktiver Tap geht weiter live.
+                _crew_cache_put(token, leg['flight'], leg['date'], [])
+                skipped += 1
                 continue
             _crew_cache_put(token, leg['flight'], leg['date'], crew)
             done += 1
