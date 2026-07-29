@@ -10390,8 +10390,26 @@ def _profile_sidekey_set(token, key, value, remove=False):
 # hier raus — das ist die Wohnadresse + GPS-Koordinaten des Users. Vorher gab
 # der Endpoint das KOMPLETTE profile-Dict 1:1 zurück → Wohnadresse für jeden
 # mit dem (nicht-geheimen) AT-Token abrufbar.
+#
+# NACHTRAG 2026-07-29 — `hometown` IST HIER RAUS (Owner: „warum sehe ich die
+# adresse von jmd auf dem crew profil? datenschutz!!").
+#
+# Es war KEIN Leak im technischen Sinn: angezeigt wurde die Stadt („Wien"),
+# nicht die Anschrift. Das Problem ist die EINWILLIGUNG. Der Wohnort wird
+# nicht selbst eingetragen, sondern aus der HEIMADRESSE abgeleitet, die der
+# Nutzer für SMART PICKUP angibt — und dort steht ausdrücklich „verschlüsselt
+# gespeichert". Aus einer Angabe, die unter diesem Versprechen für die
+# Abfahrtsberechnung erhoben wurde, still eine öffentliche Profilangabe zu
+# machen, ist von dieser Zustimmung nicht gedeckt. Datenminimierung heißt:
+# im Zweifel NICHT veröffentlichen.
+#
+# Das Feld bleibt vollständig erhalten (eigenes Profil, Family-Watch, Anzeige
+# für den Nutzer selbst) — es wird nur nicht mehr an FREMDE ausgeliefert.
+# Soll der Wohnort wieder auf Crew-Profilen stehen, gehört er als EIGENES,
+# ausdrücklich zugeschaltetes Feld in „Was deine Crew sieht" — nicht als
+# stille Ableitung aus der Pickup-Adresse.
 _PUBLIC_PROFILE_FIELDS = (
-    'name', 'homebase', 'position', 'airline', 'hometown',
+    'name', 'homebase', 'position', 'airline',
     'avatar_url', 'account_type', 'share_roster', 'share_location',
 )
 
@@ -23900,11 +23918,20 @@ def get_chat_messages(token, channel_id):
 
 @app.route('/api/crew-chat/<token>/channel/<channel_id>/send', methods=['POST'])
 def send_chat_message(token, channel_id):
-    """Body: {text}. Author = token."""
+    """Body: {text, client_message_id?}. Author = token.
+
+    ``client_message_id`` macht Offline-Replays idempotent. Alte Clients senden
+    das Feld nicht und behalten dadurch exakt das bisherige Verhalten.
+    """
     body = request.get_json(silent=True) or {}
     text = (body.get('text') or '').strip()
+    client_message_id = (body.get('client_message_id') or '').strip()
     if not text: return jsonify({'ok': False, 'error': 'empty_text'}), 400
     if len(text) > 2000: return jsonify({'ok': False, 'error': 'text_too_long'}), 413
+    if client_message_id and not re.fullmatch(
+            r'[A-Za-z0-9_-]{8,64}', client_message_id):
+        return jsonify({
+            'ok': False, 'error': 'invalid_client_message_id'}), 400
     if not _chat_path(channel_id):
         return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
     # Membership-Gate (siehe get_chat_messages): kein Schreiben in fremde
@@ -23914,6 +23941,21 @@ def send_chat_message(token, channel_id):
         _, status = _gate
         err = 'not_a_member' if status == 403 else 'invalid_channel'
         return jsonify({'ok': False, 'error': err}), status
+    # Retry nach unklarem Transport-Ausgang: dieselbe Client-Operation darf
+    # niemals eine zweite Chat-Nachricht und einen zweiten Push erzeugen.
+    if client_message_id:
+        my_author = token[:16] + '…'
+        for existing in reversed(_dm_load_messages(channel_id) or []):
+            if (
+                existing.get('client_message_id') == client_message_id
+                and existing.get('author_token') == my_author
+            ):
+                if existing.get('text') != text:
+                    return jsonify({
+                        'ok': False,
+                        'error': 'client_message_id_conflict',
+                    }), 409
+                return jsonify({'ok': True, 'message': existing})
     # BUG-021-Fix: Rate-Limit wie bei DMs (30 msgs/min pro Token) — vorher konnte
     # ein Token unbegrenzt Channel-Messages senden (Spam/Flood).
     if _token_rate_limited(token, 'chat_send', limit=30, window_sec=60):
@@ -23928,6 +23970,10 @@ def send_chat_message(token, channel_id):
             'ts': time.time(),
             'iso': datetime.now().isoformat(),
         }
+        if client_message_id:
+            # Unbekannte Felder werden vom Supabase-Adapter im metadata-jsonb
+            # konserviert und beim Laden wieder re-hydratisiert.
+            msg['client_message_id'] = client_message_id
         # Owner 2026-07-19: Bordkarten-Wunsch („Wünsche einen guten Flug") als
         # markierte Nachricht — `kind` ist keine bekannte SB-Spalte, landet also
         # (wie `deleted`) in metadata-jsonb und wird beim Laden re-hydratisiert.
