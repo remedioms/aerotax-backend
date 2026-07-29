@@ -13,6 +13,18 @@ FO, 2026-07-20):
           _roster_change_is_pickup_prune und _roster_change_is_blocktime_drift
           sind darin aufgegangen und ersatzlos entfallen.
 
+OWNER-ENTSCHEID 2026-07-29 (Screenshot Build 246): Gate 4
+(_rc_duty_substance_changed) galt zunächst NUR für den Push, der Verlauf blieb
+bewusst vollständig. Genau das hat der Owner gekippt — die Liste
+„Dienstplan-Änderungen" stand voll mit reinen ZEIT-Einträgen („Abflug LH454:
+10:25 → 10:55 · Ankunft 12:40 → 13:10", direkt darunter dieselbe Änderung
+rückwärts: das LH454-Ping-Pong). Owner wörtlich: „Das sollte nicht mal
+aufpoppen. Das ist nicht wichtig!!!! Einfach nur big changes."
+Seitdem filtert Gate 4 schon in _compute_roster_diff: ein 'modified' ohne
+DIENST-Substanz erzeugt GAR KEINEN Eintrag (kein pending, kein Verlauf, kein
+Badge). Die Zeit-Änderung selbst wird trotzdem übernommen — der Snapshot wird
+unabhängig vom Diff geschrieben. added/removed sind unberührt.
+
 KEIN echtes APNs/SB: _push_notify_async & Co. werden gemockt (Muster
 test_duty_change_push.py).
 """
@@ -153,6 +165,29 @@ def _mod(old, new):
     return {'kind': 'modified', 'datum': '2026-07-22', 'old': old, 'new': new}
 
 
+def _kein_eintrag(old, new, now=None):
+    """OWNER-REGEL 2026-07-29: die Änderung erzeugt WEDER einen Verlauf-/
+    pending-Eintrag NOCH einen Push — sie existiert schlicht nicht mehr als
+    Change. Vorher galt hier „Verlauf ja, Push nein"."""
+    datum = str((old or {}).get('datum') or (new or {}).get('datum') or '')[:10]
+    assert A._rc_duty_substance_changed(old, new, now=now) is False
+    assert A._compute_roster_diff([old], [new], today=datum, now=now) == []
+    assert A._roster_change_is_push_worthy(
+        {'kind': 'modified', 'datum': datum, 'old': old, 'new': new},
+        now=now) is False
+
+
+def _echter_eintrag(old, new, now=None):
+    """Gegenprobe: „big change" → genau EIN 'modified'-Eintrag, und er pusht."""
+    datum = str((old or {}).get('datum') or (new or {}).get('datum') or '')[:10]
+    d = A._compute_roster_diff([old], [new], today=datum, now=now)
+    assert len(d) == 1 and d[0]['kind'] == 'modified', d
+    assert A._roster_change_is_push_worthy(
+        {'kind': 'modified', 'datum': datum, 'old': old, 'new': new},
+        now=now) is True
+    return d
+
+
 def test_pickup_abbau_ist_kein_push():
     # LH räumt die PU-Zeit ab: Marker verliert 'Pickup 1330', Start fällt von
     # der Pickup- (13:30) auf die Briefing-Zeit (14:30) zurück — sonst nichts.
@@ -161,14 +196,16 @@ def test_pickup_abbau_ist_kein_push():
     assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
-def test_pickup_abbau_mit_abflug_shift_bleibt_im_verlauf_pusht_aber_nicht():
+def test_pickup_abbau_mit_abflug_shift_erzeugt_keinen_eintrag():
     # GATE 4 (2026-07-28): PU-Abbau + 1 h Abflug-Shift bei IDENTISCHER
-    # Leg-Struktur ist eine reine Zeit-Änderung → Verlauf ja, Push nein.
+    # Leg-Struktur ist eine reine Zeit-Änderung. Bis 28.07. hieß das „Verlauf
+    # ja, Push nein" — seit dem Owner-Entscheid 2026-07-29 („Einfach nur big
+    # changes", Screenshot Build 246) entsteht gar kein Eintrag mehr.
     old = _day_with_pickup()
     new = _day_with_pickup(pickup_marker='', start='14:30',
                            dep='2026-07-22T13:00:00Z')     # Leg verschoben
     assert A._rc_meaningfully_modified(old, new) is True
-    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
+    _kein_eintrag(old, new)
 
 
 def test_pickup_abbau_mit_endzeit_pflege_bleibt_still():
@@ -184,20 +221,20 @@ def test_pickup_abbau_mit_endzeit_pflege_bleibt_still():
     assert A._roster_change_is_push_worthy(_mod(old, lay)) is True
 
 
-def test_pickup_praesenz_flip_ist_still_pu_shift_nur_noch_im_verlauf():
+def test_pickup_praesenz_flip_ist_still_pu_shift_erzeugt_keinen_eintrag():
     # OWNER-REGEL 2026-07-28: das Auftauchen/Verschwinden der PU-Zeit ohne
     # Zeitänderung am Dienst ist STILL (Flip-Flop-Signatur).
     ohne = _day_with_pickup(pickup_marker='', start='14:30')
     mit = _day_with_pickup()
-    assert A._roster_change_is_push_worthy(_mod(ohne, mit)) is False
-    assert A._roster_change_is_push_worthy(_mod(mit, ohne)) is False
-    # Eine echte PU-VERSCHIEBUNG ≥ 5 min bleibt eine Verlauf-Änderung, pusht
-    # seit GATE 4 aber nicht mehr (reine Zeit, Struktur identisch).
-    pu_shift = _mod(_day_with_pickup(),
-                    _day_with_pickup(pickup_marker='Pickup 1400',
-                                     start='14:00'))
-    assert A._rc_meaningfully_modified(pu_shift['old'], pu_shift['new']) is True
-    assert A._roster_change_is_push_worthy(pu_shift) is False
+    _kein_eintrag(ohne, mit)
+    _kein_eintrag(mit, ohne)
+    # Eine echte PU-VERSCHIEBUNG ≥ 5 min war bis 28.07. eine Verlauf-Änderung
+    # ohne Push. Seit dem Owner-Entscheid 2026-07-29 („Einfach nur big
+    # changes") ist sie auch aus der LISTE raus: reine Zeit, Struktur
+    # identisch.
+    verschoben = _day_with_pickup(pickup_marker='Pickup 1400', start='14:00')
+    assert A._rc_meaningfully_modified(_day_with_pickup(), verschoben) is True
+    _kein_eintrag(_day_with_pickup(), verschoben)
     # … und eine 3-Minuten-PU-Korrektur ist schon im Verlauf keine Änderung
     # (Toleranz _RC_TIME_TOL_MIN).
     assert A._roster_change_is_push_worthy(
@@ -243,14 +280,16 @@ def test_blocktime_drift_arrival_iso_drift_not_pushworthy():
     assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
-def test_blocktime_drift_first_departure_change_nur_noch_verlauf():
-    # Der Abflug verschiebt sich um 30 min: echte Änderung für den VERLAUF,
-    # seit GATE 4 aber kein Push mehr (< 3 h, Struktur identisch).
+def test_blocktime_drift_first_departure_change_erzeugt_keinen_eintrag():
+    # Der Abflug verschiebt sich um 30 min. Bis 28.07.: Verlauf ja, Push nein.
+    # Seit dem Owner-Entscheid 2026-07-29 (das LH454-Ping-Pong stand als
+    # „Abflug 10:25 → 10:55" in der Liste) fällt auch der Eintrag weg —
+    # < 3 h, Struktur identisch.
     old = _day_with_pickup()
     new = _day_with_pickup(dep='2026-07-22T12:30:00Z')
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:30')
     assert A._rc_meaningfully_modified(old, new) is True
-    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
+    _kein_eintrag(old, new)
 
 
 def test_departure_drift_unter_toleranz_bleibt_still():
@@ -261,12 +300,14 @@ def test_departure_drift_unter_toleranz_bleibt_still():
     assert A._roster_change_is_push_worthy(_mod(old, new)) is False
 
 
-def test_blocktime_drift_pickup_change_nur_noch_verlauf():
+def test_blocktime_drift_pickup_change_erzeugt_keinen_eintrag():
+    # Wie oben, nur mit PU-Verschiebung statt Abflug — seit 2026-07-29 weder
+    # Eintrag noch Push.
     old = _day_with_pickup()
     new = _day_with_pickup(pickup_marker='Pickup 1400', start='14:00')
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:12')
     assert A._rc_meaningfully_modified(old, new) is True
-    assert A._roster_change_is_push_worthy(_mod(old, new)) is False
+    _kein_eintrag(old, new)
 
 
 def test_blocktime_drift_route_change_is_pushworthy():
@@ -297,15 +338,17 @@ def test_endzeit_pflege_ohne_legs_bleibt_still():
            'reader_facts': {'start_time': '09:00', 'end_time': '17:00'}}
     new = dict(old, reader_facts={'start_time': '09:00', 'end_time': '18:00'})
     assert A._roster_change_is_push_worthy(_mod(old, new)) is False
-    # Der Standby-BEGINN steht im Verlauf, pusht seit GATE 4 aber nicht mehr:
-    # der Dienst selbst (Standby, kein Flug) ist derselbe.
+    # Der Standby-BEGINN-Shift stand bis 28.07. im Verlauf (ohne Push). Seit
+    # dem Owner-Entscheid 2026-07-29 ist auch er aus der Liste raus: der Dienst
+    # selbst (Standby, kein Flug) ist derselbe.
     shift = dict(old, reader_facts={'start_time': '11:00', 'end_time': '18:00'})
     assert A._rc_meaningfully_modified(old, shift) is True
-    assert A._roster_change_is_push_worthy(_mod(old, shift)) is False
+    _kein_eintrag(old, shift)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Gate 4: „nur die DIENST-Substanz pusht" (Owner-Entscheid 2026-07-28)
+# Gate 4: „nur die DIENST-Substanz zählt" (Owner-Entscheid 2026-07-28,
+#         auf den VERLAUF ausgeweitet 2026-07-29)
 #
 # Owner, wörtlich: „Das Einzige, was aufpoppen darf, ist wirklich, wenn ich einen
 # komplett neuen Flug habe — keine Verspätungen, keine Gate-Wechsel, keine
@@ -314,7 +357,10 @@ def test_endzeit_pflege_ohne_legs_bleibt_still():
 # Oder eine riesige Verspätung (~4 h), WENN ich meinen Dienst noch nicht
 # angetreten habe."
 #
-# Der VERLAUF bleibt vollständig — nur der Push wird gefiltert (wie Gate 3).
+# Am 28.07. blieb der VERLAUF bewusst vollständig, nur der Push wurde gefiltert.
+# Am 29.07. hat der Owner das nach dem Screenshot von Build 246 explizit
+# gekippt („Das sollte nicht mal aufpoppen. Das ist nicht wichtig!!!! Einfach
+# nur big changes.") — dieselbe Regel gilt jetzt für Liste/Banner/Badge.
 # ══════════════════════════════════════════════════════════════════════════════
 _G4_DAY = '2026-08-02'
 
@@ -339,155 +385,157 @@ _G4_VOR_DIENST = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
 _G4_IM_DIENST = datetime(2026, 8, 2, 7, 0, tzinfo=timezone.utc)
 
 
-def test_gate4_briefing_shift_bleibt_im_verlauf_pusht_nicht():
+def test_gate4_briefing_shift_erzeugt_keinen_eintrag():
     # Der Forum-Fall („Sa 08.08: Briefing 00:35 → 01:05"): Struktur identisch,
-    # nur die Meldezeit rutscht → Verlauf ja, Push nein.
+    # nur die Meldezeit rutscht. Bis 28.07. „Verlauf ja, Push nein" — seit dem
+    # Owner-Entscheid 2026-07-29 gar kein Eintrag mehr.
     old = _g4_day(start='00:35', marker='00:35 LT Briefing FRA')
     new = _g4_day(start='01:05', marker='01:05 LT Briefing FRA')
     assert A._rc_meaningfully_modified(old, new) is True
-    assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                           now=_G4_VOR_DIENST) is False
+    _kein_eintrag(old, new, now=_G4_VOR_DIENST)
 
 
-def test_gate4_abflug_shift_unter_drei_stunden_pusht_nicht():
+def test_gate4_abflug_shift_unter_drei_stunden_erzeugt_keinen_eintrag():
     # „LH454 Abflug 10:55 → 10:25" — 30 min, identische Legs → still, egal ob
     # der Dienst schon läuft oder nicht.
     old = _g4_day(dep='2026-08-02T08:55:00Z')
     new = _g4_day(dep='2026-08-02T08:25:00Z')
     assert A._rc_meaningfully_modified(old, new) is True
     for _now in (_G4_VOR_DIENST, _G4_IM_DIENST):
-        assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                               now=_now) is False
+        _kein_eintrag(old, new, now=_now)
 
 
-def test_gate4_pingpong_ist_in_beide_richtungen_still():
-    # Der Live-Fall vom 28.07.: zwei Pushes binnen 30 Sekunden, A→B und
-    # B→A. Beide Richtungen sind reine Zeit → beide still. Es braucht KEINE
-    # zusätzliche Dedup-Logik.
-    a = _g4_day(dep='2026-08-02T08:55:00Z')
-    b = _g4_day(dep='2026-08-02T08:25:00Z')
-    assert A._roster_change_is_push_worthy(_g4_mod(a, b),
-                                           now=_G4_VOR_DIENST) is False
-    assert A._roster_change_is_push_worthy(_g4_mod(b, a),
-                                           now=_G4_VOR_DIENST) is False
+def test_gate4_pingpong_erzeugt_null_eintraege():
+    # DER OWNER-SCREENSHOT (Build 246, 29.07.): „Abflug LH454: 10:25 → 10:55 ·
+    # Ankunft 12:40 → 13:10" und direkt darunter dieselbe Änderung rückwärts.
+    # Beide Richtungen sind reine Zeit → NULL Einträge, NULL Pushes. Es braucht
+    # KEINE zusätzliche Dedup-Logik.
+    a = _g4_day(dep='2026-08-02T08:55:00Z', arr='2026-08-02T20:00:00Z')
+    b = _g4_day(dep='2026-08-02T08:25:00Z', arr='2026-08-02T19:30:00Z')
+    _kein_eintrag(a, b, now=_G4_VOR_DIENST)
+    _kein_eintrag(b, a, now=_G4_VOR_DIENST)
+    # Über einen kompletten Ping-Pong-Zyklus hinweg entsteht KEIN einziger
+    # pending-Eintrag — genau das, was der Owner in der Liste gesehen hat.
+    zustand = a
+    for naechster in (b, a, b, a, b, a):
+        assert A._compute_roster_diff([zustand], [naechster], today=_G4_DAY,
+                                      now=_G4_VOR_DIENST) == []
+        zustand = naechster
     # … und auch als 4-h-Ping-Pong (Ausnahme greift) bleibt es symmetrisch:
-    # beide Richtungen pushen dann, aber DAS fängt die Flip-Flop-Hysterese ab.
+    # beide Richtungen sind dann ECHTE Einträge, den Push-Sturm fängt die
+    # Flip-Flop-Hysterese ab.
     weit = _g4_day(dep='2026-08-02T13:00:00Z')
-    assert A._roster_change_is_push_worthy(_g4_mod(a, weit),
-                                           now=_G4_VOR_DIENST) is True
-    assert A._roster_change_is_push_worthy(_g4_mod(weit, a),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(a, weit, now=_G4_VOR_DIENST)
+    _echter_eintrag(weit, a, now=_G4_VOR_DIENST)
 
 
-def test_gate4_gate_und_blockzeiten_bleiben_still():
+def test_gate4_gate_und_blockzeiten_erzeugen_keinen_eintrag():
     # Ankunft/Blockzeit/Dienstende — die klassische LH-Zeitenpflege.
     old = _g4_day()
     new = _g4_day(arr='2026-08-02T20:47:00Z')
     new['reader_facts'] = dict(new['reader_facts'], end_time='21:17')
-    assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                           now=_G4_VOR_DIENST) is False
+    # Das ist schon unterhalb von `_rc_meaningfully_modified` still.
+    assert A._rc_meaningfully_modified(old, new) is False
+    _kein_eintrag(old, new, now=_G4_VOR_DIENST)
 
 
-def test_gate4_anderes_ziel_pusht():
-    # „Ich hatte San Francisco und jetzt habe ich LA" — genau das soll poppen.
+def test_gate4_anderes_ziel_erzeugt_genau_einen_eintrag():
+    # „Ich hatte San Francisco und jetzt habe ich LA" — genau das soll poppen,
+    # und genau das bleibt seit 2026-07-29 als EINZIGE Sorte in der Liste.
     old = _g4_day(to='SFO', layover='SFO')
     new = _g4_day(to='LAX', layover='LAX')
-    assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(old, new, now=_G4_VOR_DIENST)
     # Auch wenn der Dienst schon läuft (Umleitung im Dienst = harte Info).
-    assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                           now=_G4_IM_DIENST) is True
+    _echter_eintrag(old, new, now=_G4_IM_DIENST)
 
 
-def test_gate4_andere_flugnummer_und_neuer_leg_pushen():
+def test_gate4_andere_flugnummer_und_neuer_leg_erzeugen_je_einen_eintrag():
     old = _g4_day()
-    assert A._roster_change_is_push_worthy(
-        _g4_mod(old, _g4_day(flight='LH456')), now=_G4_VOR_DIENST) is True
+    _echter_eintrag(old, _g4_day(flight='LH456'), now=_G4_VOR_DIENST)
     zwei_legs = _g4_day()
     zwei_legs['ical_sectors'] = list(zwei_legs['ical_sectors']) + [
         {'flight': 'LH455', 'from': 'SFO', 'to': 'FRA',
          'dep_iso': '2026-08-03T22:00:00Z', 'arr_iso': '2026-08-04T08:00:00Z'}]
-    assert A._roster_change_is_push_worthy(_g4_mod(old, zwei_legs),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(old, zwei_legs, now=_G4_VOR_DIENST)
 
 
-def test_gate4_layover_und_routing_wechsel_pushen():
+def test_gate4_layover_und_routing_wechsel_erzeugen_je_einen_eintrag():
     old = _g4_day()
     lay = _g4_day()
     lay['reader_facts'] = dict(lay['reader_facts'], layover_ort='OAK')
-    assert A._roster_change_is_push_worthy(_g4_mod(old, lay),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(old, lay, now=_G4_VOR_DIENST)
     # Routing-Feld ohne Sektoren (Feeds ohne ical_sectors).
     o = {'datum': _G4_DAY, 'klass': 'Flug', 'routing': 'FRA-SFO'}
     n = {'datum': _G4_DAY, 'klass': 'Flug', 'routing': 'FRA-LAX'}
-    assert A._roster_change_is_push_worthy(_g4_mod(o, n),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(o, n, now=_G4_VOR_DIENST)
 
 
-def test_gate4_dienst_kommt_und_geht_pusht_weiter():
+def test_gate4_dienst_kommt_und_geht_bleibt_ein_eintrag():
     # Flug wird Standby (Flug-Beleg verschwindet in einen dokumentierten Tag).
     old = _g4_day()
     standby = {'datum': _G4_DAY, 'klass': 'Standby', 'routing': '',
                'reader_facts': {'start_time': '08:00', 'end_time': '16:00'}}
-    assert A._roster_change_is_push_worthy(_g4_mod(old, standby),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(old, standby, now=_G4_VOR_DIENST)
     # Frei → Dienst.
     frei = {'datum': _G4_DAY, 'klass': 'FREI'}
-    assert A._roster_change_is_push_worthy(_g4_mod(frei, standby),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(frei, standby, now=_G4_VOR_DIENST)
 
 
-def test_gate4_riesenverspaetung_vor_dienstantritt_pusht():
+def test_gate4_riesenverspaetung_vor_dienstantritt_erzeugt_einen_eintrag():
     # 4 h später, Crew ist noch zu Hause → das ist die eine Zeit-Änderung,
-    # die zählt.
+    # die zählt: die Huge-Delay-Ausnahme bleibt auch nach dem Owner-Entscheid
+    # vom 29.07. ein ECHTER Eintrag (nicht nur ein Push).
     old = _g4_day(dep='2026-08-02T09:00:00Z')
     new = _g4_day(dep='2026-08-02T13:00:00Z')
-    assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(old, new, now=_G4_VOR_DIENST)
 
 
 def test_gate4_riesenverspaetung_nach_dienstantritt_bleibt_still():
     # Dieselbe Verschiebung, aber der Dienst läuft schon (07:00 UTC >
     # Dienstbeginn 06:00 UTC) → die Crew steht am Flughafen und erfährt es dort.
+    # Seit 2026-07-29 heißt „still" auch hier: kein Eintrag.
     old = _g4_day(dep='2026-08-02T09:00:00Z')
     new = _g4_day(dep='2026-08-02T13:00:00Z')
-    assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                           now=_G4_IM_DIENST) is False
+    _kein_eintrag(old, new, now=_G4_IM_DIENST)
 
 
 def test_gate4_riesenverspaetung_schwelle_ist_180_minuten():
     old = _g4_day(dep='2026-08-02T09:00:00Z')
     knapp = _g4_day(dep='2026-08-02T11:59:00Z')          # 179 min
     genau = _g4_day(dep='2026-08-02T12:00:00Z')          # 180 min
-    assert A._roster_change_is_push_worthy(_g4_mod(old, knapp),
-                                           now=_G4_VOR_DIENST) is False
-    assert A._roster_change_is_push_worthy(_g4_mod(old, genau),
-                                           now=_G4_VOR_DIENST) is True
+    _kein_eintrag(old, knapp, now=_G4_VOR_DIENST)
+    _echter_eintrag(old, genau, now=_G4_VOR_DIENST)
 
 
-def test_gate4_grosse_vorverlegung_pusht_ebenfalls():
+def test_gate4_grosse_vorverlegung_erzeugt_ebenfalls_einen_eintrag():
     # 3 h FRÜHER ist für die Anreise noch kritischer als 3 h später.
     old = _g4_day(dep='2026-08-02T13:00:00Z', start='12:00',
                   marker='12:00 LT Briefing FRA')
     new = _g4_day(dep='2026-08-02T09:00:00Z', start='12:00',
                   marker='12:00 LT Briefing FRA')
-    assert A._roster_change_is_push_worthy(_g4_mod(old, new),
-                                           now=_G4_VOR_DIENST) is True
+    _echter_eintrag(old, new, now=_G4_VOR_DIENST)
 
 
 def test_gate4_added_und_removed_unveraendert():
-    # Gate 4 fasst added/removed NICHT an.
+    # Gate 4 fasst added/removed NICHT an — weder im Push noch (seit
+    # 2026-07-29) im Diff.
     assert A._roster_change_is_push_worthy(
         {'kind': 'added', 'datum': _G4_DAY, 'new': _g4_day()}) is True
     assert A._roster_change_is_push_worthy(
         {'kind': 'removed', 'datum': _G4_DAY, 'old': _g4_day()}) is True
     assert A._roster_change_is_push_worthy(
         {'kind': 'added', 'datum': _G4_DAY, 'new': {}}) is False
+    # Diff-Ebene: ein neuer bzw. entfallener Flugtag bleibt ein Eintrag.
+    heute = _G4_DAY
+    add = A._compute_roster_diff([], [_g4_day()], today=heute)
+    assert len(add) == 1 and add[0]['kind'] == 'added'
+    rem = A._compute_roster_diff([_g4_day()], [], today=heute)
+    assert len(rem) == 1 and rem[0]['kind'] == 'removed'
 
 
 def test_gate4_defensiv():
-    assert A._rc_push_duty_substance_changed(None, None) is False
-    assert A._rc_push_duty_substance_changed({}, {}) is False
+    assert A._rc_duty_substance_changed(None, None) is False
+    assert A._rc_duty_substance_changed({}, {}) is False
     assert A._rc_huge_delay_before_duty({}, {}) is False
     assert A._rc_huge_delay_before_duty(_g4_day(), {'ical_sectors': []}) is False
     # Naives „now" wird als UTC gelesen (kein TypeError beim Vergleich).
@@ -521,7 +569,8 @@ def test_rc_duty_start_utc_quellen():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Endpoint: take_roster_snapshot wendet die Gates NUR auf den Push an
+# Endpoint: take_roster_snapshot — Substanz-Gates wirken auf EINTRAG und Push,
+# das Vergangenheits-Gate nur auf den Push
 # (Muster + Patches wie tests/test_duty_change_push.py::_snapshot_env)
 # ══════════════════════════════════════════════════════════════════════════════
 def _snapshot_env(tmp_path, old_tage):
@@ -625,50 +674,78 @@ def _fut_flug_tag(datum, dep_hhmm='09:00', flight='LH454', to='SFO'):
                              'layover_ort': to}}
 
 
-def test_gate4_zeitshift_steht_im_verlauf_pusht_aber_nicht(tmp_path):
-    # KERN-INVARIANTE von Gate 4: die in-App-Liste bleibt VOLLSTÄNDIG, nur der
-    # Push wird gefiltert (genau wie Gate 3 es handhabt).
+def test_gate4_zeitshift_erzeugt_am_endpoint_gar_nichts(tmp_path):
+    # KERN-INVARIANTE seit dem Owner-Entscheid 2026-07-29: ein reiner
+    # Zeit-Shift erzeugt WEDER pending-Eintrag NOCH Push. Bis 28.07. stand hier
+    # noch „Verlauf vollständig, nur der Push wird gefiltert" — der Owner hat
+    # das nach dem Screenshot von Build 246 explizit gekippt.
     d = (date.today() + timedelta(days=3)).isoformat()
     r, push, changes_file = _post(
         tmp_path,
         old=[_fut_flug_tag(d, dep_hhmm='09:00')],
         new=[_fut_flug_tag(d, dep_hhmm='09:40')])       # 40 min später
     assert r.status_code == 200
-    assert r.get_json()['changes_count'] == 1           # Verlauf: vollständig
-    data = json.loads(changes_file.read_text())
-    assert len(data['pending']) == 1
-    assert data['pending'][0]['kind'] == 'modified'
-    assert push.call_count == 0                          # aber KEIN Push
+    assert r.get_json()['changes_count'] == 0
+    assert json.loads(changes_file.read_text())['pending'] == []
+    assert push.call_count == 0
 
 
-def test_gate4_pingpong_erzeugt_zwei_verlaufseintraege_null_pushes(tmp_path):
-    # Der Live-Fall: 10:55 → 10:25 und 30 s später zurück. Beide Male Verlauf,
-    # nie ein Push.
+def test_gate4_pingpong_erzeugt_null_verlaufseintraege_und_null_pushes(tmp_path):
+    # Der Live-Fall aus dem Owner-Screenshot: 10:55 → 10:25 und 30 s später
+    # zurück, beide Richtungen untereinander in der Liste. Jetzt: nichts.
     d = (date.today() + timedelta(days=3)).isoformat()
     a, b = _fut_flug_tag(d, dep_hhmm='08:55'), _fut_flug_tag(d, dep_hhmm='08:25')
     for old, new in ((a, b), (b, a)):
         r, push, changes_file = _post(tmp_path, old=[old], new=[new])
         assert r.status_code == 200
-        assert r.get_json()['changes_count'] == 1
+        assert r.get_json()['changes_count'] == 0
+        assert json.loads(changes_file.read_text())['pending'] == []
         assert push.call_count == 0
 
 
-def test_gate4_riesenverspaetung_pusht_am_endpoint(tmp_path):
+def test_gate4_stille_zeitaenderung_wird_trotzdem_in_die_daten_uebernommen(tmp_path):
+    # AUTO-ÜBERNAHME: nur der EINTRAG entfällt, die Zeit selbst muss im Roster
+    # ankommen. Der Snapshot wird unabhängig vom Diff geschrieben → der neue
+    # Stand (09:40) landet 1:1 in `_roster_snapshot_save`.
     d = (date.today() + timedelta(days=3)).isoformat()
-    r, push, _cf = _post(
+    neu = _fut_flug_tag(d, dep_hhmm='09:40')
+    saved = {}
+    p1, p2, p3, p4, p5, p6, p7, push, changes_file = _snapshot_env(
+        tmp_path, [_fut_flug_tag(d, dep_hhmm='09:00')])
+    with p1, p3, p4, p5, p6, p7, patch.object(
+            A, '_roster_snapshot_save',
+            side_effect=lambda _t, payload: saved.update(payload) or True):
+        r = A.app.test_client().post('/api/user/roster-snapshot/testtoken123',
+                                     json={'tage': [neu]})
+    assert r.status_code == 200
+    assert r.get_json()['changes_count'] == 0            # kein Eintrag …
+    assert saved['tage'] == [neu]                        # … aber die Daten sind da
+    assert (saved['tage'][0]['ical_sectors'][0]['dep_iso']
+            == f'{d}T09:40:00Z')
+
+
+def test_gate4_riesenverspaetung_erzeugt_am_endpoint_einen_eintrag(tmp_path):
+    # Die Huge-Delay-Ausnahme bleibt ein ECHTER Eintrag (+ Push).
+    d = (date.today() + timedelta(days=3)).isoformat()
+    r, push, changes_file = _post(
         tmp_path,
         old=[_fut_flug_tag(d, dep_hhmm='09:00')],
         new=[_fut_flug_tag(d, dep_hhmm='13:00')])       # 4 h später
     assert r.status_code == 200 and push.call_count == 1
+    assert r.get_json()['changes_count'] == 1
+    assert len(json.loads(changes_file.read_text())['pending']) == 1
 
 
-def test_gate4_zielwechsel_pusht_am_endpoint(tmp_path):
+def test_gate4_zielwechsel_erzeugt_am_endpoint_einen_eintrag(tmp_path):
     d = (date.today() + timedelta(days=3)).isoformat()
-    r, push, _cf = _post(
+    r, push, changes_file = _post(
         tmp_path,
         old=[_fut_flug_tag(d, to='SFO')],
         new=[_fut_flug_tag(d, to='LAX')])
     assert r.status_code == 200 and push.call_count == 1
+    assert r.get_json()['changes_count'] == 1
+    pending = json.loads(changes_file.read_text())['pending']
+    assert len(pending) == 1 and pending[0]['kind'] == 'modified'
 
 
 def test_future_change_push_body_is_concrete(tmp_path):

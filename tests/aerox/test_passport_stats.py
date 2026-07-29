@@ -172,6 +172,80 @@ def test_compute_includes_logbook_import(synth_days, monkeypatch):
     assert p["minutes_flown"] == 510 + 430 + 645 + 500 + 115 + 690
 
 
+def test_compute_ohne_import_unveraendert(synth_days):
+    """Ohne Flugbuch-Import ändert der geteilte Merge NICHTS am Roster-Bild."""
+    p_leer = A._passport_stats_compute(TOKEN, "all")
+    assert p_leer["flights"] == 5
+    assert p_leer["first_date"] == "2025-11-03"
+    assert p_leer["last_date"] == "2026-07-01"
+    assert p_leer["minutes_flown"] == 510 + 430 + 645 + 500 + 115
+
+
+def test_import_ueberlebt_kaputten_tagessatz(synth_days, monkeypatch):
+    """WURZELURSACHE (Owner-Mail 2026-07-28, „Passport zählt das Flugbuch nicht"):
+
+    Ein Tagessatz mit `ical_sectors: null` (put_briefing speichert Client-JSON
+    unverändert) ließ die alte Passport-Merge-Kopie beim ERSTEN Import-Leg
+    dieses Tages in einen AttributeError laufen — gefangen von einem
+    Sammel-`except` → der KOMPLETTE Import fiel still aus Passport/Statistik,
+    der Zeitraum blieb beim Roster-Start stehen."""
+    days = dict(synth_days)
+    days["2026-07-05"] = {"ical_sectors": None}       # kaputter Tagessatz
+    monkeypatch.setattr(A, "_manual_briefings_load", lambda t: days)
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {"legs": [
+        {"date": "2026-07-05", "flight": "LH1", "from": "FRA", "to": "MUC",
+         "block_min": 60},
+        {"date": "2011-04-02", "flight": "LH500", "from": "FRA", "to": "GIG",
+         "block_min": 690},
+    ]})
+    p = A._passport_stats_compute(TOKEN, "all")
+    assert p["flights"] == 7                       # 5 Roster + BEIDE Import-Legs
+    assert p["first_date"] == "2011-04-02"         # Zeitraum wächst ehrlich mit
+    assert "2011" in p["years"]
+    assert p["minutes_flown"] == 510 + 430 + 645 + 500 + 115 + 60 + 690
+
+
+def test_import_in_icao_dedupt_gegen_roster_iata(synth_days, monkeypatch):
+    """Flugbuch-Exporte loggen Plätze teils als ICAO. Das darf weder ein
+    Duplikat des Roster-Legs erzeugen noch aus der Statistik fallen."""
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {"legs": [
+        # identisch zum Roster-Leg 2026-07-01 LH400 FRA→JFK, nur ICAO
+        {"date": "2026-07-01", "flight": "LH400", "from": "EDDF", "to": "KJFK",
+         "block_min": 999},
+        # historischer Leg, ebenfalls ICAO
+        {"date": "2012-08-08", "flight": "LH510", "from": "EDDF", "to": "SBGR",
+         "block_min": 700},
+    ]})
+    p = A._passport_stats_compute(TOKEN, "all")
+    assert p["flights"] == 6                       # Duplikat zählt EINMAL
+    assert p["minutes_flown"] == 510 + 430 + 645 + 500 + 115 + 700
+    assert "GRU" in p["airports"] and "EDDF" not in p["airports"]
+    assert p["first_date"] == "2012-08-08"
+
+
+def test_passport_teilt_die_leg_quelle_mit_dem_flugbuch(synth_days, monkeypatch):
+    """Passport und /api/user/logbook lesen DIESELBE gemergte Leg-Quelle —
+    jedes Flugbuch-Leg ist im Passport gezählt (der Passport zählt zusätzlich
+    Legs ohne Flugnummer, die im FCL.050-Buch nicht auftauchen)."""
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {"legs": [
+        {"date": "2019-05-10", "flight": "LH500", "from": "FRA", "to": "GIG",
+         "block_min": 690},
+        {"date": "2018-03-01", "flight": "LH501", "from": "EDDF", "to": "KJFK",
+         "block_min": 500},
+    ]})
+    monkeypatch.setattr(A, "_logbook_overlay_load", lambda t: {})
+    monkeypatch.setattr(A, "_logbook_facts_load", lambda t: {})
+    monkeypatch.setattr(A, "_logbook_enrich_async", lambda t, w: None)
+    with A.app.test_request_context():
+        rv = A.get_logbook(TOKEN)
+    lb = rv.get_json() if hasattr(rv, "get_json") else rv[0].get_json()
+    lb_keys = {e["key"] for e in lb["entries"]}
+    pp_keys = {lg["key"] for lg in A._passport_legs(TOKEN)}
+    assert lb_keys and lb_keys <= pp_keys
+    p = A._passport_stats_compute(TOKEN, "all")
+    assert p["flights"] == len(pp_keys) == lb["totals"]["legs"] + 1  # +MUC-LHR
+
+
 def test_compute_empty_state(monkeypatch):
     monkeypatch.setattr(A, "_manual_briefings_load", lambda t: {})
     monkeypatch.setattr(A, "_ical_briefings_load", lambda t: {})

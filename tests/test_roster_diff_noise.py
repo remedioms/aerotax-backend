@@ -15,9 +15,24 @@ def test_enrichment_empty_to_filled_is_not_modified():
     d = A._compute_roster_diff(old, new, today=TODAY)
     assert d == []
 
-def test_real_value_change_is_modified():
+def test_reiner_meldezeit_shift_erzeugt_keinen_eintrag_mehr():
+    # OWNER-ENTSCHEID 2026-07-29 (Screenshot Build 246, LH454-Ping-Pong in der
+    # Liste): „Das sollte nicht mal aufpoppen. Das ist nicht wichtig!!!!
+    # Einfach nur big changes." Gate 4 (`_rc_duty_substance_changed`) gilt
+    # seitdem auch fuer den VERLAUF — ein reiner Meldezeit-Shift bei sonst
+    # identischem Dienst erzeugt GAR KEINEN Eintrag mehr (vorher: Verlauf ja,
+    # Push nein). Die Daten uebernimmt der Snapshot trotzdem still.
     old = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')]
     new = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='09:05')]
+    assert A._rc_meaningfully_modified(old[0], new[0]) is True
+    assert A._rc_duty_substance_changed(old[0], new[0]) is False
+    assert A._compute_roster_diff(old, new, today=TODAY) == []
+
+
+def test_routing_wechsel_ist_weiterhin_modified():
+    # Die Gegenprobe zur Owner-Regel: ein anderes ZIEL ist „big change".
+    old = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')]
+    new = [_day('2026-07-18', klass='Z72', routing='FRA-MIA', start='08:00')]
     d = A._compute_roster_diff(old, new, today=TODAY)
     assert len(d) == 1 and d[0]['kind'] == 'modified'
 
@@ -70,12 +85,17 @@ def test_leerer_tag_taucht_auf_oder_verschwindet_still():
 
 
 def test_zeit_toleranz_fuenf_minuten():
-    # Unter 5 min = LH-Zeitenpflege, ab 5 min = echte Verschiebung.
-    base = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')]
-    drift = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:03')]
-    echt = [_day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:35')]
-    assert A._compute_roster_diff(base, drift, today=TODAY) == []
-    assert len(A._compute_roster_diff(base, echt, today=TODAY)) == 1
+    # Unter 5 min = LH-Zeitenpflege, ab 5 min = echte Verschiebung — das gilt
+    # unveraendert fuer `_rc_meaningfully_modified` (die Toleranz-Schwelle).
+    # Im DIFF sind seit dem Owner-Entscheid 2026-07-29 aber BEIDE still: reine
+    # Zeit ohne Dienst-Substanz erzeugt keinen Eintrag mehr.
+    base = _day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:00')
+    drift = _day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:03')
+    echt = _day('2026-07-18', klass='Z72', routing='FRA-JFK', start='08:35')
+    assert A._rc_meaningfully_modified(base, drift) is False
+    assert A._rc_meaningfully_modified(base, echt) is True
+    assert A._compute_roster_diff([base], [drift], today=TODAY) == []
+    assert A._compute_roster_diff([base], [echt], today=TODAY) == []
 
 def test_far_future_added_is_suppressed():
     # Neuer Monat veroeffentlicht: Tag 40 Tage entfernt = KEIN 'added'-Eintrag.

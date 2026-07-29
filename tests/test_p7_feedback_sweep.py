@@ -195,28 +195,38 @@ def test_whitelist_pu_geaendert_pusht_praesenz_flip_nicht():
     mit = _flug_tag(pickup='06:40')
     assert A._roster_change_is_push_worthy(_mod(ohne, mit)) is False
     assert A._roster_change_is_push_worthy(_mod(mit, ohne)) is False
-    # Eine echte PU-VERSCHIEBUNG (beidseitig gefüllt, ≥ 5 min) bleibt eine
-    # Verlauf-Änderung — GATE 4 (2026-07-28) hält sie aber vom Push fern:
-    # dieselben Legs, dieselbe Route, nur eine andere Uhrzeit.
+    # Eine echte PU-VERSCHIEBUNG (beidseitig gefüllt, ≥ 5 min) war bis zum
+    # 28.07. eine Verlauf-Änderung ohne Push. OWNER-ENTSCHEID 2026-07-29
+    # (Screenshot Build 246, LH454-Ping-Pong in der Liste: „Das sollte nicht
+    # mal aufpoppen. Das ist nicht wichtig!!!! Einfach nur big changes."):
+    # dieselben Legs, dieselbe Route, nur eine andere Uhrzeit → GAR KEIN
+    # Eintrag mehr.
     frueher = _flug_tag(pickup='07:10')
     spaeter = _flug_tag(pickup='07:40')
     assert A._rc_meaningfully_modified(frueher, spaeter) is True
+    assert A._rc_duty_substance_changed(frueher, spaeter) is False
+    assert A._compute_roster_diff([frueher], [spaeter],
+                                  today=frueher['datum']) == []
     assert A._roster_change_is_push_worthy(_mod(frueher, spaeter)) is False
     # Minuten-Korrektur darunter ist schon im Verlauf keine Änderung.
     assert A._roster_change_is_push_worthy(
         _mod(frueher, _flug_tag(pickup='07:13'))) is False
 
 
-def test_whitelist_erster_abflug_im_verlauf_blockzeiten_nicht():
+def test_whitelist_erster_abflug_und_blockzeiten_erzeugen_keinen_eintrag():
     old = _flug_tag()
     # Nur arr_iso/end_time gedriftet → weder Verlauf noch Push.
     drift = _flug_tag(end='18:52', arr='2026-08-02T18:52:00Z')
     assert A._rc_meaningfully_modified(old, drift) is False
     assert A._roster_change_is_push_worthy(_mod(old, drift)) is False
-    # Erster Abflug um 75 min verschoben → Verlauf ja; der Push seit GATE 4
-    # erst ab 3 h Verschiebung UND nur vor Dienstantritt.
+    # Erster Abflug um 75 min verschoben: bis 28.07. „Verlauf ja, Push nein".
+    # OWNER-ENTSCHEID 2026-07-29 — der Verlauf folgt jetzt derselben Regel, es
+    # entsteht GAR KEIN Eintrag mehr (die Schwelle bleibt 3 h vor Dienstbeginn).
     dep_shift = _flug_tag(dep='2026-08-02T09:15:00Z')
     assert A._rc_meaningfully_modified(old, dep_shift) is True
+    assert A._rc_duty_substance_changed(old, dep_shift) is False
+    assert A._compute_roster_diff([old], [dep_shift],
+                                  today=old['datum']) == []
     assert A._roster_change_is_push_worthy(_mod(old, dep_shift)) is False
 
 
@@ -249,11 +259,14 @@ def test_whitelist_loch_b_tag_ohne_sektoren():
     endpflege = {'datum': '2026-08-02', 'klass': 'Standby', 'routing': '',
                  'reader_facts': {'start_time': '08:00', 'end_time': '16:04'}}
     assert A._roster_change_is_push_worthy(_mod(old, endpflege)) is False
-    # Der Standby-BEGINN-Shift landet im Verlauf; gepusht wird er seit GATE 4
-    # nicht mehr — der Dienst selbst (Standby) ist unverändert.
+    # Der Standby-BEGINN-Shift landete bis 28.07. im Verlauf (ohne Push). Seit
+    # dem OWNER-ENTSCHEID 2026-07-29 ist er auch aus der Liste raus — der
+    # Dienst selbst (Standby) ist unverändert.
     shift = {'datum': '2026-08-02', 'klass': 'Standby', 'routing': '',
              'reader_facts': {'start_time': '10:00', 'end_time': '18:00'}}
     assert A._rc_meaningfully_modified(old, shift) is True
+    assert A._rc_duty_substance_changed(old, shift) is False
+    assert A._compute_roster_diff([old], [shift], today='2026-08-02') == []
     assert A._roster_change_is_push_worthy(_mod(old, shift)) is False
 
 
@@ -321,17 +334,35 @@ def test_endpoint_loch_a_weder_verlauf_noch_push(tmp_path):
     assert push.call_count == 0
 
 
-def test_endpoint_erster_abflug_im_verlauf_ohne_push(tmp_path):
-    # 75-min-Abflug-Shift: Verlauf ja, Push nein (GATE 4, ab 3 h und nur vor
-    # Dienstantritt). Der 4-h-Fall steht in test_roster_push_gates.py.
+def test_endpoint_erster_abflug_weder_verlauf_noch_push(tmp_path):
+    # 75-min-Abflug-Shift. Bis 28.07.: Verlauf ja, Push nein. Seit dem
+    # OWNER-ENTSCHEID 2026-07-29 („Einfach nur big changes", Screenshot
+    # Build 246) auch kein Eintrag mehr — die Schwelle für einen echten
+    # Eintrag bleibt 3 h vor Dienstantritt. Der 4-h-Fall steht in
+    # test_roster_push_gates.py.
     old = _future_flug_tag()
     new = _future_flug_tag()
     new['ical_sectors'][0]['dep_iso'] = new['ical_sectors'][0]['dep_iso'].replace('08:00', '09:15')
     r, push, changes_file = _post(tmp_path, old=[old], new=[new])
     assert r.status_code == 200
-    assert r.get_json()['changes_count'] == 1     # in-App-Liste bleibt komplett
-    assert len(json.loads(changes_file.read_text())['pending']) == 1
+    assert r.get_json()['changes_count'] == 0
+    assert json.loads(changes_file.read_text())['pending'] == []
     assert push.call_count == 0
+
+
+def test_endpoint_zielwechsel_bleibt_genau_ein_eintrag(tmp_path):
+    # Gegenprobe zur Owner-Regel: ein anderes Ziel ist ein „big change" und
+    # erzeugt weiterhin genau EINEN Eintrag (+ Push).
+    old = _future_flug_tag()
+    new = _future_flug_tag(layover='JFK')
+    new['routing'] = 'FRA-JFK'
+    new['ical_sectors'] = [dict(new['ical_sectors'][0], to='JFK')]
+    r, push, changes_file = _post(tmp_path, old=[old], new=[new])
+    assert r.status_code == 200
+    assert r.get_json()['changes_count'] == 1
+    pending = json.loads(changes_file.read_text())['pending']
+    assert len(pending) == 1 and pending[0]['kind'] == 'modified'
+    assert push.call_count == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,14 +485,17 @@ def test_pickup_normalfaelle_unveraendert():
 
 # ── P7-Review-Nachbesserungen (2026-07-27) ───────────────────────────────────
 
-def test_whitelist_meldezeit_shift_ohne_pickup_nur_im_verlauf():
+def test_whitelist_meldezeit_shift_ohne_pickup_erzeugt_keinen_eintrag():
     # Review-Fund E1: Sektor-Tag OHNE Pickup-Quelle (Homebase-Report) — eine
-    # vorgezogene Meldezeit bleibt eine Verlauf-Änderung. GATE 4 (2026-07-28,
-    # Owner + Forum-Thread „Sa 08.08: Briefing 00:35 → 01:05") nimmt sie aus
-    # dem Push: Legs, Route und Ziel sind identisch.
+    # vorgezogene Meldezeit war bis 28.07. eine Verlauf-Änderung ohne Push
+    # (GATE 4, Owner + Forum-Thread „Sa 08.08: Briefing 00:35 → 01:05").
+    # OWNER-ENTSCHEID 2026-07-29 (Screenshot Build 246): Legs, Route und Ziel
+    # sind identisch → gar kein Eintrag mehr.
     old = _flug_tag(pickup='', start='07:10')
     new = _flug_tag(pickup='', start='06:30')
     assert A._rc_meaningfully_modified(old, new) is True
+    assert A._rc_duty_substance_changed(old, new) is False
+    assert A._compute_roster_diff([old], [new], today=old['datum']) == []
     assert A._roster_change_is_push_worthy(_mod(old, new)) is False
     # MIT unveränderter PU bleibt die PU die tragende Zeit → Briefing-Drift
     # ohne Abflug-Shift bleibt still.

@@ -303,11 +303,16 @@ def test_endpoint_flipflop_pusht_hoechstens_einmal(tmp_path):
     """Zwei konkurrierende Snapshot-Schreiber (die Live-Signatur) posten
     abwechselnd ihren Stand — der User darf höchstens EINEN Push sehen."""
     d = (date.today() + timedelta(days=3)).isoformat()
-    mit = dict(_miguel_3007(datum=d, mit_pickup=True))
-    ohne = dict(_miguel_3007(datum=d, mit_pickup=False))
-    # Abflug unterscheidet die beiden Zustaende ECHT (≥ 5 min) — sonst greift
-    # schon das Substanz-Gate und die Hysterese käme nie zum Zug.
-    mit['ical_sectors'] = [dict(mit['ical_sectors'][0], dep_iso=f'{d}T22:30:00Z')]
+    mit = json.loads(json.dumps(_miguel_3007(datum=d, mit_pickup=True)))
+    ohne = json.loads(json.dumps(_miguel_3007(datum=d, mit_pickup=False)))
+    # Die beiden Zustaende muessen sich in der DIENST-SUBSTANZ unterscheiden —
+    # seit dem Owner-Entscheid 2026-07-29 (Gate 4 gilt auch fuer den Verlauf)
+    # erzeugt ein reiner Zeit-Unterschied gar keinen Change mehr, und die
+    # Hysterese käme nie zum Zug. Also: anderer Flug + anderer Layover-Ort.
+    mit['ical_sectors'] = [dict(mit['ical_sectors'][0], flight='LH457',
+                                to='MUC')]
+    mit['routing'] = 'SFO-MUC'
+    mit['reader_facts']['layover_ort'] = 'MUC'
     box = [[ohne]]
     p = _snapshot_env(tmp_path, box)
     push, changes_file = p[7], p[8]
@@ -321,8 +326,8 @@ def test_endpoint_flipflop_pusht_hoechstens_einmal(tmp_path):
             box[0] = [nxt]
     # 8 Wechsel, aber hoechstens 2 Pushes (der erste je Zielzustand).
     assert push.call_count <= 2, push.call_count
-    # Der Verlauf bleibt vollstaendig — die Liste in der App zeigt weiterhin
-    # jede substanzielle Aenderung.
+    # Der Verlauf zeigt weiterhin jede SUBSTANZIELLE Aenderung — die Hysterese
+    # daempft nur den Push, nicht den Eintrag.
     assert len(json.loads(changes_file.read_text())['pending']) == 8
 
 

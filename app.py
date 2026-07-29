@@ -18746,6 +18746,163 @@ def _logbook_import_load(token):
     return None
 
 
+_AIRPORTS_ICAO_TO_IATA_CACHE = None
+
+
+def _icao_to_iata_lookup():
+    """Lazy ICAO(4) → IATA(3) aus airports_compact.json (gleiche Referenz-DB
+    wie _airports_compact_lookup). Nötig, weil Flugbuch-Exporte (LogTen,
+    OffBlock & Co.) Plätze teils als ICAO loggen — ohne die Auflösung fiele
+    ein importiertes EDDF→KJFK aus jeder IATA-Statistik (und würde zusätzlich
+    ein identisches Roster-Leg FRA→JFK NICHT deduplizieren)."""
+    global _AIRPORTS_ICAO_TO_IATA_CACHE
+    if _AIRPORTS_ICAO_TO_IATA_CACHE is not None:
+        return _AIRPORTS_ICAO_TO_IATA_CACHE
+    out = {}
+    try:
+        ap_path = os.path.join(os.path.dirname(__file__), 'airports_compact.json')
+        with open(ap_path) as f:
+            data = json.load(f)
+        fields = data.get('fields') or []
+        i_iata = fields.index('iata')
+        i_icao = fields.index('icao')
+        for r in (data.get('rows') or []):
+            try:
+                iata = (r[i_iata] or '').upper()
+                icao = (r[i_icao] or '').upper()
+                if len(iata) == 3 and len(icao) == 4:
+                    out.setdefault(icao, iata)
+            except Exception:
+                continue
+    except Exception:
+        out = {}
+    _AIRPORTS_ICAO_TO_IATA_CACHE = out
+    return out
+
+
+def _logbook_airport_norm(code):
+    """Platz-Code für Leg-Key/Statistik normalisieren: IATA bleibt IATA,
+    4-stelliges ICAO wird aufgelöst (sonst unverändert durchgereicht — nie
+    raten, nie erfinden). Leer/unplausibel → ''."""
+    c = str(code or '').strip().upper()
+    if len(c) == 3:
+        return c
+    if len(c) == 4:
+        return _icao_to_iata_lookup().get(c, c)
+    return ''
+
+
+def _logbook_merged_legs(token, require_flight=True):
+    """DIE EINE gemergte Leg-Quelle: Roster-Sektoren + importiertes Alt-Flugbuch.
+
+    Geteilt von `get_logbook` UND `_passport_stats_compute` (Owner 2026-07-28:
+    „der Passport soll dieselbe Historie zählen wie das Flugbuch") — vorher
+    hatte der Passport eine ZWEITE, leicht abweichende Merge-Implementierung
+    (`_passport_briefings_merged`), in der ein einziger kaputter Tagessatz den
+    KOMPLETTEN Import still verschluckte (`ical_sectors: null` + Import-Leg am
+    selben Tag → AttributeError im Sammel-`try` → 0 importierte Legs, Passport
+    zeigte nur das Roster-Fenster „Daten ab <Roster-Start>").
+
+    Regeln (identisch für beide Aufrufer):
+      * Roster = manual + iCal, manual gewinnt bei vorhandenen Sektoren
+        (Semantik von get_briefings).
+      * Dedupe über `_logbook_leg_key`; bei Kollision gewinnt das ROSTER-Leg,
+        das Import-Leg hängt als `imp` dran (Landungen/PF/Reg/Typ-Fallback).
+      * Ein kaputtes Leg/ein kaputter Tag kippt NIE den Rest (per-Item-Guard).
+    `require_flight` bildet den Flugbuch-Filter ab (Legs ohne Flugnummer
+    erscheinen nicht im FCL.050-Buch, zählen im Passport aber als Flug).
+
+    Rückgabe: Liste von Dicts
+    {key,date,flight,from,to,dep_iso,arr_iso,block_min,reg,type,source,sec,imp}
+    — Roster-Legs nach Datum, danach die reinen Import-Legs.
+    """
+    try:
+        manual = _manual_briefings_load(token) or {}
+    except Exception:
+        manual = {}
+    try:
+        ical = _ical_briefings_load(token) or {}
+    except Exception:
+        ical = {}
+    sectors_by_day = {}
+    for src in (ical, manual):     # manual zuletzt → manual gewinnt
+        for k, v in (src or {}).items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            secs = v.get('ical_sectors')
+            if isinstance(secs, list) and secs:
+                sectors_by_day[k] = secs
+
+    try:
+        imp = _logbook_import_load(token) or {}
+    except Exception:
+        imp = {}
+    imp_by_key = {}
+    for L in (imp.get('legs') or []):
+        if not isinstance(L, dict):
+            continue
+        try:
+            d = str(L.get('date') or '')[:10]
+            frm = _logbook_airport_norm(L.get('from'))
+            to = _logbook_airport_norm(L.get('to'))
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', d) or not frm or not to:
+                continue
+            bm = L.get('block_min')
+            imp_by_key[_logbook_leg_key(d, L.get('flight'), frm, to)] = {
+                'date': d,
+                'flight': (L.get('flight') or '').upper().replace(' ', ''),
+                'from': frm, 'to': to,
+                'dep_iso': L.get('dep_iso') or '',
+                'arr_iso': L.get('arr_iso') or '',
+                'block_min': (bm if isinstance(bm, int) and 0 < bm < 20 * 60
+                              else None),
+                'reg': L.get('reg') or None, 'type': L.get('type') or None,
+                'raw': L,
+            }
+        except Exception:
+            continue
+
+    out = []
+    seen = set()
+    for date in sorted(sectors_by_day.keys()):
+        for s in (sectors_by_day.get(date) or []):
+            if not isinstance(s, dict):
+                continue
+            try:
+                flight = (s.get('flight') or '').upper().replace(' ', '')
+                frm = _logbook_airport_norm(s.get('from'))
+                to = _logbook_airport_norm(s.get('to'))
+                if not frm or not to or (require_flight and not flight):
+                    continue
+                key = _logbook_leg_key(date, flight, frm, to)
+                seen.add(key)
+                out.append({
+                    'key': key, 'date': date, 'flight': flight,
+                    'from': frm, 'to': to,
+                    'dep_iso': s.get('dep_iso') or '',
+                    'arr_iso': s.get('arr_iso') or '',
+                    'block_min': None,
+                    'reg': s.get('reg') or s.get('tail') or None,
+                    'type': s.get('type') or None,
+                    'source': 'roster', 'sec': s,
+                    'imp': (imp_by_key.get(key) or {}).get('raw') or {},
+                })
+            except Exception:
+                continue
+    for key, L in imp_by_key.items():
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            'key': key, 'date': L['date'], 'flight': L['flight'],
+            'from': L['from'], 'to': L['to'],
+            'dep_iso': L['dep_iso'], 'arr_iso': L['arr_iso'],
+            'block_min': L['block_min'], 'reg': L['reg'], 'type': L['type'],
+            'source': 'import', 'sec': None, 'imp': L['raw'],
+        })
+    return out
+
+
 @app.route('/api/user/logbook/<token>', methods=['GET'])
 def get_logbook(token):
     """Cockpit-Flugbuch: per-Leg Blockzeiten + Kennzeichen/Muster + manuelles
@@ -18754,38 +18911,22 @@ def get_logbook(token):
     (gecacht) nachgezogen."""
     if not token:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
-    try:
-        ical = _ical_briefings_load(token) or {}
-    except Exception:
-        ical = {}
-    try:
-        manual = _manual_briefings_load(token) or {}
-    except Exception:
-        manual = {}
-    # Sektoren stehen unter ical_sectors (i. d. R. in der iCal-Quelle).
-    sectors_by_day = {}
-    for src in (manual, ical):
-        for k, v in (src or {}).items():
-            if isinstance(v, dict) and isinstance(v.get('ical_sectors'), list):
-                sectors_by_day[k] = v['ical_sectors']
     overlay = _logbook_overlay_load(token)
     try:
         from blueprints.aerox_data_blueprint import _flight_facts_from_obs
     except Exception:
         _flight_facts_from_obs = None
 
-    # Import-Blob VOR der Roster-Schleife laden: bei Key-Kollision gewinnt das
-    # Roster-Leg, aber Landungen/PF/Nacht/Reg/Typ aus dem Import bleiben als
-    # Fallback erhalten (sonst verlöre ein Überlapp-Leg seine CSV-Landungen).
+    # EINE Leg-Quelle für Flugbuch UND Crew-Passport (siehe
+    # _logbook_merged_legs): Roster-Sektoren + importiertes Alt-Flugbuch,
+    # Dedupe über den Leg-Key, Roster gewinnt — aber Landungen/PF/Nacht/Reg/Typ
+    # aus dem Import bleiben als Fallback am Roster-Leg erhalten (sonst verlöre
+    # ein Überlapp-Leg seine CSV-Landungen).
+    merged = _logbook_merged_legs(token, require_flight=True)
     try:
         imp = _logbook_import_load(token) or {}
     except Exception:
         imp = {}
-    imp_by_key = {}
-    for L in (imp.get('legs') or []):
-        if isinstance(L, dict):
-            imp_by_key[_logbook_leg_key(L.get('date'), L.get('flight'),
-                                        L.get('from'), L.get('to'))] = L
 
     # Angereicherte Reg/Typ kommen aus dem persistenten Cache, NICHT aus einem
     # LH-Call im Request-Thread (siehe _logbook_facts_load). Was fehlt, wird
@@ -18796,47 +18937,48 @@ def get_logbook(token):
     enrich_wanted = []
 
     entries = []
-    for date in sorted(sectors_by_day.keys()):
-        for s in (sectors_by_day[date] or []):
-            if not isinstance(s, dict):
-                continue
-            flight = (s.get('flight') or '').upper().replace(' ', '')
-            frm = (s.get('from') or '').upper()
-            to = (s.get('to') or '').upper()
-            if not flight or len(frm) != 3 or len(to) != 3:
-                continue
-            key = _logbook_leg_key(date, flight, frm, to)
-            iv = imp_by_key.get(key) or {}
-            dep_iso = s.get('dep_iso') or ''
-            arr_iso = s.get('arr_iso') or ''
-            reg = s.get('reg') or s.get('tail') or iv.get('reg')
-            actype = s.get('type') or iv.get('type')
-            if (not reg or not actype) and _flight_facts_from_obs:
-                cached = facts_cache.get(key)
-                if isinstance(cached, dict) and \
-                        (_now_ts - (cached.get('at') or 0)) < _LOGBOOK_FACTS_TTL_S:
-                    reg = reg or cached.get('reg')
-                    actype = actype or cached.get('type')
-                else:
-                    # Nichts (Frisches) im Cache → Hintergrund-Worker fragen.
-                    # Der Request wartet NICHT; dieses Leg bleibt diesmal ohne
-                    # Reg/Typ und ist beim nächsten Aufruf gefüllt.
-                    enrich_wanted.append((key, flight, date, frm, to))
-            ov = overlay.get(key) or {}
-            entries.append({
-                'key': key, 'date': date, 'flight': flight,
-                'from': frm, 'to': to, 'dep_iso': dep_iso, 'arr_iso': arr_iso,
-                'block_min': _logbook_block_min(dep_iso, arr_iso),
-                'reg': reg or None, 'type': actype or None,
-                'ldg_day': ov.get('ldg_day', iv.get('ldg_day')),
-                'ldg_night': ov.get('ldg_night', iv.get('ldg_night')),
-                'to_day': ov.get('to_day', iv.get('to_day')),
-                'to_night': ov.get('to_night', iv.get('to_night')),
-                'pf': (bool(ov['pf']) if ov.get('pf') is not None
-                       else iv.get('pf')),
-                'night_min': ov.get('night_min', iv.get('night_min')),
-                'remarks': ov.get('remarks', iv.get('remarks')),
-            })
+    imported_count = 0
+    for lg in merged:
+        key = lg['key']
+        iv = lg.get('imp') or {}
+        ov = overlay.get(key) or {}
+        is_import = lg.get('source') == 'import'
+        reg = lg.get('reg') or iv.get('reg')
+        actype = lg.get('type') or iv.get('type')
+        # Import-Legs werden NICHT LH-enriched (historisch, Reg/Typ stehen im
+        # Export); nur Roster-Legs holen fehlende Fakten aus dem Cache bzw.
+        # gehen an den Hintergrund-Worker (der Request wartet NIE).
+        if not is_import and (not reg or not actype) and _flight_facts_from_obs:
+            cached = facts_cache.get(key)
+            if isinstance(cached, dict) and \
+                    (_now_ts - (cached.get('at') or 0)) < _LOGBOOK_FACTS_TTL_S:
+                reg = reg or cached.get('reg')
+                actype = actype or cached.get('type')
+            else:
+                enrich_wanted.append((key, lg['flight'], lg['date'],
+                                      lg['from'], lg['to']))
+        row = {
+            'key': key, 'date': lg['date'], 'flight': lg['flight'],
+            'from': lg['from'], 'to': lg['to'],
+            'dep_iso': lg['dep_iso'], 'arr_iso': lg['arr_iso'],
+            'block_min': (lg.get('block_min') if is_import
+                          else _logbook_block_min(lg['dep_iso'], lg['arr_iso'])),
+            'reg': reg or None, 'type': actype or None,
+            'ldg_day': ov.get('ldg_day', iv.get('ldg_day')),
+            'ldg_night': ov.get('ldg_night', iv.get('ldg_night')),
+            'to_day': ov.get('to_day', iv.get('to_day')),
+            'to_night': ov.get('to_night', iv.get('to_night')),
+            'pf': (bool(ov['pf']) if ov.get('pf') is not None
+                   else iv.get('pf')),
+            'night_min': ov.get('night_min', iv.get('night_min')),
+            'remarks': ov.get('remarks', iv.get('remarks')),
+        }
+        if is_import:
+            row['role'] = iv.get('role')
+            row['pic_name'] = iv.get('pic_name')
+            row['source'] = 'import'
+            imported_count += 1
+        entries.append(row)
     # Anreicherung asynchron anstoßen (Owner-Auftrag 2026-07-27). Der Request
     # ist damit unabhängig davon, wie viele Legs noch Reg/Typ brauchen — vorher
     # skalierte genau das mit der Antwortzeit und riss die ~20-s-Edge-Grenze.
@@ -18844,41 +18986,7 @@ def get_logbook(token):
     if enrich_wanted:
         _logbook_enrich_async(token, enrich_wanted)
 
-    # Eingespieltes Alt-Flugbuch unter die Roster-Legs mergen. Roster gewinnt
-    # bei gleichem Leg-Key (live angereichert); das manuelle Overlay gewinnt
-    # auch über importierte Werte. Import-Legs werden NICHT LH-enriched
-    # (historisch, Reg/Typ stehen im Export).
-    imported_count = 0
-    if imp_by_key:
-        seen_keys = {e['key'] for e in entries}
-        for key, L in imp_by_key.items():
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            bm = L.get('block_min')
-            bm = bm if isinstance(bm, int) and 0 < bm < 20 * 60 else None
-            ov = overlay.get(key) or {}
-            entries.append({
-                'key': key, 'date': (L.get('date') or '')[:10],
-                'flight': (L.get('flight') or '').upper(),
-                'from': (L.get('from') or '').upper(),
-                'to': (L.get('to') or '').upper(),
-                'dep_iso': L.get('dep_iso') or '',
-                'arr_iso': L.get('arr_iso') or '',
-                'block_min': bm,
-                'reg': L.get('reg') or None, 'type': L.get('type') or None,
-                'ldg_day': ov.get('ldg_day', L.get('ldg_day')),
-                'ldg_night': ov.get('ldg_night', L.get('ldg_night')),
-                'to_day': ov.get('to_day', L.get('to_day')),
-                'to_night': ov.get('to_night', L.get('to_night')),
-                'pf': (bool(ov['pf']) if ov.get('pf') is not None
-                       else L.get('pf')),
-                'night_min': ov.get('night_min', L.get('night_min')),
-                'remarks': ov.get('remarks', L.get('remarks')),
-                'role': L.get('role'), 'pic_name': L.get('pic_name'),
-                'source': 'import',
-            })
-            imported_count += 1
+    if imported_count:
         entries.sort(key=lambda e: (e.get('date') or '', e.get('dep_iso') or ''))
 
     # Simulator-Sessions aus dem Import (FCL.050: FSTD-Zeit ist GETRENNT von
@@ -20332,7 +20440,8 @@ def _rc_meaningfully_modified(a, b):
         return False
 
 
-def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
+def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10,
+                         now=None):
     """Returns list of {datum, kind, old, new} where kind ∈ added/removed/modified.
 
     RAUSCHREDUKTION (Jennifer Schenke 2026-07-16 „ein Haufen Dienstplanänderungen
@@ -20367,9 +20476,22 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
        ist das ein abgeschnittener Import, keine Massen-Streichung → alle
        'removed' des Diffs fallen weg (siehe Guard am Ende der Funktion).
 
-    Die Substanz-Regel selbst lebt in `_rc_meaningfully_modified` — dieselbe
-    Funktion entscheidet auch über den Push (`_roster_change_is_push_worthy`),
-    es gibt nur noch EINE Wahrheit.
+    5) REINE ZEIT-ÄNDERUNGEN (Owner-Eskalation 2026-07-29, Screenshot Build
+       246): Die in-App-Liste stand voll mit „Abflug LH454: 10:25 → 10:55 ·
+       Ankunft 12:40 → 13:10" und direkt darunter derselben Änderung rückwärts
+       (das LH454-Ping-Pong). Owner wörtlich: „Das sollte nicht mal aufpoppen.
+       Das ist nicht wichtig!!!! Einfach nur big changes." Damit gilt Gate 4
+       (`_rc_duty_substance_changed`) — bis dahin nur Push-Filter — auch hier:
+       ein 'modified' ohne DIENST-Substanz (andere Legs/Route/Layover/
+       Dienstzustand oder ≥ 3 h Verspätung vor Dienstantritt) erzeugt GAR
+       KEINEN Eintrag mehr. Die Zeit selbst wird trotzdem übernommen: der
+       Snapshot in `take_roster_snapshot` wird unabhängig vom Diff geschrieben,
+       der Roster aktualisiert sich still. 'added'/'removed' sind unberührt.
+
+    Die Substanz-Regel selbst lebt in `_rc_meaningfully_modified` +
+    `_rc_duty_substance_changed` — dieselben Funktionen entscheiden auch über
+    den Push (`_roster_change_is_push_worthy`), es gibt nur EINE Wahrheit.
+    `now` ist nur für Tests da (Default: Wanduhr in UTC, via Gate 4).
     """
     old_by = {t.get('datum'): t for t in (old_tage or []) if isinstance(t, dict)}
     new_by = {t.get('datum'): t for t in (new_tage or []) if isinstance(t, dict)}
@@ -20416,7 +20538,12 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10):
             # Frei → Krank): beide Seiten dienstfrei → keine Dienständerung.
             # Sobald EINE Seite Dienst ist (Frei→Tour, Tour→Krank), bleibt der
             # Eintrag — genau das muss der User sehen.
-            if not (_rc_day_is_off_duty(a) and _rc_day_is_off_duty(b)):
+            # 5) GATE 4 (seit 2026-07-29 auch hier): reine Zeit-Verschiebungen
+            #    bei identischer Dienst-Substanz erzeugen KEINEN Eintrag mehr
+            #    („Einfach nur big changes"). Die Daten übernimmt der Snapshot
+            #    trotzdem.
+            if (not (_rc_day_is_off_duty(a) and _rc_day_is_off_duty(b))
+                    and _rc_duty_substance_changed(a, b, now=now)):
                 changes.append({'datum': k, 'kind': 'modified',
                                 'old': a, 'new': b})
 
@@ -20565,8 +20692,13 @@ def take_roster_snapshot(token):
         _today_ymd = _airport_local_now(_hb).strftime('%Y-%m-%d')
     except Exception:
         _today_ymd = datetime.now().strftime('%Y-%m-%d')
+    # `diff` ist seit 2026-07-29 bereits Gate-4-gefiltert (nur DIENST-Substanz;
+    # reine Zeit-Verschiebungen erzeugen keinen Eintrag mehr).
     diff = _compute_roster_diff(old_tage, new_tage, today=_today_ymd) if old_tage else []
-    # Persist new snapshot (Supabase-first + Disk, multi-instance-sicher)
+    # Persist new snapshot (Supabase-first + Disk, multi-instance-sicher).
+    # WICHTIG: das passiert UNABHÄNGIG vom Diff — auch eine Zeit-Änderung, die
+    # keinen Change-Eintrag erzeugt, landet hier in den Daten (Auto-Übernahme).
+    # Nur der Änderungs-EINTRAG entfällt, nie die Aktualisierung selbst.
     if not _roster_snapshot_save(token, {
         'taken_at': datetime.now().isoformat(), 'tage': new_tage,
     }):
@@ -20594,18 +20726,15 @@ def take_roster_snapshot(token):
             ch['status'] = 'pending'
             pending.append(ch)
         existing['pending'] = pending
-        # PUSH-GATES — die in-App-Liste behält ALLE Changes, nur der Push wird
-        # zusätzlich gefiltert:
+        # PUSH-GATES — was hier ankommt, hat Gate 2 + Gate 4 schon im Diff
+        # passiert (die in-App-Liste ist seit 2026-07-29 selbst substanz-
+        # gefiltert). Für den Push kommt zusätzlich dazu:
         #   1) Vergangenheit (Tag < heute Homebase-lokal, inkl. Ist-Zeiten-
-        #      Nachtrag nach Dienstende): Tour vorbei → still.
+        #      Nachtrag nach Dienstende): Tour vorbei → still, Eintrag bleibt.
         #   2) SUBSTANZ-GATE (`_roster_change_is_push_worthy` →
-        #      `_rc_meaningfully_modified`): Sektor/Dienst kommt-geht, Abflug-,
-        #      Melde- oder Pickup-Zeit ≥ 5 min. Alles andere still.
-        #   2b) DIENST-SUBSTANZ-GATE 4 (`_rc_push_duty_substance_changed`,
-        #      2026-07-28): von den unter 2) übrig gebliebenen 'modified'
-        #      pusht nur noch, was den DIENST ändert (andere Legs/Route/
-        #      Layover/Dienstzustand) — plus ≥ 3 h Verspätung VOR Dienstantritt.
-        #      Reine Zeit-Verschiebungen bleiben im Verlauf, klingeln nicht.
+        #      `_rc_meaningfully_modified` + `_rc_duty_substance_changed`):
+        #      dieselbe Regel wie im Diff, hier als Verteidigung in der Tiefe
+        #      (der Push darf nie lockerer sein als die Liste).
         #   3) FLIP-FLOP-HYSTERESE: derselbe Tag, der binnen 24 h in einen
         #      bereits gepushten Zustand zurückkippt, pusht kein zweites Mal.
         #      Der Zustand lebt im selben `roster_changes`-Payload und ist
@@ -20765,7 +20894,8 @@ def _rc_sector_structure(day):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GATE 4 — „nur die DIENST-Substanz pusht" (Owner-Entscheid 2026-07-28)
+# GATE 4 — „nur die DIENST-Substanz zählt" (Owner-Entscheid 2026-07-28,
+#           auf den VERLAUF ausgeweitet am 2026-07-29)
 # ══════════════════════════════════════════════════════════════════════════════
 # Owner, wörtlich: „Das Einzige, was aufpoppen darf, ist wirklich, wenn ich einen
 # komplett neuen Flug habe — keine Verspätungen, keine Gate-Wechsel, keine
@@ -20780,10 +20910,21 @@ def _rc_sector_structure(day):
 #   · Forum-Thread voller Crews zu Briefing-Minuten („Sa 08.08: Briefing
 #     00:35 → 01:05") — Zeitenpflege, die als „Dienstplan-Änderung" erschreckt.
 #
-# Gate 4 sitzt AUSSCHLIESSLICH im Push-Pfad (`_roster_change_is_push_worthy`).
-# Der Verlauf (`roster_changes`, in-App-Liste) bleibt VOLLSTÄNDIG — genauso wie
-# Gate 3 (Blockzeiten-Drift) es seit dem 24.07. handhabt: der User kann jede
-# Minutenpflege nachlesen, sie klingelt nur nicht mehr.
+# AUSWEITUNG 2026-07-29 (Owner-Eskalation, Screenshot Build 246): Gate 4 saß
+# zunächst NUR im Push-Pfad, der Verlauf blieb bewusst vollständig. Genau das
+# hat der Owner gekippt — die in-App-Liste „Dienstplan-Änderungen" stand voll
+# mit reinen Zeit-Einträgen („Abflug LH454: 10:25 → 10:55 · Ankunft 12:40 →
+# 13:10", direkt darunter dieselbe Änderung rückwärts: das LH454-Ping-Pong).
+# Owner wörtlich: „Das sollte nicht mal aufpoppen. Das ist nicht wichtig!!!!
+# Einfach nur big changes."
+#
+# Seitdem gilt die Substanz-Regel für den GESAMTEN Änderungs-Eintrag: ein
+# 'modified', das `_rc_duty_substance_changed` nicht besteht, wird gar nicht
+# mehr erfasst — kein pending-Eintrag, kein Verlauf, kein Badge, nichts zu
+# bestätigen. Die Zeit-Änderung selbst geht trotzdem in die DATEN: der Snapshot
+# wird in `take_roster_snapshot` unabhängig vom Diff geschrieben, der Roster
+# aktualisiert sich also still (Auto-Übernahme). Nur der EINTRAG entfällt.
+# 'added'/'removed' bleiben unberührt.
 #
 # Ping-Pong braucht dadurch KEINE eigene Dedup-Logik mehr: A→B und B→A sind
 # beide reine Zeit-Änderungen und damit beide still.
@@ -20904,9 +21045,9 @@ def _rc_huge_delay_before_duty(a, b, now=None, tol=_RC_HUGE_DELAY_MIN):
         return False
 
 
-def _rc_push_duty_substance_changed(a, b, now=None):
-    """GATE 4 (nur Push) — „hat sich der DIENST geändert?", nicht „hat sich
-    irgendeine Zeit geändert?".
+def _rc_duty_substance_changed(a, b, now=None):
+    """GATE 4 — „hat sich der DIENST geändert?", nicht „hat sich irgendeine
+    Zeit geändert?".
 
     True (= Push erlaubt) nur bei:
       1. **Dienst kommt/geht** — `_rc_duty_state_changed` (Frei↔Dienst, Flug-
@@ -20922,12 +21063,20 @@ def _rc_push_duty_substance_changed(a, b, now=None):
 
     STILL sind damit ALLE reinen Zeit-Änderungen bei identischer Struktur:
     Briefing-/Melde-Shift, Pickup-Shift, Abflug-Shift < 3 h, Ankunft/Block-/
-    Ist-Zeiten, Gate, Dienstende. Sie stehen weiterhin VOLLSTÄNDIG im Verlauf
-    (`_rc_meaningfully_modified` entscheidet dort unverändert) — Gate 4
-    filtert ausschließlich die Push-Zustellung.
+    Ist-Zeiten, Gate, Dienstende.
 
-    Wirft nie; im Fehlerfall fail-open (lieber ein Push zu viel als eine echte
-    Dienständerung still), konsistent mit `_roster_change_is_push_worthy`."""
+    SEIT 2026-07-29 (Owner-Eskalation, Screenshot Build 246 — die Liste war
+    voll mit „Abflug LH454: 10:25 → 10:55" + derselben Änderung rückwärts):
+    diese Regel gilt NICHT MEHR nur für den Push, sondern für den gesamten
+    Änderungs-Eintrag. `_compute_roster_diff` ruft sie für jedes 'modified'
+    auf; besteht ein Change sie nicht, entsteht gar kein Eintrag (kein
+    pending, kein Verlauf, kein Badge). Der Roster selbst übernimmt die
+    Zeit-Änderung trotzdem still — der Snapshot wird unabhängig vom Diff
+    geschrieben.
+
+    Wirft nie; im Fehlerfall fail-open (lieber ein Eintrag zu viel als eine
+    echte Dienständerung still), konsistent mit
+    `_roster_change_is_push_worthy`."""
     try:
         a = a if isinstance(a, dict) else {}
         b = b if isinstance(b, dict) else {}
@@ -20982,7 +21131,7 @@ def _roster_change_is_past(change, today_ymd, now_hhmm=None):
 
 def _roster_change_is_push_worthy(change, now=None):
     """PUSH-GATE — `_rc_meaningfully_modified` UND (seit 2026-07-28) Gate 4
-    `_rc_push_duty_substance_changed`.
+    `_rc_duty_substance_changed`.
 
     HISTORIE: Florians Whitelist (2026-07-26) ersetzte die Blacklist aus
     `_roster_change_is_pickup_prune` + `_roster_change_is_blocktime_drift`,
@@ -20999,20 +21148,23 @@ def _roster_change_is_push_worthy(change, now=None):
       · Loch B (Tage ohne Sektoren) → `_rc_report_moved` gilt uniform,
       · P7-Fund E1 (Meldezeit-Shift ohne Pickup) → `_rc_report_moved` feuert.
 
-    Damit gilt: **was nicht in den Verlauf kommt, pusht auch nicht.** Die
-    Umkehrung gilt seit Gate 4 NICHT mehr: der Verlauf ist bewusst REICHER als
-    der Push. Zusätzlich pushen added/removed nur mit BELEGTEM Dienst — ein
-    Leer-Tag ohne Klasse/Sektoren/Marker ist eine Quellen-Lücke. Wirft nie; bei
-    unbekanntem `kind` fail-open (lieber ein Push zu viel als eine echte
+    Damit gilt: **was nicht in den Verlauf kommt, pusht auch nicht** — und
+    seit dem 2026-07-29 gilt auch die Umkehrung wieder: Gate 4 sitzt jetzt
+    schon in `_compute_roster_diff`, ein 'modified' ohne Dienst-Substanz
+    existiert also gar nicht mehr als Change. Diese Funktion bleibt trotzdem
+    ein eigenständiges Gate (Verteidigung in der Tiefe + der Vergangenheits-
+    Filter darüber). Zusätzlich pushen added/removed nur mit BELEGTEM Dienst —
+    ein Leer-Tag ohne Klasse/Sektoren/Marker ist eine Quellen-Lücke. Wirft nie;
+    bei unbekanntem `kind` fail-open (lieber ein Push zu viel als eine echte
     Änderung still).
 
     GATE 4 (2026-07-28, Owner: „Das Einzige, was aufpoppen darf, ist wirklich,
     wenn ich einen komplett neuen Flug habe"): für 'modified' muss ZUSÄTZLICH
-    die Dienst-Substanz gekippt sein (`_rc_push_duty_substance_changed` —
+    die Dienst-Substanz gekippt sein (`_rc_duty_substance_changed` —
     Legs/Routing/Layover/Dienstzustand oder ≥ 3 h Verspätung vor Dienstantritt).
     Reine Zeit-Änderungen (Briefing, Melde-, Pickup-, Abflug-, Block-, Endzeit)
-    landen weiterhin im Verlauf, klingeln aber nicht mehr. `now` ist nur für
-    Tests da (Default: Wanduhr in UTC)."""
+    sind still — seit dem 29.07. auch im Verlauf. `now` ist nur für Tests da
+    (Default: Wanduhr in UTC)."""
     try:
         kind = (change or {}).get('kind')
         if kind in ('added', 'removed'):
@@ -21024,7 +21176,7 @@ def _roster_change_is_push_worthy(change, now=None):
         b = change.get('new') if isinstance(change.get('new'), dict) else {}
         if not _rc_meaningfully_modified(a, b):
             return False          # Verlauf-Regel: gar keine Änderung
-        return _rc_push_duty_substance_changed(a, b, now=now)   # Gate 4
+        return _rc_duty_substance_changed(a, b, now=now)        # Gate 4
     except Exception:
         return True
 
@@ -24397,7 +24549,24 @@ def delete_wall_post(token, post_id):
 
 # ─── Crew Forum (Themen-Foren) ──────────────────────────────────────────────
 # Kategorien: cabin | cockpit | general | pay | standby | layover
-FORUM_CATEGORIES = {'cabin', 'cockpit', 'general', 'pay', 'standby', 'layover'}
+FORUM_CATEGORIES = {'cabin', 'cockpit', 'general', 'pay', 'standby', 'layover',
+                    # 'aerox' = App-Rubrik (Feedback/Bugs/Fragen zur App) —
+                    # hält App-Themen aus dem allgemeinen Crew-Teil raus
+                    # (User-Wunsch 2026-07-28). forum_threads.category_id ist
+                    # freies TEXT ohne Constraint ⇒ KEINE Migration nötig.
+                    'aerox'}
+
+# Marker-Hashtags, die einen Thread auch OHNE aerox-Kategorie der App-Rubrik
+# zuordnen (Alt-Threads / Wall-Brücke). Spiegel von ForumRubric.resolve (iOS).
+FORUM_AEROX_TAGS = {'aerox', 'aeroxfeedback', 'appfeedback'}
+
+
+def _forum_rubric(t):
+    """'aerox' (App-Feedback) vs. 'crew' — Anzeige-Rubrik eines Threads."""
+    if (t.get('category_id') or '') == 'aerox':
+        return 'aerox'
+    tags = [str(x).lower() for x in (t.get('hashtags') or [])]
+    return 'aerox' if any(x in FORUM_AEROX_TAGS for x in tags) else 'crew'
 FORUM_HASHTAG_RE = re.compile(r'#([\wÀ-ſ]{2,32})', re.UNICODE)
 
 
@@ -25186,6 +25355,9 @@ def forum_list_threads(token):
     for t in threads:
         t['liked_by_me'] = t.get('id') in likes['threads']
         t['is_mine'] = (t.get('author_token') == token)
+        # Anzeige-Rubrik (crew|aerox) explizit ausliefern — der Client leitet
+        # sie sonst selbst ab (ForumRubric.resolve); Server-Feld gewinnt.
+        t['rubric'] = _forum_rubric(t)
         # Tote Legacy-Bild-Referenzen zentral rausfiltern (alle Clients).
         t['image_url'] = _forum_public_image_url(t.get('image_url'))
         if t.get('is_anonymous'):
@@ -25299,6 +25471,7 @@ def forum_create_thread(token):
     response_thread = dict(thread)
     response_thread.pop('author_token', None)
     response_thread['liked_by_me'] = False
+    response_thread['rubric'] = _forum_rubric(response_thread)
     return jsonify({'ok': True, 'thread': response_thread})
 
 
@@ -27915,80 +28088,25 @@ _PASSPORT_STATS_CACHE = {}      # (token, range) -> (expires_ts, payload)
 _PASSPORT_ROUTE_DUR_CACHE = {}  # 'FRA-JFK' -> (expires_ts, minutes|None)
 
 
-def _passport_briefings_merged(token):
-    """Alle Tagessätze des Users (manual + iCal gemerged) — NUR fürs Lesen der
-    ical_sectors. Gleiche Prioritäts-Semantik wie get_briefings (setdefault:
-    manual-Sektoren gewinnen, iCal füllt Lücken), aber OHNE die teuren
-    Serve-Time-Anreicherungen (Kalender-Refresh, Live-Delays) — der Passport
-    braucht nur die historischen Legs, keine Live-Zahlen."""
+def _passport_legs(token):
+    """Alle Legs des Users für den Passport — GENAU die Quelle des Flugbuchs
+    (`_logbook_merged_legs`): Roster-Sektoren (manual + iCal, manual gewinnt)
+    PLUS das importierte Alt-Flugbuch, dedupliziert über `_logbook_leg_key`
+    (Roster gewinnt bei Kollision).
+
+    `require_flight=False`: ein geflogenes Leg ohne Flugnummer (Discover-/
+    Linientraining-Zeilen, Sektoren ohne Nummern-Backfill) zählt im Passport
+    als Flug — im FCL.050-Buch bleibt es außen vor.
+
+    Owner 2026-07-28: vorher hatte der Passport eine eigene Merge-Kopie
+    (`_passport_briefings_merged`), die den kompletten Import still verlieren
+    konnte; jetzt gibt es nur noch EINE Merge-Wahrheit.
+    """
     try:
-        data = dict(_manual_briefings_load(token) or {})
-    except Exception:
-        data = {}
-    try:
-        for k, v in (_ical_briefings_load(token) or {}).items():
-            if not isinstance(v, dict):
-                continue
-            cur = data.get(k)
-            if not isinstance(cur, dict):
-                data[k] = v
-                continue
-            has_cur = isinstance(cur.get('ical_sectors'), list) and cur.get('ical_sectors')
-            has_new = isinstance(v.get('ical_sectors'), list) and v.get('ical_sectors')
-            if not has_cur and has_new:
-                cur = dict(cur)
-                cur['ical_sectors'] = v['ical_sectors']
-                data[k] = cur
-    except Exception:
-        pass
-    # FLUGBUCH-IMPORT einmischen (Kevin 2026-07-25: „Statistik berücksichtigt
-    # nur die selbst geladenen Flüge … alte Flüge aus dem Flugbuch-Import
-    # erscheinen in Statistik und Crew-Passport nicht"): importierte
-    # Karriere-Legs als synthetische Tagessätze — NUR Legs, die das Roster
-    # nicht schon trägt (Roster gewinnt bei Überlapp, gleiche Key-Semantik wie
-    # get_logbook). block_min reist mit, damit die Flugzeit-Summe historische
-    # Legs ohne route-history-Lookup ehrlich zählt.
-    try:
-        imp = _logbook_import_load(token) or {}
-        legs = imp.get('legs') or []
-        if legs:
-            existing = set()
-            for k, v in data.items():
-                if not isinstance(v, dict):
-                    continue
-                for s in (v.get('ical_sectors') or []):
-                    if isinstance(s, dict):
-                        existing.add(_logbook_leg_key(
-                            k, s.get('flight'), s.get('from'), s.get('to')))
-            for L in legs:
-                if not isinstance(L, dict):
-                    continue
-                d = (L.get('date') or '')[:10]
-                frm = (L.get('from') or '').strip().upper()
-                to = (L.get('to') or '').strip().upper()
-                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d) \
-                        or len(frm) != 3 or len(to) != 3:
-                    continue
-                key = _logbook_leg_key(d, L.get('flight'), frm, to)
-                if key in existing:
-                    continue
-                existing.add(key)
-                bm = L.get('block_min')
-                sec = {'flight': (L.get('flight') or '').upper() or None,
-                       'from': frm, 'to': to,
-                       'dep_iso': L.get('dep_iso') or None,
-                       'arr_iso': L.get('arr_iso') or None,
-                       'reg': L.get('reg') or None,
-                       'type': L.get('type') or None,
-                       'block_min': bm if isinstance(bm, int) and 0 < bm < 20 * 60 else None}
-                day = data.get(d)
-                if not isinstance(day, dict):
-                    day = {}
-                    data[d] = day
-                day.setdefault('ical_sectors', []).append(sec)
-    except Exception:
-        pass
-    return data
+        return _logbook_merged_legs(token, require_flight=False)
+    except Exception as e:
+        app.logger.warning(f'[passport] legs_merge_fail: {type(e).__name__}')
+        return []
 
 
 def _passport_route_duration_min(frm, to, budget):
@@ -28049,7 +28167,7 @@ def _passport_stats_compute(token, rng):
       häufigste zuerst). `years` trägt IMMER alle Jahre mit Flug-Daten
       (unabhängig vom Range) — daraus baut der Client seine Zeitraum-Pills."""
     from collections import Counter
-    days = _passport_briefings_merged(token)
+    legs = _passport_legs(token)
     ap_lookup = _airports_compact_lookup()
 
     flights = 0
@@ -28074,73 +28192,73 @@ def _passport_stats_compute(token, rng):
         except ValueError:
             return None
 
-    for datum in sorted(days.keys()):
-        day = days.get(datum)
-        if not isinstance(day, dict) or not isinstance(datum, str):
-            continue
+    for lg in legs:
+        datum = lg.get('date') or ''
         if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
             continue
-        secs = day.get('ical_sectors') or []
-        day_counted = False
-        for s in secs:
-            if not isinstance(s, dict):
-                continue
-            frm = (s.get('from') or '').strip().upper()
-            to = (s.get('to') or '').strip().upper()
-            if len(frm) != 3 or len(to) != 3 or frm == to:
-                continue
-            years.add(datum[:4])
-            if not _passport_range_match(datum, rng):
-                continue
-            # Geflogene Maschinen (Remo Gisler 2026-07-22): jede im Roster
-            # deklarierte/gemessene Reg sammeln — nie erfunden; die Abdeckung
-            # wächst mit den Quellen (ITA/LEON deklarieren, LH via Boards).
-            _tl = str(s.get('tail') or s.get('reg') or '').strip().upper()
-            if 2 < len(_tl) <= 10:
-                tails.add(_tl)
-            flights += 1
-            day_counted = True
-            airports.add(frm)
-            airports.add(to)
-            routes[(frm, to)] += 1
-            fn = (s.get('flight') or s.get('flight_no') or '').replace(' ', '').upper()
-            m = re.match(r'^([A-Z]{2,3})\d', fn)
-            if m:
-                airlines.add(m.group(1))
-            ca = ap_lookup.get(frm)
-            cb = ap_lookup.get(to)
-            if ca and cb:
-                distance_km += _haversine_km(ca[0], ca[1], cb[0], cb[1])
-            for ent in (ca, cb):
-                if ent and ent[2]:
-                    countries.add(ent[2])
-            # Flugzeit: arr−dep wenn beide da und plausibel; sonst die echte
-            # Import-Blockzeit (Flugbuch-Legs, Kevin 2026-07-25 — spart bei
-            # 1000+ Karriere-Legs auch das route-history-Budget); sonst der
-            # route-history-Median; sonst fällt das Leg aus der Zeit-Summe.
-            dep = _parse_iso(s.get('dep_iso'))
-            arr = _parse_iso(s.get('arr_iso'))
-            mins = None
-            if dep and arr:
-                delta = (arr - dep).total_seconds() / 60.0
-                if delta < 0:
-                    delta += 24 * 60   # Mitternachts-Wrap (naive iCal-Zeiten)
-                if 0 < delta < 20 * 60:
-                    mins = delta
-            if mins is None:
-                bm = s.get('block_min')
-                if isinstance(bm, (int, float)) and 0 < bm < 20 * 60:
-                    mins = float(bm)
-            if mins is None:
-                mins = _passport_route_duration_min(frm, to, dur_budget)
-            if mins is not None:
-                minutes += float(mins)
-            else:
-                legs_without_duration += 1
-        if day_counted:
-            if first_date is None:
-                first_date = datum
+        frm = lg.get('from') or ''
+        to = lg.get('to') or ''
+        if not frm or not to:
+            continue
+        years.add(datum[:4])
+        if not _passport_range_match(datum, rng):
+            continue
+        s = lg.get('sec') or lg.get('imp') or {}
+        # Geflogene Maschinen (Remo Gisler 2026-07-22): jede im Roster
+        # deklarierte/gemessene Reg sammeln — nie erfunden; die Abdeckung
+        # wächst mit den Quellen (ITA/LEON deklarieren, LH via Boards). Aus
+        # dem Flugbuch-Import kommen die Kennzeichen direkt mit.
+        _tl = str(lg.get('reg') or s.get('tail') or '').strip().upper()
+        if 2 < len(_tl) <= 10:
+            tails.add(_tl)
+        flights += 1
+        # Zeitraum-Text („Daten ab …") = frühestes/spätestes GEZÄHLTES Leg.
+        # Über min/max statt Reihenfolge, weil die Import-Legs hinter den
+        # Roster-Legs stehen (und damit vor ihnen liegen können).
+        if first_date is None or datum < first_date:
+            first_date = datum
+        if last_date is None or datum > last_date:
             last_date = datum
+        airports.add(frm)
+        airports.add(to)
+        if frm != to:          # Platzrunde: ein Flug, aber kein Karten-Bogen
+            routes[(frm, to)] += 1
+        fn = (lg.get('flight') or s.get('flight_no') or '').replace(' ', '').upper()
+        m = re.match(r'^([A-Z]{2,3})\d', fn)
+        if m:
+            airlines.add(m.group(1))
+        ca = ap_lookup.get(frm)
+        cb = ap_lookup.get(to)
+        if ca and cb and frm != to:
+            distance_km += _haversine_km(ca[0], ca[1], cb[0], cb[1])
+        for ent in (ca, cb):
+            if ent and ent[2]:
+                countries.add(ent[2])
+        # Flugzeit: arr−dep wenn beide da und plausibel; sonst die echte
+        # Import-Blockzeit (Flugbuch-Legs, Kevin 2026-07-25 — spart bei
+        # 1000+ Karriere-Legs auch das route-history-Budget); sonst der
+        # route-history-Median; sonst fällt das Leg aus der Zeit-Summe.
+        dep = _parse_iso(lg.get('dep_iso'))
+        arr = _parse_iso(lg.get('arr_iso'))
+        mins = None
+        if dep and arr:
+            delta = (arr - dep).total_seconds() / 60.0
+            if delta < 0:
+                delta += 24 * 60   # Mitternachts-Wrap (naive iCal-Zeiten)
+            if 0 < delta < 20 * 60:
+                mins = delta
+        if mins is None:
+            bm = lg.get('block_min')
+            if bm is None:
+                bm = s.get('block_min')
+            if isinstance(bm, (int, float)) and 0 < bm < 20 * 60:
+                mins = float(bm)
+        if mins is None and frm != to:
+            mins = _passport_route_duration_min(frm, to, dur_budget)
+        if mins is not None:
+            minutes += float(mins)
+        else:
+            legs_without_duration += 1
 
     # WELTKARTEN-BÖGEN (Kevin 2026-07-27, live bewiesen: len(routes)==80,
     # airports_count=89, aber nur 37 Flughäfen auf der Karte — SYD fehlte):
@@ -39015,7 +39133,7 @@ def ax_transit():
                     'date': _ar.strftime('%Y-%m-%d'), 'time': _ar.strftime('%H:%M'),
                     # 0 = depart-after („frühestens losfahren"), 1 = arrive-by
                     'searchForArrival': 0 if depart_mode else 1,
-                    'numB': 0, 'numF': 4, 'rtMode': 'REALTIME',
+                    'numB': 0, 'numF': 6, 'rtMode': 'REALTIME',
                     # Leg-Geometrie (Polyline.crd) mitliefern → iOS zeichnet die
                     # Linie entlang der Gleise statt Luftlinie (s. _norm_rmv).
                     'poly': 1,
@@ -39127,6 +39245,62 @@ def ax_transit():
             if request.args.get('debug') == '1':
                 out['debug'] = dbg
             return jsonify(out)
+
+        # ── FERNVERKEHR AKTIV ANFRAGEN (Owner 2026-07-29: „zeigt mir nie ICE") ──
+        # `fern=1` hat bisher nur ERLAUBT, nie GEFRAGT: jeder Provider wird genau
+        # EINMAL unvoreingenommen gefragt, HAFAS liefert seine N besten Trips. Für
+        # jede Adresse mit direkter S-/RE-Anbindung zum Flughafen sind das
+        # ausnahmslos Nahverkehr-Fahrten (live 2026-07-29: Frankfurt-Nordend → FRA
+        # = 4× U4+S8/S9 in Folge; dieselbe Suche ab Frankfurt Hbf zeigt ICEs).
+        # DESHALB: bei `fern=1` EINE ZUSÄTZLICHE Anfrage mit Produktmaske OHNE
+        # S-Bahn (Bit 8) und Regionalzug (Bit 4) = 2035 — Zubringer (U/Tram/Bus)
+        # bleiben erlaubt, die letzte Meile zum Flughafen kann nur noch Fern sein.
+        # KEIN destExtId: der Pin auf den REGIONALbahnhof (nearbystops maxNo=1)
+        # erzwingt sonst zusätzlich einen Fußweg-Umstieg Fern→Regionalbahnhof.
+        # Treffer werden nur ANGEHÄNGT — Kette, Auswahl-Regel und Default-
+        # Empfehlung bleiben unberührt; kein Treffer = kein Effekt.
+        try:
+            if want_fern and journeys:
+                _fsnap = None if depart_mode else _snap_to_airport_rail(tlat, tlon)
+                _fd_lat = _fsnap[0] if _fsnap else tlat
+                _fd_lon = _fsnap[1] if _fsnap else tlon
+                _fern_providers = []
+                if rmv_params is not None:
+                    _fp = dict(rmv_params)
+                    _fp.pop('destExtId', None)
+                    _fp['destCoordLat'] = _fd_lat
+                    _fp['destCoordLong'] = _fd_lon
+                    _fp['products'] = 2035          # alles AUSSER RE/RB (4) + S (8)
+                    _fp['numF'] = 3
+                    _fern_providers.append(('rmv_fern', lambda p=_fp: _norm_rmv(
+                        _get_json('https://www.rmv.de/hapi/trip', p, 12))))
+                if rmv_mgate_body is not None:
+                    import copy as _copy
+                    _fb = _copy.deepcopy(rmv_mgate_body)
+                    _fb['svcReqL'][0]['req']['jnyFltrL'] = [
+                        {'type': 'PROD', 'mode': 'INC', 'value': 2035}]
+                    _fb['svcReqL'][0]['req']['numF'] = 3
+                    _fern_providers.append(('rmv_mgate_fern', lambda b=_fb: _norm_rmv_mgate(
+                        _post_json('https://www.rmv.de/auskunft/bin/jp/mgate.exe', b, 12))))
+                for _fname, _ffn in _fern_providers:
+                    _fdbg = {'name': _fname}
+                    try:
+                        _fjs = _ffn() or []
+                        _fdbg['n'] = len(_fjs)
+                        # NUR echte Fern-Fahrten anhängen — sonst dupliziert die
+                        # Maske bloß U-Bahn-/Bus-Varianten der Nahverkehr-Suche.
+                        _add = [ls for ls in _fjs
+                                if any(l['mode'] == 'transit' and l['fern'] for l in ls)]
+                        _fdbg['added'] = len(_add)
+                        dbg['providers'].append(_fdbg)
+                        if _add:
+                            journeys = journeys + _add
+                            break
+                    except Exception as _fe:
+                        _fdbg['err'] = f'{type(_fe).__name__}: {str(_fe)[:120]}'
+                        dbg['providers'].append(_fdbg)
+        except Exception:
+            pass
 
         def _mins(a, b):
             try:
@@ -39292,7 +39466,7 @@ def ax_transit():
                              'first_dep_delay_min': cand.get('first_dep_delay_min'),
                              'last_arr': cand['last_arr'],
                              'legs': cand['legs']})
-                if len(alts) >= 4:
+                if len(alts) >= 6:
                     break
             if len(alts) > 1:
                 out['alternatives'] = alts
@@ -39506,16 +39680,33 @@ def airport_board(token):
                                 'stale_age_sec': int(_t_lg.time() - _lg[0])})
         except Exception:
             pass
-        # Ehrlich: kein Native-Scraper getroffen, kein AeroDataBox-Key/leer.
-        import os as _os
+        # EHRLICHER GRUND (Owner 2026-07-28, „LAX meldet source_unavailable, SFO
+        # nicht"): der User-Pfad ist FREE-FIRST (allow_paid=False) — AeroDataBox
+        # wird hier strukturell NIE gefragt. Die alte Meldung erwähnte trotzdem
+        # den ADB-Key und behauptete sonst „Quelle nicht erreichbar", obwohl für
+        # Flughäfen ohne freie Quelle (LAX/ORD/MIA/IAH/SEA …) gar keine Quelle
+        # EXISTIERT, die ausfallen könnte. Jetzt unterscheidet die Antwort:
+        #   source_down    — der Flughafen HAT eine freie Quelle (nativer
+        #                    Scraper / FRA / NAS-Scraper), sie liefert gerade
+        #                    nichts → erneut versuchen lohnt.
+        #   no_free_source — für diesen Flughafen gibt es keine freie Tafel;
+        #                    erneut versuchen ändert nichts.
+        # `reason` ist additiv (ältere iOS-Builds ignorieren das Feld).
+        has_free_src = (out_airport in ('FRA', 'EDDF')
+                        or iata in _NATIVE_BOARD_SCRAPERS
+                        or iata in _NAS_SCRAPED_BOARD_CODES)
         if out_airport in ('FRA', 'EDDF'):
-            msg = 'FRA-Board gerade nicht erreichbar.'
-        elif not _os.environ.get('AERODATABOX_KEY') and iata not in _NATIVE_BOARD_SCRAPERS:
-            msg = ('Keine Board-Daten für ' + out_airport
-                   + ' (kein nativer Scraper, AeroDataBox-Key fehlt).')
+            reason, msg = 'source_down', 'FRA-Board gerade nicht erreichbar.'
+        elif has_free_src:
+            reason = 'source_down'
+            msg = ('Tafel für ' + out_airport
+                   + ' gerade nicht erreichbar — bitte später erneut.')
         else:
-            msg = 'Keine Board-Daten für ' + out_airport + ' (Quelle nicht erreichbar oder leer).'
+            reason = 'no_free_source'
+            msg = ('Für ' + out_airport + ' gibt es keine freie Tafel-Quelle — '
+                   'hier bleibt die Tafel leer.')
         return jsonify({'ok': False, 'error': 'source_unavailable',
+                        'reason': reason,
                         'airport': out_airport, 'type': ftype, 'message': msg}), 200
     if airline:
         flights = [f for f in flights if f.get('airline') == airline]
@@ -42166,6 +42357,35 @@ def _eu_fill_once(icaos=None):
         except Exception as e:
             summary[ic] = 'err:' + type(e).__name__
     return summary
+
+
+# ── FLUGHÄFEN MIT FREIER TAFEL VOM NAS-SCRAPER ─────────────────────────────
+# Spiegel der eu_scraper-Registry (QUELLE DER WAHRHEIT:
+# `eu_scraper/airports/__init__.py` — IATA_TO_KEY + die DEFAULT/IATAS-Listen der
+# Gruppen-Module). Diese Flughäfen haben KEINEN Scraper im Backend-Prozess: der
+# NAS-Playwright-Container schreibt ihre Boards nach `airport_delay_obs`, und der
+# Tafel-Endpoint serviert die HEUTIGEN Rows daraus (obs-Fallback). NUR für die
+# ehrliche Fehler-Begründung gebraucht (source_down vs. no_free_source) — es
+# steuert KEINE Quelle und kostet nichts. Neue NAS-Airports hier nachtragen.
+_NAS_SCRAPED_BOARD_CODES = frozenset({
+    # Europa
+    'ZRH', 'VIE', 'BUD', 'DUB', 'PRG', 'STR', 'MAN', 'STN', 'EMA',
+    'MAD', 'BCN', 'PMI', 'AGP', 'ALC', 'VLC', 'SVQ', 'BIO', 'IBZ', 'LPA',
+    'TFN', 'TFS', 'ACE', 'FUE', 'SCQ', 'VGO', 'GRX', 'XRY', 'RMU', 'MAH',
+    'OVD', 'SDR', 'LEI', 'REU', 'GRO',
+    'LIS', 'OPO', 'FAO', 'FNC', 'PDL', 'TER', 'HOR', 'PXO', 'SMA', 'FLW', 'CVU',
+    # Nordamerika (KEIN LAX/ORD/MIA/IAH/SEA — dort existiert keine freie Quelle)
+    'SFO', 'BOS', 'IAD', 'PHX', 'YVR', 'YYC',
+    'JFK', 'EWR', 'LGA', 'DFW', 'CLT', 'MCO', 'LAS', 'DEN',
+    # Naher Osten + Süd-/Ostasien + Ozeanien
+    'DXB', 'DOH', 'BLR', 'KWI', 'HYD', 'SIN', 'HKG', 'SYD', 'AKL', 'NRT',
+    # Lateinamerika
+    'GRU', 'SCL', 'BOG',
+    'EZE', 'AEP', 'COR', 'MDZ', 'BRC', 'IGR', 'SLA', 'USH', 'FTE',
+    'TUC', 'ROS', 'NQN', 'MDQ', 'REL', 'BHI', 'CRD', 'JUJ', 'CPC',
+    # Afrika (ACSA)
+    'JNB', 'CPT', 'DUR', 'BFN', 'PLZ', 'ELS', 'GRJ', 'KIM', 'UTN',
+})
 
 
 # Standard-Airport-Set für den server-seitigen Poller. FRA + MUC sind Pflicht
