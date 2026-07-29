@@ -1497,6 +1497,16 @@ def _berlin_day(iso_utc):
 # Kopfraums, ~3 % des Kontingents. Die echte Zahl steht nach dem Deploy als
 # lhfo:<stunde>:common_crew_rotation im Zähler.
 _ROT_PICKUP_HORIZON_H = 30
+# KONDITIONALE VERLÄNGERUNG (Owner 2026-07-29). Miguels Fall hat die 30-h-Kante
+# als zu knapp entlarvt: sein Rückflug LH455 SFO→FRA lag beim Import 30 h 43 min
+# voraus — der Rotations-Call fiel aus, und weil im selben Lauf auch der
+# myTime-Fetch scheiterte, verlor der Tag seinen bereits bekannten Marker.
+# 36 h decken die Lücke, sollen aber NICHT pauschal Calls kosten (LH-Quota).
+# Deshalb gilt der Fern-Bereich (30…36 h) nur für Legs, für die wir NOCH KEINEN
+# Pickup kennen (`known_anchors` = Anker der Last-Good-Einträge). Wer den Wert
+# schon hat, zahlt nichts; wer blind ist, bekommt seinen einen Versuch früher.
+# Kosten bleiben ≤1 Call pro User pro Lauf (alle RNs gehen in EINEN Request).
+_ROT_PICKUP_HORIZON_FAR_H = 36
 # Rückblick: ein Rückflug, der GERADE abgeht, soll seinen Marker behalten
 # (die Kachel „Dienst heute" liest ihn bis zum Abflug).
 _ROT_PICKUP_BACK_H = 3
@@ -1514,12 +1524,16 @@ _ROT_MAX_PER_IMPORT = _ROT_RN_PER_CALL
 _ROT_LHFO_HOUR_CEILING = 800
 
 
-def pickup_rotation_ids(resp, now=None, horizon_h=_ROT_PICKUP_HORIZON_H):
+def pickup_rotation_ids(resp, now=None, horizon_h=_ROT_PICKUP_HORIZON_H,
+                        far_horizon_h=_ROT_PICKUP_HORIZON_FAR_H,
+                        known_anchors=None):
     """Duty-Events-Response → Liste der rotationIds, für die ein Pickup-Wert
     plausibel VORLIEGEN kann und GEBRAUCHT wird. Pure/testbar.
 
     Ein Leg qualifiziert, wenn ALLE vier Bedingungen gelten:
       1. Flug-Event mit startTime im Fenster [now − 3 h, now + horizon_h].
+         ERWEITERUNG: bis `far_horizon_h`, wenn für dieses Leg noch KEIN Pickup
+         bekannt ist (`known_anchors`, s. _ROT_PICKUP_HORIZON_FAR_H).
       2. Es startet an einer Station, an der laut Roster eine HOTEL-Nacht
          liegt (±2 Tage) — nur dort gibt es einen Hotel-Pickup. Am
          Homebase-Abflug ist pickupTime laut LH immer None, ein Call dorthin
@@ -1531,8 +1545,12 @@ def pickup_rotation_ids(resp, now=None, horizon_h=_ROT_PICKUP_HORIZON_H):
         return []
     from datetime import datetime as _d, timedelta as _td, timezone as _tz
     now = now or _d.now(_tz.utc)
+    known = set(known_anchors or ())
     lo = (now - _td(hours=_ROT_PICKUP_BACK_H)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    hi = (now + _td(hours=max(1, int(horizon_h)))).strftime('%Y-%m-%dT%H:%M:%SZ')
+    near_h = max(1, int(horizon_h))
+    hi = (now + _td(hours=near_h)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    hi_far = (now + _td(hours=max(near_h, int(far_horizon_h or 0)))
+              ).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     hotel_days = []          # (day8, station)
     legs = []                # (start_iso, station, day8, rotation_id)
@@ -1555,7 +1573,12 @@ def pickup_rotation_ids(resp, now=None, horizon_h=_ROT_PICKUP_HORIZON_H):
             if not (et == 'flight' or cat in _FLIGHT_CATS):
                 continue
             s = (ev.get('startTime') or '').strip()
-            if not (s and len(frm) == 3 and lo <= s <= hi):
+            if not (s and len(frm) == 3 and lo <= s <= hi_far):
+                continue
+            # Fern-Bereich (zwischen hi und hi_far): nur, solange wir für genau
+            # dieses Leg noch KEINEN Pickup kennen. Sonst wäre der Call ein
+            # Quota-Geschenk an einen bereits beantworteten Tag.
+            if s > hi and _anchor_key(s) in known:
                 continue
             # _as_list wegen der LH-Known-Issue (Ein-Element-Arrays kommen als
             # Skalar) — hier defensiv in BEIDE Richtungen: käme
@@ -1780,8 +1803,61 @@ def ical_pickup_candidates(ical_text):
     return out
 
 
-def merge_ical_pickups(ics, candidates):
-    """Pickup-VEVENTs aus dem Kalender-Link in ein FlightOps-ICS einhängen —
+def _pickup_inst(iso):
+    """UTC-ISO → aware datetime, sonst None. Wirft nie."""
+    try:
+        v = _dt.datetime.fromisoformat(str(iso or '').replace('Z', '+00:00'))
+        return v if v.tzinfo else v.replace(tzinfo=_dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _anchor_key(iso):
+    """Anker-Identität eines Legs = sein Abflug-Instant auf die MINUTE genau
+    ('YYYY-MM-DDTHH:MM' in UTC), sonst ''. Bewusst minutengenau und ohne
+    Toleranz: der Last-Good-Pfad (s.u.) darf einen Pickup nur dann wieder
+    einhängen, wenn der ankernde Leg UNVERÄNDERT ist — verschiebt LH den
+    Abflug, verschiebt sich in aller Regel auch der Hotel-Pickup, und dann
+    wäre ein wiederbelebter Alt-Wert geraten statt gemessen."""
+    inst = _pickup_inst(iso)
+    if inst is None:
+        return ''
+    return inst.astimezone(_dt.timezone.utc).strftime('%Y-%m-%dT%H:%M')
+
+
+def _ics_pickup_scan(ics):
+    """ICS → (pickups, deps) — die zwei Listen, die JEDER Pickup-Riegel braucht.
+      pickups = [(instant, iso, summary)] jedes Pickup-VEVENTs
+      deps    = sortiertes [(instant, iso)] jedes Flug-VEVENTs (LOCATION 'XXX - YYY')
+    Pure/testbar, wirft nie."""
+    pickups, deps = [], []
+    try:
+        import app as _app
+        from blueprints.crew_live_state import parse_pickup_hhmm
+        for ev in (_app._parse_ics_to_events(ics) or []):
+            if not isinstance(ev, dict):
+                continue
+            iso = str(ev.get('start_iso') or '').strip()
+            inst = _pickup_inst(iso)
+            if inst is None:
+                continue
+            summ = re.sub(r'[\r\n\t]+', ' ',
+                          str(ev.get('summary') or '')).strip()
+            if parse_pickup_hhmm(summ):
+                pickups.append((inst, iso, summ))
+                continue
+            loc = str(ev.get('location') or '').strip().upper()
+            if _ICS_LEG_LOCATION_RE.match(loc):
+                deps.append((inst, iso))
+    except Exception as e:
+        log.warning('[lh_flightops] ics-pickup-scan: %s', type(e).__name__)
+    deps.sort()
+    return pickups, deps
+
+
+def merge_ical_pickups(ics, candidates, uid_prefix='pu-ical',
+                       strict_anchor=False):
+    """Pickup-VEVENTs aus einer Zweitquelle in ein FlightOps-ICS einhängen —
     NUR für Roster-Tage, die die Primärquelle leer gelassen hat. Pure/testbar,
     wirft nie; ohne verwertbaren Kandidaten kommt das ICS unverändert zurück.
 
@@ -1797,53 +1873,40 @@ def merge_ical_pickups(ics, candidates):
         Berlin-Tag als der Abflug, wird DTSTART auf den Abflug gezogen (die
         Wahrheit steckt im Summary, `pickup_utc_for_leg` rekonstruiert sie).
       • Höchstens EIN Pickup je Roster-Tag; bei mehreren Kandidaten gewinnt der
-        SPÄTESTE plausible — dieselbe Regel wie in `pickup_utc_for_leg`."""
+        SPÄTESTE plausible — dieselbe Regel wie in `pickup_utc_for_leg`.
+
+    `strict_anchor=True` (Last-Good-Pfad): der Kandidat MUSS ein `anchor`-Feld
+    tragen, und im neuen ICS muss GENAU dieser Abflug (minutengenau) noch
+    stehen. Ohne das Feld oder bei verschobenem Abflug fällt der Kandidat raus.
+    `uid_prefix` trennt die Ebenen im erzeugten VEVENT (Diagnose + keine
+    doppelten UIDs, wenn zwei Ebenen nacheinander laufen)."""
     if not ics or not candidates:
         return ics
     try:
-        import app as _app
-        from datetime import datetime as _d, timezone as _tz
-        from blueprints.crew_live_state import parse_pickup_hhmm
-
-        def _inst(iso):
-            try:
-                v = _d.fromisoformat(str(iso or '').replace('Z', '+00:00'))
-                return v if v.tzinfo else v.replace(tzinfo=_tz.utc)
-            except Exception:
-                return None
-
+        pickups, deps = _ics_pickup_scan(ics)
         have_days = set()      # Berlin-Tage, die schon einen Pickup tragen
-        deps = []              # (instant, iso) aller Flug-VEVENTs
-        for ev in (_app._parse_ics_to_events(ics) or []):
-            if not isinstance(ev, dict):
-                continue
-            iso = str(ev.get('start_iso') or '').strip()
-            inst = _inst(iso)
-            if inst is None:
-                continue
-            summ = str(ev.get('summary') or '')
-            if parse_pickup_hhmm(summ):
-                d = _berlin_day(iso)
-                if d:
-                    have_days.add(d)
-                continue
-            loc = str(ev.get('location') or '').strip().upper()
-            if _ICS_LEG_LOCATION_RE.match(loc):
-                deps.append((inst, iso))
+        for _p_inst, p_iso, _summ in pickups:
+            d = _berlin_day(p_iso)
+            if d:
+                have_days.add(d)
         if not deps:
             return ics
-        deps.sort()
         chosen = {}            # Berlin-Tag → (pickup_instant, iso, summary, dep_iso)
         for cand in candidates:
             if not isinstance(cand, dict):
                 continue
             p_iso = str(cand.get('utc') or '')
-            p_inst = _inst(p_iso)
+            p_inst = _pickup_inst(p_iso)
             summ = re.sub(r'[\r\n\t]+', ' ', str(cand.get('summary') or '')).strip()
             if p_inst is None or not summ:
                 continue
+            want = _anchor_key(cand.get('anchor')) if strict_anchor else ''
+            if strict_anchor and not want:
+                continue
             anchor = None
             for d_inst, d_iso in deps:
+                if want and _anchor_key(d_iso) != want:
+                    continue
                 lead = (d_inst - p_inst).total_seconds() / 60.0
                 if 0 <= lead <= _PICKUP_LEAD_MAX_MIN:
                     anchor = d_iso
@@ -1864,13 +1927,13 @@ def merge_ical_pickups(ics, candidates):
             stamp = _ics_stamp(p_iso if _berlin_day(p_iso) == day else dep_iso)
             if not stamp:
                 continue
-            add += ['BEGIN:VEVENT', f'UID:pu-ical-{i}@aerox-flightops',
+            add += ['BEGIN:VEVENT', f'UID:{uid_prefix}-{i}@aerox-flightops',
                     f'DTSTART:{stamp}', f'DTEND:{stamp}',
                     f'SUMMARY:{summ}', 'END:VEVENT']
         if not add:
             return ics
-        log.info('[lh_flightops] pickup-fallback: %d Marker aus dem '
-                 'Kalender-Link ergaenzt', len(add) // 6)
+        log.info('[lh_flightops] pickup-fallback (%s): %d Marker ergaenzt',
+                 uid_prefix, len(add) // 6)
         # VOR dem ersten VEVENT einhängen — der Tages-Summary wird in
         # Event-Reihenfolge zusammengesetzt, und der Hotel-Pickup ist der
         # FRÜHESTE Termin des Tages (vor Briefing und Abflug). Damit liest der
@@ -1971,6 +2034,201 @@ def apply_ical_pickup_fallback(user_token, ics, body_url=None):
         log.warning('[lh_flightops] pickup-fallback wiring: %s',
                     type(e).__name__)
         return ics
+
+
+# ── DRITTE EBENE: LAST-GOOD (Owner 2026-07-29 „der Import löscht einen bereits
+# bekannten Pickup") ────────────────────────────────────────────────────────
+# BEWEIS (Miguel, Layover SFO, Rückflug LH455 30.07. 21:40Z): der Marker
+# „12:40 LT Pickup SFO" stand am 27.07. 22:14 im gespeicherten Roster und war
+# nach dem Import am 29.07. 14:57Z WEG. Zwei Ursachen stapelten sich:
+#   1. Die Primärquelle schwieg — der Abflug lag 30 h 43 min voraus, also knapp
+#      außerhalb von `_ROT_PICKUP_HORIZON_H` (dagegen der konditionale
+#      Fern-Horizont unten in `pickup_rotation_ids`).
+#   2. Die Zweitquelle schwieg — der myTime-Fetch scheiterte, und die Grace lag
+#      NUR im prozess-lokalen `_pickup_ical_cache`, der an dem Tag zweimal mit
+#      dem Container neu entstand.
+# Schweigen BEIDER Quellen ist ein Normalfall (Netz, Deploy, Quota-Notbremse) —
+# und weil `_ics_events_to_briefings` jeden angefassten Tag frisch aufbaut,
+# UPSERTet ein pickup-loser Import den Tag OHNE Marker. Genau das ist die
+# Löschung.
+#
+# Diese Ebene macht die Löschung unmöglich, ohne je zu raten:
+#   • Was ein Import tatsächlich ausgeliefert hat, wird pro (Token, Tag) im
+#     PROFIL gemerkt (`calendar_feed.pickup_last_good`) — Supabase, also
+#     deploy-fest, im Gegensatz zum Prozess-Cache.
+#   • Liefert ein späterer Import für den Tag NICHTS, wird der gemerkte Marker
+#     wieder eingehängt — aber nur, wenn der ANKERNDE Leg minutengenau
+#     unverändert im neuen ICS steht (`strict_anchor`). Ist der Umlauf
+#     gestrichen oder verschoben, fällt der Pickup von selbst weg.
+#   • Liefert eine echte Quelle etwas, gewinnt sie (PRIMARY WINS in
+#     `merge_ical_pickups`) und der neue Wert wird das neue Last-Good.
+# Owner-Regel bleibt gewahrt: Pickup NUR aus echten Quellen, NIE geschätzt —
+# ein Last-Good-Wert IST ein echter, früher gemessener Wert.
+_PICKUP_LAST_GOOD_MAX = 60          # Einträge (Tage) pro User
+_PICKUP_LAST_GOOD_MAX_AGE_D = 30    # Tage seit der letzten echten Beobachtung
+_PICKUP_LAST_GOOD_KEEP_BACK_D = 2   # so viele Tage Vergangenheit bleiben stehen
+
+
+def pickups_in_ics(ics):
+    """ICS → [{'day','utc','summary','anchor'}] für jedes Pickup-VEVENT, das
+    einen Anker-Leg hat. `day` ist der Berlin-Tag des ANKERS (= der Roster-Tag,
+    auf dem der Marker landet), `anchor` der Abflug des ankernden Legs.
+    Pure/testbar, wirft nie."""
+    out = []
+    try:
+        pickups, deps = _ics_pickup_scan(ics)
+        for p_inst, p_iso, summ in pickups:
+            anchor = None
+            for d_inst, d_iso in deps:
+                lead = (d_inst - p_inst).total_seconds() / 60.0
+                if 0 <= lead <= _PICKUP_LEAD_MAX_MIN:
+                    anchor = d_iso
+                    break
+            if anchor is None:
+                continue
+            day = _berlin_day(anchor)
+            if not day:
+                continue
+            out.append({'day': day, 'utc': p_iso, 'summary': summ[:120],
+                        'anchor': anchor})
+    except Exception as e:
+        log.warning('[lh_flightops] pickups_in_ics: %s', type(e).__name__)
+    return out
+
+
+def _ics_covered_days(ics):
+    """Berlin-Tage, die dieses ICS überhaupt anfasst. Nur für DIESE Tage darf
+    ein Import den Last-Good-Stand ersetzen — ein Import mit engerem Fenster
+    (`from_date`/`to_date` im Body) darf die Marker der übrigen Tage nicht
+    stillschweigend wegwerfen."""
+    days = set()
+    try:
+        import app as _app
+        for ev in (_app._parse_ics_to_events(ics) or []):
+            if not isinstance(ev, dict):
+                continue
+            d = _berlin_day(str(ev.get('start_iso') or '').strip())
+            if d:
+                days.add(d)
+    except Exception:
+        pass
+    return days
+
+
+def _pickup_last_good_feed(user_token, fresh=False):
+    """(profile, calendar_feed) als KOPIEN — Schreiber müssen beide zurückhängen."""
+    import app as _app
+    pf = _app._profile_load(user_token, fresh=fresh) or {}
+    prof = dict(pf.get('profile') or {})
+    feed = prof.get('calendar_feed')
+    feed = dict(feed) if isinstance(feed, dict) else {}
+    return prof, feed
+
+
+def pickup_last_good_load(user_token):
+    """Zuletzt ausgelieferte Pickups aus dem Profil. Liste (evtl. leer), nie None,
+    wirft nie. Einträge ohne vollständigen Anker sind wertlos und fallen raus."""
+    try:
+        _prof, feed = _pickup_last_good_feed(user_token)
+        blob = feed.get('pickup_last_good')
+        items = blob.get('items') if isinstance(blob, dict) else blob
+        out = []
+        for it in (items or []):
+            if not isinstance(it, dict):
+                continue
+            if not (it.get('utc') and it.get('summary')
+                    and it.get('anchor') and it.get('day')):
+                continue
+            out.append(dict(it))
+        return out
+    except Exception as e:
+        log.warning('[lh_flightops] pickup last-good load: %s', type(e).__name__)
+        return []
+
+
+def pickup_last_good_anchors(user_token):
+    """Anker-Keys (Abflug-Minuten), für die wir SCHON einen Pickup kennen.
+    Genau die Legs, für die sich ein teurer Fern-Rotations-Call NICHT lohnt."""
+    try:
+        return {_anchor_key(it.get('anchor'))
+                for it in pickup_last_good_load(user_token)
+                if _anchor_key(it.get('anchor'))}
+    except Exception:
+        return set()
+
+
+def _pickup_last_good_norm(items):
+    """Vergleichsform (ohne `ts`) — nur inhaltliche Änderungen dürfen schreiben."""
+    return sorted((str(it.get('day') or ''), str(it.get('utc') or ''),
+                   str(it.get('summary') or ''), _anchor_key(it.get('anchor')))
+                  for it in (items or []) if isinstance(it, dict))
+
+
+def pickup_last_good_store(user_token, ics, previous=None, now=None):
+    """Merkt sich, was DIESER Import für jeden Tag wirklich ausgeliefert hat.
+    Gibt die neue Liste zurück; schreibt nur, wenn sie sich inhaltlich geändert
+    hat (ein refresh-all-Lauf über 250 Profile soll keine 250 Profil-Writes
+    kosten). Wirft nie."""
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    now_iso = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    floor_day = (now - _dt.timedelta(days=_PICKUP_LAST_GOOD_KEEP_BACK_D)
+                 ).strftime('%Y-%m-%d')
+    prev_list = list(previous or [])
+    prev_ts = {}
+    for it in prev_list:
+        if isinstance(it, dict) and it.get('ts'):
+            prev_ts[(str(it.get('day') or ''),
+                     _anchor_key(it.get('anchor')))] = str(it.get('ts'))
+    covered = _ics_covered_days(ics)
+    keep = []
+    for it in pickups_in_ics(ics):
+        if it['day'] < floor_day:
+            continue
+        it['ts'] = prev_ts.get((it['day'], _anchor_key(it['anchor'])), now_iso)
+        keep.append(it)
+    fresh_days = {it['day'] for it in keep}
+    # Tage, die dieser Import GAR NICHT abgedeckt hat, bleiben unangetastet.
+    for it in prev_list:
+        if not isinstance(it, dict):
+            continue
+        day = str(it.get('day') or '')
+        if not day or day < floor_day or day in fresh_days or day in covered:
+            continue
+        seen = _pickup_inst(it.get('ts'))
+        if seen is not None and (now - seen).days > _PICKUP_LAST_GOOD_MAX_AGE_D:
+            continue
+        keep.append(dict(it))
+    keep.sort(key=lambda x: (str(x.get('day') or ''), str(x.get('utc') or '')))
+    keep = keep[-_PICKUP_LAST_GOOD_MAX:]
+    if _pickup_last_good_norm(keep) == _pickup_last_good_norm(prev_list):
+        return keep
+    try:
+        import app as _app
+        prof, feed = _pickup_last_good_feed(user_token, fresh=True)
+        feed['pickup_last_good'] = {'ts': now_iso, 'items': keep}
+        prof['calendar_feed'] = feed
+        _app._profile_save(user_token, prof)
+    except Exception as e:
+        log.warning('[lh_flightops] pickup last-good save: %s', type(e).__name__)
+    return keep
+
+
+def apply_pickup_last_good(user_token, ics, now=None):
+    """NIE-LÖSCHEN-RIEGEL: hängt bekannte Pickups wieder ein, deren Anker-Leg
+    unverändert ist, und schreibt den neuen Stand fort. Wirft nie.
+    `now` nur für Tests (die Aufräum-Grenze hängt an der Wanduhr)."""
+    if not ics:
+        return ics
+    try:
+        stored = pickup_last_good_load(user_token)
+        if stored:
+            ics = merge_ical_pickups(ics, stored, uid_prefix='pu-lastgood',
+                                     strict_anchor=True)
+        pickup_last_good_store(user_token, ics, stored, now=now)
+    except Exception as e:
+        log.warning('[lh_flightops] pickup last-good wiring: %s',
+                    type(e).__name__)
+    return ics
 
 
 def duty_events_to_ics(resp, pickups=None):
@@ -2860,7 +3118,10 @@ def flightops_import(token):
     # eine Zugabe, nie eine Vorbedingung.
     _pickups = None
     try:
-        _rns = pickup_rotation_ids(resp)
+        # `known_anchors` schaltet den Fern-Horizont (30→36 h) NUR für Legs frei,
+        # für die noch kein Pickup bekannt ist — siehe _ROT_PICKUP_HORIZON_FAR_H.
+        _rns = pickup_rotation_ids(
+            resp, known_anchors=pickup_last_good_anchors(token))
         if _rns:
             _pickups = rotation_pickups_for(token, _rns)
     except Exception as e:
@@ -2874,6 +3135,10 @@ def flightops_import(token):
     # holt ihn der gespeicherte Kalender-Link (myTime) nach — pro Tag, nur wo
     # oben nichts stand. Siehe apply_ical_pickup_fallback. Nie eine Vorbedingung.
     ics = apply_ical_pickup_fallback(token, ics, body.get('pickup_ical_url'))
+    # NIE-LÖSCHEN-RIEGEL (Owner 2026-07-29): schweigen BEIDE Quellen, hängt der
+    # zuletzt ausgelieferte Marker wieder dran — aber nur bei unverändertem
+    # Anker-Leg. Schreibt danach den neuen Stand ins Profil fort (deploy-fest).
+    ics = apply_pickup_last_good(token, ics)
     try:
         import app as _app
         with _app.app.test_request_context(json={'ics_text': ics}):

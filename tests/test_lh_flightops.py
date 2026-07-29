@@ -2,6 +2,7 @@
 Rein offline: PKCE-Korrektheit, Authorize-URL-Bau, Token-Exchange (HTTP gemockt),
 Duty-Events-Parser gegen die dokumentierte Response-Shape. Kein Live-Call."""
 import base64
+import datetime as _dtmod
 import hashlib
 import os
 import sys
@@ -2042,6 +2043,243 @@ def test_merge_ical_pickups_is_a_noop_without_usable_input():
     assert fo.merge_ical_pickups(None, [{'utc': 'x', 'summary': 'y'}]) is None
 
 
+# ── LAST-GOOD: ein Import darf einen bekannten Pickup NIE loeschen ───────────
+# Owner 2026-07-29, belegter Fall (Miguel, Layover SFO): der Marker „12:40 LT
+# Pickup SFO" stand am 27.07. im gespeicherten Roster und war nach dem Import
+# am 29.07. 14:57Z weg — Primaerquelle stumm (Abflug 30 h 43 min voraus, knapp
+# ausserhalb des Horizonts), Zweitquelle stumm (myTime-Fetch kaputt, Grace lag
+# nur im Prozess-Cache, Container an dem Tag 2x neu). Weil der Feed-Import
+# jeden angefassten Tag frisch aufbaut, UPSERTet ein pickup-loser Import den
+# Tag OHNE Marker. Diese Ebene macht das unmoeglich.
+
+# Die Aufraeum-Grenze haengt an der Wanduhr; die Fixtures sind auf den 25./26.
+# Juli 2026 datiert. Deshalb laufen die Last-Good-Tests mit fixer Uhr.
+_LG_NOW = _dtmod.datetime(2026, 7, 26, 12, 0, tzinfo=_dtmod.timezone.utc)
+
+
+def _apply_lg(token, ics):
+    return fo.apply_pickup_last_good(token, ics, now=_LG_NOW)
+
+
+def _fake_profiles(monkeypatch):
+    """In-Memory-Profilspeicher (SB/Disk-frei) mit der ECHTEN Signatur von
+    _profile_load/_profile_save — inkl. Kopier-Semantik."""
+    import copy
+    import app as backend
+    store = {}
+
+    def _load(token, fresh=False):
+        return copy.deepcopy(store.get(token) or {'token': token, 'profile': {}})
+
+    def _save(token, profile, full_disk_payload=None):
+        store[token] = {'token': token, 'profile': copy.deepcopy(profile)}
+        return True
+
+    monkeypatch.setattr(backend, '_profile_load', _load)
+    monkeypatch.setattr(backend, '_profile_save', _save)
+    return store
+
+
+def _ics_with_pickup():
+    """FlightOps-ICS + Pickup aus dem myTime-Link (der Normal-Lauf)."""
+    return fo.merge_ical_pickups(
+        fo.duty_events_to_ics(DUTY_DTW_PICKUP),
+        fo.ical_pickup_candidates(
+            _mytime_ics(('14:00 LT Pickup DTW', '20260726T180000Z'))))
+
+
+def test_pickups_in_ics_reads_marker_plus_anker():
+    """Was gemerkt wird, ist der Marker MIT seinem Anker-Leg — ohne Anker
+    koennte er spaeter nie geprueft wieder eingehaengt werden."""
+    assert fo.pickups_in_ics(_ics_with_pickup()) == [{
+        'day': '2026-07-26', 'utc': '2026-07-26T18:00:00Z',
+        'summary': '14:00 LT Pickup DTW', 'anchor': '2026-07-26T20:00:00Z'}]
+    # Ohne Anker (Pickup ohne passenden Abflug) wird nichts gemerkt.
+    assert fo.pickups_in_ics(_mytime_ics(
+        ('14:00 LT Pickup DTW', '20260726T180000Z'))) == []
+    assert fo.pickups_in_ics('') == [] and fo.pickups_in_ics(None) == []
+
+
+def test_last_good_pickup_survives_an_import_where_both_sources_are_silent(monkeypatch):
+    """KERNFALL (a): Lauf 1 liefert den Marker, Lauf 2 liefert NICHTS —
+    der Tag behaelt ihn trotzdem, Ende-zu-Ende durch die Feed-Pipeline."""
+    import app as backend
+    _fake_profiles(monkeypatch)
+    good = _ics_with_pickup()
+    assert _apply_lg('AT-LG1', good) == good     # nichts zu heilen
+    assert [s['summary'] for s in fo.pickup_last_good_load('AT-LG1')] \
+        == ['14:00 LT Pickup DTW']
+    naked = fo.duty_events_to_ics(DUTY_DTW_PICKUP)               # beide Quellen stumm
+    assert 'Pickup' not in naked
+    healed = _apply_lg('AT-LG1', naked)
+    assert 'SUMMARY:14:00 LT Pickup DTW' in healed
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(healed))[0]
+    assert backend._rc_pickup_hhmm(b['2026-07-26']) == '14:00'
+
+
+def test_last_good_pickup_falls_when_the_anchor_leg_moves(monkeypatch):
+    """KERNFALL (b): der ankernde Leg ist verschoben/gestrichen ⇒ der alte
+    Pickup wird NICHT wiederbelebt. „Nie loeschen" gilt nur solange der Anker
+    steht — ein verschobener Umlauf hat auch eine andere Pickup-Zeit, und die
+    duerfen wir nicht raten (Owner-Regel: nur echte Quellen)."""
+    import copy
+    _fake_profiles(monkeypatch)
+    _apply_lg('AT-LG2', _ics_with_pickup())
+    assert fo.pickup_last_good_load('AT-LG2')
+    # Abflug 1 h spaeter — das lose 0…6-h-Fenster wuerde den Alt-Wert noch
+    # durchlassen, der Anker-Vergleich nicht.
+    moved = copy.deepcopy(DUTY_DTW_PICKUP)
+    moved['rosterDays'][1]['events'][1]['startTime'] = '2026-07-26T21:00:00Z'
+    assert 'Pickup' not in _apply_lg(
+        'AT-LG2', fo.duty_events_to_ics(moved))
+    # Und der gemerkte Stand ist damit auch weg (der Tag war abgedeckt).
+    assert fo.pickup_last_good_load('AT-LG2') == []
+    # Umlauf komplett gestrichen (Tag ohne Leg) ⇒ ebenfalls kein Marker.
+    _fake_profiles(monkeypatch)
+    _apply_lg('AT-LG3', _ics_with_pickup())
+    gone = copy.deepcopy(DUTY_DTW_PICKUP)
+    gone['rosterDays'][1]['events'] = []
+    assert 'Pickup' not in _apply_lg(
+        'AT-LG3', fo.duty_events_to_ics(gone))
+
+
+def test_a_live_source_always_beats_the_last_good_value(monkeypatch):
+    """Korrektur-Fall: LH/myTime traegt 13:30 nach ⇒ der neue Wert gewinnt und
+    wird das neue Last-Good. Der Riegel friert nichts ein."""
+    _fake_profiles(monkeypatch)
+    _apply_lg('AT-LG4', _ics_with_pickup())
+    corrected = fo.merge_ical_pickups(
+        fo.duty_events_to_ics(DUTY_DTW_PICKUP), fo.ical_pickup_candidates(
+            _mytime_ics(('13:30 LT Pickup DTW', '20260726T173000Z'))))
+    out = _apply_lg('AT-LG4', corrected)
+    assert 'SUMMARY:13:30 LT Pickup DTW' in out
+    assert '14:00 LT Pickup' not in out
+    assert [s['summary'] for s in fo.pickup_last_good_load('AT-LG4')] \
+        == ['13:30 LT Pickup DTW']
+
+
+def test_last_good_survives_a_fresh_process_after_a_deploy(monkeypatch):
+    """KERNFALL (d): genau Miguels Lage — neuer Container (Prozess-Cache leer),
+    myTime-Fetch kaputt, Primaerquelle stumm. Der Profil-Stand traegt."""
+    import app as backend
+    _fake_profiles(monkeypatch)
+    monkeypatch.setattr(backend, '_server_ical_refresh_enabled', lambda: True)
+    monkeypatch.setattr(fo, 'pickup_ical_url',
+                        lambda tok, body=None: 'https://x/f.ics')
+    text = _mytime_ics(('14:00 LT Pickup DTW', '20260726T180000Z'))
+    monkeypatch.setattr(backend, '_fetch_calendar_feed_text', lambda u: (text, None))
+    fo._pickup_ical_cache.clear()
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    run1 = _apply_lg(
+        'AT-LG5', fo.apply_ical_pickup_fallback('AT-LG5', ics))
+    assert 'SUMMARY:14:00 LT Pickup DTW' in run1
+    # DEPLOY: Prozess-Cache weg, Link tot.
+    fo._pickup_ical_cache.clear()
+    monkeypatch.setattr(backend, '_fetch_calendar_feed_text',
+                        lambda u: (None, 'fetch_failed'))
+    run2 = _apply_lg(
+        'AT-LG5', fo.apply_ical_pickup_fallback('AT-LG5', ics))
+    assert 'SUMMARY:14:00 LT Pickup DTW' in run2
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(run2))[0]
+    assert backend._rc_pickup_hhmm(b['2026-07-26']) == '14:00'
+    fo._pickup_ical_cache.clear()
+
+
+def test_last_good_handles_the_midnight_wrap_round_trip(monkeypatch):
+    """Der Wrap-Fall (RN 171012) muss durch Merken+Wiedereinhaengen IDENTISCH
+    wieder herauskommen — der Marker gehoert auf den RUECKFLUG-Tag."""
+    import app as backend
+    _fake_profiles(monkeypatch)
+    wrapped = fo.merge_ical_pickups(
+        fo.duty_events_to_ics(DUTY_KIX_MULTINIGHT), fo.ical_pickup_candidates(
+            _mytime_ics(('06:50 LT Pickup KIX', '20260728T215000Z'))))
+    _apply_lg('AT-LG6', wrapped)
+    healed = _apply_lg(
+        'AT-LG6', fo.duty_events_to_ics(DUTY_KIX_MULTINIGHT))
+    b = backend._ics_events_to_briefings(backend._parse_ics_to_events(healed))[0]
+    assert backend._rc_pickup_hhmm(b['2026-07-29']) == '06:50'
+    assert not backend._rc_pickup_hhmm(b.get('2026-07-28') or {})
+
+
+def test_last_good_writes_the_profile_only_on_real_change(monkeypatch):
+    """Ein refresh-all-Lauf ueber alle Profile darf nicht pro User einen
+    Profil-Write kosten — nur inhaltliche Aenderungen schreiben."""
+    import app as backend
+    _fake_profiles(monkeypatch)
+    writes = []
+    orig = backend._profile_save
+    monkeypatch.setattr(backend, '_profile_save',
+                        lambda tok, prof, full_disk_payload=None:
+                        (writes.append(tok), orig(tok, prof))[1])
+    good = _ics_with_pickup()
+    _apply_lg('AT-LG7', good)
+    assert writes == ['AT-LG7']
+    for _ in range(3):
+        _apply_lg('AT-LG7', good)
+    assert writes == ['AT-LG7']                 # unveraendert ⇒ kein Write
+    # Ein Import ganz ohne Pickup und ohne Vorstand schreibt gar nichts.
+    _apply_lg('AT-LG8', fo.duty_events_to_ics(DUTY_KIX_MULTINIGHT))
+    assert writes == ['AT-LG7']
+
+
+def test_last_good_keeps_days_this_import_did_not_cover(monkeypatch):
+    """Ein Import mit engerem Fenster darf die Marker der uebrigen Tage nicht
+    stillschweigend wegwerfen — ersetzt wird nur, was das ICS abdeckt."""
+    _fake_profiles(monkeypatch)
+    prev = [{'day': '2026-08-10', 'utc': '2026-08-10T05:00:00Z',
+             'summary': '07:00 LT Pickup SFO', 'anchor': '2026-08-10T08:00:00Z',
+             'ts': '2026-07-26T10:00:00Z'}]
+    keep = fo.pickup_last_good_store('AT-LG9', _ics_with_pickup(),
+                                     previous=prev, now=_LG_NOW)
+    assert sorted(k['day'] for k in keep) == ['2026-07-26', '2026-08-10']
+    # Deckt der Import den Tag AB und liefert dort nichts, faellt der Eintrag —
+    # genau so stirbt ein wirklich gestrichener Pickup.
+    keep2 = fo.pickup_last_good_store('AT-LG9',
+                                      fo.duty_events_to_ics(DUTY_DTW_PICKUP),
+                                      previous=keep, now=_LG_NOW)
+    assert [k['day'] for k in keep2] == ['2026-08-10']
+
+
+def test_last_good_prunes_past_days_and_stale_entries(monkeypatch):
+    """Aufraeumen: vergangene Tage und lange nicht mehr bestaetigte Eintraege
+    fallen raus, damit das Profil nicht waechst."""
+    from datetime import datetime, timezone
+    _fake_profiles(monkeypatch)
+    now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    prev = [
+        {'day': '2026-07-26', 'utc': '2026-07-26T18:00:00Z',      # laengst vorbei
+         'summary': '14:00 LT Pickup DTW', 'anchor': '2026-07-26T20:00:00Z',
+         'ts': '2026-07-26T10:00:00Z'},
+        {'day': '2026-09-01', 'utc': '2026-09-01T05:00:00Z',      # zu lange her
+         'summary': '07:00 LT Pickup JFK', 'anchor': '2026-09-01T08:00:00Z',
+         'ts': '2026-07-01T10:00:00Z'},
+        {'day': '2026-08-25', 'utc': '2026-08-25T05:00:00Z',      # bleibt
+         'summary': '07:00 LT Pickup SFO', 'anchor': '2026-08-25T08:00:00Z',
+         'ts': '2026-08-19T10:00:00Z'}]
+    keep = fo.pickup_last_good_store('AT-LGA', '', previous=prev, now=now)
+    assert [k['day'] for k in keep] == ['2026-08-25']
+
+
+def test_last_good_layer_is_inert_for_users_without_any_pickup(monkeypatch):
+    """Kein Pickup, kein Vorstand ⇒ das ICS bleibt Byte-identisch."""
+    _fake_profiles(monkeypatch)
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    assert _apply_lg('AT-LGB', ics) == ics
+    assert _apply_lg('AT-LGB', None) is None
+    assert _apply_lg('AT-LGB', '') == ''
+
+
+def test_last_good_strict_anchor_needs_the_field(monkeypatch):
+    """Ein Kandidat OHNE anchor darf im strikten Modus nichts einhaengen —
+    sonst waere Last-Good schwaecher gerieglt als die Live-Quelle."""
+    ics = fo.duty_events_to_ics(DUTY_DTW_PICKUP)
+    loose = [{'utc': '2026-07-26T18:00:00Z', 'summary': '14:00 LT Pickup DTW'}]
+    assert fo.merge_ical_pickups(ics, loose, strict_anchor=True) == ics
+    assert 'Pickup' in fo.merge_ical_pickups(ics, loose)
+    tagged = [dict(loose[0], anchor='2026-07-26T20:00:00Z')]
+    assert 'Pickup' in fo.merge_ical_pickups(ics, tagged, strict_anchor=True)
+
+
 # ── Welche Umlaeufe kosten einen Call? ───────────────────────────────────────
 
 def _now(iso):
@@ -2065,6 +2303,31 @@ def test_pickup_rotation_ids_only_layover_returns_in_the_horizon():
     # Schon abgeflogen und ausserhalb des Rueckblicks → kein Call.
     assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
                                  now=_now('2026-07-27T12:00:00')) == []
+
+
+def test_far_horizon_fires_only_while_no_pickup_is_known():
+    """KERNFALL (c): Miguels Abflug lag beim Import 30 h 43 min voraus — knapp
+    hinter der 30-h-Kante, also fiel der Rotations-Call aus. Der Fern-Horizont
+    (36 h) holt ihn, kostet aber NUR, solange wir fuer genau dieses Leg noch
+    keinen Pickup kennen."""
+    # LH443 startet 26.07. 20:00Z.
+    known = {'2026-07-26T20:00'}
+    far = _now('2026-07-25T13:15:00')          # 30 h 45 min voraus
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP, now=far) == ['169929']
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP, now=far,
+                                  known_anchors=known) == []
+    # Ein BEKANNTER Pickup eines ANDEREN Legs schuetzt nicht.
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP, now=far,
+                                  known_anchors={'2026-08-01T20:00'}) == ['169929']
+    # Innerhalb der 30 h wird immer frisch geholt (LH korrigiert die Zeit noch).
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP, now=_now('2026-07-26T12:00:00'),
+                                  known_anchors=known) == ['169929']
+    # Grenzen: 35 h ja, 37 h nein.
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
+                                  now=_now('2026-07-25T09:00:00')) == ['169929']
+    assert fo.pickup_rotation_ids(DUTY_DTW_PICKUP,
+                                  now=_now('2026-07-25T07:00:00')) == []
+    assert fo._ROT_PICKUP_HORIZON_H == 30 and fo._ROT_PICKUP_HORIZON_FAR_H == 36
 
 
 def test_pickup_rotation_ids_keeps_a_just_departing_leg_in_the_lookback():
@@ -3103,7 +3366,7 @@ def test_import_kicks_prefetch_after_success(monkeypatch):
     monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
     monkeypatch.setattr(fo, 'duty_events',
                         lambda tok, fd, td, interactive=False: DUTY_LINKS)
-    monkeypatch.setattr(fo, 'pickup_rotation_ids', lambda resp: [])
+    monkeypatch.setattr(fo, 'pickup_rotation_ids', lambda resp, **kw: [])
     monkeypatch.setattr(fo, 'duty_events_to_ics', lambda resp, pickups=None: 'ICS')
     monkeypatch.setattr(fo, 'apply_ical_pickup_fallback',
                         lambda tok, ics, url=None: ics)
