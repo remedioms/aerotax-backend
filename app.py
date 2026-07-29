@@ -12639,6 +12639,12 @@ def _hangout_audience_normalize(raw, owner_profile):
         note = note.strip()[:120]
         if note:
             out['note'] = note
+    # VIBES (2026-07-29): reine Selbst-Beschreibung des Plans, filtert NICHT —
+    # deshalb hier im selben offenen jsonb wie `note` und NICHT in
+    # _hangout_audience_is_restricted.
+    vibes = _hangout_vibes_normalize(raw.get('vibes'))
+    if vibes:
+        out['vibes'] = vibes
     return out if len(out) > 1 else None
 
 
@@ -12717,6 +12723,179 @@ def _hangout_audience_label(aud):
     if 'cabin' in roles:
         parts.append('Kabine')
     return ' · '.join(parts) or None
+
+
+# ── VIBE-TAGS: „was IST der Plan?" (Owner 2026-07-29) ───────────────────────
+#
+# Ausdrücklich KEINE Demografie (Alter/Geschlecht/Sprache) — das Profil bleibt
+# unverändert, es wird nichts Neues über Menschen erhoben. Stattdessen sagt der
+# ERSTELLER, was sein Plan ist; die Crew selektiert sich selbst („Kanu" =
+# Sportlich, „Bar-Nacht" = Nightlife). Vibes FILTERN NICHT — sie werden nur
+# angezeigt, genau wie die Freitext-`note`. Deshalb leben sie im bestehenden,
+# bewusst offenen `audience`-jsonb und brauchen KEINE Migration.
+_HANGOUT_VIBES = (
+    ('sportlich', 'Sportlich'),
+    ('bar', 'Bar-Abend'),
+    ('kaffee', 'Kaffee & Chill'),
+    ('sightseeing', 'Sightseeing'),
+    ('essen', 'Essen gehen'),
+    ('nightlife', 'Nightlife'),
+)
+_HANGOUT_VIBE_KEYS = tuple(k for k, _ in _HANGOUT_VIBES)
+_HANGOUT_VIBE_LABELS = dict(_HANGOUT_VIBES)
+_HANGOUT_MAX_VIBES = 3
+
+
+def _hangout_vibes_normalize(raw):
+    """Client-Wunsch → gespeicherte Vibe-Keys. [] wenn nichts Gültiges dabei ist.
+
+    Whitelist + kanonische Reihenfolge + Dedupe + Deckel bei 3. Der Deckel hält
+    die Pillen-Zeile auf Karte und Chat-Kopf einzeilig; die Whitelist verhindert,
+    dass über diesen Weg Freitext in die Anzeige sickert.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    want = {str(x).strip().lower() for x in raw}
+    return [k for k in _HANGOUT_VIBE_KEYS if k in want][:_HANGOUT_MAX_VIBES]
+
+
+def _hangout_vibes_of_aud(aud):
+    """Vibe-Keys aus einer gespeicherten Zielgruppe. Tolerant, [] bei nichts."""
+    if not isinstance(aud, dict):
+        return []
+    return _hangout_vibes_normalize(aud.get('vibes'))
+
+
+def _hangout_vibe_labels(keys):
+    """Keys → deutsche Anzeige-Labels (unbekannte Keys fallen still weg)."""
+    return [_HANGOUT_VIBE_LABELS[k] for k in (keys or [])
+            if k in _HANGOUT_VIBE_LABELS]
+
+
+# ── ZEITFENSTER: „von wann bis wann" ────────────────────────────────────────
+#
+# Gespeichert wurde bisher NUR `pin_date` (= Ablauf-Datum). Der Chat-Kontext
+# („Samstag 14:00–18:00") braucht das echte Fenster. Reine Anzeige-Strings,
+# verbatim durchgereicht — die Zeitzonen-Wahrheit hat der Client, der Server
+# interpretiert hier bewusst nichts.
+_HANGOUT_META_KEYS = ('starts_at', 'ends_at')
+
+
+def _hangout_meta_normalize(raw):
+    """Client-`meta` → gespeichertes Anzeige-Meta. None wenn nichts drin ist."""
+    if not isinstance(raw, dict):
+        return None
+    out = {'v': 1}
+    for k in _HANGOUT_META_KEYS:
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()[:40]
+    return out if len(out) > 1 else None
+
+
+def _hangout_meta_of_row(row):
+    """Anzeige-Meta einer manual_pins-Row — tolerant (Spalte darf fehlen)."""
+    raw = (row or {}).get('meta')
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+# ── ZUSAGEN („Bin dabei") ───────────────────────────────────────────────────
+#
+# Bis heute gab es KEINEN Beitritts-Mechanismus: „beitreten" hieß den Chat
+# öffnen, und das wurde nur LOKAL auf dem Gerät vermerkt. Niemand konnte sehen,
+# wer kommt. Minimaler Zustand: eine Token-Liste auf der Pin-Zeile.
+_HANGOUT_MAX_ATTENDEES = 200
+
+
+def _hangout_attendees_of_row(row):
+    """Token-Liste der Zusagen — tolerant (Spalte darf fehlen), dedupliziert."""
+    raw = (row or {}).get('attendees')
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out = []
+    for t in raw:
+        if isinstance(t, str) and t and t not in out:
+            out.append(t)
+    return out[:_HANGOUT_MAX_ATTENDEES]
+
+
+def _hangout_people(tokens, viewer_token, profiles=None):
+    """Zusagen → ANZEIGE-Liste (Name/Avatar/opake match_id).
+
+    Gibt NIE ein rohes Token zurück: das Token IST das Bearer-Credential
+    (gleiche Regel wie `owner_token` in den Listen-Endpoints).
+    """
+    toks = [t for t in (tokens or []) if t]
+    if not toks:
+        return []
+    profs = profiles if isinstance(profiles, dict) else _profiles_load_bulk(toks)
+    out = []
+    for t in toks:
+        p = profs.get(t) or {}
+        mine = (t == viewer_token)
+        out.append({
+            'match_id': _hashlib.sha256(t.encode()).hexdigest()[:16],
+            'name': 'Du' if mine else (p.get('name') or 'Crew'),
+            'avatar_url': p.get('avatar_url') or None,
+            'mine': mine,
+        })
+    return out
+
+
+def _hangout_public_fields(row, viewer_token):
+    """Die additiven Anzeige-Felder, die JEDER Hangout-Auslieferungsweg braucht.
+
+    EINE Quelle für Vibes/Zeitfenster/Zusagen-Zähler, damit die drei Endpoints
+    (hangouts, crew-at-destination, manual-pins) nicht auseinanderlaufen.
+    """
+    aud = _hangout_audience_of_row(row)
+    att = _hangout_attendees_of_row(row)
+    vibes = _hangout_vibes_of_aud(aud)
+    return {
+        'vibes': vibes,
+        'vibe_labels': _hangout_vibe_labels(vibes),
+        'meta': _hangout_meta_of_row(row),
+        'attendee_count': len(att),
+        'attending': bool(viewer_token) and viewer_token in att,
+    }
+
+
+def _pin_optional_column_missing(err):
+    """True wenn ein Insert/Update NUR an einer noch nicht migrierten
+    Zusatz-Spalte scheiterte (PostgREST PGRST204). Migrations werden hier
+    manuell appliedet — dieser Fall muss unterscheidbar bleiben von einem
+    echten Schreibfehler."""
+    msg = str(err or '')
+    if 'PGRST204' in msg:
+        return True
+    low = msg.lower()
+    return ('column' in low or 'schema cache' in low) and any(
+        c in msg for c in ('audience', 'meta', 'attendees'))
+
+
+def _hangout_load_one(pin_id):
+    """EINE manual_pins-Row per ID. None wenn es sie nicht (mehr) gibt."""
+    if not pin_id or not SB_AVAILABLE:
+        return None
+    try:
+        r = (sb.table('manual_pins').select('*')
+             .eq('id', pin_id).limit(1).execute())
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        app.logger.warning(
+            f'[hangouts] load_one_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
 
 
 def _manual_pins_load(token):
@@ -12962,6 +13141,7 @@ def get_crew_at_destination(token):
             'id': pid,
             'audience': aud,
             'audience_label': _hangout_audience_label(aud),
+            **_hangout_public_fields(p, token),
             'iata': p.get('iata_code'),
             'lat': p.get('lat'),
             'lng': p.get('lng'),
@@ -13047,11 +13227,13 @@ def list_hangouts(token):
             'id': pid,
             'audience': aud,
             'audience_label': _hangout_audience_label(aud),
+            **_hangout_public_fields(p, token),
             'iata': p.get('iata_code'),
             'lat': p.get('lat'),
             'lng': p.get('lng'),
             'date': str(p.get('pin_date')) if p.get('pin_date') else None,
             'note': p.get('note'),
+            'owner_avatar_url': None if mine else (oprof.get('avatar_url') or None),
             # Token-Leak-Schutz: rohes owner_token NUR für self + mutual Friends.
             'owner_token': owner if (mine or is_friend) else None,
             'owner_name': 'Du' if mine else (oprof.get('name') or (owner[:8] + '…')),
@@ -13059,6 +13241,114 @@ def list_hangouts(token):
             'mine': mine,
         })
     return jsonify({'ok': True, 'hangouts': out})
+
+
+def _hangout_visible_row(token, pin_id):
+    """Row eines Hangouts, WENN dieser Viewer ihn sehen darf. Sonst None.
+
+    Gleiche Regel wie die Listen-Endpoints: abgelaufen → weg, Zielgruppe
+    verfehlt → weg (fail-closed), eigener Hangout → immer sichtbar. Ein nicht
+    sichtbarer Hangout ist für den Aufrufer nicht von einem nicht existierenden
+    zu unterscheiden (404), sonst verriete der Status seine Existenz.
+    """
+    row = _hangout_load_one(pin_id)
+    if not row or not _pin_not_expired(row):
+        return None
+    if (row.get('user_token') or '') == token:
+        return row
+    viewer_prof = (_profile_load(token) or {}).get('profile') or {}
+    if not _hangout_audience_matches(_hangout_audience_of_row(row), viewer_prof):
+        return None
+    return row
+
+
+def _hangout_detail_payload(row, token):
+    """Ein Hangout mit ALLEM, was der Chat-Kontext-Kopf braucht — inkl. der
+    aufgelösten Zusagen-Liste (Namen/Avatare, NIE rohe Tokens)."""
+    owner = row.get('user_token') or ''
+    mine = owner == token
+    att = _hangout_attendees_of_row(row)
+    friend_set = set(_friends_load(token).get('friends') or [])
+    profs = _profiles_load_bulk([t for t in ([owner] + att) if t and t != token])
+    oprof = {} if mine else (profs.get(owner) or {})
+    aud = _hangout_audience_of_row(row)
+    return {
+        'id': row.get('id'),
+        'iata': row.get('iata_code'),
+        'lat': row.get('lat'),
+        'lng': row.get('lng'),
+        'date': str(row.get('pin_date')) if row.get('pin_date') else None,
+        'note': row.get('note'),
+        'audience': aud,
+        'audience_label': _hangout_audience_label(aud),
+        **_hangout_public_fields(row, token),
+        'attendees': _hangout_people(att, token, profiles=profs),
+        'owner_name': 'Du' if mine else (oprof.get('name') or (owner[:8] + '…')),
+        'owner_avatar_url': None if mine else (oprof.get('avatar_url') or None),
+        'owner_match_id': _hashlib.sha256(owner.encode()).hexdigest()[:16],
+        'owner_token': owner if (mine or owner in friend_set) else None,
+        'mine': mine,
+    }
+
+
+@app.route('/api/user/hangouts/<token>/<pin_id>', methods=['GET'])
+def get_hangout_detail(token, pin_id):
+    """EIN Hangout mit vollem Kontext — die Quelle für den Kontext-Kopf im
+    Gruppenchat (Owner 2026-07-29: „der Gruppenchat hat keine Informationen").
+
+    Der Chat kennt nur seinen Channel `group__pin_<id>`; damit ein frisch
+    Beigetretener sofort versteht, WAS/WO/WANN/MIT WEM, holt er sich hier den
+    Hangout selbst statt auf durchgereichte Parameter der aufrufenden View
+    angewiesen zu sein (die Chat-Liste und der Push-Deep-Link haben sie nicht).
+    """
+    row = _hangout_visible_row(token, pin_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    return jsonify({'ok': True, 'hangout': _hangout_detail_payload(row, token)})
+
+
+@app.route('/api/user/hangouts/<token>/<pin_id>/join', methods=['POST'])
+def join_hangout(token, pin_id):
+    """„Bin dabei" an/aus. Body: {join: true|false} (default true).
+
+    Minimaler Zustand: eine Token-Liste auf der Pin-Zeile (keine neue Tabelle).
+    Bewusste Grenze: Read-Modify-Write ohne Transaktion — zwei exakt
+    gleichzeitige Zusagen auf DENSELBEN Hangout können sich überschreiben. Bei
+    der Größenordnung eines Crew-Treffs ist das vertretbar; es geht um eine
+    Anwesenheits-Anzeige, nicht um eine Buchung.
+    """
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    row = _hangout_visible_row(token, pin_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    want = (request.get_json(silent=True) or {}).get('join')
+    join = True if want is None else bool(want)
+    att = _hangout_attendees_of_row(row)
+    if join and token not in att:
+        if len(att) >= _HANGOUT_MAX_ATTENDEES:
+            return jsonify({'ok': False, 'error': 'attendees_full'}), 409
+        att = att + [token]
+    elif not join and token in att:
+        att = [t for t in att if t != token]
+    else:
+        # Nichts zu tun — trotzdem den aktuellen Stand zurückgeben (idempotent).
+        return jsonify({'ok': True, 'attending': join,
+                        'attendee_count': len(att),
+                        'attendees': _hangout_people(att, token)})
+    try:
+        sb.table('manual_pins').update({'attendees': att}).eq('id', pin_id).execute()
+    except Exception as e:
+        app.logger.warning(
+            f'[hangouts] join_fail err={type(e).__name__}: {str(e)[:120]}')
+        # Fehlt die Spalte (Migration 20260729 noch nicht appliedet), sagen wir
+        # das ehrlich — statt „gespeichert" zu behaupten und die Zusage still
+        # zu verlieren. Der Client blendet den Schalter dann aus.
+        if _pin_optional_column_missing(e):
+            return jsonify({'ok': False, 'error': 'attendees_unsupported'}), 503
+        return jsonify({'ok': False, 'error': 'join_failed'}), 500
+    return jsonify({'ok': True, 'attending': join, 'attendee_count': len(att),
+                    'attendees': _hangout_people(att, token)})
 
 
 @app.route('/api/user/layover-visibility/<token>', methods=['GET'])
@@ -13346,6 +13636,7 @@ def list_manual_pins(token):
         'note': p.get('note'),
         'audience': _hangout_audience_of_row(p),
         'audience_label': _hangout_audience_label(_hangout_audience_of_row(p)),
+        **_hangout_public_fields(p, token),
     } for p in rows]
     return jsonify({'ok': True, 'pins': out})
 
@@ -13381,6 +13672,7 @@ def create_manual_pin(token):
     pin_id = _uuid.uuid4().hex[:16]
     audience = _hangout_audience_normalize(
         body.get('audience'), (_profile_load(token) or {}).get('profile') or {})
+    meta = _hangout_meta_normalize(body.get('meta'))
     row = {
         'id': pin_id, 'user_token': token, 'iata_code': iata,
         'lat': float(lat), 'lng': float(lng), 'pin_date': pin_date, 'note': note,
@@ -13388,17 +13680,39 @@ def create_manual_pin(token):
     }
     if audience:
         row['audience'] = audience
+    if meta:
+        row['meta'] = meta
+    # Der Ersteller ist automatisch dabei — sonst stünde auf seinem eigenen
+    # Treffpunkt „0 dabei", was schlicht falsch wäre.
+    row['attendees'] = [token]
+    degraded = []
     try:
         sb.table('manual_pins').insert(row).execute()
     except Exception as e:
         app.logger.warning(f'[crew-dest] pin_insert_fail err={type(e).__name__}: {str(e)[:120]}')
         # Fehlt die audience-Spalte (Migration 20260728_hangout_audience.sql
-        # noch nicht appliedet), wird der Hangout BEWUSST NICHT ohne seine
-        # Zielgruppe gespeichert — sonst stünde ein „nur meine Airline"-Treff
-        # plötzlich für alle offen. Offene Hangouts bleiben unbetroffen.
-        if audience and _hangout_audience_column_missing(e):
+        # noch nicht appliedet), wird ein EINGESCHRÄNKTER Hangout BEWUSST NICHT
+        # ohne seine Zielgruppe gespeichert — sonst stünde ein „nur meine
+        # Airline"-Treff plötzlich für alle offen.
+        if (audience and _hangout_audience_is_restricted(audience)
+                and _hangout_audience_column_missing(e)):
             return jsonify({'ok': False, 'error': 'audience_unsupported'}), 503
-        return jsonify({'ok': False, 'error': 'insert_failed'}), 500
+        # Die übrigen Zusatzspalten (meta/attendees, und eine NUR beschreibende
+        # audience mit Vibes/Freitext) tragen Anzeige-Beiwerk. Fehlt die
+        # Migration, darf der Hangout daran nicht scheitern → EINMAL ohne sie.
+        if not _pin_optional_column_missing(e):
+            return jsonify({'ok': False, 'error': 'insert_failed'}), 500
+        degraded = [k for k in ('audience', 'meta', 'attendees') if k in row]
+        slim = {k: v for k, v in row.items() if k not in degraded}
+        try:
+            sb.table('manual_pins').insert(slim).execute()
+        except Exception as e2:
+            app.logger.warning(
+                f'[crew-dest] pin_insert_slim_fail err={type(e2).__name__}: {str(e2)[:120]}')
+            return jsonify({'ok': False, 'error': 'insert_failed'}), 500
+        app.logger.warning(f'[crew-dest] pin_insert_degraded dropped={degraded}')
+        audience = None if 'audience' in degraded else audience
+        meta = None if 'meta' in degraded else meta
     # Best-effort Geo-Push an AeroX-User im ~100-km-Umkreis (nach dem Commit,
     # try/except intern — bricht NIE den Erstell-Response). Sendet nur wenn
     # HANGOUT_GEO_PUSH aktiv; sonst nur count-Logging. Deep-Link auf den Hangout.
@@ -13411,11 +13725,20 @@ def create_manual_pin(token):
                                    title=(note or iata), pin_id=pin_id)
         except Exception:
             pass
+    vibes = _hangout_vibes_of_aud(audience)
     return jsonify({'ok': True, 'pin': {
         'id': pin_id, 'iata': iata, 'lat': lat, 'lng': lng,
         'date': pin_date, 'note': note,
         'audience': audience,
-        'audience_label': _hangout_audience_label(audience)}})
+        'audience_label': _hangout_audience_label(audience),
+        'vibes': vibes,
+        'vibe_labels': _hangout_vibe_labels(vibes),
+        'meta': meta,
+        'attendee_count': 0 if 'attendees' in degraded else 1,
+        'attending': 'attendees' not in degraded,
+        # Ehrlichkeit: welche Anzeige-Extras die (noch) fehlende Migration
+        # geschluckt hat. Der Client kann das ignorieren; Logs/Tests nicht.
+        'degraded': degraded or None}})
 
 
 @app.route('/api/user/manual-pins/<token>/<pin_id>/delete', methods=['POST'])
@@ -31480,6 +31803,44 @@ _AIRPORT_BOARD_TTL = 120      # 2 Min — Board ändert sich nicht schneller sin
 # teurer zu holen, ändert sich für die Tagesstatistik nicht im Minutentakt.
 _AIRPORT_DAY_CACHE = {}        # key -> (ts, list)
 _AIRPORT_DAY_TTL = 180         # 3 Min — für Delay-Capture-Genauigkeit reduziert (war 5 Min).
+
+# ── Serve-Stale-While-Revalidate für Board-Caches (Owner 2026-07-29:
+# „Tafel sagt wieder offline") ────────────────────────────────────────────────
+# Wurzel: nach TTL-Ablauf scrapte z.B. FRA ~10 s SYNCHRON IM REQUEST (20 Seiten
+# Fraport-Feed) — Clients auf Hotel-WLAN liefen in ihren Timeout und zeigten
+# das Offline-Banner, obwohl weder Netz noch Scraper kaputt waren. Jetzt wird
+# ein ABGELAUFENER Cache sofort serviert und GENAU EIN Hintergrund-Thread
+# frischt auf (Single-Flight); nur ein kalter Cache (erster Abruf nach Boot)
+# holt noch synchron. Schlägt der Refresh fehl (Quelle down), bleibt der
+# Stale-Stand stehen — besser eine minutenalte Tafel als ein falsches Offline.
+_BOARD_SWR_INFLIGHT = set()
+_BOARD_SWR_LOCK = _req_threading.Lock()
+
+
+def _board_swr(cache, ckey, ttl, fetch):
+    """fresh → direkt; stale → stale + async Refresh (single-flight); kalt → sync."""
+    import time as _t
+    cached = cache.get(ckey)
+    if cached and (_t.time() - cached[0]) < ttl:
+        return cached[1]
+    if cached:
+        with _BOARD_SWR_LOCK:
+            due = ckey not in _BOARD_SWR_INFLIGHT
+            if due:
+                _BOARD_SWR_INFLIGHT.add(ckey)
+        if due:
+            def _refresh():
+                try:
+                    fetch()
+                except Exception:
+                    pass
+                finally:
+                    with _BOARD_SWR_LOCK:
+                        _BOARD_SWR_INFLIGHT.discard(ckey)
+            _req_threading.Thread(target=_refresh, daemon=True,
+                                  name='board-swr-' + str(ckey)).start()
+        return cached[1]
+    return fetch()
 # AeroDataBox-Pünktlichkeit (Nicht-FRA-Airports, RapidAPI, env-gated). Aggressiv
 # gecacht — Free-Tier = 600 Units/Monat, also pro (airport,airline) 15 Min TTL.
 # key (airport, airline) -> (ts, result-dict).
@@ -34301,12 +34662,17 @@ def _native_board_cached(iata, flight_type, allow_paid=True):
 
 
 def _fra_board_cached(flight_type):
-    """Gecachtes FRA-Board (dep/arr). None bei Quelle-down."""
+    """Gecachtes FRA-Board (dep/arr). None bei Quelle-down. Stale wird sofort
+    serviert + async aufgefrischt (_board_swr) — nie mehr 10 s im Request."""
+    ckey = 'FRA_' + ('arr' if flight_type == 'arrival' else 'dep')
+    return _board_swr(_AIRPORT_BOARD_CACHE, ckey, _AIRPORT_BOARD_TTL,
+                      lambda: _fra_board_fetch(flight_type))
+
+
+def _fra_board_fetch(flight_type):
+    """Synchroner Scrape-Teil von `_fra_board_cached` (via _board_swr)."""
     import time as _t
     ckey = 'FRA_' + ('arr' if flight_type == 'arrival' else 'dep')
-    cached = _AIRPORT_BOARD_CACHE.get(ckey)
-    if cached and (_t.time() - cached[0]) < _AIRPORT_BOARD_TTL:
-        return cached[1]
     # Viele Seiten holen — der Fraport-Feed ist eine now-relative, nach sched
     # sortierte Rolling-Liste (~25 Flüge/Seite). Mit nur 3 Seiten (~75 Flüge)
     # fielen Langstrecken-Flüge, die erst später am Tag abfliegen (viele LH-
@@ -34424,11 +34790,15 @@ def _fra_day_board_cached(flight_type='departure'):
     abgeflogene Flüge) wird gecacht, damit Ticker/Cancellations/Busiest-Routes den
     ganzen Tag sehen. Die Pünktlichkeits-Quote (`_punctuality_stats`) zählt davon
     nur die bereits abgeflogenen (sched <= now) → stabile, nur-wachsende Zahl."""
+    ckey = 'FRA_DAY_' + ('arr' if flight_type == 'arrival' else 'dep')
+    return _board_swr(_AIRPORT_DAY_CACHE, ckey, _AIRPORT_DAY_TTL,
+                      lambda: _fra_day_board_fetch(flight_type))
+
+
+def _fra_day_board_fetch(flight_type='departure'):
+    """Synchroner Scrape-Teil von `_fra_day_board_cached` (via _board_swr)."""
     import time as _t
     ckey = 'FRA_DAY_' + ('arr' if flight_type == 'arrival' else 'dep')
-    cached = _AIRPORT_DAY_CACHE.get(ckey)
-    if cached and (_t.time() - cached[0]) < _AIRPORT_DAY_TTL:
-        return cached[1]
     # Viele Seiten → so viel vom Tag wie Fraport ausliefert — inkl. der
     # VERGANGENHEITS-Seiten (negative Pages), sonst besteht die „Tages"-Tafel
     # nur aus Zukunft und die Pünktlichkeits-Stichprobe hängt am Poll-Zufall.

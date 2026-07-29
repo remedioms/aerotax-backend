@@ -842,6 +842,40 @@ def register_live_activity():
                     'stored': True})
 
 
+@live_activity_bp.route('/api/live-activity/optout', methods=['POST'])
+def optout_live_activity():
+    """Body: {token}. Owner 2026-07-29 („option to turn off live activities"):
+    ALLE gespeicherten Live-Activity-Tokens des Users löschen — auch die
+    push-to-START-Tokens, sonst erzeugt das Backend die Lockscreen-Karte beim
+    nächsten Flug einfach neu. Re-Opt-in braucht keine Server-Seite: der
+    Client lädt seine Tokens beim nächsten Start wieder hoch (PushService).
+    Idempotent — doppeltes Opt-out ist ok."""
+    body = request.get_json(silent=True) or {}
+    user_token = (body.get('token') or '').strip()
+    if not user_token:
+        return jsonify({'ok': False, 'error': 'missing_fields'}), 400
+    denied = _auth_body_token(user_token)
+    if denied is not None:
+        return denied
+    client = _sb()
+    if client is None:
+        return jsonify({'ok': False,
+                        'error': 'live_activity_store_unavailable'}), 503
+    try:
+        client.table('live_activities').delete() \
+            .eq('user_token', user_token).execute()
+    except Exception as exc:
+        log.warning('[live-activity] optout failed user_ref=%s: %s',
+                    _token_ref(user_token), type(exc).__name__)
+        return jsonify({'ok': False,
+                        'error': 'live_activity_store_unavailable'}), 503
+    with _state_lock:
+        _LAST_SENT.clear()
+    log.info('[live-activity] OPTOUT user_ref=%s — alle Tokens gelöscht',
+             _token_ref(user_token))
+    return jsonify({'ok': True})
+
+
 @live_activity_bp.route('/api/live-activity/end', methods=['POST'])
 def end_live_activity():
     """Body: {token, activity_id}. Der Client hat die Activity beendet oder
