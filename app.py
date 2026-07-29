@@ -545,6 +545,10 @@ _BUG004_GET_PII_PREFIXES = (
                             #   bleibt public (Gate greift nur bei Token im Pfad).
     '/api/user/friend-groups/',       # Gruppen-Namen + Member-Tokens
     '/api/user/crew-at-destination/', # wer ist mit mir am Ziel (Friends-PII)
+    '/api/user/crew-here/', # wer ist HEUTE am selben Ort (Namen/Avatare + die
+                            #   operativen Roster-Fakten anderer Crew)
+    '/api/user/circles/',   # Kreise: eigene Mitgliedschaften + (als Ersteller)
+                            #   die offenen Beitritts-Anfragen
     '/api/station/',        # /<token>/<iata>/activity → Friends-Aktivität
     # ── Flug-Lebenszyklus (Owner 2026-07-03): owner-scoped, token-gebunden ──
     '/api/ax/flight-inbound-chain/',  # /<token> → Tail-Verkettung + Delay-Prognose
@@ -12601,7 +12605,8 @@ def _hangout_role_of_position(raw):
     return None
 
 
-def _hangout_audience_normalize(raw, owner_profile):
+def _hangout_audience_normalize(raw, owner_profile, owner_ops=None,
+                                owner_circles=None):
     """Client-Wunsch → gespeicherte Zielgruppe. None = offen für alle.
 
     Erwartet {airline: 'same'|'any', base: 'same'|'any', roles: [...],
@@ -12613,10 +12618,21 @@ def _hangout_audience_normalize(raw, owner_profile):
 
     `note` („Wer passt dazu": „sportlich, Lust auf Kanu") ist FREITEXT und
     filtert NICHT — sie wird nur angezeigt.
+
+    OPERATIVE FILTER (v2, Owner 2026-07-29) — `same_hotel`, `free_tomorrow`,
+    `min_nights`, `arriving_today`, `departing_tomorrow`: dieselbe „same"-
+    Snapshot-Logik. Sie brauchen `owner_ops` (= _crew_ops_facts des Erstellers
+    an Ort+Datum DES HANGOUTS); ohne die nötige Roster-Info fällt die
+    Einschränkung weg, statt eine unerfüllbare zu speichern.
+
+    KREIS (`circle_id`): nur wenn der Ersteller SELBST aktives Mitglied ist —
+    sonst könnte man einen Hangout in einen Kreis werfen, zu dem man nicht
+    gehört.
     """
     if not isinstance(raw, dict):
         return None
     prof = owner_profile or {}
+    ops = owner_ops if isinstance(owner_ops, dict) else {}
     out = {'v': 1}
     if str(raw.get('airline') or '').strip().lower() == 'same':
         key = _canonical_airline_key(prof.get('airline'))
@@ -12634,6 +12650,38 @@ def _hangout_audience_normalize(raw, owner_profile):
         # Beide Rollen = keine Einschränkung → gar nicht erst speichern.
         if roles and len(roles) < len(_HANGOUT_AUDIENCE_ROLES):
             out['roles'] = roles
+    # ── OPERATIVE FILTER (v2) — aus dem ROSTER beantwortbar, nichts Neues
+    #    über MENSCHEN. Semantik + Schwellen: siehe _crew_ops_facts /
+    #    _crew_no_early_start.
+    if raw.get('same_hotel') is True:
+        # „Selbes Hotel" wird — wie „same airline" — beim ERSTELLEN aufgelöst
+        # und eingefroren. Kennt das Crew-Hotel-Verzeichnis für die Airline des
+        # Erstellers an dieser Station kein Hotel, fällt die Einschränkung weg
+        # (wir können nicht auf etwas filtern, das wir nicht kennen).
+        hotel = ops.get('hotel')
+        if hotel:
+            out['same_hotel'] = True
+            out['hotel'] = _crew_hotel_key(hotel)
+            out['hotel_label'] = str(hotel).strip()[:80]
+    if raw.get('free_tomorrow') is True:
+        out['free_tomorrow'] = True
+    try:
+        min_nights = int(raw.get('min_nights') or 0)
+    except (TypeError, ValueError):
+        min_nights = 0
+    if min_nights >= 2:
+        out['min_nights'] = min(min_nights, _CREW_OPS_MAX_NIGHTS)
+    if raw.get('arriving_today') is True:
+        out['arriving_today'] = True
+    if raw.get('departing_tomorrow') is True:
+        out['departing_tomorrow'] = True
+    # ── KREIS (Selbst-Zuordnung statt Demografie) ──
+    circle_id = str(raw.get('circle_id') or '').strip()[:40]
+    if circle_id and circle_id in (owner_circles or set()):
+        out['circle_id'] = circle_id
+        cname = _circle_name_of(circle_id)
+        if cname:
+            out['circle_name'] = cname
     note = (raw.get('note') or '')
     if isinstance(note, str):
         note = note.strip()[:120]
@@ -12663,21 +12711,42 @@ def _hangout_audience_of_row(row):
     return raw if isinstance(raw, dict) else None
 
 
-def _hangout_audience_is_restricted(aud):
-    """True wenn die Zielgruppe wirklich einschränkt (Freitext zählt nicht)."""
+# Operative Filter-Keys — die, für die der Viewer Roster-Fakten braucht.
+_HANGOUT_OPS_KEYS = ('same_hotel', 'free_tomorrow', 'min_nights',
+                     'arriving_today', 'departing_tomorrow')
+
+
+def _hangout_audience_needs_ops(aud):
+    """True wenn diese Zielgruppe operative Roster-Fakten des Viewers braucht."""
     if not isinstance(aud, dict):
         return False
-    return bool(aud.get('airline') or aud.get('base') or aud.get('roles'))
+    return any(aud.get(k) for k in _HANGOUT_OPS_KEYS)
 
 
-def _hangout_audience_matches(aud, viewer_profile):
+def _hangout_audience_is_restricted(aud):
+    """True wenn die Zielgruppe wirklich einschränkt (Freitext/Vibes zählen
+    nicht). Auch die Grundlage für „eingeschränkt ⇒ KEIN Geo-Push"."""
+    if not isinstance(aud, dict):
+        return False
+    return bool(aud.get('airline') or aud.get('base') or aud.get('roles')
+                or aud.get('circle_id') or _hangout_audience_needs_ops(aud))
+
+
+def _hangout_audience_matches(aud, viewer_profile, viewer_ops=None,
+                              viewer_circles=None):
     """Darf dieser Viewer den Hangout sehen? FAIL-CLOSED bei fehlendem Fakt.
 
     Kein/leerer Filter (auch: Alt-Hangouts ohne `audience`) → True.
+
+    `viewer_ops` = _crew_ops_facts des Viewers an ORT und DATUM DES HANGOUTS
+    (nicht an seinem heutigen Ort!). `viewer_circles` = Menge seiner aktiven
+    Kreis-IDs. Fehlen sie, während die Zielgruppe sie braucht, ist das
+    fail-closed ein NICHT-Treffer — nie ein Treffer.
     """
     if not _hangout_audience_is_restricted(aud):
         return True
     prof = viewer_profile or {}
+    ops = viewer_ops if isinstance(viewer_ops, dict) else {}
     want_airline = aud.get('airline')
     if want_airline:
         have = _canonical_airline_key(prof.get('airline'))
@@ -12693,7 +12762,96 @@ def _hangout_audience_matches(aud, viewer_profile):
         role = _hangout_role_of_position(prof.get('position'))
         if not role or role not in want_roles:
             return False
+    # ── OPERATIVE FILTER — jeder einzeln fail-closed ──
+    if aud.get('same_hotel'):
+        want_hotel = str(aud.get('hotel') or '')
+        have_hotel = _crew_hotel_key(ops.get('hotel'))
+        if not want_hotel or not have_hotel or have_hotel != want_hotel:
+            return False
+    if aud.get('free_tomorrow'):
+        # Tri-State: NUR ein explizites True zählt (None = unbekannt = raus).
+        if ops.get('free_tomorrow') is not True:
+            return False
+    want_nights = aud.get('min_nights')
+    if want_nights:
+        have_nights = ops.get('nights')
+        try:
+            if not isinstance(have_nights, int) or have_nights < int(want_nights):
+                return False
+        except (TypeError, ValueError):
+            return False
+    if aud.get('arriving_today') and ops.get('arriving_today') is not True:
+        return False
+    if aud.get('departing_tomorrow') and ops.get('departing_tomorrow') is not True:
+        return False
+    # ── KREIS ──
+    want_circle = aud.get('circle_id')
+    if want_circle:
+        if not viewer_circles or str(want_circle) not in set(viewer_circles):
+            return False
     return True
+
+
+def _hangout_viewer_ctx(token, viewer_profile=None):
+    """LAZY Kontext für den Zielgruppen-Filter EINES Viewers.
+
+    Warum ein Kontext-Objekt und nicht drei Parameter: die operativen Fakten
+    hängen an ORT+DATUM des jeweiligen Hangouts, die Listen-Endpoints laufen
+    aber über viele Hangouts an vielen Stationen. Der Kontext liest den Roster
+    EINMAL, die Kreis-Mitgliedschaft EINMAL, und memoisiert die abgeleiteten
+    Fakten pro (Station, Datum). Für einen Feed OHNE eingeschränkte Hangouts
+    passiert gar kein zusätzlicher Read (alles lazy)."""
+    state = {'profile': viewer_profile, 'days': None, 'circles': None,
+             'ops': {}}
+
+    def profile():
+        if state['profile'] is None:
+            state['profile'] = (_profile_load(token) or {}).get('profile') or {}
+        return state['profile']
+
+    def ops(iata, ref_date):
+        key = (str(iata or '').upper(), str(ref_date or '')[:10])
+        if key not in state['ops']:
+            if state['days'] is None:
+                state['days'] = _crew_roster_days(token)
+            state['ops'][key] = _crew_ops_facts(
+                token, key[0], key[1], profile=profile(), days=state['days'])
+        return state['ops'][key]
+
+    def circles():
+        if state['circles'] is None:
+            state['circles'] = _circles_of_user(token)
+        return state['circles']
+
+    return {'profile': profile, 'ops': ops, 'circles': circles}
+
+
+def _hangout_row_matches(row, viewer_profile, ctx=None):
+    """Darf dieser Viewer DIESE Hangout-Row sehen?
+
+    EINE Regel für alle Auslieferungswege (hangouts-Feed, crew-at-destination,
+    Detail/Join). Die operativen Filter werden gegen den ORT und das DATUM DES
+    HANGOUTS ausgewertet — ein „selbes Hotel"-Treff in BKK fragt, ob der Viewer
+    an DEM Tag in DEM Hotel in BKK ist, nicht wo er heute steht.
+
+    Ohne `ctx` (Kontext-Objekt aus _hangout_viewer_ctx) wird ein Hangout, der
+    operative Fakten oder Kreis-Mitgliedschaft verlangt, fail-closed NICHT
+    ausgeliefert."""
+    aud = _hangout_audience_of_row(row)
+    if not _hangout_audience_is_restricted(aud):
+        return True
+    needs_ops = _hangout_audience_needs_ops(aud)
+    needs_circle = bool(aud.get('circle_id'))
+    if not needs_ops and not needs_circle:
+        return _hangout_audience_matches(aud, viewer_profile)
+    if ctx is None:
+        return False
+    iata = str((row or {}).get('iata_code') or '').strip().upper()
+    ref = str((row or {}).get('pin_date') or '')[:10] or _crew_ops_today()
+    return _hangout_audience_matches(
+        aud, viewer_profile,
+        viewer_ops=(ctx['ops'](iata, ref) if needs_ops else None),
+        viewer_circles=(ctx['circles']() if needs_circle else None))
 
 
 def _hangout_audience_column_missing(err):
@@ -12712,6 +12870,9 @@ def _hangout_audience_label(aud):
     if not _hangout_audience_is_restricted(aud):
         return None
     parts = []
+    if aud.get('circle_id'):
+        cname = str(aud.get('circle_name') or '').strip()
+        parts.append(f'Kreis {cname}' if cname else 'Nur Kreis-Mitglieder')
     if aud.get('airline'):
         parts.append('Nur ' + (aud.get('airline_label')
                                or str(aud['airline']).title()))
@@ -12722,6 +12883,16 @@ def _hangout_audience_label(aud):
         parts.append('Cockpit')
     if 'cabin' in roles:
         parts.append('Kabine')
+    if aud.get('same_hotel'):
+        parts.append('Selbes Hotel')
+    if aud.get('free_tomorrow'):
+        parts.append('Morgen frei')
+    if aud.get('min_nights'):
+        parts.append(f"≥{int(aud['min_nights'])} Nächte")
+    if aud.get('arriving_today'):
+        parts.append('Heute angekommen')
+    if aud.get('departing_tomorrow'):
+        parts.append('Reist morgen ab')
     return ' · '.join(parts) or None
 
 
@@ -13021,6 +13192,464 @@ def _user_current_iata_uncached(token):
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# OPERATIVE ROSTER-FAKTEN — „wer ist gerade hier, und wie lange noch?"
+# (Owner 2026-07-29: „Hangouts werden kaum genutzt. Demografie-Filter sind vom
+#  Tisch. AeroX kennt die Roster — nutz DIE.")
+# ───────────────────────────────────────────────────────────────────────────
+# EINE Quelle für drei Flächen:
+#   · /api/user/crew-here/<token>      — die Matching-Grundlage („5 hier, 3 im
+#                                        selben Hotel, 4 morgen frei")
+#   · die operativen Hangout-Filter    — audience.same_hotel / free_tomorrow /
+#                                        min_nights / arriving_today /
+#                                        departing_tomorrow
+#   · Kreis-Sichtbarkeit               — unabhängig davon (crew_circles)
+#
+# ES WIRD NICHTS NEUES ÜBER MENSCHEN ERHOBEN. Jeder Fakt hier kommt aus dem
+# Roster, den der User ohnehin importiert, plus dem bereits vorhandenen
+# Crew-Hotel-Verzeichnis. Kein Alter, kein Geschlecht, keine Sprache.
+#
+# SICHTBARKEIT: wer seinen Roster/Standort nicht teilt, zählt NICHT mit —
+# dieselben Gates wie Modus A von crew-at-destination (`layover_visibility`,
+# `share_roster`, `share_location`, keine Family-Konten).
+# SCHWELLEN (bewusst konservativ und HIER dokumentiert, damit iOS dieselbe
+# Sprache sprechen kann): „morgen frei" heisst NICHT „gar kein Dienst", sondern
+# „keine FRÜHE Verpflichtung am Morgen danach" — genau die Frage, die vor einem
+# Abend-Hangout zählt.
+_CREW_OPS_EARLY_DUTY_MIN = 10 * 60      # Dienstbeginn vor 10:00 Ortszeit = früh
+_CREW_OPS_EARLY_PICKUP_MIN = 8 * 60     # Pickup vor 08:00 Ortszeit = früh
+_CREW_OPS_MAX_NIGHTS = 14               # Zähl-Deckel (und Deckel für min_nights)
+
+
+def _crew_ops_today():
+    """Der Betriebstag, gegen den „heute/morgen" gerechnet wird.
+
+    Berliner Tag — die Roster-`datum`-Keys sind Homebase-Tage, exakt wie in
+    friends-today. Server-UTC wäre zwischen 00:00–02:00 CEST der Vortag."""
+    from datetime import date as _d
+    try:
+        return _airport_local_now('FRA').strftime('%Y-%m-%d')
+    except Exception:
+        return _d.today().isoformat()
+
+
+def _crew_day_shift(datum, days):
+    """'2026-07-29' + n Tage → '2026-07-30'. '' bei Müll. Wirft nie."""
+    from datetime import date as _d, timedelta as _td
+    try:
+        return (_d.fromisoformat(str(datum or '')[:10]) + _td(days=days)).isoformat()
+    except Exception:
+        return ''
+
+
+def _crew_roster_days(token):
+    """Roster-Tage EINES Users als {YYYY-MM-DD: day-dict}.
+
+    Gleiche Quelle wie _user_future_layovers/_user_current_iata: frischer
+    `_store`, sonst der persistente roster_snapshot (überlebt Container-
+    Restart). {} = wir wissen nichts über diesen User (→ alles fail-closed)."""
+    if not token:
+        return {}
+    sess = _store.get(token) or {}
+    tage = (sess.get('result_data') or {}).get('_tage_detail') or []
+    if not tage:
+        tage = (_roster_snapshot_read(token) or {}).get('tage') or []
+    out = {}
+    for t in tage:
+        if not isinstance(t, dict):
+            continue
+        d = (t.get('datum') or '')[:10]
+        if len(d) == 10:
+            out[d] = t
+    return out
+
+
+def _crew_day_place(day):
+    """Aufenthalts-/Übernachtungs-IATA EINES Roster-Tags ('' wenn unbekannt).
+    Dieselbe Ableitung wie Feed/Overlap (_feed_nightstop_ort) — NICHT blind
+    reader_facts.layover_ort."""
+    if not isinstance(day, dict):
+        return ''
+    place = (_feed_nightstop_ort(day) or '').upper().strip()
+    return place if len(place) == 3 and place.isalpha() else ''
+
+
+# ── Hotel: was wir ehrlich WISSEN können ───────────────────────────────────
+# Es gibt KEIN per-User-Hotelfeld im Roster (weder iCal noch CAS liefern es
+# verlässlich). Die einzige belastbare Quelle ist das Crew-Hotel-Verzeichnis:
+# (Airline, Station) → Hotel. „Selbes Hotel" heisst hier also exakt: dieselbe
+# Airline-Crew an derselben Station, für die das Verzeichnis EIN Hotel kennt.
+# Ist für die Airline/Station nichts hinterlegt, ist das Hotel UNBEKANNT —
+# und alles, was darauf filtert, fällt fail-closed aus.
+#
+# WICHTIG (Sicherheits-Gate, vgl. _filter_crew_hotels): Crew-Hotels sind
+# airline-vertraulich. Der Hotelname eines FREMDEN wird NIE ausgeliefert —
+# nur der abgeleitete Boolean `same_hotel`. Seinen EIGENEN Hotelnamen darf
+# ein User sehen (es ist seine eigene Airline).
+_CREW_HOTEL_MAP_MEMO = {}
+_CREW_HOTEL_MAP_LOCK = _req_threading.Lock()
+_CREW_HOTEL_MAP_TTL = 600.0
+
+
+def _crew_hotel_map(airline_key):
+    """{IATA: Hotelname} EINER Airline (approved+active), 10 min memoisiert.
+
+    Mehrere Hotels pro Station sind erlaubt (Optionen) → deterministisch
+    gewinnt der Eintrag mit den meisten Votes, Name als Tiebreak. Sonst
+    bekämen zwei Viewer für dieselbe Station verschiedene Antworten."""
+    key = (airline_key or '').strip().upper()
+    if not key:
+        return {}
+    now = time.time()
+    with _CREW_HOTEL_MAP_LOCK:
+        hit = _CREW_HOTEL_MAP_MEMO.get(key)
+        if hit is not None and (now - hit[1]) < _CREW_HOTEL_MAP_TTL:
+            return hit[0]
+    out = {}
+    try:
+        for row in (_crew_hotel_dir_serve(key) or []):
+            iata = str((row or {}).get('iata') or '').strip().upper()
+            hotel = str((row or {}).get('hotel') or '').strip()
+            if len(iata) != 3 or not hotel:
+                continue
+            try:
+                votes = int(row.get('votes') or 0)
+            except (TypeError, ValueError):
+                votes = 0
+            prev = out.get(iata)
+            if prev is None or (votes, hotel) > (prev[0], prev[1]):
+                out[iata] = (votes, hotel)
+    except Exception as e:
+        app.logger.warning(
+            f'[crew-ops] hotel_map_fail err={type(e).__name__}: {str(e)[:120]}')
+        out = {}
+    out = {k: v[1] for k, v in out.items()}
+    with _CREW_HOTEL_MAP_LOCK:
+        _CREW_HOTEL_MAP_MEMO[key] = (out, now)
+        if len(_CREW_HOTEL_MAP_MEMO) > 200:
+            _CREW_HOTEL_MAP_MEMO.clear()
+    return out
+
+
+def _crew_hotel_at(airline, iata):
+    """Crew-Hotel dieser Airline an dieser Station, oder None (= unbekannt)."""
+    key = _canonical_airline_key(airline)
+    st = str(iata or '').strip().upper()
+    if not key or len(st) != 3:
+        return None
+    return _crew_hotel_map(key).get(st) or None
+
+
+def _crew_hotel_key(hotel):
+    """Vergleichs-Normalform eines Hotelnamens ('' wenn leer). Case-fold +
+    Whitespace-Kollaps — „Novotel  Suvarnabhumi" == „novotel suvarnabhumi"."""
+    return ' '.join(str(hotel or '').split()).casefold()
+
+
+# ── „Keine frühe Verpflichtung morgen früh" ────────────────────────────────
+
+def _crew_day_start_minutes(day):
+    """Frühester belastbarer DIENSTBEGINN eines Roster-Tags in Minuten seit
+    Mitternacht (Stations-Ortszeit) oder None.
+
+    Quellen wie _rc_duty_start_utc: reader_facts.start_time und die EXPLIZITE
+    Briefing-Zeit aus den Markern. Es gewinnt die frühere.
+
+    BEWUSST OHNE PICKUP: Pickup und Dienstbeginn sind ZWEI Signale mit zwei
+    eigenen Schwellen (08:00 bzw. 10:00, Owner 2026-07-29). Liesse man den
+    Pickup hier mitlaufen, wäre die 08:00-Schwelle wirkungslos — jeder Pickup
+    vor 08:00 läge ohnehin unter 10:00, und ein Pickup um 08:30 (Dienst ~09:30)
+    würde fälschlich als „früher Dienst" gewertet."""
+    rf = (day or {}).get('reader_facts') or {} if isinstance(day, dict) else {}
+    cands = []
+    for v in (rf.get('start_time'), _rc_briefing_hhmm(day)):
+        m = _rc_hhmm_minutes(v)
+        if m is not None:
+            cands.append(m)
+    return min(cands) if cands else None
+
+
+def _crew_pickup_minutes(day):
+    """Pickup-Zeit eines Roster-Tags in Minuten seit Mitternacht oder None."""
+    return _rc_hhmm_minutes(_rc_pickup_hhmm(day))
+
+
+def _crew_no_early_start(day):
+    """„Morgen frei" im operativen Sinn: hat dieser Tag KEINE frühe
+    Verpflichtung? True / False / None (= unbekannt).
+
+    SCHWELLEN: Pickup vor 08:00 Ortszeit ODER Dienstbeginn vor 10:00 Ortszeit
+    ⇒ früh (False). Sonst True.
+
+    TRI-STATE ist Absicht, kein Bequemlichkeits-Bug:
+      · kein Roster-Tag              → None (wir wissen es schlicht nicht)
+      · Zeiten bekannt und spät      → True
+      · keine Zeiten, aber echte Flug-Sektoren → None (wir WISSEN, dass
+        geflogen wird, nur nicht wann — „frei" wäre gelogen)
+      · keine Zeiten, keine Flüge (Frei-Tag, Urlaub, reiner Layover-Ruhetag)
+        → True
+    None zählt NIRGENDS mit und sieht keinen `free_tomorrow`-Hangout."""
+    if not isinstance(day, dict):
+        return None
+    pu = _crew_pickup_minutes(day)
+    if pu is not None and pu < _CREW_OPS_EARLY_PICKUP_MIN:
+        return False
+    st = _crew_day_start_minutes(day)
+    if st is not None and st < _CREW_OPS_EARLY_DUTY_MIN:
+        return False
+    if st is not None or pu is not None:
+        return True
+    has_flight = any(_is_real_flight_sector(s)
+                     for s in (day.get('ical_sectors') or [])
+                     if isinstance(s, dict))
+    return None if has_flight else True
+
+
+def _crew_nights_at(days, iata, ref_date):
+    """Wie viele Nächte bleibt der User ab `ref_date` noch an dieser Station?
+
+    Zählt zusammenhängende Roster-Tage mit demselben Aufenthaltsort ab
+    ref_date (ref_date selbst = Nacht 1). 0 wenn er an dem Tag gar nicht dort
+    ist. Gedeckelt auf _CREW_OPS_MAX_NIGHTS."""
+    st = str(iata or '').strip().upper()
+    if len(st) != 3:
+        return 0
+    d = str(ref_date or '')[:10]
+    n = 0
+    while n < _CREW_OPS_MAX_NIGHTS and d:
+        if _crew_day_place((days or {}).get(d)) != st:
+            break
+        n += 1
+        d = _crew_day_shift(d, 1)
+    return n
+
+
+def _crew_ops_facts(token, iata, ref_date=None, profile=None, days=None):
+    """Operative Roster-Fakten EINES Users an EINER Station an EINEM Tag.
+
+    Returns {here, place, hotel, nights, free_tomorrow, arriving_today,
+             departing_tomorrow}:
+      · here                — ist er an `ref_date` an dieser Station?
+      · place               — wo er an `ref_date` tatsächlich ist (oder None)
+      · hotel               — Crew-Hotel seiner Airline dort (None = unbekannt)
+      · nights              — verbleibende zusammenhängende Nächte ab ref_date
+      · free_tomorrow       — True/False/None, siehe _crew_no_early_start
+      · arriving_today      — kam er an ref_date erst dort an? (None = unbekannt)
+      · departing_tomorrow  — ist er am Folgetag woanders? (None = unbekannt)
+
+    Alle Nachbar-Fakten sind None, wenn er an dem Tag gar nicht dort ist —
+    sonst behaupteten sie etwas über eine Station, an der er nicht steht."""
+    st = str(iata or '').strip().upper()
+    ref = str(ref_date or '')[:10] or _crew_ops_today()
+    days = _crew_roster_days(token) if days is None else (days or {})
+    place = _crew_day_place(days.get(ref))
+    here = len(st) == 3 and place == st
+    prof = profile if isinstance(profile, dict) else (
+        (_profile_load(token) or {}).get('profile') or {})
+    prev_day = days.get(_crew_day_shift(ref, -1))
+    next_day = days.get(_crew_day_shift(ref, 1))
+    return {
+        'here': here,
+        'place': place or None,
+        'hotel': _crew_hotel_at(prof.get('airline'), st) if here else None,
+        'nights': _crew_nights_at(days, st, ref) if here else 0,
+        'free_tomorrow': _crew_no_early_start(next_day) if here else None,
+        'arriving_today': (
+            None if (not here or prev_day is None)
+            else _crew_day_place(prev_day) != st),
+        'departing_tomorrow': (
+            None if (not here or next_day is None)
+            else _crew_day_place(next_day) != st),
+    }
+
+
+# ── „WER IST GERADE HIER" — die Matching-Grundlage ─────────────────────────
+# Kandidaten-Pool = alle Tokens mit registriertem Push-Gerät (dieselbe Menge,
+# die der Hangout-Geo-Push seit 2026-07-16 scannt). ZWEI PHASEN, damit die
+# teuren Roster-Reads gedeckelt bleiben:
+#   1) billig: Bulk-Profile + der 10-min-memoisierte _user_current_iata
+#   2) teuer:  nur noch für die Handvoll, die WIRKLICH an der Station ist
+# Das Ergebnis wird pro Station 5 min memoisiert — der heutige Roster-Ort
+# ändert sich höchstens beim Roster-Update.
+_CREW_HERE_TTL = 300.0
+_CREW_HERE_MEMO = {}
+_CREW_HERE_LOCK = _req_threading.Lock()
+_CREW_HERE_DEEP_MAX = 200        # Deckel für Phase 2 (Roster-Reads)
+_CREW_HERE_PREVIEW_MAX = 12      # „kleine Vorschau-Liste"
+
+
+def _crew_push_registered_tokens(limit=20000, page=1000):
+    """Alle Tokens mit registriertem Push-Gerät (paginiert). Der etablierte
+    „alle erreichbaren AeroX-User"-Pool (vorher inline in _users_near)."""
+    if not SB_AVAILABLE or sb is None:
+        return []
+    tokens = []
+    try:
+        for i in range(0, limit, page):
+            r = (sb.table('user_push_tokens').select('user_token')
+                 .range(i, i + page - 1).execute())
+            batch = [x.get('user_token') for x in (r.data or [])
+                     if x.get('user_token')]
+            tokens.extend(batch)
+            if len(batch) < page:
+                break
+    except Exception as e:
+        app.logger.warning(
+            f'[crew-ops] token_scan_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+    return [t for t in dict.fromkeys(tokens) if t]
+
+
+def _crew_here_members_uncached(iata, ref_date):
+    """Wer ist an dieser Station an diesem Tag? Liste von
+    {token, profile, ops} — OHNE Viewer-Bezug (deshalb memoisierbar)."""
+    st = str(iata or '').strip().upper()
+    if len(st) != 3:
+        return []
+    tokens = _crew_push_registered_tokens()
+    if not tokens:
+        return []
+    profs = _profiles_load_bulk(tokens)
+    # Phase 1 — billig.
+    cands = []
+    for t in tokens:
+        p = profs.get(t) or {}
+        if _is_family_account(p):
+            continue
+        # Wer Roster ODER Standort explizit nicht teilt, zählt NICHT mit.
+        if p.get('share_roster') is False or p.get('share_location') is False:
+            continue
+        if _user_current_iata(t) != st:
+            continue
+        cands.append(t)
+    # Phase 2 — teuer, gedeckelt.
+    out = []
+    for t in cands[:_CREW_HERE_DEEP_MAX]:
+        # `layover_visibility` ist der DESIGNIERTE Opt-out für „mein Layover
+        # darf als Match erscheinen" — erst hier abgefragt (ein SB-Read pro
+        # Token), weil die Menge jetzt klein ist.
+        if not _layover_visibility_get(t):
+            continue
+        prof = profs.get(t) or {}
+        ops = _crew_ops_facts(t, st, ref_date, profile=prof)
+        if not ops.get('here'):
+            continue
+        out.append({'token': t, 'profile': prof, 'ops': ops})
+    return out
+
+
+def _crew_here_members(iata, ref_date=None):
+    """Memoisierte Fassung von _crew_here_members_uncached (5 min pro Station)."""
+    st = str(iata or '').strip().upper()
+    ref = str(ref_date or '')[:10] or _crew_ops_today()
+    key = (st, ref)
+    now = time.time()
+    with _CREW_HERE_LOCK:
+        hit = _CREW_HERE_MEMO.get(key)
+        if hit is not None and (now - hit[1]) < _CREW_HERE_TTL:
+            return hit[0]
+    val = _crew_here_members_uncached(st, ref)
+    with _CREW_HERE_LOCK:
+        _CREW_HERE_MEMO[key] = (val, now)
+        if len(_CREW_HERE_MEMO) > 500:
+            _CREW_HERE_MEMO.clear()
+    return val
+
+
+@app.route('/api/user/crew-here/<token>', methods=['GET'])
+def get_crew_here(token):
+    """WER IST GERADE HIER — ehrliche Matching-Grundlage für Hangouts.
+
+    Query: ?iata=BKK (default: eigener heutiger Roster-Ort), ?date=YYYY-MM-DD.
+
+    Returns:
+      { ok, iata, date, here, my_hotel, my_nights, my_free_tomorrow,
+        counts: {total, same_hotel, free_tomorrow, staying_2plus,
+                 arriving_today, departing_tomorrow},
+        crew: [{match_id, name, avatar_url, token?, is_friend, same_hotel,
+                free_tomorrow, nights, arriving_today, departing_tomorrow}],
+        crew_truncated, reason? }
+
+    EHRLICH statt schön: `counts.total` zählt NUR Crew, die ihren Roster/
+    Standort teilt (layover_visibility + share_roster + share_location, keine
+    Family-Konten) und deren heutiger Roster-Ort DIESE Station ist. Kein
+    Hochrechnen, kein „ungefähr".
+
+    PRIVACY:
+      · Das rohe Token (= Bearer-Credential) reist NUR für gegenseitige
+        Friends mit — sonst nur die opake match_id (Regel wie crew-at-
+        destination / hangouts).
+      · Der HOTELNAME eines Fremden wird NIE ausgeliefert (Crew-Hotels sind
+        airline-vertraulich, vgl. _filter_crew_hotels) — nur der abgeleitete
+        Boolean `same_hotel`. `my_hotel` ist das eigene Hotel des Viewers.
+    """
+    st = (request.args.get('iata') or '').strip().upper()[:3]
+    ref = (request.args.get('date') or '').strip()[:10] or _crew_ops_today()
+    my_days = _crew_roster_days(token)
+    my_prof = (_profile_load(token) or {}).get('profile') or {}
+    if len(st) != 3 or not st.isalpha():
+        st = _crew_day_place(my_days.get(ref))
+    empty = {'ok': True, 'iata': st or None, 'date': ref, 'here': False,
+             'my_hotel': None, 'my_nights': 0, 'my_free_tomorrow': None,
+             'counts': {'total': 0, 'same_hotel': 0, 'free_tomorrow': 0,
+                        'staying_2plus': 0, 'arriving_today': 0,
+                        'departing_tomorrow': 0},
+             'crew': [], 'crew_truncated': False}
+    if len(st) != 3:
+        # Kein bekannter Aufenthaltsort — das sagen wir, statt 0 zu behaupten.
+        return jsonify(dict(empty, reason='no_location'))
+
+    mine = _crew_ops_facts(token, st, ref, profile=my_prof, days=my_days)
+    my_hotel_key = _crew_hotel_key(mine.get('hotel'))
+    friend_set = set(_friends_load(token).get('friends') or [])
+
+    members = [m for m in _crew_here_members(st, ref)
+               if m.get('token') and m['token'] != token]
+    counts = {'total': len(members), 'same_hotel': 0, 'free_tomorrow': 0,
+              'staying_2plus': 0, 'arriving_today': 0, 'departing_tomorrow': 0}
+    crew = []
+    for m in members:
+        ops = m.get('ops') or {}
+        same_hotel = bool(my_hotel_key) and (
+            _crew_hotel_key(ops.get('hotel')) == my_hotel_key)
+        if same_hotel:
+            counts['same_hotel'] += 1
+        if ops.get('free_tomorrow') is True:
+            counts['free_tomorrow'] += 1
+        if int(ops.get('nights') or 0) >= 2:
+            counts['staying_2plus'] += 1
+        if ops.get('arriving_today') is True:
+            counts['arriving_today'] += 1
+        if ops.get('departing_tomorrow') is True:
+            counts['departing_tomorrow'] += 1
+        prof = m.get('profile') or {}
+        is_friend = m['token'] in friend_set
+        crew.append({
+            'match_id': _hashlib.sha256(m['token'].encode()).hexdigest()[:16],
+            'name': (prof.get('name') or 'Crew'),
+            'avatar_url': prof.get('avatar_url') or None,
+            # Rohes Token NUR für gegenseitige Friends (DM-Flow).
+            'token': m['token'] if is_friend else None,
+            'is_friend': is_friend,
+            'same_hotel': same_hotel,
+            'free_tomorrow': ops.get('free_tomorrow'),
+            'nights': int(ops.get('nights') or 0),
+            'arriving_today': ops.get('arriving_today'),
+            'departing_tomorrow': ops.get('departing_tomorrow'),
+        })
+    # Vorschau-Liste: Friends zuerst, dann selbes Hotel, dann längster Aufenthalt.
+    crew.sort(key=lambda c: (not c['is_friend'], not c['same_hotel'],
+                             -c['nights'], c['name'].lower()))
+    return jsonify({
+        'ok': True, 'iata': st, 'date': ref, 'here': bool(mine.get('here')),
+        'my_hotel': mine.get('hotel'), 'my_nights': int(mine.get('nights') or 0),
+        'my_free_tomorrow': mine.get('free_tomorrow'),
+        'counts': counts,
+        'crew': crew[:_CREW_HERE_PREVIEW_MAX],
+        'crew_truncated': len(crew) > _CREW_HERE_PREVIEW_MAX,
+    })
+
+
 @app.route('/api/user/crew-at-destination/<token>', methods=['GET'])
 def get_crew_at_destination(token):
     """Crew an MEINEN Zielen. Returns:
@@ -13037,6 +13666,9 @@ def get_crew_at_destination(token):
     friend_set = set(friends)
     # Eigenes Profil für den Zielgruppen-Filter der Hangout-Pins (Modus B).
     viewer_prof = (_profile_load(token) or {}).get('profile') or {}
+    # Lazy-Kontext für die operativen Filter + Kreise (liest nur, wenn hier
+    # wirklich ein entsprechend eingeschränkter Hangout auftaucht).
+    viewer_ctx = _hangout_viewer_ctx(token, viewer_prof)
 
     # ── Modus A: Layover-Matches gruppiert nach IATA ──
     by_iata = defaultdict(lambda: {'friends': {}, 'my_dates': set()})
@@ -13134,7 +13766,7 @@ def get_crew_at_destination(token):
         # gilt derselbe serverseitige Filter wie in /api/user/hangouts, sonst
         # käme ein eingeschränkter Hangout über die Hintertür doch an.
         aud = _hangout_audience_of_row(p)
-        if not mine and not _hangout_audience_matches(aud, viewer_prof):
+        if not mine and not _hangout_row_matches(p, viewer_prof, viewer_ctx):
             continue
         oprof = {} if mine else (_owner_profs.get(owner) or {})
         pins_out.append({
@@ -13206,6 +13838,7 @@ def list_hangouts(token):
     """
     friend_set = set(_friends_load(token).get('friends') or [])
     viewer_prof = (_profile_load(token) or {}).get('profile') or {}
+    viewer_ctx = _hangout_viewer_ctx(token, viewer_prof)
     out = []
     _pins = _hangouts_load_all_active()
     # N+1-Fix (2026-07-01): Owner-Namen in EINEM Bulk-Query statt pro Hangout.
@@ -13219,7 +13852,7 @@ def list_hangouts(token):
         owner = p.get('user_token') or ''
         mine = owner == token
         aud = _hangout_audience_of_row(p)
-        if not mine and not _hangout_audience_matches(aud, viewer_prof):
+        if not mine and not _hangout_row_matches(p, viewer_prof, viewer_ctx):
             continue  # Zielgruppe verfehlt → gar nicht erst ausliefern
         is_friend = owner in friend_set
         oprof = {} if mine else (_owner_profs.get(owner) or {})
@@ -13257,7 +13890,8 @@ def _hangout_visible_row(token, pin_id):
     if (row.get('user_token') or '') == token:
         return row
     viewer_prof = (_profile_load(token) or {}).get('profile') or {}
-    if not _hangout_audience_matches(_hangout_audience_of_row(row), viewer_prof):
+    if not _hangout_row_matches(row, viewer_prof,
+                                _hangout_viewer_ctx(token, viewer_prof)):
         return None
     return row
 
@@ -13363,6 +13997,359 @@ def set_layover_visibility(token):
     enabled = bool(body.get('enabled'))
     ok = _layover_visibility_set(token, enabled)
     return jsonify({'ok': ok, 'enabled': enabled})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# KREISE (crew_circles) — Selbst-Zuordnung STATT Demografie
+# ───────────────────────────────────────────────────────────────────────────
+# Owner 2026-07-29: „nur Deutschsprachige" / „nur Frauen" soll möglich sein,
+# OHNE dass AeroX Sprache oder Geschlecht über Menschen speichert. Lösung: ein
+# Kreis ist ein frei benannter, öffentlich sichtbarer Topf, dem man SELBST
+# beitritt. Ein Hangout kann an einen Kreis adressiert werden
+# (`audience.circle_id`) → nur aktive Mitglieder sehen ihn.
+#
+# Der Unterschied zur Demografie ist der springende Punkt: AeroX kategorisiert
+# niemanden. Es speichert nur, was jemand über sich SELBST erklärt hat, indem
+# er auf „Beitreten" getippt hat. Es gibt kein Zuweisen von aussen.
+#
+# v1-GRENZEN (bewusst, Owner-Vorgabe „minimaler Umfang"):
+#   · kein Kreis-Chat, keine Rollen ausser „Ersteller", keine Moderation
+#     (kein Kick, kein Report, kein Umbenennen) — Follow-up.
+#   · `join_policy='request'` bringt genau so viel Mechanik mit, wie es zum
+#     Funktionieren braucht: Beitritt landet als `pending`, der Ersteller
+#     bestätigt oder lehnt ab. Ohne das wäre „auf Anfrage" eine Sackgasse.
+#   · Mitglieder-LISTEN werden nicht ausgeliefert — nur die ANZAHL. Wer in
+#     „Nur Frauen" ist, ist niemandes Geschäft ausser seins.
+# Migration: supabase_migrations/20260729_crew_circles.sql (additiv).
+_CREW_CIRCLES_TABLE = 'crew_circles'
+_CREW_CIRCLE_MEMBERS_TABLE = 'crew_circle_members'
+_CREW_CIRCLE_JOIN_POLICIES = ('open', 'request')
+_CREW_CIRCLE_NAME_MAX = 40
+_CREW_CIRCLE_MAX_OWNED = 10       # Anti-Spam: Kreise pro Ersteller
+_CREW_CIRCLE_LIST_LIMIT = 500
+
+
+def _circle_storage_missing(err):
+    """True wenn der Fehler NUR heisst „die Kreis-Tabellen gibt es noch nicht"
+    (Migration nicht appliedet). Muss unterscheidbar bleiben von einem echten
+    Schreibfehler — sonst behaupteten wir „gespeichert", wo nichts steht."""
+    msg = str(err or '')
+    low = msg.lower()
+    if 'PGRST205' in msg or 'PGRST204' in msg:
+        return True
+    return 'crew_circle' in low and (
+        'does not exist' in low or 'schema cache' in low
+        or 'not find the table' in low)
+
+
+def _circle_match_id(tok):
+    """Opake, stabile ID eines Mitglieds — NIE das rohe Token (= Credential).
+    Gleiche Bildung wie owner_match_id in den Hangout-Endpoints."""
+    return _hashlib.sha256((tok or '').encode()).hexdigest()[:16]
+
+
+def _circles_of_user(token):
+    """IDs der Kreise, in denen dieser User AKTIVES Mitglied ist.
+
+    FAIL-CLOSED: leere Menge bei SB-down oder fehlender Tabelle — dann sieht
+    er keinen kreis-adressierten Hangout, statt versehentlich alle."""
+    if not token or not SB_AVAILABLE:
+        return set()
+    try:
+        r = (sb.table(_CREW_CIRCLE_MEMBERS_TABLE).select('circle_id')
+             .eq('user_token', token).eq('status', 'active')
+             .limit(_CREW_CIRCLE_LIST_LIMIT).execute())
+        return {str(x.get('circle_id')) for x in (r.data or [])
+                if x.get('circle_id')}
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] my_circles_fail err={type(e).__name__}: {str(e)[:120]}')
+        return set()
+
+
+def _circle_load(circle_id):
+    """EINE Kreis-Row oder None."""
+    if not circle_id or not SB_AVAILABLE:
+        return None
+    try:
+        r = (sb.table(_CREW_CIRCLES_TABLE).select('*')
+             .eq('id', str(circle_id)).limit(1).execute())
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+def _circle_name_of(circle_id):
+    """Anzeige-Name eines Kreises ('' wenn unbekannt) — für das eingefrorene
+    `audience.circle_name` beim Erstellen eines Hangouts."""
+    row = _circle_load(circle_id) or {}
+    return str(row.get('name') or '').strip()[:_CREW_CIRCLE_NAME_MAX]
+
+
+def _circle_membership_rows(circle_ids=None, user_token=None, status=None):
+    """Mitgliedschafts-Rows, gefiltert. [] bei SB-down/fehlender Tabelle."""
+    if not SB_AVAILABLE:
+        return []
+    try:
+        q = sb.table(_CREW_CIRCLE_MEMBERS_TABLE).select('*')
+        if circle_ids is not None:
+            ids = [str(c) for c in circle_ids][:_CREW_CIRCLE_LIST_LIMIT]
+            if not ids:
+                return []
+            q = q.in_('circle_id', ids)
+        if user_token:
+            q = q.eq('user_token', user_token)
+        if status:
+            q = q.eq('status', status)
+        r = q.limit(5000).execute()
+        return r.data or []
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] members_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+
+
+def _circle_public(row, count, my_status, is_owner):
+    """Anzeige-Shape EINES Kreises. Keine Mitglieder-Liste — nur die Anzahl."""
+    return {
+        'id': str(row.get('id') or ''),
+        'name': str(row.get('name') or '').strip(),
+        'emoji': row.get('emoji') or None,
+        'color': row.get('color') or None,
+        'join_policy': (row.get('join_policy') or 'open'),
+        'member_count': int(count or 0),
+        'joined': my_status == 'active',
+        'pending': my_status == 'pending',
+        'mine': bool(is_owner),
+        'created_at': str(row.get('created_at')) if row.get('created_at') else None,
+    }
+
+
+@app.route('/api/user/circles/<token>', methods=['GET'])
+def list_crew_circles(token):
+    """Alle Kreise (global entdeckbar) + mein Verhältnis dazu.
+
+    Returns: { ok, circles: [{id, name, emoji, color, join_policy,
+                              member_count, joined, pending, mine, created_at}],
+               storage } — `storage: 'unavailable'` heisst ehrlich: die
+    Migration ist noch nicht appliedet, der Client blendet die Fläche aus
+    (statt „keine Kreise" zu behaupten).
+    """
+    if not SB_AVAILABLE:
+        return jsonify({'ok': True, 'circles': [], 'storage': 'unavailable'})
+    try:
+        r = (sb.table(_CREW_CIRCLES_TABLE).select('*')
+             .order('created_at', desc=True)
+             .limit(_CREW_CIRCLE_LIST_LIMIT).execute())
+        rows = r.data or []
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] list_fail err={type(e).__name__}: {str(e)[:120]}')
+        if _circle_storage_missing(e):
+            return jsonify({'ok': True, 'circles': [], 'storage': 'unavailable'})
+        return jsonify({'ok': False, 'error': 'list_failed'}), 500
+    ids = [str(x.get('id')) for x in rows if x.get('id')]
+    counts = {}
+    my_status = {}
+    for m in _circle_membership_rows(circle_ids=ids):
+        cid = str(m.get('circle_id') or '')
+        if (m.get('status') or 'active') == 'active':
+            counts[cid] = counts.get(cid, 0) + 1
+        if m.get('user_token') == token:
+            my_status[cid] = m.get('status') or 'active'
+    out = [_circle_public(x, counts.get(str(x.get('id')), 0),
+                          my_status.get(str(x.get('id'))),
+                          (x.get('created_by') or '') == token)
+           for x in rows]
+    return jsonify({'ok': True, 'circles': out, 'storage': 'ok'})
+
+
+@app.route('/api/user/circles/<token>', methods=['POST'])
+def create_crew_circle(token):
+    """Kreis anlegen. Body: {name, emoji?, color?, join_policy?}.
+
+    Der Ersteller ist automatisch AKTIVES Mitglied — ein Kreis mit null
+    Mitgliedern wäre sinnlos. Token-binding durch das _bug004-Gate.
+    """
+    import uuid as _uuid
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    body = request.get_json(silent=True) or {}
+    name = ' '.join(str(body.get('name') or '').split())[:_CREW_CIRCLE_NAME_MAX]
+    if len(name) < 2:
+        return jsonify({'ok': False, 'error': 'name_required'}), 400
+    policy = str(body.get('join_policy') or 'open').strip().lower()
+    if policy not in _CREW_CIRCLE_JOIN_POLICIES:
+        policy = 'open'
+    emoji = str(body.get('emoji') or '').strip()[:8] or None
+    color = str(body.get('color') or '').strip()[:9] or None
+    if color and not re.match(r'^#[0-9A-Fa-f]{6}$', color):
+        color = None
+    # Anti-Spam: Deckel für eigene Kreise.
+    try:
+        r = (sb.table(_CREW_CIRCLES_TABLE).select('id')
+             .eq('created_by', token).limit(_CREW_CIRCLE_MAX_OWNED + 1).execute())
+        if len(r.data or []) >= _CREW_CIRCLE_MAX_OWNED:
+            return jsonify({'ok': False, 'error': 'too_many_circles'}), 409
+    except Exception as e:
+        if _circle_storage_missing(e):
+            return jsonify({'ok': False, 'error': 'circles_unsupported'}), 503
+        app.logger.warning(
+            f'[circles] quota_check_fail err={type(e).__name__}: {str(e)[:120]}')
+    cid = _uuid.uuid4().hex[:16]
+    row = {'id': cid, 'name': name, 'emoji': emoji, 'color': color,
+           'join_policy': policy, 'created_by': token,
+           'created_at': datetime.now(timezone.utc).isoformat()}
+    try:
+        sb.table(_CREW_CIRCLES_TABLE).insert(row).execute()
+        sb.table(_CREW_CIRCLE_MEMBERS_TABLE).upsert(
+            {'circle_id': cid, 'user_token': token, 'role': 'owner',
+             'status': 'active',
+             'joined_at': datetime.now(timezone.utc).isoformat()},
+            on_conflict='circle_id,user_token').execute()
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] create_fail err={type(e).__name__}: {str(e)[:160]}')
+        if _circle_storage_missing(e):
+            return jsonify({'ok': False, 'error': 'circles_unsupported'}), 503
+        return jsonify({'ok': False, 'error': 'create_failed'}), 500
+    return jsonify({'ok': True,
+                    'circle': _circle_public(row, 1, 'active', True)})
+
+
+@app.route('/api/user/circles/<token>/<circle_id>', methods=['GET'])
+def get_crew_circle(token, circle_id):
+    """EIN Kreis + mein Verhältnis dazu. Der ERSTELLER sieht zusätzlich die
+    offenen Beitritts-Anfragen (`requests`, nur bei join_policy='request') —
+    als opake match_id + Name/Avatar, nie als rohe Tokens."""
+    row = _circle_load(circle_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    members = _circle_membership_rows(circle_ids=[circle_id])
+    count = sum(1 for m in members if (m.get('status') or 'active') == 'active')
+    my_status = None
+    for m in members:
+        if m.get('user_token') == token:
+            my_status = m.get('status') or 'active'
+            break
+    is_owner = (row.get('created_by') or '') == token
+    out = _circle_public(row, count, my_status, is_owner)
+    if is_owner:
+        pend = [m for m in members if (m.get('status') or '') == 'pending']
+        profs = _profiles_load_bulk([m.get('user_token') for m in pend])
+        out['requests'] = [{
+            'match_id': _circle_match_id(m.get('user_token')),
+            'name': (profs.get(m.get('user_token')) or {}).get('name') or 'Crew',
+            'avatar_url': (profs.get(m.get('user_token')) or {}).get('avatar_url') or None,
+        } for m in pend]
+    return jsonify({'ok': True, 'circle': out})
+
+
+@app.route('/api/user/circles/<token>/<circle_id>/join', methods=['POST'])
+def join_crew_circle(token, circle_id):
+    """Beitreten — FREIWILLIG, idempotent. Bei join_policy='request' landet der
+    Beitritt als `pending` (sichtbar erst nach Bestätigung durch den Ersteller);
+    bei 'open' sofort `active`."""
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    row = _circle_load(circle_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    status = ('pending' if (row.get('join_policy') or 'open') == 'request'
+              else 'active')
+    # Wer schon aktiv drin ist, bleibt aktiv (eine Anfrage darf einen
+    # bestätigten Beitritt nie zurückstufen).
+    existing = _circle_membership_rows(circle_ids=[circle_id], user_token=token)
+    if existing and (existing[0].get('status') or 'active') == 'active':
+        status = 'active'
+    try:
+        sb.table(_CREW_CIRCLE_MEMBERS_TABLE).upsert(
+            {'circle_id': str(circle_id), 'user_token': token,
+             'role': 'owner' if (row.get('created_by') or '') == token else 'member',
+             'status': status,
+             'joined_at': datetime.now(timezone.utc).isoformat()},
+            on_conflict='circle_id,user_token').execute()
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] join_fail err={type(e).__name__}: {str(e)[:160]}')
+        if _circle_storage_missing(e):
+            return jsonify({'ok': False, 'error': 'circles_unsupported'}), 503
+        return jsonify({'ok': False, 'error': 'join_failed'}), 500
+    return jsonify({'ok': True, 'status': status,
+                    'joined': status == 'active', 'pending': status == 'pending'})
+
+
+@app.route('/api/user/circles/<token>/<circle_id>/leave', methods=['POST'])
+def leave_crew_circle(token, circle_id):
+    """Verlassen (auch: eine offene Anfrage zurückziehen). Idempotent.
+
+    Bleibt danach KEIN aktives Mitglied übrig, wird der Kreis gelöscht — ein
+    leerer Kreis ist nur noch ein Name, der Hangouts unsichtbar machen würde."""
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    try:
+        (sb.table(_CREW_CIRCLE_MEMBERS_TABLE).delete()
+         .eq('circle_id', str(circle_id)).eq('user_token', token).execute())
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] leave_fail err={type(e).__name__}: {str(e)[:160]}')
+        if _circle_storage_missing(e):
+            return jsonify({'ok': False, 'error': 'circles_unsupported'}), 503
+        return jsonify({'ok': False, 'error': 'leave_failed'}), 500
+    rest = _circle_membership_rows(circle_ids=[circle_id])
+    deleted = False
+    if not any((m.get('status') or 'active') == 'active' for m in rest):
+        try:
+            sb.table(_CREW_CIRCLES_TABLE).delete().eq('id', str(circle_id)).execute()
+            sb.table(_CREW_CIRCLE_MEMBERS_TABLE).delete().eq(
+                'circle_id', str(circle_id)).execute()
+            deleted = True
+        except Exception as e:
+            app.logger.warning(
+                f'[circles] gc_fail err={type(e).__name__}: {str(e)[:120]}')
+    return jsonify({'ok': True, 'joined': False, 'pending': False,
+                    'circle_deleted': deleted})
+
+
+@app.route('/api/user/circles/<token>/<circle_id>/requests/<match_id>',
+           methods=['POST'])
+def decide_crew_circle_request(token, circle_id, match_id):
+    """Beitritts-Anfrage bestätigen/ablehnen. Body: {approve: bool}.
+
+    NUR der Ersteller. Adressiert wird über die opake `match_id` — das rohe
+    Token eines Anfragenden verlässt den Server nie."""
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    row = _circle_load(circle_id)
+    if not row:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    if (row.get('created_by') or '') != token:
+        return jsonify({'ok': False, 'error': 'not_owner'}), 403
+    approve = bool((request.get_json(silent=True) or {}).get('approve', True))
+    target = None
+    for m in _circle_membership_rows(circle_ids=[circle_id], status='pending'):
+        if _circle_match_id(m.get('user_token')) == str(match_id):
+            target = m.get('user_token')
+            break
+    if not target:
+        return jsonify({'ok': False, 'error': 'request_not_found'}), 404
+    try:
+        if approve:
+            sb.table(_CREW_CIRCLE_MEMBERS_TABLE).update(
+                {'status': 'active'}).eq('circle_id', str(circle_id)).eq(
+                'user_token', target).execute()
+        else:
+            (sb.table(_CREW_CIRCLE_MEMBERS_TABLE).delete()
+             .eq('circle_id', str(circle_id)).eq('user_token', target).execute())
+    except Exception as e:
+        app.logger.warning(
+            f'[circles] decide_fail err={type(e).__name__}: {str(e)[:160]}')
+        return jsonify({'ok': False, 'error': 'decide_failed'}), 500
+    return jsonify({'ok': True, 'approved': approve,
+                    'match_id': str(match_id)})
 
 
 @app.route('/api/leaderboard/<iata>/<token>', methods=['GET'])
@@ -13522,20 +14509,9 @@ def _users_near(lat, lon, radius_km=HANGOUT_GEO_PUSH_RADIUS_KM,
         return []
 
     # Kandidaten-Tokens: alle registrierten Push-Empfänger (paginiert).
-    tokens = []
-    try:
-        for i in range(0, 20000, 1000):
-            r = (sb.table('user_push_tokens').select('user_token')
-                 .range(i, i + 999).execute())
-            batch = [x.get('user_token') for x in (r.data or []) if x.get('user_token')]
-            tokens.extend(batch)
-            if len(batch) < 1000:
-                break
-    except Exception as e:
-        app.logger.warning(
-            f'[hangout-geo] token_scan_fail err={type(e).__name__}: {str(e)[:120]}')
-        return []
-    tokens = [t for t in dict.fromkeys(tokens) if t and t != exclude_token]
+    # Geteilt mit /api/user/crew-here (_crew_push_registered_tokens) — EIN
+    # Scan-Weg, damit beide Flächen denselben Pool sehen.
+    tokens = [t for t in _crew_push_registered_tokens() if t != exclude_token]
     if not tokens:
         return []
 
@@ -13647,10 +14623,17 @@ def create_manual_pin(token):
     werden aus iata aufgelöst wenn nicht mitgegeben. Token-binding durch
     _bug004-Gate.
 
-    `audience` (optional, Owner 2026-07-28) = {airline:'same'|'any',
-    base:'same'|'any', roles:['cockpit'|'cabin'], note:'Wer passt dazu'}.
-    Wird gegen das Ersteller-Profil aufgelöst und eingefroren gespeichert;
-    die Auslieferung filtert serverseitig (_hangout_audience_matches).
+    `audience` (optional) = Zielgruppe. v1 (2026-07-28, Profil-Fakten):
+        {airline:'same'|'any', base:'same'|'any', roles:['cockpit'|'cabin'],
+         note:'Wer passt dazu', vibes:[...]}
+    v2 (2026-07-29, OPERATIVE Fakten aus dem Roster + Kreise):
+        {same_hotel:true, free_tomorrow:true, min_nights:2,
+         arriving_today:true, departing_tomorrow:true, circle_id:'…'}
+    Alles wird gegen den ERSTELLER (Profil + Roster an Ort/Datum des Hangouts)
+    aufgelöst und eingefroren gespeichert; die Auslieferung filtert
+    serverseitig (_hangout_row_matches). Was der Ersteller selbst nicht
+    belegen kann (unbekanntes Hotel, fremder Kreis), fällt weg statt eine
+    unerfüllbare Einschränkung zu speichern.
     """
     import uuid as _uuid
     if not SB_AVAILABLE:
@@ -13670,8 +14653,18 @@ def create_manual_pin(token):
     pin_date = (body.get('date') or '').strip() or None
     note = (body.get('note') or '').strip()[:280] or None
     pin_id = _uuid.uuid4().hex[:16]
+    _owner_prof = (_profile_load(token) or {}).get('profile') or {}
+    # Operative Filter + Kreis werden — wie „same airline" — gegen den ERSTELLER
+    # aufgelöst und eingefroren, und zwar an ORT und DATUM DES HANGOUTS.
+    _raw_aud = body.get('audience') if isinstance(body.get('audience'), dict) else {}
+    _owner_ops = None
+    if any(_raw_aud.get(k) for k in _HANGOUT_OPS_KEYS):
+        _owner_ops = _crew_ops_facts(token, iata, pin_date, profile=_owner_prof)
+    _owner_circles = (_circles_of_user(token)
+                      if str(_raw_aud.get('circle_id') or '').strip() else set())
     audience = _hangout_audience_normalize(
-        body.get('audience'), (_profile_load(token) or {}).get('profile') or {})
+        body.get('audience'), _owner_prof,
+        owner_ops=_owner_ops, owner_circles=_owner_circles)
     meta = _hangout_meta_normalize(body.get('meta'))
     row = {
         'id': pin_id, 'user_token': token, 'iata_code': iata,
@@ -24549,20 +25542,19 @@ def delete_wall_post(token, post_id):
 
 # ─── Crew Forum (Themen-Foren) ──────────────────────────────────────────────
 # Kategorien: cabin | cockpit | general | pay | standby | layover
-FORUM_CATEGORIES = {'cabin', 'cockpit', 'general', 'pay', 'standby', 'layover',
-                    # 'aerox' = App-Rubrik (Feedback/Bugs/Fragen zur App) —
-                    # hält App-Themen aus dem allgemeinen Crew-Teil raus
-                    # (User-Wunsch 2026-07-28). forum_threads.category_id ist
-                    # freies TEXT ohne Constraint ⇒ KEINE Migration nötig.
-                    'aerox'}
+# AEROX-RUBRIK WIEDER ENTFERNT (Owner 2026-07-29, am selben Tag eingeführt):
+# eine eigene App-Rubrik hat das Forum in zwei Sprachen geteilt — App-Feedback
+# lebt wieder mitten unter den Crew-Themen. `_forum_rubric` bleibt als reine
+# ANZEIGE-Ableitung (Marker-Hashtags) erhalten, damit bereits gepostete
+# #aerox-Threads weiterhin klassifizierbar sind; die Kategorie selbst ist raus,
+# es kann also nichts Neues mehr dorthin gepostet werden.
+FORUM_CATEGORIES = {'cabin', 'cockpit', 'general', 'pay', 'standby', 'layover'}
 
-# Marker-Hashtags, die einen Thread auch OHNE aerox-Kategorie der App-Rubrik
-# zuordnen (Alt-Threads / Wall-Brücke). Spiegel von ForumRubric.resolve (iOS).
 FORUM_AEROX_TAGS = {'aerox', 'aeroxfeedback', 'appfeedback'}
 
 
 def _forum_rubric(t):
-    """'aerox' (App-Feedback) vs. 'crew' — Anzeige-Rubrik eines Threads."""
+    """'aerox' (App-Feedback) vs. 'crew' — reine Anzeige-Ableitung."""
     if (t.get('category_id') or '') == 'aerox':
         return 'aerox'
     tags = [str(x).lower() for x in (t.get('hashtags') or [])]

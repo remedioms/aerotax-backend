@@ -3616,8 +3616,16 @@ def flightops_crewlist(token):
     def _cached():
         e = _crew_cache_get(token, flight, date)
         if e and e.get('crew'):
-            return jsonify({'ok': True, 'crew': e['crew'], 'cached': True,
-                            'cached_at': e.get('cached_at')})
+            # AEROX-VERKNÜPFUNG NACHZIEHEN (Owner-Regression 2026-07-29:
+            # „Crew lädt jetzt instant, aber es steht nicht mehr, wer bei
+            # AeroX ist"): der Prefetch schreibt bewusst die ROHE Liste
+            # (Anreicherung kostet ~25 SB-Reads/Leg) — seit er läuft, ist
+            # eine rohe Zeile der Normalfall statt der Ausnahme. Der geteilte
+            # Pfad reicherte längst an, dieser Eigen-Cache-Pfad NICHT: die
+            # „Auf AeroX"-Zeile verschwand. Gleiche Funktion, gleiche Kosten
+            # (nur Supabase-Reads, KEIN LH-Call).
+            return jsonify({'ok': True, 'crew': _crew_reenrich(e['crew']),
+                            'cached': True, 'cached_at': e.get('cached_at')})
         return None
 
     _st, _acc = _access_state(token)
