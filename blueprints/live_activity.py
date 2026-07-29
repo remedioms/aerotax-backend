@@ -97,6 +97,15 @@ from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 
+try:
+    # IANA-Zeitzone pro IATA (kuratierte Tabelle, keine Heuristik). Gebraucht
+    # für `fromTZIdentifier`/`toTZIdentifier` im MQTT-Fanout — ohne sie zeigt
+    # die Live Activity die Marke in Homebase- statt in Ortszeit.
+    from airport_tz import airport_tz as _airport_tz
+except Exception:                                     # pragma: no cover
+    def _airport_tz(iata):
+        return None
+
 log = logging.getLogger('aerotax')
 live_activity_bp = Blueprint('live_activity_bp', __name__)
 
@@ -291,6 +300,29 @@ _CONTENT_FIELDS = {
     # z.B. „Dienstplan-Verbindung erneuern"). Fehlte hier: der Normalizer warf
     # den Key als unknown_key weg und die Lockscreen-Karte verlor den Satz.
     'rosterFrozenNote':    'str',
+    # ── Nachzug 2026-07-29: die Felder, die Swift seit dem 27.07. hat ────────
+    #
+    # ⚠️ ALLE FÜNF WAREN HIER NICHT GELISTET — der Normalizer hat sie als
+    # `unknown_key` VERWORFEN. Der Vertrag ist damit still auseinandergelaufen:
+    # ein Sender durfte sie schicken, angekommen sind sie nie.
+    #
+    # `fromTZIdentifier`/`toTZIdentifier` sind der Grund für diesen Nachzug.
+    # Der Client leitet daraus die ORTSZONE der Marke ab
+    # (`DutyActivityAttributes.ContentState.markZone` → `DutyAnchor.markZone`,
+    # dieselbe Regel wie im Home-Widget). Fehlen sie, rendert die Karte in der
+    # Anzeige-Zone — bei einem Dienstbeginn in San Francisco also die
+    # Frankfurter Uhrzeit, während das Widget daneben die Ortszeit zeigt.
+    # Ein Push OHNE diese Felder überschreibt einen Zustand MIT ihnen (APNs
+    # ersetzt das ContentState vollständig) und dreht den Fehler damit zurück.
+    'fromTZIdentifier':    'str',
+    'toTZIdentifier':      'str',
+    # Flugnummer des AKTIVEN Legs. Wandert mit der Phase (nach dem Turnaround
+    # LH583 statt der beim Start eingefrorenen LH582) — sie hier zu verwerfen
+    # hieß: die Pille zeigt weiter den Hinflug.
+    'flightNo':            'str',
+    # Tages-Angaben des Writers („Do 30.07"), Fußzeile der aufgeklappten Insel.
+    'mainTimeIsToday':     'bool',
+    'mainTimeDayLabel':    'str',
 }
 
 # Nicht-optional in Swift ⇒ Key MUSS im JSON stehen (der synthetisierte
@@ -1014,6 +1046,20 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             'generatedAt': now_iso,
             'fromIATA': frm,
             'toIATA': to,
+            # ORTSZONEN DER BEIDEN STRECKENENDEN (2026-07-29).
+            #
+            # Ohne sie fällt der Client auf die Anzeige-Zone zurück — und weil
+            # dieser Fanout das ContentState VOLLSTÄNDIG ersetzt, hätte ein
+            # einziges MQTT-Event die Ortszeit auf dem Sperrbildschirm wieder
+            # in Homebase-Zeit gedreht, während das Home-Widget weiter die
+            # Ortszeit zeigt. Genau diesen Widerspruch soll die Runde beenden.
+            #
+            # Nachgeschlagen wird in der kuratierten IATA→IANA-Tabelle, nicht
+            # geraten: unbekannter Code ⇒ None ⇒ Feld fällt weg ⇒ der Client
+            # behauptet keine Ortszeit (`DutyAnchor.markZone` liefert dann
+            # `nil`).
+            'fromTZIdentifier': _airport_tz(frm),
+            'toTZIdentifier': _airport_tz(to),
             'schedDep': facts.get('sched_dep') or sector.get('dep_iso'),
             'estDep': est_dep,
             'schedArr': facts.get('sched_arr') or sector.get('arr_iso'),

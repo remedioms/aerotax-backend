@@ -525,6 +525,26 @@ def test_roster_frozen_note_is_part_of_the_contract():
     assert 'bad_type:rosterFrozenNote' in p2
 
 
+def test_leg_timezones_are_part_of_the_contract():
+    """Nachzug 2026-07-29: iOS leitet aus `fromTZIdentifier`/`toTZIdentifier`
+    die ORTSZONE der Marke ab (`DutyAnchor.markZone`). Der Normalizer warf
+    beide Keys als unknown_key weg — die Live Activity zeigte den Dienstbeginn
+    in San Francisco deshalb weiter in Frankfurter Zeit, während das Widget
+    daneben schon die Ortszeit anzeigte."""
+    state, problems = LA._normalize_content_state(
+        _state(fromTZIdentifier='America/Los_Angeles',
+               toTZIdentifier='Europe/Berlin',
+               flightNo='LH455',
+               mainTimeIsToday=False,
+               mainTimeDayLabel='Do 30.07'))
+    assert problems == []
+    assert state['fromTZIdentifier'] == 'America/Los_Angeles'
+    assert state['toTZIdentifier'] == 'Europe/Berlin'
+    assert state['flightNo'] == 'LH455'
+    assert state['mainTimeIsToday'] is False
+    assert state['mainTimeDayLabel'] == 'Do 30.07'
+
+
 def test_normalize_missing_required_key_is_fatal():
     # `stateVersion`/`phase`/`kicker`/`mainTime`/`generatedAt` sind in Swift
     # nicht-optional, und der synthetisierte Decoder nutzt KEINE Defaults.
@@ -893,6 +913,43 @@ def test_push_for_affected_sends_for_delay(sb, auth, apns, monkeypatch):
     assert cs['route'] == 'FRA–JFK' and cs['footLeading'] == 'LH400'
     assert isinstance(cs['estDep'], float)
     assert 'cancelled' not in cs                # kein erfundenes Signal
+
+
+def test_push_for_affected_carries_leg_timezones(sb, auth, apns):
+    """Der Fanout ersetzt das ContentState VOLLSTÄNDIG. Ohne die Zonen hätte
+    ein einziges MQTT-Event die Ortszeit auf dem Sperrbildschirm wieder in
+    Homebase-/Gerätezeit gedreht — während das Home-Widget die Ortszeit zeigt.
+    """
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2026-07-28T08:25:00Z',
+              'arr_iso': '2026-07-28T19:40:00Z'}
+    LA.push_for_affected([(TOKEN, sector)], 'departed', 'LH454',
+                         '2026-07-28',
+                         facts={'est_arr': '2026-07-28T19:55:00Z'})
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['fromTZIdentifier'] == 'Europe/Berlin'
+    assert cs['toTZIdentifier'] == 'America/Los_Angeles'
+
+
+def test_push_for_affected_invents_no_timezone(sb, auth, apns):
+    """Unbekannter IATA-Code ⇒ Feld fällt weg. Der Client behauptet dann keine
+    Ortszeit, statt eine geratene Zone anzuzeigen."""
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    sector = {'flight': 'XX1', 'from': 'FRA', 'to': 'QQQ',
+              'dep_iso': '2026-07-28T08:25:00Z',
+              'arr_iso': '2026-07-28T19:40:00Z'}
+    LA.push_for_affected([(TOKEN, sector)], 'departed', 'XX1', '2026-07-28',
+                         facts={'est_arr': '2026-07-28T19:55:00Z'})
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['fromTZIdentifier'] == 'Europe/Berlin'
+    assert 'toTZIdentifier' not in cs
 
 
 def test_push_for_affected_ignores_irrelevant_kinds(sb, auth, apns):
