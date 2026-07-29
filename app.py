@@ -10472,9 +10472,24 @@ def user_entitlement(token):
     Rollout-Kommentar oben. Antwort: {ok, pro_required, free_until, family}."""
     if not token:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     loaded = _profile_load(token) or {}
     prof = dict(loaded.get('profile') or {})
     is_family = (prof.get('account_type') == 'family')
+    google_sub = prof.get('google_play_subscription')
+    google_active = False
+    google_valid_until = None
+    if isinstance(google_sub, dict) and google_sub.get('active') is True:
+        google_valid_until = google_sub.get('valid_until')
+        try:
+            google_active = (
+                datetime.fromisoformat(
+                    str(google_valid_until).replace('Z', '+00:00'))
+                > datetime.now(timezone.utc)
+            )
+        except Exception:
+            google_active = False
     # Kohorten-Stempel: persistiertes pro_first_seen → echtes Auth-Signup-Datum →
     # sonst JETZT (und einmalig persistieren). So gilt jeder, der die App vor dem
     # Wall-Datum öffnet, als Gründungs-Crew, auch ohne E-Mail-Signup (Apple/Family).
@@ -10487,7 +10502,11 @@ def user_entitlement(token):
     seen_date = str(seen)[:10]
     if is_family:
         return jsonify({'ok': True, 'pro_required': False,
-                        'free_until': None, 'family': True})
+                        'free_until': None, 'family': True,
+                        'subscription_active': google_active,
+                        'subscription_platform': (
+                            'google_play' if google_active else None),
+                        'subscription_valid_until': google_valid_until})
     # HARD WALL: bis zum Wall-Datum gratis, danach erforderlich (Code/Trial/Kauf).
     # Gründungs-Crew = vor dem Wall-Datum dabei → free bis zum Wall-Datum, danach
     # über den 6-Monate-Code (KEINE passive Gnadenfrist mehr, sonst kein Auto-Renew-
@@ -10497,7 +10516,12 @@ def user_entitlement(token):
     free_until = _PAYWALL_WALL_DATE if founding else seen_date
     pro_required = today >= free_until
     return jsonify({'ok': True, 'pro_required': pro_required,
-                    'free_until': free_until, 'family': False, 'founding': founding})
+                    'free_until': free_until, 'family': False,
+                    'founding': founding,
+                    'subscription_active': google_active,
+                    'subscription_platform': (
+                        'google_play' if google_active else None),
+                    'subscription_valid_until': google_valid_until})
 
 
 @app.route('/api/storekit/promo-offer', methods=['GET'])
@@ -11859,23 +11883,65 @@ def _push_installation_register(user_token, registry, unregister_token=None):
         return None
 
 
+def _push_fcm_installation_register(user_token, registry,
+                                    unregister_token=None):
+    """Atomically bind one FCM installation to an account."""
+    reg = registry or {}
+    fcm_token = (reg.get('fcm_token') or '').strip()
+    if not (SB_AVAILABLE and sb is not None and user_token and fcm_token):
+        return None
+    params = {
+        'p_user_token': user_token,
+        'p_fcm_token': fcm_token,
+        'p_bundle_id': (
+            reg.get('bundle_id') or 'de.aerosteuer.aerox').strip(),
+        'p_device_id': (reg.get('device_id') or '').strip() or None,
+        'p_metadata': {
+            'registered_via': reg.get('registered_via') or 'native_fcm',
+        },
+        'p_unregister_secret_hash': (
+            _hashlib.sha256(str(unregister_token).encode('utf-8')).hexdigest()
+            if unregister_token else None),
+    }
+    try:
+        result = sb.rpc('register_fcm_installation', params).execute()
+        data = result.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if isinstance(data, dict):
+            data = data.get('register_fcm_installation') or data.get('id')
+        return str(data) if data else None
+    except Exception as e:
+        app.logger.error(
+            f'[push-install] fcm_register_fail '
+            f'user_ref={_push_token_ref(user_token)} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
 def _push_installations_for_user(user_token):
-    """Return active APNs installations; None means durable store unavailable."""
+    """Return active native installations; None means store unavailable."""
     if not (SB_AVAILABLE and sb is not None and user_token):
         return None
     try:
         result = (sb.table('push_installations').select(
-            'id,user_token,apns_token,bundle_id,environment,device_id,platform,'
-            'active,metadata')
+            'id,user_token,apns_token,fcm_token,bundle_id,environment,device_id,'
+            'platform,active,metadata')
             .eq('user_token', user_token).eq('active', True).execute())
         rows = []
         for row in (result.data or []):
-            if not isinstance(row, dict) or not (row.get('apns_token') or '').strip():
+            if not isinstance(row, dict):
+                continue
+            apns_token = (row.get('apns_token') or '').strip()
+            fcm_token = (row.get('fcm_token') or '').strip()
+            if not apns_token and not fcm_token:
                 continue
             rows.append({
                 'installation_id': str(row.get('id') or ''),
                 'token': user_token,
-                'apns_token': row.get('apns_token') or '',
+                'apns_token': apns_token,
+                'fcm_token': fcm_token,
                 'bundle_id': row.get('bundle_id') or 'aerotax.AeroTax',
                 'apns_env': _push_normalized_environment(row.get('environment')),
                 'device_id': row.get('device_id') or '',
@@ -11916,6 +11982,34 @@ def _push_installation_tombstone(user_token, installation_id=None,
     except Exception as e:
         app.logger.error(
             f'[push-install] tombstone_fail user_ref={_push_token_ref(user_token)} '
+            f'err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return None
+
+
+def _push_fcm_installation_tombstone(user_token, fcm_token=None,
+                                     device_id=None, reason='logout'):
+    """Durably disable the matching Android endpoint(s)."""
+    if not (SB_AVAILABLE and sb is not None and user_token):
+        return None
+    params = {
+        'p_user_token': user_token,
+        'p_fcm_token': (fcm_token or '').strip() or None,
+        'p_device_id': (device_id or '').strip() or None,
+        'p_reason': reason,
+    }
+    try:
+        result = sb.rpc('tombstone_fcm_installations', params).execute()
+        data = result.data
+        if isinstance(data, list):
+            data = data[0] if data else 0
+        if isinstance(data, dict):
+            data = data.get('tombstone_fcm_installations', 0)
+        return int(data or 0)
+    except Exception as e:
+        app.logger.error(
+            f'[push-install] fcm_tombstone_fail '
+            f'user_ref={_push_token_ref(user_token)} '
             f'err={type(e).__name__}: {str(e)[:160]}'
         )
         return None
@@ -11997,7 +12091,9 @@ def _push_delivery_registrations(user_token):
     # (including tombstoned/account-rebound devices), never "lazy rebind me".
     # Lazy re-registration here would allow a stale legacy row to resurrect a
     # logged-out or newly account-bound device.
-    if (legacy.get('apns_token') or '').strip():
+    if ((legacy.get('apns_token') or '').strip()
+            or ((legacy.get('platform') or '').strip().lower() == 'android'
+                and (legacy.get('push_token') or '').strip())):
         # This row belongs to the APNs migration path, so an empty durable set
         # means tombstoned/rebound. Suppress its Expo fallback too; it commonly
         # points at the same physical app installation.
@@ -30455,6 +30551,99 @@ def register_push_apns():
     return jsonify(response)
 
 
+@app.route('/api/push/register-fcm', methods=['POST'])
+def register_push_fcm():
+    """Native Android push registration.
+
+    Body: {token, fcm_token, platform, bundle_id, device_id}. The durable
+    installation registry is authoritative; the legacy row remains a
+    compatibility fallback.
+    """
+    body = request.get_json(silent=True) or {}
+    user_token = (body.get('token') or '').strip()
+    fcm_token = (body.get('fcm_token') or '').strip()
+    if not user_token or not fcm_token:
+        return jsonify({'ok': False, 'error': 'missing token or fcm_token'}), 400
+    if len(fcm_token) > 4096:
+        return jsonify({'ok': False, 'error': 'invalid_fcm_token'}), 400
+    if not _request_bearer_matches(user_token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
+    existing = _push_load(user_token) or {}
+    merged = {
+        **existing,
+        'token': user_token,
+        'push_token': fcm_token,
+        'platform': 'android',
+        'bundle_id': ((body.get('bundle_id') or '').strip()
+                      or 'de.aerosteuer.aerox'),
+        'device_id': (body.get('device_id') or existing.get('device_id') or ''),
+        'registered_at': datetime.now().isoformat(),
+        'registered_via': 'native_fcm',
+    }
+    unregister_token = _secrets.token_urlsafe(32)
+    installation_id = _push_fcm_installation_register(
+        user_token,
+        {
+            'fcm_token': fcm_token,
+            'bundle_id': merged['bundle_id'],
+            'device_id': merged['device_id'],
+            'registered_via': 'native_fcm',
+        },
+        unregister_token=unregister_token,
+    )
+    if SB_AVAILABLE and sb is not None and not installation_id:
+        response = jsonify({'ok': False, 'error': 'push_registry_unavailable'})
+        response.status_code = 503
+        response.headers['Retry-After'] = '5'
+        return response
+    if not _push_save(user_token, merged):
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    response = {'ok': True}
+    if installation_id:
+        response['installation_id'] = installation_id
+        response['unregister_token'] = unregister_token
+    return jsonify(response)
+
+
+@app.route('/api/push/unregister-fcm', methods=['POST'])
+def unregister_push_fcm():
+    """Remove the calling Android installation's FCM endpoint on logout."""
+    body = request.get_json(silent=True) or {}
+    user_token = (body.get('token') or '').strip()
+    if not user_token:
+        return jsonify({'ok': False, 'error': 'missing token'}), 400
+    if not _request_bearer_matches(user_token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
+    existing = _push_load(user_token) or {}
+    requested_fcm = (body.get('fcm_token') or '').strip()
+    requested_device = (body.get('device_id') or '').strip()
+    durable_result = _push_fcm_installation_tombstone(
+        user_token, requested_fcm, requested_device, reason='logout')
+    if SB_AVAILABLE and sb is not None and durable_result is None:
+        response = jsonify({'ok': False, 'error': 'push_registry_unavailable'})
+        response.status_code = 503
+        response.headers['Retry-After'] = '5'
+        return response
+    if not existing:
+        return jsonify({'ok': True, 'noop': durable_result in (None, 0)})
+    stored_fcm = (existing.get('push_token') or '').strip()
+    stored_device = (existing.get('device_id') or '').strip()
+    identity_matches = (
+        (not requested_fcm or requested_fcm == stored_fcm)
+        and (not requested_device or requested_device == stored_device)
+    )
+    if existing.get('platform') != 'android' or not identity_matches:
+        return jsonify({'ok': True, 'noop': durable_result in (None, 0)})
+    cleared = {
+        **existing,
+        'push_token': '',
+        'unregistered_at': datetime.now().isoformat(),
+    }
+    if _push_save(user_token, cleared):
+        return jsonify({'ok': True, 'noop': False})
+    return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+
+
 @app.route('/api/push/unregister-apns', methods=['POST'])
 def unregister_push_apns():
     """Entfernt den Push-Token eines Geräts für diesen User. Body: {token}.
@@ -30784,6 +30973,119 @@ def _send_apns(apns_token, title, body, data=None, topic=None,
         return False, 'transport_error'
 
 
+_FCM_CREDENTIALS_CACHE = {'credentials': None, 'project_id': None}
+
+
+def _fcm_credentials():
+    """Return refreshed Google OAuth credentials and project id.
+
+    ``FCM_SERVICE_ACCOUNT_JSON`` accepts either JSON or base64-encoded JSON.
+    With no explicit secret, Application Default Credentials are supported.
+    Secret values are never included in logs or return values.
+    """
+    import base64
+    import google.auth
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account
+
+    cached = _FCM_CREDENTIALS_CACHE.get('credentials')
+    project_id = _FCM_CREDENTIALS_CACHE.get('project_id')
+    if cached is None:
+        raw = os.environ.get('FCM_SERVICE_ACCOUNT_JSON', '').strip()
+        if raw:
+            try:
+                info = json.loads(raw)
+            except (ValueError, TypeError):
+                info = json.loads(base64.b64decode(raw).decode('utf-8'))
+            cached = service_account.Credentials.from_service_account_info(
+                info, scopes=['https://www.googleapis.com/auth/firebase.messaging'])
+            project_id = info.get('project_id')
+        else:
+            cached, project_id = google.auth.default(
+                scopes=['https://www.googleapis.com/auth/firebase.messaging'])
+        project_id = (os.environ.get('FCM_PROJECT_ID', '').strip()
+                      or project_id)
+        if not project_id:
+            raise RuntimeError('missing_fcm_project_id')
+        _FCM_CREDENTIALS_CACHE.update(
+            credentials=cached, project_id=project_id)
+    if not cached.valid or cached.expired or not cached.token:
+        cached.refresh(GoogleAuthRequest())
+    return cached, project_id
+
+
+def _send_fcm(fcm_token, title, body, data=None, thread_id=None):
+    """Send one Android notification via the FCM HTTP v1 API."""
+    try:
+        import requests
+        credentials, project_id = _fcm_credentials()
+        safe_data = {}
+        for key, value in (data or {}).items():
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                safe_data[str(key)] = json.dumps(
+                    value, separators=(',', ':'), ensure_ascii=False)
+            elif isinstance(value, bool):
+                safe_data[str(key)] = 'true' if value else 'false'
+            else:
+                safe_data[str(key)] = str(value)
+        if thread_id:
+            safe_data.setdefault('thread_id', str(thread_id))
+        push_type = safe_data.get('type', '').strip().lower()
+        if (push_type in ('dm', 'group_message', 'chat', 'message')
+                or str(thread_id or '').startswith(('dm__', 'group__'))):
+            channel_id = 'aerox_messages'
+        elif push_type in (
+                'roster_change', 'duty_change', 'flight_update',
+                'inbound_departure', 'inbound_arrival', 'inbound_delay'):
+            channel_id = 'aerox_operations'
+        else:
+            channel_id = 'aerox_community'
+        message = {
+            'token': fcm_token,
+            'notification': {'title': str(title or '')[:120],
+                             'body': str(body or '')[:240]},
+            'data': safe_data,
+            'android': {
+                'priority': 'high',
+                'notification': {
+                    'channel_id': channel_id,
+                    'sound': 'default',
+                    'click_action': 'de.aerosteuer.aerox.NOTIFICATION_OPEN',
+                },
+            },
+        }
+        response = requests.post(
+            f'https://fcm.googleapis.com/v1/projects/{project_id}/messages:send',
+            json={'message': message},
+            headers={
+                'Authorization': f'Bearer {credentials.token}',
+                'Content-Type': 'application/json; charset=UTF-8',
+            },
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return True, None
+        reason = None
+        try:
+            payload = response.json() or {}
+            error = payload.get('error') or {}
+            for detail in error.get('details') or []:
+                if isinstance(detail, dict) and detail.get('errorCode'):
+                    reason = detail.get('errorCode')
+                    break
+            reason = reason or error.get('status')
+        except Exception:
+            pass
+        print(f"[FCM] send failed status={response.status_code} "
+              f"reason={str(reason or 'unknown')[:60]}")
+        return False, reason or f'http_{response.status_code}'
+    except Exception as exc:
+        print(f"[FCM] transport/config error={type(exc).__name__}")
+        return False, 'fcm_transport_error'
+
+
 def _send_push_notification(token, title, body, data=None,
                             thread_id=None, badge=None, category=None,
                             actor_token=None, _return_detail=False):
@@ -30909,8 +31211,59 @@ def _send_push_notification(token, title, body, data=None,
             print(f"[PUSH] tombstoned dead installation "
                   f"user_ref={_push_token_ref(token)} reason={reason}")
 
+    # Android FCM installations participate in the same multi-device fan-out.
+    # The legacy row is only a compatibility fallback during migration.
+    seen_fcm = set()
+    for reg in registrations:
+        fcm_endpoint = (reg.get('fcm_token') or '').strip()
+        if not fcm_endpoint or fcm_endpoint in seen_fcm:
+            continue
+        seen_fcm.add(fcm_endpoint)
+        attempted += 1
+        ok, reason = _send_fcm(
+            fcm_endpoint, title, body, data=data, thread_id=thread_id)
+        if ok:
+            delivered += 1
+            _push_installation_delivery_update(reg, True)
+            print(f"[PUSH] fcm ok user_ref={_push_token_ref(token)} "
+                  f"installation={str(reg.get('installation_id') or 'legacy')[:8]}")
+            continue
+        reasons.append(reason or 'fcm_send_failed')
+        _push_installation_delivery_update(reg, False, reason=reason)
+        if reason in ('UNREGISTERED', 'INVALID_ARGUMENT'):
+            if reg.get('installation_id'):
+                _push_installation_tombstone(
+                    token, installation_id=reg.get('installation_id'),
+                    reason='fcm_' + str(reason).lower())
+            print(f"[PUSH] tombstoned dead fcm installation "
+                  f"user_ref={_push_token_ref(token)} reason={reason}")
+
+    legacy_push_token = ((legacy or {}).get('push_token') or '').strip()
+    legacy_platform = ((legacy or {}).get('platform') or '').strip().lower()
+    fcm_token = (
+        legacy_push_token
+        if legacy_platform == 'android' and legacy_push_token not in seen_fcm
+        else ''
+    )
+    if fcm_token:
+        attempted += 1
+        ok, reason = _send_fcm(fcm_token, title, body, data=data,
+                               thread_id=thread_id)
+        if ok:
+            delivered += 1
+            print(f"[PUSH] fcm ok user_ref={_push_token_ref(token)}")
+        else:
+            reasons.append(reason or 'fcm_send_failed')
+            if reason in ('UNREGISTERED', 'INVALID_ARGUMENT'):
+                try:
+                    _push_save(token, {**legacy, 'push_token': ''})
+                except Exception:
+                    pass
+                print(f"[PUSH] cleared dead fcm endpoint "
+                      f"user_ref={_push_token_ref(token)} reason={reason}")
+
     # Expo is a compatibility fallback, not an additional duplicate channel.
-    expo_token = ((legacy or {}).get('push_token') or '').strip()
+    expo_token = legacy_push_token if legacy_platform != 'android' else ''
     if delivered == 0 and expo_token:
         attempted += 1
         try:
@@ -30935,9 +31288,11 @@ def _send_push_notification(token, title, body, data=None,
         return _result(True, True, 'delivered', delivered, attempted)
     if (legacy or {}).get('_durable_registry_unavailable'):
         return _result(False, False, 'push_registry_unavailable', 0, attempted)
-    if not seen and not expo_token:
+    if not seen and not seen_fcm and not expo_token and not fcm_token:
         return _result(True, True, 'no_active_installations', 0, attempted)
-    if seen and reasons and all(reason in dead_reasons for reason in reasons):
+    native_dead_reasons = dead_reasons + ('UNREGISTERED', 'INVALID_ARGUMENT')
+    if (seen or seen_fcm or fcm_token) and reasons and all(
+            reason in native_dead_reasons for reason in reasons):
         return _result(True, True, 'all_installations_tombstoned', 0, attempted)
     return _result(False, False, ','.join(sorted(set(reasons))) or 'send_failed',
                    0, attempted)
@@ -48688,7 +49043,302 @@ def upload_calendar_events(token):
                     'reconcile': _reconcile_dbg})
 
 
-# ── IAP-Mock (UI-only, kein echter StoreKit-Hit) ──────────────────────
+# ── App-store subscriptions ────────────────────────────────────────────
+
+_GOOGLE_PLAY_CREDENTIALS_CACHE = {'credentials': None}
+
+
+def _google_play_credentials():
+    """Refreshed Android Publisher credentials without logging secrets."""
+    import base64 as _b64
+    import google.auth
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account
+
+    credentials = _GOOGLE_PLAY_CREDENTIALS_CACHE.get('credentials')
+    if credentials is None:
+        raw = os.environ.get('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON', '').strip()
+        if raw:
+            try:
+                info = json.loads(raw)
+            except (ValueError, TypeError):
+                info = json.loads(_b64.b64decode(raw).decode('utf-8'))
+            credentials = service_account.Credentials.from_service_account_info(
+                info,
+                scopes=['https://www.googleapis.com/auth/androidpublisher'],
+            )
+        else:
+            credentials, _ = google.auth.default(
+                scopes=['https://www.googleapis.com/auth/androidpublisher'])
+        _GOOGLE_PLAY_CREDENTIALS_CACHE['credentials'] = credentials
+    if (not credentials.valid or credentials.expired
+            or not credentials.token):
+        credentials.refresh(GoogleAuthRequest())
+    return credentials
+
+
+def _google_play_account_ref(user_token):
+    """The exact non-PII identifier attached with obfuscatedAccountId."""
+    return _hashlib.sha256(
+        str(user_token or '').encode('utf-8')).hexdigest()
+
+
+def _google_play_subscription_verify(user_token, purchase_token):
+    """Verify one Play subscription and acknowledge its initial purchase."""
+    import requests
+
+    package_name = os.environ.get(
+        'GOOGLE_PLAY_PACKAGE_NAME', 'de.aerosteuer.aerox').strip()
+    product_id = os.environ.get(
+        'AEROX_GOOGLE_PLAY_YEARLY_PRODUCT', 'aerox.pro.yearly').strip()
+    credentials = _google_play_credentials()
+    base = (
+        'https://androidpublisher.googleapis.com/androidpublisher/v3/'
+        f'applications/{package_name}/purchases/subscriptionsv2/tokens/'
+        f'{purchase_token}'
+    )
+    response = requests.get(
+        base,
+        headers={'Authorization': f'Bearer {credentials.token}'},
+        timeout=10,
+    )
+    if response.status_code != 200:
+        app.logger.warning(
+            f'[play-billing] verify_fail status={response.status_code}')
+        return None, f'google_http_{response.status_code}'
+    payload = response.json() or {}
+    external = payload.get('externalAccountIdentifiers') or {}
+    bound_account = (external.get('obfuscatedExternalAccountId') or '').strip()
+    if not bound_account or not hmac.compare_digest(
+            bound_account, _google_play_account_ref(user_token)):
+        return None, 'account_binding_mismatch'
+    matching = [
+        item for item in (payload.get('lineItems') or [])
+        if isinstance(item, dict) and item.get('productId') == product_id
+    ]
+    if not matching:
+        return None, 'product_mismatch'
+    expiries = []
+    for item in matching:
+        try:
+            expiries.append(datetime.fromisoformat(
+                str(item.get('expiryTime') or '').replace('Z', '+00:00')))
+        except Exception:
+            pass
+    valid_until = max(expiries) if expiries else None
+    now_utc = datetime.now(timezone.utc)
+    state = (payload.get('subscriptionState') or '').strip()
+    active_states = {
+        'SUBSCRIPTION_STATE_ACTIVE',
+        'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
+        # A cancelled auto-renewal remains entitled through expiryTime.
+        'SUBSCRIPTION_STATE_CANCELED',
+    }
+    active = bool(
+        state in active_states
+        and valid_until is not None
+        and valid_until > now_utc
+    )
+    acknowledged = (
+        payload.get('acknowledgementState')
+        == 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED'
+    )
+    if active and not acknowledged:
+        ack = requests.post(
+            (
+                'https://androidpublisher.googleapis.com/androidpublisher/v3/'
+                f'applications/{package_name}/purchases/subscriptions/'
+                f'{product_id}/tokens/{purchase_token}:acknowledge'
+            ),
+            json={},
+            headers={
+                'Authorization': f'Bearer {credentials.token}',
+                'Content-Type': 'application/json; charset=UTF-8',
+            },
+            timeout=10,
+        )
+        acknowledged = ack.status_code in (200, 204, 409)
+        if not acknowledged:
+            app.logger.warning(
+                f'[play-billing] acknowledge_fail status={ack.status_code}')
+    return {
+        'active': active,
+        'state': state,
+        'product_id': product_id,
+        'package_name': package_name,
+        'valid_until': valid_until.isoformat() if valid_until else None,
+        'acknowledged': acknowledged,
+        'purchase_token_hash': _hashlib.sha256(
+            purchase_token.encode('utf-8')).hexdigest(),
+        'verified_at': datetime.now(timezone.utc).isoformat(),
+    }, None
+
+
+def _google_play_subscription_index_upsert(user_token, verified):
+    """Persist an RTDN lookup without ever retaining the Play purchase token."""
+    if not (SB_AVAILABLE and sb is not None and user_token
+            and isinstance(verified, dict)):
+        return True
+    token_hash = (verified.get('purchase_token_hash') or '').strip()
+    if not token_hash:
+        return False
+    row = {
+        'purchase_token_hash': token_hash,
+        'user_token': user_token,
+        'product_id': verified.get('product_id'),
+        'package_name': verified.get('package_name'),
+        'active': verified.get('active') is True,
+        'state': verified.get('state'),
+        'valid_until': verified.get('valid_until'),
+        'acknowledged': verified.get('acknowledged') is True,
+        'verified_at': verified.get('verified_at'),
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        sb.table('google_play_subscriptions').upsert(
+            row, on_conflict='purchase_token_hash').execute()
+        return True
+    except Exception as exc:
+        app.logger.error(
+            f'[play-billing] index_upsert_fail '
+            f'user_ref={_push_token_ref(user_token)} '
+            f'err={type(exc).__name__}')
+        return False
+
+
+def _google_play_subscription_owner(purchase_token):
+    """Resolve an RTDN purchase token via its one-way hash."""
+    if not (SB_AVAILABLE and sb is not None and purchase_token):
+        return None
+    token_hash = _hashlib.sha256(
+        purchase_token.encode('utf-8')).hexdigest()
+    try:
+        result = (sb.table('google_play_subscriptions')
+                  .select('user_token')
+                  .eq('purchase_token_hash', token_hash)
+                  .limit(1).execute())
+        rows = result.data or []
+        return (rows[0].get('user_token') or '').strip() if rows else None
+    except Exception as exc:
+        app.logger.error(
+            f'[play-billing] index_lookup_fail err={type(exc).__name__}')
+        raise
+
+
+def _google_play_rtdn_authorized():
+    """Verify the OIDC JWT attached by the dedicated Pub/Sub push identity."""
+    audience = os.environ.get('GOOGLE_PLAY_RTDN_AUDIENCE', '').strip()
+    expected_email = os.environ.get(
+        'GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT_EMAIL', '').strip().lower()
+    auth = (request.headers.get('Authorization') or '').strip()
+    if not audience or not expected_email or not auth.lower().startswith(
+            'bearer '):
+        return False
+    encoded = auth.split(None, 1)[1].strip()
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2 import id_token as google_id_token
+        claims = google_id_token.verify_oauth2_token(
+            encoded, GoogleAuthRequest(), audience=audience)
+    except Exception:
+        return False
+    email = str(claims.get('email') or '').strip().lower()
+    return bool(
+        claims.get('email_verified') is True
+        and hmac.compare_digest(email, expected_email)
+    )
+
+
+@app.route('/api/play/rtdn', methods=['POST'])
+def google_play_rtdn():
+    """Authenticated Google Play real-time subscription lifecycle updates."""
+    if not _google_play_rtdn_authorized():
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    envelope = request.get_json(silent=True) or {}
+    encoded = ((envelope.get('message') or {}).get('data') or '').strip()
+    try:
+        developer = json.loads(base64.b64decode(
+            encoded, validate=True).decode('utf-8'))
+    except Exception:
+        return jsonify({'ok': False, 'error': 'invalid_pubsub_message'}), 400
+    expected_package = os.environ.get(
+        'GOOGLE_PLAY_PACKAGE_NAME', 'de.aerosteuer.aerox').strip()
+    if developer.get('packageName') != expected_package:
+        return jsonify({'ok': False, 'error': 'package_mismatch'}), 403
+    if developer.get('testNotification') is not None:
+        return '', 204
+    notification = developer.get('subscriptionNotification')
+    if not isinstance(notification, dict):
+        # Non-subscription Play events do not affect the AeroX entitlement.
+        return '', 204
+    purchase_token = (notification.get('purchaseToken') or '').strip()
+    subscription_id = (notification.get('subscriptionId') or '').strip()
+    expected_product = os.environ.get(
+        'AEROX_GOOGLE_PLAY_YEARLY_PRODUCT', 'aerox.pro.yearly').strip()
+    if not purchase_token or subscription_id != expected_product:
+        return jsonify({'ok': False, 'error': 'invalid_subscription'}), 400
+    try:
+        user_token = _google_play_subscription_owner(purchase_token)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'lookup_unavailable'}), 503
+    if not user_token:
+        # The purchase may predate this backend or belong to another app. Ack
+        # the Pub/Sub delivery; a client restore will establish the index.
+        app.logger.warning('[play-billing] rtdn_unmapped_purchase')
+        return '', 204
+    try:
+        verified, error = _google_play_subscription_verify(
+            user_token, purchase_token)
+    except Exception as exc:
+        app.logger.error(
+            f'[play-billing] rtdn_verify_error={type(exc).__name__}')
+        return jsonify({'ok': False, 'error': 'verification_unavailable'}), 503
+    if verified is None:
+        app.logger.warning(f'[play-billing] rtdn_rejected reason={error}')
+        return '', 204
+    if not _google_play_subscription_index_upsert(user_token, verified):
+        return jsonify({'ok': False, 'error': 'index_persist_failed'}), 503
+    if not _profile_sidekey_set(
+            user_token, 'google_play_subscription', verified):
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 503
+    return '', 204
+
+
+@app.route('/api/play/subscription/verify', methods=['POST'])
+def verify_google_play_subscription():
+    """Owner-bound server verification for Google Play Billing purchases."""
+    body = request.get_json(silent=True) or {}
+    user_token = (body.get('token') or '').strip()
+    purchase_token = (body.get('purchase_token') or '').strip()
+    if not user_token or not purchase_token:
+        return jsonify(
+            {'ok': False, 'error': 'missing_token_or_purchase'}), 400
+    if len(purchase_token) > 8192:
+        return jsonify({'ok': False, 'error': 'invalid_purchase_token'}), 400
+    if not _request_bearer_matches(user_token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
+    try:
+        verified, error = _google_play_subscription_verify(
+            user_token, purchase_token)
+    except Exception as exc:
+        app.logger.error(
+            f'[play-billing] transport/config error={type(exc).__name__}')
+        return jsonify(
+            {'ok': False, 'error': 'play_verification_unavailable'}), 503
+    if verified is None:
+        status = 403 if error in (
+            'account_binding_mismatch', 'product_mismatch') else 400
+        return jsonify({'ok': False, 'error': error}), status
+    if not _google_play_subscription_index_upsert(user_token, verified):
+        return jsonify({'ok': False, 'error': 'index_persist_failed'}), 503
+    if not _profile_sidekey_set(
+            user_token, 'google_play_subscription', verified):
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 503
+    return jsonify({'ok': True, **verified})
+
+
+# Legacy UI endpoint kept for old clients. It is not trusted by Android's
+# entitlement path; Android uses /api/play/subscription/verify exclusively.
 
 @app.route('/api/user/subscription/<token>', methods=['GET'])
 def get_subscription(token):
