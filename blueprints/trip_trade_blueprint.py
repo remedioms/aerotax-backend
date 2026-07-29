@@ -693,6 +693,12 @@ def _canonical_airline(value):
     if not v:
         return None
     low = v.lower()
+    # Lufthansa Cargo (2026-07-29): fällt bewusst in denselben „Lufthansa"-
+    # Wert — ein Cargo-Pilot soll die Tauschbörse seiner Main-Kollegen sehen
+    # und umgekehrt. „Lufthansa Cargo" träfe schon den Substring; die
+    # Kurzformen „LH Cargo"/„GEC"/„LCAG" (Freitext-Profil) nicht.
+    if low in ('gec', 'lcag') or ('cargo' in low and low.startswith('lh')):
+        return 'Lufthansa'
     if 'lufthansa' in low or low in ('lh', 'dlh'):
         return 'Lufthansa'
     return v

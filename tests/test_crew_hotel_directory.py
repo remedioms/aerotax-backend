@@ -210,3 +210,69 @@ def test_canonical_airline_key():
     assert app._canonical_airline_key('Eurowings') == 'EUROWINGS'
     assert app._canonical_airline_key('') == ''
     assert app._canonical_airline_key(None) == ''
+
+
+# ── Lufthansa Cargo: eigene ANZEIGE, operativ derselbe Bucket ─────────────────
+# Owner 2026-07-29: Cargo wird als eigene Airline wählbar (leichter Kollegen
+# finden), ist aber operativ identisch zu Lufthansa Main. Der Kanonisierer MUSS
+# beides zusammenführen — sonst fiele Cargo-Crew aus Crewhotels, Airline-Forum
+# und der Hangout-Zielgruppe „nur meine Airline" ihrer Main-Kollegen heraus.
+
+def test_canonical_airline_key_cargo_faellt_mit_lufthansa_zusammen():
+    for raw in ('Lufthansa Cargo', 'lufthansa cargo', '  Lufthansa Cargo AG ',
+                'LH Cargo', 'lh cargo', 'GEC', 'gec', 'LCAG'):
+        assert app._canonical_airline_key(raw) == 'LUFTHANSA', raw
+
+
+def test_canonical_airline_key_cargo_bricht_bestand_nicht():
+    """BESTANDSSCHUTZ: wer heute „Lufthansa"/„LH"/„DLH" trägt, behält exakt
+    seinen Bucket — die neue Cargo-Wahl ist rein opt-in, es wird niemand
+    migriert und niemand aus dem LH-Bucket herausgelöst."""
+    assert app._canonical_airline_key('Lufthansa') == 'LUFTHANSA'
+    assert app._canonical_airline_key('LH') == 'LUFTHANSA'
+    assert app._canonical_airline_key('DLH') == 'LUFTHANSA'
+    assert app._canonical_airline_key('Deutsche Lufthansa AG') == 'LUFTHANSA'
+
+
+def test_canonical_airline_key_cargo_kollidiert_nicht_mit_nachbarn():
+    """Der Cargo-Zweig darf weder den Lufthansa-City-Bucket kapern noch
+    fremde Cargo-Airlines einsammeln (eigener Bucket bleibt eigener Bucket)."""
+    assert app._canonical_airline_key('Lufthansa City') == 'LUFTHANSA CITY'
+    assert app._canonical_airline_key('Lufthansa CityLine') == 'LUFTHANSA CITY'
+    assert app._canonical_airline_key('Cargolux') == 'CARGOLUX'
+    assert app._canonical_airline_key('Turkish Cargo') == 'TURKISH CARGO'
+    assert app._canonical_airline_key('Cargo') == 'CARGO'
+
+
+def test_canonical_airline_label_nennt_den_wirklich_gefilterten_kreis():
+    """Das Zielgruppen-Label darf keine Trennung versprechen, die der Filter
+    nicht macht: „Lufthansa Cargo" filtert auf ALLE Lufthansa."""
+    assert app._canonical_airline_label('Lufthansa Cargo') == 'Lufthansa'
+    assert app._canonical_airline_label('LH') == 'Lufthansa'
+    assert app._canonical_airline_label('lx') == 'SWISS'
+    # Ist der Roh-String selbst der Bucket-Name, gewinnt die Schreibweise des Users.
+    assert app._canonical_airline_label('Lufthansa') == 'Lufthansa'
+    assert app._canonical_airline_label('SWISS') == 'SWISS'
+    assert app._canonical_airline_label('AeroWest') == 'AeroWest'
+    assert app._canonical_airline_label('') == ''
+    assert app._canonical_airline_label(None) == ''
+
+
+def test_hangout_audience_cargo_sieht_lufthansa_treffs_und_umgekehrt():
+    """Kernversprechen: die Zielgruppe „nur meine Airline" eines Cargo-Piloten
+    trifft die Main-Kollegen an derselben Station — und der Treff eines
+    Main-Kollegen bleibt für Cargo sichtbar. Sonst wäre die neue Wahl eine
+    Verschlechterung."""
+    aud_cargo = app._hangout_audience_normalize(
+        {'airline': 'same'}, {'airline': 'Lufthansa Cargo'})
+    assert aud_cargo['airline'] == 'LUFTHANSA'
+    assert aud_cargo['airline_label'] == 'Lufthansa'
+    assert app._hangout_audience_matches(aud_cargo, {'airline': 'Lufthansa'})
+    assert app._hangout_audience_matches(aud_cargo, {'airline': 'LH'})
+
+    aud_main = app._hangout_audience_normalize(
+        {'airline': 'same'}, {'airline': 'Lufthansa'})
+    assert app._hangout_audience_matches(aud_main, {'airline': 'Lufthansa Cargo'})
+    # Fremde Airlines bleiben draußen (fail-closed wie bisher).
+    assert not app._hangout_audience_matches(aud_main, {'airline': 'SWISS'})
+    assert not app._hangout_audience_matches(aud_main, {'airline': ''})

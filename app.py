@@ -12793,7 +12793,10 @@ def _hangout_audience_normalize(raw, owner_profile, owner_ops=None,
         key = _canonical_airline_key(prof.get('airline'))
         if key:
             out['airline'] = key
-            out['airline_label'] = (prof.get('airline') or '').strip() or key
+            # Label = der Kreis, der WIRKLICH gefiltert wird (2026-07-29):
+            # ein Cargo-Profil filtert auf den LUFTHANSA-Bucket, also steht da
+            # „Nur Lufthansa" — „Nur Lufthansa Cargo" wäre schlicht gelogen.
+            out['airline_label'] = _canonical_airline_label(prof.get('airline')) or key
     elif airline_in and airline_in.lower() != 'any':
         # KONKRETE Airline („SWISS", „Lufthansa", „LX") — durch denselben
         # Kanonisierer wie das Profil, sonst träfen „LX" und „SWISS" nie
@@ -12801,7 +12804,7 @@ def _hangout_audience_normalize(raw, owner_profile, owner_ops=None,
         key = _canonical_airline_key(airline_in)
         if key:
             out['airline'] = key
-            out['airline_label'] = airline_in[:40]
+            out['airline_label'] = (_canonical_airline_label(airline_in) or key)[:40]
     base_in = str(raw.get('base') or '').strip()
     if base_in.lower() == 'same':
         base = (prof.get('homebase') or '').strip().upper()
@@ -25517,7 +25520,10 @@ def get_wall_feed(token):
     # Anonyme Posts tragen kein author_airline (wird unten gestrippt) → fallen aus
     # einer airline-gefilterten Ansicht heraus (man kann sie keiner Airline
     # zuordnen, ohne die Anonymität zu brechen).
-    airline_filter = (request.args.get('airline') or '').strip().upper() or None
+    # Kanonisiert (2026-07-29, Lufthansa Cargo): „LH", „Lufthansa" und
+    # „Lufthansa Cargo" gehören operativ in DIESELBE Wall-Sicht. Ohne den
+    # Kanonisierer sähe ein Cargo-Profil nur noch Cargo-Posts.
+    airline_filter = _canonical_airline_key(request.args.get('airline')) or None
     friends = set((_friends_load(token).get('friends') or []))
     friends.add(token)
     blocked = _blocked_by(token)
@@ -25561,7 +25567,7 @@ def get_wall_feed(token):
     if airline_filter:
         feed = [p for p in feed
                 if not p.get('is_anonymous')
-                and (p.get('author_airline') or '').strip().upper() == airline_filter]
+                and _canonical_airline_key(p.get('author_airline')) == airline_filter]
     feed.sort(key=lambda p: -(p.get('ts') or 0))
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
@@ -26661,16 +26667,23 @@ def forum_list_threads(token):
     # Airline-Scope (User-Feature): (1) erzwungene Sichtbarkeit — Threads mit
     # scope='airline' sieht NUR die gleiche Airline; (2) optionaler Nutzer-Filter
     # ?airline_scope=mine → nur Threads der eigenen Airline.
+    # KANONISIERT vergleichen (2026-07-29, Lufthansa Cargo): vorher war das ein
+    # roher UPPER-Vergleich — „LUFTHANSA CARGO" != „LUFTHANSA" hätte die neu
+    # wählbare Cargo-Anzeige aus dem LH-Airline-Forum ausgesperrt (und „LH" vs.
+    # „Lufthansa" trennte schon vorher still). Der Kanonisierer ist eine
+    # Viele-zu-Eins-Abbildung: was vorher gleich war, ist es weiterhin — die
+    # Sichtbarkeit kann also nur WACHSEN, nie schrumpfen. Bestandsnutzer
+    # verlieren dadurch keinen Thread.
     try:
-        my_airline = (((_profile_load(token) or {}).get('profile', {}) or {})
-                      .get('airline') or '').strip().upper()
+        my_airline = _canonical_airline_key(
+            ((_profile_load(token) or {}).get('profile', {}) or {}).get('airline'))
     except Exception:
         my_airline = ''
     airline_filter = (request.args.get('airline_scope') or 'all').strip().lower()
 
     def _airline_visible(t):
         tscope = (t.get('scope') or 'all')
-        tair = (t.get('author_airline') or '').strip().upper()
+        tair = _canonical_airline_key(t.get('author_airline'))
         # scope='airline' → NUR sichtbar wenn die Airline des Betrachters die des
         # Threads matcht. FIX (Bug-Hunt #7): vorher war ein airline-only-Thread für
         # jeden OHNE gesetzte Airline sichtbar (Leak). Jetzt restriktiv: kein
@@ -27820,6 +27833,21 @@ def _canonical_airline_key(airline):
     # Airline mit „City" im Namen (Sun City Airlines → LH-City-Bucket-Leak).
     if 'lufthansa city' in v or 'cityline' in v or v == 'vl':
         return 'LUFTHANSA CITY'
+    # Lufthansa Cargo (IATA LH, ICAO GEC) — BEWUSST DERSELBE Schlüssel wie
+    # Lufthansa Main (Owner 2026-07-29, O-Ton eines Cargo-Piloten: „so findet
+    # man freunde einfacher"). Cargo ist eine eigene ANZEIGE und ein eigenes
+    # SUCHKRITERIUM (dort zählt der ROH-String aus dem Profil), aber operativ
+    # dieselbe Welt: gleiche Crewhotels, gleiche Stationen, gleicher
+    # LH-FlightOps-Bucket. Ein EIGENER Bucket wäre eine Verschlechterung — er
+    # würde Cargo-Crew aus dem Hotel-Verzeichnis, aus dem Airline-Forum und
+    # vor allem aus der Hangout-Zielgruppe „nur meine Airline" ihrer
+    # Main-Kollegen an derselben Station aussperren. NICHT auftrennen.
+    # „Lufthansa Cargo" träfe zwar schon den 'lufthansa'-Substring unten; die
+    # Kurzformen „LH Cargo"/„GEC"/„LCAG" (Profil-Airline ist im EditProfile
+    # ein Freitextfeld) nicht — deshalb der explizite Zweig.
+    if ('cargo' in v and ('lufthansa' in v or v.startswith('lh'))) \
+            or v in ('gec', 'lcag'):
+        return 'LUFTHANSA'
     if 'lufthansa' in v or v in ('lh', 'dlh'):
         return 'LUFTHANSA'
     if 'swiss' in v or v in ('lx', 'swr'):
@@ -27833,6 +27861,35 @@ def _canonical_airline_key(airline):
     # „AeroWest" matcht keinen der Substring-Zweige oben und landet damit als
     # eigener Bucket 'AEROWEST' (crowdsource-gefüllt), genau wie gewünscht.
     return v.upper()
+
+
+# Anzeige-Name je kanonischem Bucket. Gebraucht überall dort, wo ein LABEL den
+# Kreis benennt, den der Filter WIRKLICH trifft (Hangout-Zielgruppe).
+_CANONICAL_AIRLINE_LABELS = {
+    'LUFTHANSA': 'Lufthansa',
+    'LUFTHANSA CITY': 'Lufthansa City',
+    'SWISS': 'SWISS',
+    'ITA AIRWAYS': 'ITA Airways',
+}
+
+
+def _canonical_airline_label(airline):
+    """Ehrliches Anzeige-Label für den Kreis, den `_canonical_airline_key`
+    wirklich trifft. '' wenn keine Airline erkennbar.
+
+    Ist der Roh-String selbst schon der Bucket-Name („Lufthansa", „SWISS",
+    unbekannte Airlines), gewinnt der Roh-String — die Schreibweise des Users
+    bleibt erhalten. Fällt er dagegen in einen FREMD benannten Bucket
+    („Lufthansa Cargo"/„LH"/„DLH" → LUFTHANSA, „LX" → SWISS), gewinnt der
+    Gruppenname: sonst verspräche „Nur Lufthansa Cargo" eine Trennung, die der
+    Filter gar nicht macht (er lässt die ganze LH-Crew durch)."""
+    raw = (airline or '').strip()
+    key = _canonical_airline_key(raw)
+    if not key:
+        return ''
+    if raw.upper() == key:
+        return raw
+    return _CANONICAL_AIRLINE_LABELS.get(key, key.title())
 
 
 def _crew_hotel_token_hash(token):

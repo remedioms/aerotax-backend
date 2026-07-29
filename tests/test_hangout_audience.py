@@ -83,9 +83,33 @@ def test_normalize_base_any_bleibt_offen():
 
 
 def test_normalize_konkrete_airline_wird_kanonisiert():
+    """GEÄNDERT 2026-07-29 (Lufthansa Cargo): das Label benennt jetzt den
+    Kreis, der WIRKLICH gefiltert wird, statt den Roh-String durchzureichen.
+    „LX" filtert auf den SWISS-Bucket → „Nur SWISS" (vorher „Nur LX").
+    Auslöser war der Cargo-Fall: „Nur Lufthansa Cargo" hätte eine Trennung
+    versprochen, die der Filter gar nicht macht (er lässt die ganze LH-Crew
+    durch — genau so gewollt, aber das Label darf nicht lügen).
+    KEINE sichtbare Änderung für die App: jeder Wert aus dem iOS-Picker
+    (`HangoutAudienceOptions.airlines`) ist selbst schon der Bucket-Name und
+    behält deshalb seine Schreibweise — siehe die Fälle unten."""
     aud = A._hangout_audience_normalize({'airline': 'LX'}, LH_FRA_CABIN)
     assert aud['airline'] == 'SWISS'
-    assert aud['airline_label'] == 'LX'
+    assert aud['airline_label'] == 'SWISS'
+    # Schreibweise des Users bleibt, wo der Roh-String selbst der Bucket ist.
+    for name in ('Lufthansa', 'Lufthansa City', 'Eurowings', 'Discover',
+                 'Condor', 'Edelweiss', 'Austrian', 'Swiss', 'Brussels',
+                 'TUIfly', 'ITA Airways'):
+        aud = A._hangout_audience_normalize({'airline': name}, LH_FRA_CABIN)
+        assert aud['airline_label'] == name, name
+
+
+def test_normalize_konkrete_airline_cargo_meint_ganz_lufthansa():
+    """Cargo ist operativ Lufthansa: Zielgruppe und Label sagen das auch."""
+    aud = A._hangout_audience_normalize({'airline': 'Lufthansa Cargo'},
+                                        LH_FRA_CABIN)
+    assert aud['airline'] == 'LUFTHANSA'
+    assert aud['airline_label'] == 'Lufthansa'
+    assert A._hangout_audience_label(aud).startswith('Nur Lufthansa')
 
 
 def test_konkrete_base_filtert_wie_die_eigene():
