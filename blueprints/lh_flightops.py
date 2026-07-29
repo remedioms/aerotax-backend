@@ -909,7 +909,14 @@ _LHFO_HOUR_INTERACTIVE_CEILING = 900
 # Analog zum Stunden-Gate um die Refresher-Marge gesenkt (Tageslimit 6.000;
 # Lazy-Rotation-Refreshes ≈ wenige hundert/Tag laufen separat in lhfoRD:).
 _LHFO_DAY_BACKGROUND_CEILING = 5000
-_LHFO_DAY_INTERACTIVE_CEILING = 5600
+# TEMP-ANHEBUNG 2026-07-29 abends: Der Tagesdeckel war um ~15:00Z gerissen
+# (5601 >= 5600) → interaktive User-Imports fleet-weit tot (502→CF-404) für
+# die restlichen ~6 h bis zum UTC-Mitternacht-Reset, mitten in der Abend-
+# Primetime. 5900 lässt interaktive Flows wieder durch und hält 100 Calls
+# Sicherheitsband unter dem echten LH-Tageskontingent von 6.000; Hintergrund
+# bleibt bei 5000 voll gestoppt. Nach Wirkungsnachweis der Quota-Diät
+# (Verbrauch < 5000/Tag) zurück auf 5600 senken.
+_LHFO_DAY_INTERACTIVE_CEILING = 5900
 
 # Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
 # Supabase, der Tagesstand ändert sich träge — 120 s reichen für einen
