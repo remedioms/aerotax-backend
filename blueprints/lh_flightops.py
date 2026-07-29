@@ -2693,6 +2693,24 @@ def flightops_oauth_exchange():
     tok = _exchange_code(code, flow['verifier'])
     if not tok:
         return jsonify({'ok': False, 'error': 'exchange_failed'}), 502
+    # GEBURTSSTUNDE DES GRANTS festhalten (Owner-Frage 2026-07-28: „wie viele
+    # Accounts sind noch verbunden — und schon wie lange?"). Die zweite Hälfte
+    # war bis hier UNBEANTWORTBAR: `relogin_at` markiert nur den TOD eines
+    # Grants, für sein Alter gab es keinen Zeitstempel. `_tokens_save` ersetzt
+    # den ganzen flightops_tokens-Blob, deshalb muss der Wert HIER am frischen
+    # `tok` hängen — und deshalb verschwinden needs_relogin/relogin_at beim
+    # Neu-Verbinden von selbst.
+    _prev = _tokens_mirror_raw(flow['user_token']) or {}
+    tok['connected_at'] = time.time()
+    # Erst-Verbindung vs. Wieder-Verbindung unterscheiden: `first_connected_at`
+    # überlebt jedes Relogin und misst die Bindung des Users an LH insgesamt,
+    # `reconnects` zählt, wie oft er dafür schon nachlegen musste (= der Preis,
+    # den die Grant-Burns ihn gekostet haben).
+    tok['first_connected_at'] = _prev.get('first_connected_at') or tok['connected_at']
+    try:
+        tok['reconnects'] = int(_prev.get('reconnects') or 0) + (1 if _prev.get('refresh') or _prev.get('relogin_at') else 0)
+    except (TypeError, ValueError):
+        tok['reconnects'] = 0
     if not _tokens_save(flow['user_token'], tok):
         # Save NICHT bestätigt ⇒ ehrlich scheitern: ein »verbunden« ohne
         # durablen RT wäre eine Familie, die beim ersten Refresh stirbt.
@@ -2738,12 +2756,25 @@ def flightops_oauth_callback_relay():
 def flightops_status(token):
     """Ist dieser User mit FlightOps verbunden?"""
     t = _tokens_load(token)
-    return jsonify({'ok': True,
-                    'connected': bool(t.get('access')
-                                      and not t.get('needs_relogin')),
-                    'needs_relogin': bool(t.get('needs_relogin')),
-                    'scope': t.get('scope'),
-                    'configured': flightops_configured()})
+    out = {'ok': True,
+           'connected': bool(t.get('access')
+                             and not t.get('needs_relogin')),
+           'needs_relogin': bool(t.get('needs_relogin')),
+           'scope': t.get('scope'),
+           'configured': flightops_configured()}
+    # Verbindungs-ALTER (seit 2026-07-28). Nur ausgeben, was wirklich
+    # dasteht — Grants von VOR diesem Deploy haben keinen Zeitstempel, und
+    # ein geschätztes Alter wäre eine erfundene Zahl. Fehlt das Feld, fehlt
+    # die Zeile (Design-Regel: nie Daten erfinden).
+    for k in ('connected_at', 'first_connected_at', 'relogin_at'):
+        if t.get(k):
+            out[k] = t[k]
+    if t.get('reconnects'):
+        out['reconnects'] = t['reconnects']
+    if t.get('connected_at'):
+        out['connected_days'] = round(
+            (time.time() - float(t['connected_at'])) / 86400.0, 1)
+    return jsonify(out)
 
 
 @lh_flightops_bp.route('/api/lh/flightops/import/<token>', methods=['POST'])

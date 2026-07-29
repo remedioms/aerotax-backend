@@ -3110,3 +3110,79 @@ def test_import_kicks_prefetch_after_success(monkeypatch):
     assert kicked and kicked[0][0] == 'AT-U'
     assert fo._crew_prefetch_legs(kicked[0][1], today='2026-07-24')[0]['access'] \
         == 'SECRET42'
+
+
+# ── Verbindungs-ALTER (Owner-Frage: „wie lange schon verbunden?") ────────────
+def test_status_meldet_verbindungsalter(monkeypatch):
+    """`connected_at` → Alter in Tagen. Vorher war nur der TOD eines Grants
+    (`relogin_at`) datiert, seine Geburt nicht."""
+    import time as _t
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'A', 'refresh': 'R', 'scope': 's',
+        'connected_at': _t.time() - 3 * 86400,
+        'first_connected_at': _t.time() - 10 * 86400, 'reconnects': 2})
+    import app as backend
+    d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
+    assert d['connected'] is True
+    assert 2.9 <= d['connected_days'] <= 3.1
+    assert d['reconnects'] == 2
+    assert d['first_connected_at'] < d['connected_at']
+
+
+def test_status_erfindet_kein_alter_fuer_altgrants(monkeypatch):
+    """Grants von VOR dem Deploy haben keinen Zeitstempel — dann fehlt die
+    Zeile, statt ein geschätztes Alter zu erfinden (Design-Regel)."""
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'A', 'refresh': 'R', 'scope': 's'})
+    import app as backend
+    d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
+    assert d['connected'] is True
+    assert 'connected_days' not in d and 'connected_at' not in d
+
+
+def test_exchange_stempelt_verbindung_und_zaehlt_reconnects(monkeypatch):
+    """Beim Neu-Verbinden: connected_at frisch, first_connected_at bleibt,
+    reconnects +1 — und der tote needs_relogin-Zustand ist weg, weil
+    _tokens_save den ganzen Blob ersetzt."""
+    import time as _t
+    alt = _t.time() - 30 * 86400
+    monkeypatch.setattr(fo, 'flightops_configured', lambda: True)
+    monkeypatch.setattr(fo, '_flow_take', lambda s: {
+        'user_token': 'AT-U', 'verifier': 'V'})
+    monkeypatch.setattr(fo, '_exchange_code',
+                        lambda c, v: {'access': 'A', 'refresh': 'R2',
+                                      'scope': 's'})
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: {
+        'refresh': 'R1', 'needs_relogin': True, 'relogin_at': _t.time(),
+        'first_connected_at': alt, 'reconnects': 1})
+    saved = {}
+    monkeypatch.setattr(fo, '_tokens_save',
+                        lambda tok, t: (saved.update(t), True)[1])
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/oauth/exchange',
+        json={'code': 'C', 'state': 'S'}).get_json()
+    assert d['ok'] is True and d['connected'] is True
+    assert saved['first_connected_at'] == alt      # überlebt das Relogin
+    assert saved['reconnects'] == 2                # der Burn ist gezählt
+    assert saved['connected_at'] > alt
+    assert 'needs_relogin' not in saved and 'relogin_at' not in saved
+
+
+def test_erstverbindung_zaehlt_keinen_reconnect(monkeypatch):
+    """Wer sich ZUM ERSTEN MAL verbindet, hat 0 Reconnects — sonst sähe jeder
+    Neu-User wie ein Grant-Burn-Opfer aus."""
+    monkeypatch.setattr(fo, 'flightops_configured', lambda: True)
+    monkeypatch.setattr(fo, '_flow_take', lambda s: {
+        'user_token': 'AT-N', 'verifier': 'V'})
+    monkeypatch.setattr(fo, '_exchange_code',
+                        lambda c, v: {'access': 'A', 'refresh': 'R', 'scope': 's'})
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: {})
+    saved = {}
+    monkeypatch.setattr(fo, '_tokens_save',
+                        lambda tok, t: (saved.update(t), True)[1])
+    import app as backend
+    backend.app.test_client().post('/api/lh/flightops/oauth/exchange',
+                                   json={'code': 'C', 'state': 'S'})
+    assert saved['reconnects'] == 0
+    assert saved['connected_at'] == saved['first_connected_at']
