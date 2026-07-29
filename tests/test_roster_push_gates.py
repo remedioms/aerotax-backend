@@ -215,10 +215,19 @@ def test_pickup_abbau_mit_endzeit_pflege_bleibt_still():
     new = _day_with_pickup(pickup_marker='', start='14:30')
     new['reader_facts']['end_time'] = '20:15'
     assert A._roster_change_is_push_worthy(_mod(old, new)) is False
-    # Ein anderer Layover-Ort dagegen ist echte Substanz.
+    # GEÄNDERT 2026-07-29 (Phantom-Klasse (b)): ein anderer Layover-Ort BEI
+    # unveränderten Sektoren ist ein Derivat der Leg-Reihenfolge, keine
+    # Substanz. Substanz ist er nur noch, wenn die Sektoren ihn tragen …
     lay = _day_with_pickup(pickup_marker='', start='14:30')
     lay['reader_facts'] = dict(lay['reader_facts'], layover_ort='BOS')
+    assert A._roster_change_is_push_worthy(_mod(old, lay)) is False
+    lay['ical_sectors'] = [_sector(to='BOS')]
     assert A._roster_change_is_push_worthy(_mod(old, lay)) is True
+    # … oder wenn eine Seite gar keine Sektoren hat (Feeds ohne ical_sectors).
+    ohne_a = {k: v for k, v in old.items() if k != 'ical_sectors'}
+    ohne_b = {k: v for k, v in old.items() if k != 'ical_sectors'}
+    ohne_b['reader_facts'] = dict(old['reader_facts'], layover_ort='BOS')
+    assert A._roster_change_is_push_worthy(_mod(ohne_a, ohne_b)) is True
 
 
 def test_pickup_praesenz_flip_ist_still_pu_shift_erzeugt_keinen_eintrag():
@@ -314,6 +323,11 @@ def test_blocktime_drift_route_change_is_pushworthy():
     old = _day_with_pickup()
     new2 = _day_with_pickup()
     new2['routing'] = 'FRA-MIA'                            # Route geändert
+    # GEÄNDERT 2026-07-29: das routing-FELD allein reicht nicht mehr, wenn
+    # beide Seiten Sektoren tragen — dann ist es aus ihnen abgeleitet und erbt
+    # jede Rotation. Die echte Streckenänderung steht in den Sektoren.
+    assert A._roster_change_is_push_worthy(_mod(old, new2)) is False
+    new2['ical_sectors'] = [_sector(to='MIA')]
     assert A._roster_change_is_push_worthy(_mod(old, new2)) is True
 
 
@@ -459,15 +473,137 @@ def test_gate4_andere_flugnummer_und_neuer_leg_erzeugen_je_einen_eintrag():
     _echter_eintrag(old, zwei_legs, now=_G4_VOR_DIENST)
 
 
-def test_gate4_layover_und_routing_wechsel_erzeugen_je_einen_eintrag():
+def test_gate4_routing_regel_gilt_nur_ohne_sektoren():
+    # PRÄZISIERT 2026-07-29 (Phantom-Klasse (b)): Regel 3 (routing/layover_ort)
+    # ist laut Docstring dafür da, „die Zielinformation bei Feeds OHNE
+    # ical_sectors" zu tragen. Liegen auf beiden Seiten Sektoren, ist sie ein
+    # DERIVAT davon — und erbt jede Reihenfolge-Rotation der Quelle
+    # (AT-687E2AFA61B942CF: layover_ort MUC↔YVR bei identischen Legs).
+    # (1) Beidseitig Sektoren, identische Legs, nur layover_ort kippt → still.
     old = _g4_day()
     lay = _g4_day()
     lay['reader_facts'] = dict(lay['reader_facts'], layover_ort='OAK')
-    _echter_eintrag(old, lay, now=_G4_VOR_DIENST)
-    # Routing-Feld ohne Sektoren (Feeds ohne ical_sectors).
+    _kein_eintrag(old, lay, now=_G4_VOR_DIENST)
+    # dito für das routing-Feld allein.
+    rt = _g4_day()
+    rt['routing'] = 'FRA-SFO-OAK'
+    _kein_eintrag(old, rt, now=_G4_VOR_DIENST)
+    # (2) Routing-Feld ohne Sektoren (Feeds ohne ical_sectors) → weiter Substanz,
+    #     der dokumentierte Zweck der Regel bleibt erhalten.
     o = {'datum': _G4_DAY, 'klass': 'Flug', 'routing': 'FRA-SFO'}
     n = {'datum': _G4_DAY, 'klass': 'Flug', 'routing': 'FRA-LAX'}
     _echter_eintrag(o, n, now=_G4_VOR_DIENST)
+    # (3) Auch einseitig degradiert (neu ohne Sektoren) greift die Regel noch.
+    ohne = dict(_g4_day(), ical_sectors=[], routing='FRA-LAX')
+    _echter_eintrag(old, ohne, now=_G4_VOR_DIENST)
+    # (4) ECHTER Zielwechsel bleibt unberührt — den trägt Regel 2 (Sektoren).
+    _echter_eintrag(_g4_day(to='DEL', layover='DEL'),
+                    _g4_day(to='BOM', layover='BOM'), now=_G4_VOR_DIENST)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHANTOM-KLASSE (b) 2026-07-29: die REIHENFOLGE der Legs ist keine Substanz
+#
+# `_rc_sector_structure` gab eine GEORDNETE Liste zurück, das Gate verglich
+# `sa_ != sb_`. Konkurrierende Importer (iCal-Feed, LH-FlightOps-ICS, PDF)
+# legen dieselben Legs in unterschiedlicher Reihenfolge ab → Phantom-Änderung
+# bei jedem Quellenwechsel. Live-Belege vom 29.07.:
+#   · AT-7634A16FCF5A498B, 15.07.: identische drei Legs, nur rotiert
+#     (MUC-PMI-STR-PMI ↔ STR-PMI-MUC-PMI-STR),
+#   · AT-687E2AFA61B942CF: Pickup-Marker vor/nach Layover vertauscht, mit
+#     layover_ort MUC↔YVR als Folgefehler.
+# Fix: `sorted()` im Fingerprint (Identität = Flugnummer + Stationen) +
+# Regel 3 nur noch ohne beidseitige Sektoren.
+# ══════════════════════════════════════════════════════════════════════════════
+_ROT_DAY = '2026-08-05'
+
+
+def _leg(flight, frm, to, dep):
+    return {'flight': flight, 'from': frm, 'to': to,
+            'dep_iso': f'{_ROT_DAY}T{dep}:00Z',
+            'arr_iso': f'{_ROT_DAY}T{dep}:00Z'}
+
+
+_ROT_LEGS = [_leg('LH100', 'MUC', 'PMI', '06:00'),
+             _leg('LH101', 'PMI', 'STR', '09:00'),
+             _leg('LH102', 'STR', 'PMI', '12:00')]
+
+
+def _rot_day(legs, routing='MUC-PMI-STR-PMI', layover='PMI'):
+    return {'datum': _ROT_DAY, 'klass': 'Flug', 'routing': routing,
+            'marker': '05:00 LT Briefing MUC',
+            'ical_sectors': list(legs),
+            'reader_facts': {'start_time': '05:00', 'end_time': '13:00',
+                             'layover_ort': layover}}
+
+
+_ROT_NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+
+
+def test_sector_structure_ist_reihenfolge_invariant():
+    a = _rot_day(_ROT_LEGS)
+    b = _rot_day([_ROT_LEGS[2], _ROT_LEGS[0], _ROT_LEGS[1]])
+    assert A._rc_sector_structure(a) == A._rc_sector_structure(b)
+    assert A._rc_sector_structure(a) == sorted(A._rc_sector_structure(a))
+    # … und damit auch die Hysterese-Signatur (sonst pushte jede Rotation neu).
+    assert A._rc_state_sig(a) == A._rc_state_sig(b)
+
+
+def test_rotierte_identische_legs_erzeugen_keinen_eintrag():
+    # AT-7634A16FCF5A498B, 15.07.: dieselben drei Legs, andere Array-Reihenfolge.
+    a = _rot_day(_ROT_LEGS)
+    b = _rot_day([_ROT_LEGS[2], _ROT_LEGS[0], _ROT_LEGS[1]])
+    assert A._rc_meaningfully_modified(a, b) is False
+    _kein_eintrag(a, b, now=_ROT_NOW)
+    _kein_eintrag(b, a, now=_ROT_NOW)
+
+
+def test_rotation_mit_layover_folgefehler_bleibt_still():
+    # AT-687E2AFA61B942CF: Pickup-Marker vor/nach Layover vertauscht → die
+    # Quelle leitet daraus ein anderes routing/layover_ort ab. Solange die
+    # SEKTOREN beidseitig identisch sind, ist das ein Derivat der Rotation.
+    a = _rot_day(_ROT_LEGS, routing='MUC-PMI-STR-PMI', layover='MUC')
+    b = _rot_day([_ROT_LEGS[1], _ROT_LEGS[2], _ROT_LEGS[0]],
+                 routing='STR-PMI-MUC-PMI-STR', layover='YVR')
+    _kein_eintrag(a, b, now=_ROT_NOW)
+
+
+def test_echter_leg_tausch_bleibt_ein_eintrag_trotz_sortierung():
+    # Gegenprobe DEL→BOM: das Ziel wechselt wirklich → Eintrag + Push. Die
+    # Sortierung darf einen echten Tausch NIE verschlucken.
+    a = _rot_day(_ROT_LEGS)
+    b = _rot_day([_ROT_LEGS[0], _ROT_LEGS[1],
+                  _leg('LH102', 'STR', 'BOM', '12:00')])
+    _echter_eintrag(a, b, now=_ROT_NOW)
+    # Auch ein zusätzlicher/fehlender Leg bleibt sichtbar.
+    _echter_eintrag(a, _rot_day(_ROT_LEGS[:2]), now=_ROT_NOW)
+    # … und ein Flugnummern-Tausch bei gleichen Stationen ebenso.
+    _echter_eintrag(a, _rot_day([_ROT_LEGS[0], _ROT_LEGS[1],
+                                 _leg('LH999', 'STR', 'PMI', '12:00')]),
+                    now=_ROT_NOW)
+
+
+def test_rotation_am_endpoint_erzeugt_weder_pending_noch_push(tmp_path):
+    d = (date.today() + timedelta(days=4)).isoformat()
+
+    def _at(datum, legs, layover):
+        day = _rot_day(legs, layover=layover)
+        day['datum'] = datum
+        day['ical_sectors'] = [dict(s, dep_iso=s['dep_iso'].replace(_ROT_DAY,
+                                                                   datum),
+                                    arr_iso=s['arr_iso'].replace(_ROT_DAY,
+                                                                 datum))
+                               for s in legs]
+        return day
+
+    r, push, changes_file = _post(
+        tmp_path,
+        old=[_at(d, _ROT_LEGS, 'MUC')],
+        new=[_at(d, [_ROT_LEGS[2], _ROT_LEGS[0], _ROT_LEGS[1]], 'YVR')])
+    assert r.status_code == 200
+    assert r.get_json()['changes_count'] == 0
+    assert json.loads(changes_file.read_text())['pending'] == []
+    assert push.call_count == 0
 
 
 def test_gate4_dienst_kommt_und_geht_bleibt_ein_eintrag():
@@ -604,17 +740,54 @@ def _post(tmp_path, old, new):
     return r, push, changes_file
 
 
-def test_past_change_recorded_but_not_pushed(tmp_path):
+def test_past_modified_landet_im_verlauf_statt_im_pending(tmp_path):
+    # GEÄNDERT 2026-07-29 (Phantom-Klasse (a)): bis dahin landete ein
+    # 'modified' an einem VERGANGENEN Tag zwar nicht im Push, aber sehr wohl
+    # im pending — und damit im Badge. Fleet-Messung: 77 von 172 offenen
+    # pending-Einträgen hingen an Tagen < heute. Jetzt: Verlauf ja, pending
+    # nein, Push nein.
     d_past = (date.today() - timedelta(days=1)).isoformat()
     r, push, changes_file = _post(
         tmp_path,
         old=[_tag(d_past, routing='FRA-JFK')],
         new=[_tag(d_past, routing='FRA-MIA')])
     assert r.status_code == 200
-    assert r.get_json()['changes_count'] == 1     # in-App-Liste behält den Change
+    assert r.get_json()['changes_count'] == 1     # der Change EXISTIERT …
+    data = json.loads(changes_file.read_text())
+    assert data['pending'] == []                  # … aber ohne Badge-Wirkung
+    assert len(data['history']) == 1
+    assert data['history'][0]['datum'] == d_past
+    assert data['history'][0]['status'] == 'past_auto'
+    assert push.call_count == 0                   # und KEIN Push
+
+
+def test_heutiger_modified_bleibt_pending(tmp_path):
+    # Gegenprobe: HEUTE ist nicht Vergangenheit. Der „heute, aber Dienst schon
+    # beendet"-Zweig von `_roster_change_is_past` bleibt dem PUSH vorbehalten —
+    # die Liste zeigt den heutigen Tag weiter als offen.
+    d_today = date.today().isoformat()
+    r, push, changes_file = _post(
+        tmp_path,
+        old=[_tag(d_today, routing='FRA-JFK')],
+        new=[_tag(d_today, routing='FRA-MIA')])
+    assert r.status_code == 200
+    data = json.loads(changes_file.read_text())
+    assert len(data['pending']) == 1 and data['pending'][0]['status'] == 'pending'
+    assert data.get('history') in ([], None)
+
+
+def test_past_added_und_removed_bleiben_pending(tmp_path):
+    # Nur 'modified' wird archiviert. Ein NACHGETRAGENER oder GESTRICHENER
+    # Dienst in der Vergangenheit ist für Logbuch/Steuer relevant und bleibt
+    # eine offene Kenntnisnahme. ('added' meldet der Diff nur für heute…+10 d,
+    # darum hier über 'removed' geprüft.)
+    d_past = (date.today() - timedelta(days=1)).isoformat()
+    r, push, changes_file = _post(tmp_path, old=[_tag(d_past)], new=[])
+    assert r.status_code == 200
     data = json.loads(changes_file.read_text())
     assert len(data['pending']) == 1
-    assert push.call_count == 0                   # aber KEIN Push
+    assert data['pending'][0]['kind'] == 'removed'
+    assert push.call_count == 0                   # Push-Gate bleibt Vergangenheit
 
 
 def test_pickup_flip_weder_verlauf_noch_push(tmp_path):

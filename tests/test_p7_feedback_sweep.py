@@ -241,13 +241,26 @@ def test_whitelist_klasse_routing_layover_pushen():
     echter_standby = {'datum': '2026-08-02', 'klass': 'Standby', 'routing': '',
                       'reader_facts': {'start_time': '07:10', 'end_time': '18:30'}}
     assert A._roster_change_is_push_worthy(_mod(old, echter_standby)) is True
+    # POLICY-NACHZUG 2026-07-29 (Phantom-Klasse (b)): routing/layover_ort
+    # zählen nur noch, wenn mindestens EINE Seite keine Sektoren hat. Bei
+    # beidseitig belegten Sektoren sind sie aus ihnen abgeleitet und erben die
+    # Leg-REIHENFOLGE der jeweiligen Quelle (Live: MUC↔YVR bei identischen
+    # Legs). Die Streckenänderung selbst trägt die Sektor-Regel.
     routing = dict(_flug_tag(), routing='FRA-JFK')
-    assert A._roster_change_is_push_worthy(_mod(old, routing)) is True
+    assert A._roster_change_is_push_worthy(_mod(old, routing)) is False
+    routing_ohne_sektoren_a = {k: v for k, v in old.items()
+                               if k != 'ical_sectors'}
+    routing_ohne_sektoren_b = dict(routing_ohne_sektoren_a, routing='FRA-JFK')
+    assert A._roster_change_is_push_worthy(
+        _mod(routing_ohne_sektoren_a, routing_ohne_sektoren_b)) is True
     neuer_leg = _flug_tag()
     neuer_leg['ical_sectors'] = [_sec(), _sec(flight='LH441', frm='IAH', to='FRA')]
     assert A._roster_change_is_push_worthy(_mod(old, neuer_leg)) is True
     layover = _flug_tag(layover='JFK')
     alt_layover = _flug_tag(layover='BOS')
+    assert A._roster_change_is_push_worthy(_mod(layover, alt_layover)) is False
+    # Trägt der Sektor den anderen Layover, bleibt es eine echte Änderung.
+    alt_layover['ical_sectors'] = [_sec(to='BOS')]
     assert A._roster_change_is_push_worthy(_mod(layover, alt_layover)) is True
 
 

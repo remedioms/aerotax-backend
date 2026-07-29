@@ -21979,11 +21979,34 @@ def take_roster_snapshot(token):
     try:
         existing = _roster_changes_read(token) or {'pending': [], 'history': []}
         pending = existing.get('pending') or []
+        history = existing.get('history') or []
+        # VERGANGENHEITS-GATE FÜR DIE LISTE (2026-07-29): `modified` an einem
+        # Tag VOR heute (Homebase-lokal) darf keinen Badge mehr erzeugen. Der
+        # Push kennt diese Regel seit dem 20.07. (`_roster_change_is_past`) —
+        # die in-App-Liste kannte sie nicht, und LH trägt nach jeder Landung
+        # Ist-Zeiten/Marker in längst geflogene Tage nach. Fleet-Messung
+        # 2026-07-29: 77 von 172 offenen pending-Einträgen (62 Token) hingen an
+        # Tagen < heute — u.a. ein 24.07.-Eintrag und ein 13.07. mit
+        # IDENTISCHEN Sektoren. Der Nutzer kann daran nichts mehr entscheiden.
+        # Der Eintrag entfällt nicht, er landet direkt im VERLAUF (nachlesbar,
+        # aber ohne „bitte bestätigen"-Wirkung).
+        # `now_hhmm=None` ist Absicht: damit wertet `_roster_change_is_past`
+        # AUSSCHLIESSLICH den Datums-Vergleich `datum < heute` aus. Der
+        # zusätzliche „heute, aber Dienst schon beendet"-Zweig bleibt dem PUSH
+        # vorbehalten — ein Eintrag am HEUTIGEN Tag bleibt pending.
+        # 'added'/'removed' sind unberührt (ein nachgetragener/gestrichener
+        # Dienst in der Vergangenheit ist steuerlich/logbuchseitig relevant).
         for ch in diff:
             ch['detected_at'] = datetime.now().isoformat()
-            ch['status'] = 'pending'
-            pending.append(ch)
+            if (ch.get('kind') == 'modified'
+                    and _roster_change_is_past(ch, _today_ymd, None)):
+                ch['status'] = 'past_auto'
+                history.append(ch)
+            else:
+                ch['status'] = 'pending'
+                pending.append(ch)
         existing['pending'] = pending
+        existing['history'] = history
         # PUSH-GATES — was hier ankommt, hat Gate 2 + Gate 4 schon im Diff
         # passiert (die in-App-Liste ist seit 2026-07-29 selbst substanz-
         # gefiltert). Für den Push kommt zusätzlich dazu:
@@ -22141,14 +22164,27 @@ def _rc_flight_norm(v):
 
 def _rc_sector_structure(day):
     """Struktur-Fingerprint der Flüge OHNE Zeiten (Flugnummer + Stationen):
-    „sind es dieselben Legs?" — Zeiten-Drift bleibt dadurch unsichtbar."""
+    „sind es dieselben Legs?" — Zeiten-Drift bleibt dadurch unsichtbar.
+
+    REIHENFOLGE-INVARIANT seit 2026-07-29 (`sorted`): konkurrierende Importer
+    (iCal-Feed, LH-FlightOps-ICS, PDF) legen dieselben Legs in
+    UNTERSCHIEDLICHER Reihenfolge ab — und die geordnete Liste machte daraus
+    „andere Flüge". Live belegt an AT-7634A16FCF5A498B (15.07., identische drei
+    Legs, nur rotiert: MUC-PMI-STR-PMI ↔ STR-PMI-MUC-PMI-STR) und an
+    AT-687E2AFA61B942CF (Pickup-Marker vor/nach Layover vertauscht). Die
+    IDENTITÄT eines Legs trägt Flugnummer + Stationen, nicht seine Position im
+    Array — dieselben Legs in anderer Reihenfolge sind dieselben Legs. Die
+    ECHTE Reihenfolge braucht hier niemand: der früheste Abflug kommt aus
+    `_rc_first_dep_utc` (liest `dep_iso` selbst), die Abflug-Drift aus
+    `_rc_leg_departures_moved` (eigener Key-Dict), die Anzeige aus
+    `_roster_change_summary` (liest `ical_sectors` roh)."""
     out = []
     for s in ((day or {}).get('ical_sectors') or []):
         if isinstance(s, dict):
             out.append((_rc_flight_norm(s.get('flight')),
                         str(s.get('from') or '').upper(),
                         str(s.get('to') or '').upper()))
-    return out
+    return sorted(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -22316,7 +22352,13 @@ def _rc_duty_substance_changed(a, b, now=None):
          Flugnummer + Stationen, OHNE Zeiten), beidseitig belegt und
          verschieden. „SFO war's, jetzt ist es LAX."
       3. **Routing / Layover-Ort** — beidseitig gefüllt und verschieden; trägt
-         die Zielinformation bei Feeds ohne `ical_sectors`.
+         die Zielinformation bei Feeds ohne `ical_sectors`. NUR DANN: liegen
+         auf BEIDEN Seiten Sektoren vor, ist Regel 2 die Wahrheit und Regel 3
+         ein DERIVAT (Backend/Reader bauen `routing`/`layover_ort` aus genau
+         diesen Sektoren) — sie erbt dann jede Reihenfolge-Rotation und meldet
+         Phantome. Live belegt an AT-687E2AFA61B942CF: identische Legs, nur
+         Pickup-Marker vor/nach Layover vertauscht → `layover_ort` MUC↔YVR als
+         reiner Folgefehler. Gate unten: `if not (sa_ and sb_)`.
       4. **Riesen-Verspätung vor Dienstantritt** — `_rc_huge_delay_before_duty`.
 
     STILL sind damit ALLE reinen Zeit-Änderungen bei identischer Struktur:
@@ -22344,10 +22386,16 @@ def _rc_duty_substance_changed(a, b, now=None):
         sa_, sb_ = _rc_sector_structure(a), _rc_sector_structure(b)
         if sa_ and sb_ and sa_ != sb_:
             return True           # 2) andere Flüge/Stationen
-        for af, bf in ((a.get('routing'), b.get('routing')),
-                       (arf.get('layover_ort'), brf.get('layover_ort'))):
-            if _rc_field_changed(af, bf):
-                return True       # 3) Route/Layover-Ort
+        if not (sa_ and sb_):
+            # 3) Route/Layover-Ort — NUR wenn mindestens eine Seite gar keine
+            #    Sektoren hat. Bei beidseitig belegten Sektoren hat Regel 2
+            #    bereits „dieselben Legs" festgestellt; ein trotzdem
+            #    abweichendes routing/layover_ort ist dann ein Derivat der
+            #    Leg-REIHENFOLGE, kein Dienstwechsel.
+            for af, bf in ((a.get('routing'), b.get('routing')),
+                           (arf.get('layover_ort'), brf.get('layover_ort'))):
+                if _rc_field_changed(af, bf):
+                    return True
         return _rc_huge_delay_before_duty(a, b, now=now)   # 4) Riesen-Delay
     except Exception:
         return True
