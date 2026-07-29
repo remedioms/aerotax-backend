@@ -747,6 +747,10 @@ def _refresher_refresh_grant(user_token):
             log.info('[fo-refresher] fremdes claim (Alt-Code/Übergang) '
                      'token=%s', (user_token or '')[:8])
             return 'skipped_claim_foreign'
+        # VERTEILUNGS-MESSUNG (2026-07-29): genau hier — und nur hier — geht ein
+        # LH-Token-Call raus. Der Zähler beantwortet die Frage, die heute nicht
+        # beantwortbar war: viele Nutzer je einmal zu oft ODER wenige sehr oft?
+        _rot_day_note(user_token)
         nt, err = _refresh(rt)
         if nt:
             # Rotiert der Server den Refresh-Token, den NEUEN persistieren;
@@ -1065,12 +1069,16 @@ def flight_leg_details(user_token, flight, date=None, dep=None, arr=None):
     return _api_get(user_token, '/COMMON_FLIGHT_LEG_DETAILS', params)
 
 
-def crew_hotel(user_token, station, provider=None):
-    """COMMON_CREW_HOTEL_INFO — Layover-Hotel-Infos für eine Station."""
+def crew_hotel(user_token, station, provider=None, interactive=False):
+    """COMMON_CREW_HOTEL_INFO — Layover-Hotel-Infos für eine Station.
+
+    `interactive=True` = Nutzer-Tap (Hotel-Fläche) → reservierter Headroom im
+    Key-Gate, s. _api_get. Default bleibt Hintergrund (Briefing/Verzeichnis)."""
     params = {'station': (station or '').upper()}
     if provider:
         params['provider'] = provider
-    return _api_get(user_token, '/COMMON_CREW_HOTEL_INFO', params)
+    return _api_get(user_token, '/COMMON_CREW_HOTEL_INFO', params,
+                    interactive=interactive)
 
 
 def _truthy(v):
@@ -1177,7 +1185,8 @@ def parse_crew_hotel(resp):
 
 
 def check_in_times(user_token, flight, date, dep, arr,
-                   duty_type='OD', crew_category='COC', **extra):
+                   duty_type='OD', crew_category='COC', interactive=False,
+                   **extra):
     """COMMON_CHECK_IN_TIMES — Briefing-/Check-in-Zeiten je FLUG (→ Pickup/
     Report). Doku-bestätigte Parameter (Owner 2026-07-22): flightDesignator,
     flightDate, departureAirport, arrivalAirport, dutyType (OD/DH),
@@ -1207,7 +1216,11 @@ def check_in_times(user_token, flight, date, dep, arr,
         'flightDate': _date_z(date), 'departureAirport': (dep or '').upper(),
         'arrivalAirport': (arr or '').upper(),
         'dutyType': duty_type, 'crewCategory': crew_category, **extra}
-    return _api_get(user_token, '/COMMON_CHECK_IN_TIMES', params)
+    # `interactive` ist ein EIGENER Keyword-Parameter (NICHT in **extra): sonst
+    # landete er als Query-Param bei LH. Bedeutung wie überall — Nutzer-Tap
+    # bekommt den reservierten Headroom im Key-Gate (s. _api_get).
+    return _api_get(user_token, '/COMMON_CHECK_IN_TIMES', params,
+                    interactive=interactive)
 
 
 def airport_weather(user_token, station, **extra):
@@ -1221,13 +1234,19 @@ def simulator_crewlist(user_token, **params):
     return _api_get(user_token, '/COMMON_SIMULATOR_CREWLIST', params)
 
 
-def service_get(user_token, service, params=None):
+def service_get(user_token, service, params=None, interactive=False):
     """Generischer Service-Call (für Diagnose/Verdrahtung). `service` ist der
-    COMMON_*-Name. Nur echte Services zulassen."""
+    COMMON_*-Name. Nur echte Services zulassen.
+
+    `interactive=True` nur setzen, wenn der Aufruf wirklich an einem Nutzer-Tap
+    hängt (z.B. Check-in-Zeiten) — sonst frisst Hintergrundarbeit den
+    reservierten Headroom (s. _api_get)."""
     s = (service or '').strip().upper()
     if not s.startswith('COMMON_') or not re.fullmatch(r'COMMON_[A-Z_]+', s):
         return None
-    return _api_get(user_token, '/' + s, params if isinstance(params, dict) else {})
+    return _api_get(user_token, '/' + s,
+                    params if isinstance(params, dict) else {},
+                    interactive=interactive)
 
 
 # Das einzige Fenster, für das der MOCK Daten hat (dokumentiertes Beispiel).
@@ -3444,30 +3463,63 @@ def _crew_shared_serve(token, flight, date, dep=None, arr=None, now=None):
 #   • ~130 verbundene User. Bestandslast heute: refresh-all alle 2 h mit
 #     Kadenz-Gate (3,5 h / 11,5 h) ⇒ ~4 Duty-Events-Calls pro User und Tag
 #     (~520) + Rotations-Pickups (~300–400) + interaktive Flows.
-#   • Prefetch-Deckel: 8 Legs pro Import, Horizont 7 Tage, und ein Leg wird nur
-#     angefasst, wenn KEINE Zeile (egal welcher User) jünger als 20 h ist.
-#     Ein Leg kostet damit ≤ 1 Call/Tag — für die ganze Crew zusammen, sobald
-#     zwei AeroX-User denselben Flug haben.
-#   • Worst Case: 130 User × 8 Legs × 1×/20 h ≈ 1.040 Calls/Tag. Realistisch
-#     deutlich weniger (Freitage, überlappende Crews, Kurzstrecken-Legs
-#     desselben Tages). Zusammen mit der Bestandslast bleibt der Tag klar unter
-#     dem Hintergrund-Deckel 5.200.
+#   • Prefetch-Deckel (Stand 29.07.): 8 Legs pro Lauf, Horizont 3 Tage, und ein
+#     Leg wird nur angefasst, wenn KEINE Zeile (egal welcher User) jünger als
+#     20 h ist. Ein Leg kostet damit ≤ 1 Call/20 h — für die ganze Crew
+#     zusammen, sobald zwei AeroX-User denselben Flug haben.
+#   • Worst Case: 141 User × 8 Legs × 1×/20 h ≈ 1.350 Calls/Tag; GEMESSEN sind
+#     es 247 Legs im 3-Tage-Fenster ⇒ ≈ 300 Calls/Tag (Herleitung unten).
 #   • Gegenrechnung: der geteilte Cache SPART interaktive Calls (jeder Tap
 #     innerhalb der TTL ist gratis, statt 1–2 Calls). Netto ist das Paket
 #     quotenneutraler, als der Prefetch allein aussieht.
 # NOTBREMSE: Prefetch hört als ERSTES auf — eigene, tiefere Deckel (550/h,
 # 3.800/Tag) ÜBER dem regulären Hintergrund-Gate in _api_get. Der Roster darf
 # nie an einer Zugabe verhungern (gleiche Logik wie _ROT_LHFO_HOUR_CEILING).
-# GANZER MONAT (Owner 2026-07-28 „preload the whole month"): Horizont 31 Tage,
-# Leg-Deckel auf einen vollen Monatsplan ausgelegt. Der Schutz bleibt bei den
-# eigenen Budget-Deckeln (550/h · 3800/Tag) — ein kalter Erst-Warm verteilt
-# sich damit einfach über mehrere Läufe/Tage, statt die Quote zu reißen.
-# Ferne Legs sind bei LH meist noch LEER — dafür schreibt der Prefetch jetzt
-# einen Leer-MARKER (s. _crew_prefetch_run), sonst holt die halbe Crew täglich
-# dieselbe leere Liste.
-_CREW_PREFETCH_DAYS = 31
-_CREW_PREFETCH_MAX_LEGS = 48
+#
+# ── HORIZONT-KORREKTUR 2026-07-29 (Monats-Prefetch riss das Tagesbudget) ────
+# GEMESSEN, nicht geschätzt:
+#   • ax_api_budget 28.07. → 29.07., common_crewlist: 92 → 2.876 Calls/Tag
+#     (Faktor 31) — exakt seit dem Monats-Prefetch (Horizont 31 Tage/48 Legs).
+#     Am 29.07. 12:50 UTC riss der Tages-Deckel (lhfoD 5.303 ≥ 5.000) und ALLE
+#     Hintergrund-Calls aller User starben.
+#   • RECHNUNG (Tabelle flightops_crew_cache, 29.07. gezählt): im 32-Tage-
+#     Fenster liegen 2.281 Leg-Zeilen (≈71/Tag über die ganze Nutzerbasis).
+#     Jedes Leg wird durch _CREW_PREFETCH_MIN_AGE_S alle 20 h EINMAL geholt
+#     ⇒ 2.281 × 24/20 ≈ 2.740 Calls/Tag. Gemessen: 2.876. Die Rechnung geht
+#     auf — der Monats-Horizont IST die Ursache, kein anderer Pfad.
+# NEUER HORIZONT: 3 Tage (heute + 2). Begründung, in dieser Reihenfolge:
+#   (a) FRISCHE: ein Roster ändert sich. Eine Crew-Liste für ein Leg in drei
+#       Wochen ist bis dahin meist veraltet — sie wäre teuer UND falsch.
+#   (b) HEBEL: der Cache ist GETEILT (_crew_cache_scan über alle User). Der
+#       Spar-Effekt entsteht dort, wo VIELE gleichzeitig dasselbe Leg öffnen —
+#       also bei den nahen Legs (heutiger/nächster Dienst), nicht bei fernen.
+#       Messung 29.07.: pro Datum ≈ so viele DISTINCT flights wie Zeilen
+#       (84 Zeilen/84 Flüge heute) ⇒ ferne Legs teilen praktisch niemanden,
+#       jeder Fern-Prefetch ist ein Voll-Call für genau einen Menschen.
+#   (c) NUTZUNG: angetippt wird der heutige/nächste Dienst. Alles Fernere lädt
+#       beim Antippen nach (flightops_crewlist, interactive=True, schnell).
+#   Kosten im 3-Tage-Fenster (gemessen): 247 Legs über alle User
+#     ⇒ 247 × 24/20 ≈ 296 Calls/Tag statt 2.876 (−~2.580/Tag).
+#     Zum Vergleich: 4 Tage = 317 Legs (≈380/Tag), 7 Tage = 557 (≈670/Tag) —
+#     das Ziel „deutlich unter 500" hält nur der 3-Tage-Horizont mit Luft.
+# HARTES LEG-BUDGET pro User und Lauf: 8. Verteilung im 3-Tage-Fenster
+# (gemessen, 95 User mit Legs): Median 1, p90 7, Maximum 11. 8 lässt also ~95%
+# der User vollständig durch und deckelt nur den Kurzstrecken-Tail; der Rest
+# bleibt dem On-Demand-Pfad. Gekappt wird SICHTBAR (Log in
+# _crew_prefetch_legs) — stilles Abschneiden ist genau das, was uns in den
+# Monats-Prefetch hineingeritten hat.
+_CREW_PREFETCH_DAYS = 3
+_CREW_PREFETCH_MAX_LEGS = 8
 _CREW_PREFETCH_MIN_AGE_S = 20 * 3600
+# LEER-Legs: LH füllt die Crew-Liste erst kurz vor Abflug. Eine leere Antwort
+# erzeugt KEINE Cache-Zeile (_crew_cache_put steigt bei leerer Liste aus, und
+# _crew_cache_scan filtert Zeilen ohne crew weg) — der 20-h-Amortisierer greift
+# dort also NICHT, und dasselbe leere Leg würde bei jedem Kick neu geholt.
+# Deshalb ein prozess-lokaler Leer-Marker: der Hintergrund-Prefetch lebt im
+# Poll-Container, ein Prozess-Gedächtnis reicht für genau diesen Pfad. Der
+# INTERAKTIVE Tap ist davon unberührt (er läuft nie durch diese Funktion).
+_CREW_PREFETCH_EMPTY_TTL_S = 6 * 3600
+_CREW_PREFETCH_EMPTY_MAX = 4000
 _CREW_PREFETCH_HOUR_CEILING = 550
 _CREW_PREFETCH_DAY_CEILING = 3800
 # Pro Token höchstens alle 6 h vorwärmen (refresh-all läuft alle 2 h und
@@ -3481,6 +3533,30 @@ _CREW_PREFETCH_SLEEP_S = 0.7
 _crew_prefetch_seen = {}                 # token → ts des letzten Prefetch-Starts
 _crew_prefetch_lock = threading.Lock()
 _crew_prefetch_active = [0]
+_crew_prefetch_empty = {}                # (flight, date) → ts der LEER-Antwort
+
+
+def _crew_prefetch_empty_recent(flight, date, now=None):
+    """True, wenn LH für dieses Leg zuletzt eine LEERE Crew-Liste geliefert hat
+    (innerhalb _CREW_PREFETCH_EMPTY_TTL_S). Siehe Banner: leere Antworten
+    hinterlassen KEINE Cache-Zeile, der 20-h-Amortisierer greift dort nicht.
+    Pure genug für Tests; wirft nie."""
+    now = now or time.time()
+    with _crew_prefetch_lock:
+        ts = _crew_prefetch_empty.get((str(flight or ''), str(date or '')[:10]))
+    return bool(ts and 0 <= (now - ts) < _CREW_PREFETCH_EMPTY_TTL_S)
+
+
+def _crew_prefetch_empty_mark(flight, date, now=None):
+    """Leer-Antwort merken (prozess-lokal, beschränkt)."""
+    now = now or time.time()
+    with _crew_prefetch_lock:
+        _crew_prefetch_empty[(str(flight or ''), str(date or '')[:10])] = now
+        if len(_crew_prefetch_empty) > _CREW_PREFETCH_EMPTY_MAX:
+            for k in sorted(_crew_prefetch_empty,
+                            key=_crew_prefetch_empty.get)[
+                                :_CREW_PREFETCH_EMPTY_MAX // 2]:
+                _crew_prefetch_empty.pop(k, None)
 
 
 def _crew_prefetch_legs(resp, today=None):
@@ -3489,8 +3565,12 @@ def _crew_prefetch_legs(resp, today=None):
     Pure/testbar."""
     t = str(today or _dt.date.today().isoformat())[:10]
     try:
+        # _CREW_PREFETCH_DAYS zählt KALENDERTAGE INKLUSIVE heute (3 = heute + 2
+        # Tage). Die Grenze unten ist inklusiv, deshalb −1 — vorher deckte
+        # „31" faktisch 32 Tage ab, und genau diese stille Zugabe zahlt man am
+        # Tagesbudget.
         hi = (_dt.date.fromisoformat(t)
-              + _dt.timedelta(days=_CREW_PREFETCH_DAYS)).isoformat()
+              + _dt.timedelta(days=max(1, _CREW_PREFETCH_DAYS) - 1)).isoformat()
     except Exception:
         return []
     out, seen = [], set()
@@ -3510,7 +3590,19 @@ def _crew_prefetch_legs(resp, today=None):
                     'dep': (p.get('departureAirport') or '').upper(),
                     'arr': (p.get('arrivalAirport') or '').upper(),
                     'access': acc})
+    # ZEITLICH NÄCHSTE ZUERST: der Deckel darf nur den fernen Rest abschneiden,
+    # nie den Dienst von heute. Feinere Sortierung als das Flugdatum gibt es
+    # hier nicht — die crewlist-_links tragen nur flightDate (keine Uhrzeit);
+    # innerhalb eines Tages entscheidet daher die Flugnummer (stabil/deterministisch).
     out.sort(key=lambda x: (x['date'], x['flight']))
+    if len(out) > _CREW_PREFETCH_MAX_LEGS:
+        # SICHTBAR kappen (Lehre 29.07.): der Monats-Prefetch schnitt still ab
+        # und niemand sah, dass ein Vielflieger 48 Calls pro Lauf auslöste.
+        # Der Rest ist NICHT verloren — er lädt beim Antippen nach.
+        log.info('[lh_flightops] crew-prefetch gedeckelt: %d von %d Legs '
+                 '(Horizont %d Tage, Deckel %d) — Rest bleibt On-Demand',
+                 _CREW_PREFETCH_MAX_LEGS, len(out), _CREW_PREFETCH_DAYS,
+                 _CREW_PREFETCH_MAX_LEGS)
     return out[:_CREW_PREFETCH_MAX_LEGS]
 
 
@@ -3532,6 +3624,9 @@ def _crew_prefetch_run(token, legs, now=None):
                 log.info('[lh_flightops] crew-prefetch pausiert (Budget) — '
                          '%d Legs offen', len(legs) - done - skipped - failed)
                 break
+            if _crew_prefetch_empty_recent(leg['flight'], leg['date'], now):
+                skipped += 1              # LH hatte hier zuletzt nichts —
+                continue                  # nicht im Stundentakt nachbohren
             best = _crew_pick_best(_crew_cache_scan(leg['flight'], leg['date']),
                                    leg['date'])
             if best:
@@ -3550,13 +3645,14 @@ def _crew_prefetch_run(token, legs, now=None):
                 continue                  # verpasste Zugabe, kein Fehlerfall
             crew = parse_crew_list(resp)
             if not crew:
-                # LH füllt erst kurz vor Abflug. LEER-MARKER trotzdem cachen:
-                # der 20h-Amortisierer unterdrückt damit crew-weit die
-                # tägliche Wieder-Abfrage derselben leeren Fern-Liste (beim
-                # 31-Tage-Horizont sonst der größte Kostenblock). Der Serve-
-                # Pfad liefert leere Zeilen NIE aus (_crew_shared_serve) —
-                # ein interaktiver Tap geht weiter live.
-                _crew_cache_put(token, leg['flight'], leg['date'], [])
+                # LH füllt erst kurz vor Abflug. KORREKTUR 2026-07-29: der alte
+                # Kommentar behauptete einen persistenten „Leer-Marker" — den
+                # gab es nie, `_crew_cache_put` steigt bei leerer Liste sofort
+                # aus (und `_crew_cache_scan` filtert crew-lose Zeilen weg).
+                # Das Leg wurde deshalb bei JEDEM Kick neu geholt. Marker jetzt
+                # prozess-lokal (s. Banner), TTL 6 h. Ein interaktiver Tap geht
+                # weiter live — dieser Marker gilt nur für den Prefetch.
+                _crew_prefetch_empty_mark(leg['flight'], leg['date'], now)
                 skipped += 1
                 continue
             _crew_cache_put(token, leg['flight'], leg['date'], crew)
@@ -3718,14 +3814,20 @@ def flightops_checkin(token):
         return jsonify({'ok': False, 'error': 'not_connected'}), 401
     b = request.get_json(silent=True) or {}
     flight, date = b.get('flight'), b.get('date')
+    # INTERAKTIV (Fund 29.07.): dieser Endpoint hängt an einem Nutzer-Tap, lief
+    # aber unter dem HINTERGRUND-Deckel — nach dem Reißen des Tagesdeckels
+    # (lhfoD 5.303 ≥ 5.000 um 12:50 UTC) bekam der User hier 502, während der
+    # Crew-Button (interactive=True) weiterlief. Nur Hintergrundarbeit darf
+    # sterben; Taps gehören in den reservierten Headroom (900/h · 5.600/Tag).
     p = _resolve_link_params(token, 'checkintimes', flight, date,
-                             b.get('dep'), b.get('arr'))
+                             b.get('dep'), b.get('arr'), interactive=True)
     if p:
-        resp = service_get(token, 'COMMON_CHECK_IN_TIMES', p)
+        resp = service_get(token, 'COMMON_CHECK_IN_TIMES', p, interactive=True)
     else:
         resp = check_in_times(token, flight, date, b.get('dep'), b.get('arr'),
                               duty_type=(b.get('duty_type') or 'OD'),
-                              crew_category=(b.get('crew_category') or 'COC'))
+                              crew_category=(b.get('crew_category') or 'COC'),
+                              interactive=True)
     times = parse_check_in_times(resp)
     if not times:
         return jsonify({'ok': False, 'error': 'checkin_unavailable'}), 502
@@ -3742,7 +3844,10 @@ def flightops_hotel(token):
     if _st != 'ok':
         return jsonify({'ok': False, 'error': 'not_connected'}), 401
     b = request.get_json(silent=True) or {}
-    resp = crew_hotel(token, b.get('station'), b.get('provider'))
+    # INTERAKTIV (Fund 29.07., gleiche Begründung wie beim Check-in): Layover-
+    # Hotel schaut man nach, während man im Bus sitzt — ein Tap, kein Cron.
+    resp = crew_hotel(token, b.get('station'), b.get('provider'),
+                      interactive=True)
     return jsonify({'ok': True, 'hotels': parse_crew_hotel(resp),
                     'station': (b.get('station') or '').upper()})
 
@@ -4183,7 +4288,127 @@ _REFRESHER_DEMAND_RETRY_STATES = frozenset((
     'refused', 'error', 'save_pending'))
 
 
-def _refresher_due(scan, now=None, demand=None):
+# ── ROTATIONS-BREMSE (Verstärkungs-Audit 2026-07-29) ────────────────────────
+# MESSUNG 29.07.: 4.057 oauth_refresh bei 601 gesunden Grants = 6,75 Rotationen
+# pro Grant und Tag. Rechnerisch erklärbar ist davon nur ein Teil:
+#   · Keepalive           601 × 24/20 h            ≈  721/Tag
+#   · Sync-Kadenz (Demand-Vorlauf des 2-h-Crons; AT lebt 59 min < 3,5-h-Takt,
+#     also kostet JEDER Sync-Lauf genau eine Rotation) ≤ 6/Grant/Tag
+# Der Rest kommt aus einer RÜCKKOPPLUNG, die im Code stand:
+#   `transient`/`error` LIESSEN den Demand-Eintrag STEHEN (oben) — und der
+#   'fresh'-Kurzschluss in _refresher_refresh_grant greift NUR, wenn ein
+#   gültiger AT da ist. Ein Grant, dessen Rotation dauerhaft scheitert, hat
+#   keinen gültigen AT ⇒ er war in JEDEM 60-s-Tick erneut fällig:
+#       86.400 s / 60 s = 1.440 LH-Token-Calls pro Tag und Grant.
+#   Genau der Kreis, den man bei einer Drosselung NICHT haben will:
+#   Über-Quota → Fehlschläge → mehr Versuche → mehr Über-Quota.
+# Zwei Bremsen, beide hier:
+#   (1) MINDESTABSTAND _ROT_MIN_GAP_S zwischen zwei LH-Rotationsversuchen
+#       DESSELBEN Grants — unabhängig vom Status. 5 min ist der ehrliche
+#       Boden: ein AT lebt 59 min, eine zweite Rotation innerhalb von 5 min
+#       kann NIE nötig sein. Für „Nutzer braucht es jetzt" kostenlos: nach
+#       einer ERFOLGREICHEN Rotation ist der AT 59 min gültig, der Nutzer
+#       wartet also nie; und ein frisch abgelaufener AT wird weiterhin im
+#       nächsten Tick (≤60 s) rotiert.
+#   (2) EXPONENTIELLER RÜCKZUG nach echten Fehlschlägen (_ROT_FAIL_STATES):
+#       120 s · 2^(n−1), gedeckelt bei 1 h. Ein dauerhaft scheiternder Grant
+#       macht damit ~26 statt 1.440 Versuche/Tag (Faktor ~55).
+# HEILIG BLEIBT: der Keepalive. Der Deckel (1 h) liegt um Größenordnungen
+# unter _REFRESHER_KEEPALIVE_S (20 h) — ein Refresh-Token kann durch die
+# Bremse NIE idle sterben. Und die Bremse macht nichts auf, sie macht nur zu:
+# Claim-RPC, Choke-Point-Gate und der Asymmetrie-Vertrag in _tokens_save sind
+# unberührt.
+_ROT_MIN_GAP_S = 300
+_ROT_BACKOFF_BASE_S = 120
+_ROT_BACKOFF_MAX_S = 3600
+# Nur Status, bei denen wirklich ein LH-Token-Call rausging und scheiterte.
+# Bewusst NICHT dabei: skipped_claim_* (kein LH-Call, Supabase degradiert —
+# schnelles Wiederkommen ist dort richtig und kostet kein Kontingent) und
+# save_pending (Nachsave-Heilung; die bremst schon der Mindestabstand).
+_ROT_FAIL_STATES = frozenset(('transient', 'error'))
+# token -> {'last': ts des letzten Versuchs, 'fails': Fehlschläge in Folge}
+_rot_gate = {}
+_ROT_GATE_CAP = 4000
+
+
+def _rot_backoff_s(fails):
+    """Rückzugsfenster nach `fails` Fehlschlägen in Folge (0 ⇒ nur der
+    Mindestabstand). Verdopplung ab 120 s, hart gedeckelt bei 1 h."""
+    if fails <= 0:
+        return 0.0
+    return float(min(_ROT_BACKOFF_MAX_S, _ROT_BACKOFF_BASE_S * (2 ** (fails - 1))))
+
+
+def _rot_gate_ok(tok, now, gate=None):
+    """Darf dieser Grant JETZT einen LH-Rotationsversuch machen? Wirft nie —
+    im Zweifel True (die Bremse darf niemals einen Grant dauerhaft aussperren;
+    ein verpasster Refresh ist billiger als ein blockierter Keepalive)."""
+    try:
+        g = (_rot_gate if gate is None else gate).get(tok)
+        if not g:
+            return True
+        wait = max(_ROT_MIN_GAP_S, _rot_backoff_s(g.get('fails') or 0))
+        return (now - (g.get('last') or 0)) >= wait
+    except Exception:
+        return True
+
+
+def _rot_gate_note(tok, st, now=None):
+    """Versuch stempeln und Fehlschlagszähler fortschreiben. Bewusst beim
+    VERSUCH (nicht erst beim Erfolg) — der LH-Call ist raus und hat, falls LH
+    Token-Calls aufs Kontingent bucht, bereits gekostet. Wirft nie."""
+    try:
+        now = now or time.time()
+        if len(_rot_gate) > _ROT_GATE_CAP:
+            # Deckel: ältesten Stempel-Block halbieren. Ein verlorener Stempel
+            # heißt nur »darf sofort wieder« — nie »rotiert doppelt«.
+            for k in sorted(_rot_gate,
+                            key=lambda k: _rot_gate[k].get('last') or 0
+                            )[:_ROT_GATE_CAP // 2]:
+                _rot_gate.pop(k, None)
+        g = _rot_gate.setdefault(tok, {'last': 0.0, 'fails': 0})
+        g['last'] = now
+        g['fails'] = (g.get('fails') or 0) + 1 if st in _ROT_FAIL_STATES else 0
+    except Exception:
+        pass
+
+
+# ── VERTEILUNGS-MESSUNG (Auftrag 1d) ────────────────────────────────────────
+# Die Zähler lhfoR/lhfoRD sagen nur, WIE VIELE Token-Calls rausgingen — nicht,
+# ob das viele Nutzer je einmal zu oft oder wenige Nutzer sehr oft waren.
+# Genau diese Frage war heute nicht beantwortbar. Deshalb ein schlanker
+# In-Process-Zähler pro Grant und UTC-Tag (nur im Refresher-Container, der
+# ist der einzige Rotierer): Token gekürzt auf 8 Zeichen, Reset bei Tageswechsel,
+# Ausgabe über /api/internal/flightops/relogin-watch (Top-Verbraucher).
+_rot_day = {'day': '', 'n': {}}
+_ROT_DAY_TOP = 10
+
+
+def _rot_day_note(tok, now=None):
+    """Einen tatsächlich abgesetzten LH-Token-Call diesem Grant zuschreiben."""
+    try:
+        day = time.strftime('%Y%m%d', time.gmtime(now or time.time()))
+        if _rot_day['day'] != day:
+            _rot_day['day'], _rot_day['n'] = day, {}
+        k = (tok or '')[:8]
+        _rot_day['n'][k] = _rot_day['n'].get(k, 0) + 1
+    except Exception:
+        pass
+
+
+def _rot_day_report():
+    """{'day', 'grants', 'calls', 'top': [[tok8, n], …]} — Verteilung der
+    heutigen Rotationen. Leer, solange nichts rotiert wurde."""
+    try:
+        n = _rot_day['n']
+        top = sorted(n.items(), key=lambda kv: -kv[1])[:_ROT_DAY_TOP]
+        return {'day': _rot_day['day'], 'grants': len(n),
+                'calls': sum(n.values()), 'top': [[k, v] for k, v in top]}
+    except Exception:
+        return {}
+
+
+def _refresher_due(scan, now=None, demand=None, out=None):
     """Fällige Grants, am knappsten ablaufende zuerst. needs_relogin und
     Grants ohne RT fallen raus; geparkte behandelt _refresher_refresh_grant
     selbst (nur Nachsave, keine Rotation).
@@ -4206,10 +4431,19 @@ def _refresher_due(scan, now=None, demand=None):
     last_rotated ≈ expires_at − _REFRESHER_AT_LIFETIME_S. Der Fehler ist die
     60-s-Sicherheitsmarge (die Schätzung liegt ~1 min ZU FRÜH ⇒ minimal
     eifriger, nie zu spät). Fehlt expires_at ganz (0), ist der Grant nach
-    dieser Rechnung uralt ⇒ keepalive-fällig — die sichere Richtung."""
+    dieser Rechnung uralt ⇒ keepalive-fällig — die sichere Richtung.
+
+    BREMSE (2026-07-29): zusätzlich muss der Grant das Rotations-Gate passieren
+    (Mindestabstand 5 min, danach exponentieller Rückzug nach Fehlschlägen —
+    s. _rot_gate_ok). Gefiltert wird HIER und nicht erst in
+    _refresher_refresh_grant, damit der Tick für gebremste Grants weder einen
+    Supabase-Read noch den QPS-Schlafschritt bezahlt. Der Rückgabewert bleibt
+    die reine Fällig-Liste (fünf Tests hängen an dieser Form); wie viele Grants
+    die Bremse zurückgehalten hat, landet — falls übergeben — in `out['gated']`
+    fürs Tick-Log."""
     now = now or time.time()
     demand = _refresher_demand if demand is None else demand
-    due = []
+    due, gated = [], 0
     for tok, t in scan:
         if t.get('needs_relogin') or not t.get('refresh'):
             continue
@@ -4220,8 +4454,13 @@ def _refresher_due(scan, now=None, demand=None):
         if not (tok in demand
                 or (now - last_rotated) > _REFRESHER_KEEPALIVE_S):
             continue
+        if not _rot_gate_ok(tok, now):
+            gated += 1
+            continue
         due.append((exp, tok))
     due.sort()
+    if out is not None:
+        out['gated'] = gated
     return [tok for _exp, tok in due]
 
 
@@ -4231,8 +4470,10 @@ def _refresher_tick():
     # Deshalb zählt sie (wie bisher für die Reihenfolge) jetzt auch als
     # Demand-Quelle für die Fällig-Entscheidung.
     wanted = _refresh_wanted_drain()
-    due = _refresher_due(_refresher_scan(),
-                         demand=set(_refresher_demand) | wanted)
+    _out = {}
+    scan = _refresher_scan()
+    due = _refresher_due(scan, demand=set(_refresher_demand) | wanted,
+                         out=_out)
     # Vorgemerkte (ein Worker sah einen abgelaufenen AT) zuerst — aber nur,
     # wenn der durable Stand die Fälligkeit bestätigt; sonst war die
     # Vormerkung stale und wird verworfen.
@@ -4252,6 +4493,11 @@ def _refresher_tick():
         finally:
             _refresher_state['busy'] = False
         stats[st] = stats.get(st, 0) + 1
+        # BREMSE stempeln (2026-07-29): Versuch gezählt, Fehlschlagszähler
+        # fortgeschrieben. Muss VOR dem Demand-Quittieren stehen, damit ein
+        # stehen bleibender Demand den Grant nicht im nächsten 60-s-Tick
+        # erneut gegen LH schickt (das war die Rückkopplung, 1.440 Calls/Tag).
+        _rot_gate_note(tok, st)
         # Demand quittieren — außer bei den Status, die exakt „nochmal
         # versuchen" bedeuten (Claim-Infra weg, LH transient): dort bleibt der
         # Bedarf stehen, sonst müsste der User erneut anklopfen.
@@ -4261,9 +4507,18 @@ def _refresher_tick():
         # stündliche Refresh-Wellen zu bilden.
         time.sleep(_REFRESHER_GRANT_GAP_S + secrets.randbelow(600) / 1000.0)
     _refresher_state['last'] = {'ts': time.time(), 'due': len(ordered),
+                                'gated': _out.get('gated', 0),
+                                'scan': len(scan),
+                                'demand': len(_refresher_demand),
                                 'stats': stats}
-    if ordered:
-        log.info('[fo-refresher] tick due=%d %s', len(ordered), stats)
+    # SICHTBARKEIT (Auftrag 3, 2026-07-29): JEDER Tick loggt — vorher gab es
+    # nur bei Arbeit eine Zeile, und die kam wegen des fehlenden Root-Handlers
+    # ohnehin nie an (s. app.py, Boot-Setup). Eine Zeile/Minute ist der Preis
+    # dafür, dass die Rotationsmechanik künftig aus `docker logs aerotax-poll`
+    # ablesbar ist statt aus Vermutungen.
+    log.info('[fo-refresher] tick scan=%d due=%d gated=%d demand=%d %s',
+             len(scan), len(ordered), _out.get('gated', 0),
+             len(_refresher_demand), stats or '{}')
 
 
 def _refresher_main():
@@ -4480,7 +4735,11 @@ def flightops_relogin_watch():
                         'expected': _refresher_enabled(),
                         'active': bool(_refresher_state.get('active')),
                         'last_tick': _refresher_state.get('last_tick'),
-                        'last': _refresher_state.get('last')}})
+                        'last': _refresher_state.get('last'),
+                        # Verstärkungs-Audit 2026-07-29: Rotationen pro Grant
+                        # und Tag (Top-Verbraucher). Ohne das war „6,75 pro
+                        # Grant" ein Mittelwert ohne Verteilung.
+                        'rotations_today': _rot_day_report()}})
 
 
 # Rollen-gesteuerter Autostart (No-Op ohne LH_FLIGHTOPS_REFRESHER=1 bzw. ohne

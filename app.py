@@ -141,6 +141,32 @@ app.logger.setLevel(_log_level)
 # vom propagierten gunicorn-handler trotzdem geschluckt.
 _aerox_logging.getLogger().setLevel(_log_level)
 _aerox_logging.getLogger('gunicorn.error').setLevel(_log_level)
+
+# ── DER FEHLENDE HANDLER (Blindflug-Fund 2026-07-29) ───────────────────────
+# Das Level-Setup oben war seit 2026-05-31 nur die halbe Miete: LEVEL ohne
+# HANDLER bringt nichts. Fast das ganze Backend loggt über
+# `logging.getLogger('aerotax')` — dieser Logger hat keinen eigenen Handler und
+# propagiert an den Root-Logger. Der hat unter gunicorn AUCH keinen: gunicorn
+# hängt seine Handler an `gunicorn.error`/`gunicorn.access` und setzt dort
+# ausdrücklich `propagate = False`; Flask hängt seinen Default-Handler an
+# `app.logger` (Logger-Name 'app'), nicht an Root. Ohne Handler in der ganzen
+# Kette greift Pythons `logging.lastResort` — und der hat Level WARNING.
+# ERGEBNIS: JEDER log.info(...) des Backends wurde still verworfen. Genau
+# deshalb lieferte `docker logs aerotax-poll | grep 'fo-refresher'` NULL Zeilen,
+# obwohl der Refresher-Loop nachweislich lief (Status-Endpoint meldete frische
+# Ticks) — die Rotations-Diagnose war ein Blindflug, log.warning/error kamen
+# durch (lastResort ≥ WARNING), die Zusammenfassungen nicht.
+# Lokal reproduziert: Root-Level INFO + 0 Handler ⇒ info() unsichtbar,
+# warning() sichtbar.
+# Nur setzen, wenn WIRKLICH niemand einen Handler hat (unter pytest hängt das
+# logging-Plugin eigene Handler an — dort nichts doppeln).
+import sys as _aerox_sys
+if not _aerox_logging.getLogger().handlers and 'pytest' not in _aerox_sys.modules:
+    _root_h = _aerox_logging.StreamHandler(_aerox_sys.stdout)
+    _root_h.setFormatter(_aerox_logging.Formatter(
+        '%(asctime)s %(levelname)s %(name)s %(message)s'))
+    _aerox_logging.getLogger().addHandler(_root_h)
+
 _install_logging_redaction(
     app.logger,
     _aerox_logging.getLogger(),
@@ -19621,7 +19647,16 @@ def _maybe_refresh_flightops(token):
         def _do():
             try:
                 from blueprints.lh_flightops import flightops_import
-                with app.test_request_context(json={}):
+                # HINTERGRUND (Fund 29.07.): dieser Re-Import lief mit LEEREM
+                # Body und galt damit im Key-Gate als INTERAKTIV — er fraß den
+                # Headroom, der für echte Taps (Connect, Re-Login-Heilung,
+                # Crew-Button) reserviert ist. Er ist aber fire-and-forget:
+                # die Antwort an den User kommt aus den gespeicherten
+                # Briefings, ein ausgefallener Lauf heißt „Roster minimal
+                # älter", nicht „App kaputt". Genau das ist die Definition von
+                # Hintergrundarbeit — also `background:1` (Deckel 650/h ·
+                # 5.000/Tag) wie im refresh-all-Cron.
+                with app.test_request_context(json={'background': 1}):
                     flightops_import(token)
             except Exception as e:
                 app.logger.warning(f'[flightops-refresh] tok={token[:8]} {type(e).__name__}')

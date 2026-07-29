@@ -349,9 +349,15 @@ def test_parse_crew_hotel_real():
 
 
 def test_service_get_rejects_bad_service(monkeypatch):
-    monkeypatch.setattr(fo, '_api_get', lambda tok, path, params=None: {'called': path})
+    monkeypatch.setattr(fo, '_api_get',
+                        lambda tok, path, params=None, interactive=False:
+                        {'called': path, 'interactive': interactive})
     assert fo.service_get('T', 'DROP TABLE') is None
-    assert fo.service_get('T', 'common_crewlist') == {'called': '/COMMON_CREWLIST'}
+    assert fo.service_get('T', 'common_crewlist') == {
+        'called': '/COMMON_CREWLIST', 'interactive': False}
+    # Nutzer-Taps dürfen den reservierten Headroom nutzen (2026-07-29).
+    assert fo.service_get('T', 'common_crewlist',
+                          interactive=True)['interactive'] is True
 
 
 def test_ping_endpoint(monkeypatch):
@@ -1139,7 +1145,8 @@ def test_checkin_endpoint_prefers_link_params(monkeypatch):
                         lambda tok: fo.extract_duty_links(DUTY_LINKS))
     got = {}
     monkeypatch.setattr(fo, 'service_get',
-                        lambda tok, svc, params: got.update(svc=svc, p=params) or
+                        lambda tok, svc, params, interactive=False:
+                        got.update(svc=svc, p=params, ia=interactive) or
                         {'briefingBegin': '2026-07-24T07:30:00Z'})
     import app as backend
     r = backend.app.test_client().post('/api/lh/flightops/checkin/AT-U',
@@ -1150,6 +1157,8 @@ def test_checkin_endpoint_prefers_link_params(monkeypatch):
     assert r.get_json()['times']['briefingBegin'] == '2026-07-24T07:30:00Z'
     assert got['svc'] == 'COMMON_CHECK_IN_TIMES'
     assert got['p']['dutyType'] == 'OD' and got['p']['crewCategory'] == 'COC'
+    # Der Check-in hängt an einem Nutzer-Tap → interaktives Budget-Gate.
+    assert got['ia'] is True
 
 
 # ── Periodischer Voll-Refresh (Cron-Endpoint) ────────────────────────────────
@@ -2933,11 +2942,12 @@ def test_crew_prefetch_legs_uses_duty_links_only():
                      'arr': 'JFK', 'access': 'SECRET42'}]
     # Ausserhalb des Horizonts (Flug liegt in der Vergangenheit) ⇒ nichts.
     assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-25') == []
-    # GANZER MONAT (Owner 2026-07-28 „preload the whole month"): 23 Tage vor
-    # dem Flug liegt IM Horizont …
-    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-01') != []
-    # … erst jenseits von 31 Tagen ist Schluss.
-    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-06-20') == []
+    # HORIZONT 3 KALENDERTAGE (Korrektur 2026-07-29, s. Banner): heute + 2
+    # liegt drin …
+    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-22') != []
+    # … heute + 3 nicht mehr (der Monats-Horizont riss das Tagesbudget).
+    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-21') == []
+    assert fo._crew_prefetch_legs(DUTY_LINKS, today='2026-07-01') == []
 
 
 def test_crew_prefetch_legs_dedupes_and_caps():
