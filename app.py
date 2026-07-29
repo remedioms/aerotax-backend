@@ -22005,7 +22005,30 @@ def take_roster_snapshot(token):
             else:
                 ch['status'] = 'pending'
                 pending.append(ch)
-        existing['pending'] = pending
+        # SELBSTHEILUNG für den ALTBESTAND: das Gate oben wirkt nur auf NEUE
+        # Diffs. Die schon offenen Vergangenheits-Einträge (Messung 2026-07-29:
+        # 75 'modified' auf 40 Token) würden sonst ewig im Badge stehen — sie
+        # pushen nicht, sie sind nicht entscheidbar, und der User müsste sie
+        # von Hand wegtippen. Derselbe Test, dieselbe Verschiebung nach
+        # `history`, ausgeführt im normalen Code-Pfad (jeder Snapshot, also
+        # jedes App-Öffnen mit Roster). Läuft auch, wenn `diff` leer ist —
+        # sonst heilte nur, wer ohnehin gerade eine Änderung hat.
+        _kept, _aged = [], 0
+        for ch in pending:
+            if (isinstance(ch, dict) and ch.get('kind') == 'modified'
+                    and _roster_change_is_past(ch, _today_ymd, None)):
+                ch['status'] = 'past_auto'
+                history.append(ch)
+                _aged += 1
+            else:
+                _kept.append(ch)
+        if _aged:
+            try:
+                app.logger.info(
+                    f'[roster-changes] past_pending_archived={_aged}')
+            except Exception:
+                pass
+        existing['pending'] = _kept
         existing['history'] = history
         # PUSH-GATES — was hier ankommt, hat Gate 2 + Gate 4 schon im Diff
         # passiert (die in-App-Liste ist seit 2026-07-29 selbst substanz-

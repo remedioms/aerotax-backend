@@ -776,6 +776,37 @@ def test_heutiger_modified_bleibt_pending(tmp_path):
     assert data.get('history') in ([], None)
 
 
+def test_altbestand_vergangener_pendings_heilt_sich_selbst(tmp_path):
+    # SELBSTHEILUNG: das Gate wirkt nur auf NEUE Diffs — die am 29.07.
+    # gemessenen 75 offenen Vergangenheits-'modified' auf 40 Token würden sonst
+    # ewig im Badge stehen. Jeder Snapshot räumt sie jetzt nach `history`, auch
+    # wenn der aktuelle Diff LEER ist.
+    d_past = (date.today() - timedelta(days=3)).isoformat()
+    d_fut = (date.today() + timedelta(days=3)).isoformat()
+    changes_file = tmp_path / 'roster_changes_test.json'
+    changes_file.write_text(json.dumps({'pending': [
+        {'datum': d_past, 'kind': 'modified', 'status': 'pending'},
+        {'datum': d_past, 'kind': 'removed', 'status': 'pending'},
+        {'datum': d_fut, 'kind': 'modified', 'status': 'pending'},
+    ], 'history': []}))
+    tag = _tag(d_fut)
+    p1, p2, p3, p4, p5, p6, p7, push, _cf = _snapshot_env(tmp_path, [tag])
+    with p1, p2, p3, patch.object(A, '_roster_changes_path',
+                                  return_value=str(changes_file)), p5, p6, p7, \
+            patch.object(A, '_sb_roster_changes_load', return_value=None), \
+            patch.object(A, '_sb_roster_changes_upsert', return_value=False):
+        r = A.app.test_client().post('/api/user/roster-snapshot/testtoken123',
+                                     json={'tage': [tag]})
+    assert r.status_code == 200
+    assert r.get_json()['changes_count'] == 0        # gar kein neuer Diff
+    data = json.loads(changes_file.read_text())
+    kinds = sorted((c['datum'], c['kind']) for c in data['pending'])
+    assert kinds == [(d_past, 'removed'), (d_fut, 'modified')]
+    assert [c['datum'] for c in data['history']] == [d_past]
+    assert data['history'][0]['status'] == 'past_auto'
+    assert push.call_count == 0
+
+
 def test_past_added_und_removed_bleiben_pending(tmp_path):
     # Nur 'modified' wird archiviert. Ein NACHGETRAGENER oder GESTRICHENER
     # Dienst in der Vergangenheit ist für Logbuch/Steuer relevant und bleibt
