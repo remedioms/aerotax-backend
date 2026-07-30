@@ -1170,6 +1170,67 @@ def parse_crew_list(resp):
     return out
 
 
+def parse_simulator_crewlist(resp):
+    """COMMON_SIMULATOR_CREWLIST → dieselbe normalisierte Form wie die
+    Flug-Crewliste: [{position, name, pk, duty}] — damit die App-Oberfläche
+    („Wer fliegt mit") unverändert bleibt und nur die Überschrift wechselt.
+
+    ECHTE SHAPE (live geholt 2026-07-30 an einem SIM-Termin von Mark Elser,
+    Forum-Anfrage „gibt es eine Möglichkeit die SIM Crewlisten abzufragen?"):
+    die Antwort ist eine LISTE von Sessions — nicht ein Objekt wie bei
+    COMMON_CREWLIST —, jede mit
+        {entries: [{crewName, staffIdentifier, crewFunction,
+                    simulatorFunction, simulatorActivity}],
+         forDate, ftNumber, shift, simulator, errorReply, errorMessage}
+
+    Unterschiede, die hier aufgelöst werden:
+      · `crewName` ist EIN Feld (kein first/last wie bei COMMON_CREWLIST),
+      · `staffIdentifier` ist die Personalnummer — also das, was dort
+        `pkNumber` heißt. Genau darüber läuft die AeroX-Verknüpfung
+        (Identitäten NUR über die PK, siehe Crew-Match-Regel).
+      · `simulatorFunction` (z.B. PF/PM) ist SIM-spezifisch und wird an die
+        Position gehängt, wenn sie etwas anderes sagt als `crewFunction`.
+
+    Sessions mit `errorReply` werden übersprungen. Pure/testbar."""
+    out, seen = [], set()
+    for session in _as_list(resp):
+        if not isinstance(session, dict) or session.get('errorReply'):
+            continue
+        for m in _as_list(session.get('entries')):
+            if not isinstance(m, dict):
+                continue
+            name = (m.get('crewName') or '').strip()
+            pk = (m.get('staffIdentifier') or '').strip() or None
+            # Dieselbe Person kann in mehreren Sessions desselben Tages
+            # stehen (Doppel-Slot) — einmal reicht.
+            key = (pk or name.upper())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            pos = (m.get('crewFunction') or '').strip()
+            sim_fn = (m.get('simulatorFunction') or '').strip()
+            if sim_fn and sim_fn.upper() != pos.upper():
+                pos = f'{pos} · {sim_fn}' if pos else sim_fn
+            out.append({'position': pos, 'name': name.title() or None,
+                        'pk': pk,
+                        'duty': (m.get('simulatorActivity') or '').strip() or None})
+    return out
+
+
+def simulator_session_info(resp):
+    """Session-Kopf der SIM-Antwort → {simulator, shift, ftNumber, date} für
+    die Überschrift („SIM 3 · Frühschicht"). Nimmt die erste fehlerfreie
+    Session. Nie Pflicht — fehlt ein Feld, bleibt es None."""
+    for session in _as_list(resp):
+        if not isinstance(session, dict) or session.get('errorReply'):
+            continue
+        return {'simulator': (session.get('simulator') or '').strip() or None,
+                'shift': (session.get('shift') or '').strip() or None,
+                'ftNumber': (session.get('ftNumber') or '').strip() or None,
+                'date': (session.get('forDate') or '').strip() or None}
+    return {}
+
+
 def parse_crew_hotel(resp):
     """COMMON_CREW_HOTEL_INFO → [{airline, hotel, phone, transfer, transfer_phone}]
     (echte Shape 2026-07-22). Pure/testbar."""
@@ -1236,9 +1297,16 @@ def airport_weather(user_token, station, **extra):
     return _api_get(user_token, '/COMMON_AIRPORT_WEATHER', params)
 
 
-def simulator_crewlist(user_token, **params):
-    """COMMON_SIMULATOR_CREWLIST — Sim-Session-Crew."""
-    return _api_get(user_token, '/COMMON_SIMULATOR_CREWLIST', params)
+def simulator_crewlist(user_token, interactive=False, **params):
+    """COMMON_SIMULATOR_CREWLIST — Sim-Session-Crew. Parameter: `forDate`
+    (YYYY-MM-DDZ) + `accessCode` aus den Duty-Events-_links; eine Flugnummer
+    gibt es hier nicht.
+
+    `interactive` ist ein EIGENER Keyword-Parameter (NICHT in **params) —
+    sonst landet er als Query-Param bei LH. Genau dieselbe Falle steckt in
+    check_in_times, dort mit derselben Begründung dokumentiert."""
+    return _api_get(user_token, '/COMMON_SIMULATOR_CREWLIST', params,
+                    interactive=interactive)
 
 
 def service_get(user_token, service, params=None, interactive=False):
@@ -2797,6 +2865,50 @@ def _resolve_link_params(user_token, service, flight, date, dep=None, arr=None,
     return _links_find(fresh, service, flight, date, dep, arr)
 
 
+# ── SIM-Crewliste: eigene Referenz-Suche (Mark Elser, Forum 2026-07-30) ─────
+# Ein Simulator-Termin hat KEINE Flugnummer. Die Referenz aus den Duty-Events
+# wird allein über das Datum adressiert (live belegt 2026-07-30):
+#     {"forDate": "2026-07-07Z", "accessCode": "…"}
+# gegenüber der Flug-Crewliste
+#     {"flightDesignator": "LH1558", "flightDate": "…", "departureAirport": …}
+# `_links_find` verlangt zwingend einen passenden `flightDesignator` und kann
+# eine SIM-Referenz deshalb NIE finden — genau deshalb blieb der Service
+# unerreichbar, obwohl die Funktion seit Langem im Code steht.
+def _links_find_sim(links, date):
+    """SIM-Referenz für einen Tag oder None. `date` als YYYY-MM-DD; LH hängt
+    ein 'Z' an (`forDate`), deshalb Präfix-Vergleich. Pure/testbar."""
+    dt_ = (date or '')[:10]
+    if not dt_:
+        return None
+    for l in links or []:
+        if not isinstance(l, dict) or l.get('service') != 'simulatorcrewlist':
+            continue
+        p = l.get('params') or {}
+        if (p.get('forDate') or '').startswith(dt_):
+            return p
+    return None
+
+
+def _resolve_sim_link_params(user_token, date, interactive=False):
+    """Wie `_resolve_link_params`, nur für den SIM-Tag: Cache → bei Miss das
+    Tages-Fenster live nachladen (1 Duty-Events-Call) und Cache erneuern.
+    None, wenn an dem Tag kein SIM im eigenen Plan steht."""
+    p = _links_find_sim(_links_load(user_token), date)
+    if p:
+        return p
+    if not date:
+        return None
+    resp = duty_events(user_token, date, date, interactive=interactive)
+    if not isinstance(resp, dict):
+        return None
+    fresh = extract_duty_links(resp)
+    if fresh:
+        merged = [l for l in _links_load(user_token)
+                  if not any(l == g for g in fresh)] + fresh
+        _links_save(user_token, merged[-800:])
+    return _links_find_sim(fresh, date)
+
+
 def _store_own_pk(user_token, pk):
     """LH-Personalnummer im Profil-Mirror ablegen (metadata.lh_pk_number).
     Idempotent, wirft nie."""
@@ -4123,6 +4235,63 @@ def _crew_prefetch_kick(token, resp):
     except Exception as e:
         log.warning('[lh_flightops] crew-prefetch-kick: %s', type(e).__name__)
         return False
+
+
+@lh_flightops_bp.route('/api/lh/flightops/sim-crewlist/<token>', methods=['POST'])
+def flightops_sim_crewlist(token):
+    """„Wer sitzt mit im SIM" für einen Simulator-Termin. Body {date}.
+
+    Owner-Zusage an Mark Elser (Forum 2026-07-26: „gibt es eine Möglichkeit
+    die SIM Crewlisten abzufragen?" — „Werde ich mit aufnehmen!"). Die
+    Funktion `simulator_crewlist` lag seit Langem im Code, wurde aber von
+    NIRGENDWO aufgerufen: Ein SIM-Termin hat keine Flugnummer, und die
+    gemeinsame Referenz-Suche `_links_find` verlangt zwingend einen
+    `flightDesignator`. Die SIM-Referenz wird allein über `forDate`
+    adressiert — sie war damit strukturell unauffindbar.
+
+    Antwort-Form ABSICHTLICH identisch zur Flug-Crewliste
+    ({ok, crew:[{position,name,pk,duty}]}), damit die App dieselbe Fläche
+    benutzt; zusätzlich `session` mit Gerät/Schicht für die Überschrift.
+
+    STATUS-CODES wie bei flightops_crewlist:
+      401 not_connected · 503 token_refresh_pending ·
+      404 no_sim_that_day (kein SIM an dem Tag im eigenen Plan) ·
+      502 simulator_crewlist_unavailable.
+
+    INTERAKTIV: hängt am Crew-Button, läuft also unter dem interaktiven
+    Budget-Deckel — nicht unter dem Hintergrund-Deckel, der in vollen Tagen
+    reißt."""
+    b = request.get_json(silent=True) or {}
+    date = (b.get('date') or '')[:10]
+    if not date:
+        return jsonify({'ok': False, 'error': 'date_required'}), 400
+
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+    if _st != 'ok':
+        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+
+    p = _resolve_sim_link_params(token, date, interactive=True) or {}
+    access = (p.get('accessCode') or '').strip()
+    if not access:
+        return jsonify({'ok': False, 'error': 'no_sim_that_day'}), 404
+
+    resp = simulator_crewlist(token, forDate=p.get('forDate') or f'{date}Z',
+                              accessCode=access, interactive=True)
+    if resp is None:
+        return jsonify({'ok': False,
+                        'error': 'simulator_crewlist_unavailable'}), 502
+    crew = parse_simulator_crewlist(resp)
+    # AeroX-Verknüpfung wie bei der Flug-Crewliste: wer von den Kollegen ein
+    # AeroX-Profil hat, wird über die Personalnummer gefunden (NUR über die PK
+    # — Namens-Fuzzy ist bewusst raus, siehe Crew-Match-Regel).
+    try:
+        crew = _crew_reenrich(crew, flight=None, date=date)
+    except Exception as e:
+        log.warning('[lh_flightops] sim-crew reenrich: %s', type(e).__name__)
+    return jsonify({'ok': True, 'crew': crew,
+                    'session': simulator_session_info(resp)})
 
 
 @lh_flightops_bp.route('/api/lh/flightops/crewlist/<token>', methods=['POST'])

@@ -3727,3 +3727,89 @@ def test_same_profile_is_never_linked_twice(monkeypatch):
         flight='LH762', date='2026-07-30')
     assert out.get('111222A', {}).get('token') == 'AT-ANITA'
     assert 'Anita D.' not in out
+
+
+# ── SIM-Crewliste (Mark Elser, Forum 2026-07-30) ────────────────────────────
+# Ein Simulator-Termin hat KEINE Flugnummer: die Referenz wird allein über
+# `forDate` adressiert. Genau deshalb konnte die gemeinsame Referenz-Suche sie
+# nie finden — sie verlangt einen passenden `flightDesignator`.
+#
+# Fixture = die ECHTE Shape, live geholt am 2026-07-30 an einem SIM-Termin
+# (Namen/Nummern ersetzt): die Antwort ist eine LISTE von Sessions, nicht ein
+# Objekt wie bei COMMON_CREWLIST.
+
+_SIM_RESP = [{
+    'entries': [
+        {'crewFunction': 'CPT', 'simulatorFunction': 'PF',
+         'simulatorActivity': 'LPC', 'crewName': 'MUSTERMANN',
+         'staffIdentifier': '111111A'},
+        {'crewFunction': 'FO', 'simulatorFunction': 'PM',
+         'simulatorActivity': 'LPC', 'crewName': 'beispiel',
+         'staffIdentifier': '222222B'},
+        {'crewFunction': 'TRI', 'simulatorFunction': 'TRI',
+         'simulatorActivity': 'INSTR', 'crewName': 'Lehrer',
+         'staffIdentifier': '333333C'},
+    ],
+    'errorMessage': None, 'errorReply': False, 'forDate': '2026-07-07Z',
+    'ftNumber': 'FT42', 'shift': 'FRUEH', 'simulator': 'SIM3',
+}]
+
+
+def test_sim_crewliste_wird_wie_die_flugcrew_normalisiert():
+    crew = fo.parse_simulator_crewlist(_SIM_RESP)
+    assert [c['pk'] for c in crew] == ['111111A', '222222B', '333333C']
+    # Gleiche Schluessel wie die Flug-Crewliste, damit die App-Flaeche bleibt.
+    assert set(crew[0]) == {'position', 'name', 'pk', 'duty'}
+    # crewName ist EIN Feld und kommt in gemischter Schreibweise.
+    assert crew[1]['name'] == 'Beispiel'
+
+
+def test_sim_funktion_haengt_an_der_position_nur_wenn_sie_etwas_neues_sagt():
+    crew = fo.parse_simulator_crewlist(_SIM_RESP)
+    assert crew[0]['position'] == 'CPT · PF'      # PF ergaenzt CPT
+    assert crew[2]['position'] == 'TRI'           # TRI == TRI, keine Dopplung
+
+
+def test_sim_fehler_session_wird_uebersprungen():
+    bad = [{'errorReply': True, 'errorMessage': 'nope', 'entries': [
+        {'crewName': 'X', 'staffIdentifier': '999'}]}]
+    assert fo.parse_simulator_crewlist(bad) == []
+    assert fo.parse_simulator_crewlist(None) == []
+    assert fo.parse_simulator_crewlist({'entries': []}) == []
+
+
+def test_dieselbe_person_in_zwei_sessions_erscheint_einmal():
+    doppelt = _SIM_RESP + [dict(_SIM_RESP[0])]
+    assert len(fo.parse_simulator_crewlist(doppelt)) == 3
+
+
+def test_session_kopf_fuer_die_ueberschrift():
+    info = fo.simulator_session_info(_SIM_RESP)
+    assert info['simulator'] == 'SIM3' and info['shift'] == 'FRUEH'
+    assert fo.simulator_session_info([]) == {}
+
+
+def test_sim_referenz_wird_ueber_das_datum_gefunden_nicht_ueber_die_flugnummer():
+    """Der Kern des Bugs: `_links_find` verlangt einen flightDesignator und
+    findet die SIM-Referenz deshalb NIE — `_links_find_sim` findet sie."""
+    links = [
+        {'service': 'simulatorcrewlist',
+         'params': {'forDate': '2026-07-07Z', 'accessCode': 'AAA'}},
+        {'service': 'crewlist',
+         'params': {'flightDesignator': 'LH1558', 'flightDate': '2026-07-08Z',
+                    'accessCode': 'BBB'}},
+    ]
+    assert fo._links_find_sim(links, '2026-07-07')['accessCode'] == 'AAA'
+    assert fo._links_find_sim(links, '2026-07-08') is None      # SIM nur am 07.
+    assert fo._links_find_sim(links, '') is None
+    # Gegenprobe: die alte Suche findet die SIM-Referenz nicht.
+    assert fo._links_find(links, 'simulatorcrewlist', '', '2026-07-07') is None
+
+
+def test_interactive_landet_nicht_als_query_param_bei_lh():
+    """Dieselbe Falle wie bei check_in_times: `interactive` muss ein eigener
+    Keyword-Parameter sein, sonst geht es als Query-Param an LH raus."""
+    import inspect
+    sig = inspect.signature(fo.simulator_crewlist)
+    assert 'interactive' in sig.parameters
+    assert sig.parameters['interactive'].kind is not inspect.Parameter.VAR_KEYWORD
