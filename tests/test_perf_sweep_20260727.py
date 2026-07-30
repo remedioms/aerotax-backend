@@ -515,6 +515,30 @@ def test_zeitbudget_stoppt_weitere_lh_calls(mqtt, monkeypatch):
     assert all(out[leg] is None for leg in legs[len(fetched):])
 
 
+# ── WARUM HIER `_HEUTE` STEHT UND KEIN FESTES DATUM (Fund 2026-07-30) ──────
+# Diese Tests standen drei Tage lang auf ROT und wurden von allen Beteiligten
+# als "vorbestehend" abgetan — mich eingeschlossen. Sie waren aber nicht
+# kaputt, sondern ABGELAUFEN: `_enrich_leg_delays` hat seit dem 04.07. einen
+# Vergangenheits-Guard (nur heute−2 … morgen+1 wird angereichert). Am
+# Entstehungstag war das hartkodierte '2026-07-27' schlicht "heute"; seit dem
+# 30.07. liegt es ausserhalb des Fensters, der Guard ueberspringt jeden Sektor
+# und die Tests fallen um.
+#
+# Das Gefaehrliche daran war nicht das rote Kreuz, sondern die STILLE
+# ENTWERTUNG der Nachbarn: `test_budget_erfindet_keine_werte` und
+# `test_ohne_budget_laeuft_die_weitergabe_ueber_alles` blieben gruen — aber
+# vakuum-gruen, weil gar nichts mehr angereichert wurde. "Nichts erfunden" ist
+# trivial wahr, wenn nichts passiert. Der Schutz, den sie absichern sollen
+# (Zeitbudget bricht ab, es werden keine Werte erfunden), war faktisch
+# ungetestet. Gegen den echten Produktcode mit heutigem Datum geprueft: er ist
+# intakt — Abbruch nach 4 von 40 Sektoren.
+#
+# REGEL: In Tests, die einen Datums-Guard durchlaufen, NIE ein festes Datum
+# hartkodieren. Entweder `_HEUTE` wie hier, oder die Uhr per
+# tests/_clock_freeze.py einfrieren.
+_HEUTE = time.strftime('%Y-%m-%d')
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 6 · Briefing — Zeitbudget der Live-Anreicherung
 # ══════════════════════════════════════════════════════════════════════════
@@ -536,7 +560,7 @@ def test_anreicherung_bricht_am_budget_ab(monkeypatch):
     monkeypatch.setattr(_app, '_flight_obs_merged', _slow_merge)
     monkeypatch.setattr(_app, '_ax_codeshare_map', lambda: {})
     secs = _sectors(40)
-    _app._enrich_leg_delays(secs, '2026-07-27', deadline=time.time() + 0.2)
+    _app._enrich_leg_delays(secs, _HEUTE, deadline=time.time() + 0.2)
     assert len(seen) < 40, 'Budget hat nicht gegriffen'
     assert len(seen) > 0, 'gar nichts angereichert'
 
@@ -547,7 +571,7 @@ def test_ohne_deadline_werden_alle_sektoren_angereichert(monkeypatch):
     monkeypatch.setattr(_app, '_flight_obs_merged',
                         lambda fn, **kw: (seen.append(fn), None)[1])
     monkeypatch.setattr(_app, '_ax_codeshare_map', lambda: {})
-    _app._enrich_leg_delays(_sectors(12), '2026-07-27')
+    _app._enrich_leg_delays(_sectors(12), _HEUTE)
     assert len(seen) == 12
 
 
@@ -558,7 +582,7 @@ def test_budget_erfindet_keine_werte(monkeypatch):
                         lambda fn, **kw: time.sleep(0.05) or None)
     monkeypatch.setattr(_app, '_ax_codeshare_map', lambda: {})
     secs = _sectors(40)
-    _app._enrich_leg_delays(secs, '2026-07-27', deadline=time.time() + 0.15)
+    _app._enrich_leg_delays(secs, _HEUTE, deadline=time.time() + 0.15)
     untouched = [s for s in secs if 'delay_known' not in s]
     assert untouched, 'Test greift nicht — alle Sektoren wurden angefasst'
     for s in untouched:
@@ -726,7 +750,7 @@ def test_budget_dichtet_keinen_tail_an(monkeypatch):
     monkeypatch.setattr(_app, '_carry_forward_turnaround_tails',
                         lambda secs, homebase=None: calls.append(len(secs)))
     secs = _sectors(40)
-    _app._enrich_leg_delays(secs, '2026-07-27', deadline=time.time() + 0.15)
+    _app._enrich_leg_delays(secs, _HEUTE, deadline=time.time() + 0.15)
     assert calls and calls[0] < 40, \
         'Weitergabe lief ueber nicht angereicherte Sektoren'
 
@@ -737,7 +761,7 @@ def test_ohne_budget_laeuft_die_weitergabe_ueber_alles(monkeypatch):
     monkeypatch.setattr(_app, '_ax_codeshare_map', lambda: {})
     monkeypatch.setattr(_app, '_carry_forward_turnaround_tails',
                         lambda secs, homebase=None: calls.append(len(secs)))
-    _app._enrich_leg_delays(_sectors(6), '2026-07-27')
+    _app._enrich_leg_delays(_sectors(6), _HEUTE)
     assert calls == [6]
 
 
