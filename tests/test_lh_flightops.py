@@ -3743,25 +3743,35 @@ _SIM_RESP = [{
         {'crewFunction': 'CPT', 'simulatorFunction': 'PF',
          'simulatorActivity': 'LPC', 'crewName': 'MUSTERMANN',
          'staffIdentifier': '111111A'},
+        # ECHTE EIGENHEIT (live 2026-07-30): LH fuellt `staffIdentifier` NUR
+        # beim Anfragenden. Bei den Kollegen ist das Feld da, aber LEER — die
+        # AeroX-Verknuepfung (die bewusst NUR ueber die PK laeuft) kann fuer
+        # sie also nie greifen. Sie muessen trotzdem in der Liste stehen.
         {'crewFunction': 'FO', 'simulatorFunction': 'PM',
-         'simulatorActivity': 'LPC', 'crewName': 'beispiel',
-         'staffIdentifier': '222222B'},
+         'simulatorActivity': 'CH', 'crewName': 'BEISPIEL, A',
+         'staffIdentifier': ''},
         {'crewFunction': 'TRI', 'simulatorFunction': 'TRI',
-         'simulatorActivity': 'INSTR', 'crewName': 'Lehrer',
-         'staffIdentifier': '333333C'},
+         'simulatorActivity': 'BS', 'crewName': 'LEHRER, B',
+         'staffIdentifier': ''},
     ],
     'errorMessage': None, 'errorReply': False, 'forDate': '2026-07-07Z',
-    'ftNumber': 'FT42', 'shift': 'FRUEH', 'simulator': 'SIM3',
+    # Auch das echte Format: shift ist eine ZIFFER, simulator eine Nummer,
+    # ftNumber traegt Muster+Session+Station.
+    'ftNumber': 'A320 N FT66 FRA', 'shift': '3', 'simulator': '328',
 }]
 
 
 def test_sim_crewliste_wird_wie_die_flugcrew_normalisiert():
     crew = fo.parse_simulator_crewlist(_SIM_RESP)
-    assert [c['pk'] for c in crew] == ['111111A', '222222B', '333333C']
+    assert [c['pk'] for c in crew] == ['111111A', None, None]
     # Gleiche Schluessel wie die Flug-Crewliste, damit die App-Flaeche bleibt.
     assert set(crew[0]) == {'position', 'name', 'pk', 'duty'}
-    # crewName ist EIN Feld und kommt in gemischter Schreibweise.
-    assert crew[1]['name'] == 'Beispiel'
+    # crewName ist EIN Feld im Format "NACHNAME, V" — Reihenfolge bleibt wie
+    # von LH geliefert (Umsortieren waere geraten), nur die Schreibweise wird
+    # lesbar gemacht.
+    assert crew[1]['name'] == 'Beispiel, A'
+    # Kollegen OHNE Personalnummer duerfen nicht rausfallen.
+    assert len(crew) == 3
 
 
 def test_sim_funktion_haengt_an_der_position_nur_wenn_sie_etwas_neues_sagt():
@@ -3779,13 +3789,16 @@ def test_sim_fehler_session_wird_uebersprungen():
 
 
 def test_dieselbe_person_in_zwei_sessions_erscheint_einmal():
+    """Dedupe muss AUCH ohne Personalnummer funktionieren (Kollegen haben
+    keine) — sonst steht der Doppel-Slot zweimal in der Liste."""
     doppelt = _SIM_RESP + [dict(_SIM_RESP[0])]
     assert len(fo.parse_simulator_crewlist(doppelt)) == 3
 
 
 def test_session_kopf_fuer_die_ueberschrift():
     info = fo.simulator_session_info(_SIM_RESP)
-    assert info['simulator'] == 'SIM3' and info['shift'] == 'FRUEH'
+    assert info['simulator'] == '328' and info['shift'] == '3'
+    assert info['ftNumber'] == 'A320 N FT66 FRA'
     assert fo.simulator_session_info([]) == {}
 
 
