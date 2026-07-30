@@ -60,13 +60,22 @@ WDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 RE_DAY = re.compile(r'\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(\d{2})\b')
 # STRENGE Leg-Regex — AC-Typ ist PFLICHT (unterscheidet Duty-Leg vom
 # Crew-Info-Echo). Info-Code am Ende optional.
+#
+# TAGES-SUFFIX (Upload #24 Hendrik Neubert, 2026-07-30): Condor hängt an die
+# Flugnummer den Abflugtag des Umlaufs an — im IDP mit LEERZEICHEN vor dem
+# Slash: „DE 2144 /17 SDQ 0240 1144 FRA 339". Ohne das optionale `/\d{1,2}`
+# bricht die Regex genau vor `SDQ` ab und das Leg fällt STILL raus (hier
+# 4 statt 5 Legs, 1806 statt 2350 min — nur die Plan-Kontrollsumme
+# „Flight time" hat es gefangen). Dieselbe Konvention wie in den
+# OffBlock-CSVs („DE 2199 /14", dort ohne Leerzeichen) → Suffix strippen,
+# nicht in die Flugnummer übernehmen.
 RE_LEG = re.compile(
-    r'\b([A-Z]{2})\s?(\d{2,4})\s+(?:R\s+)?'      # Flugnummer (+ Request-Marker)
+    r'\b([A-Z]{2})\s?(\d{2,4})\s*(?:/\s?\d{1,2})?\s+(?:R\s+)?'  # Flugnr (+Tages-Suffix, +Request)
     r'([A-Z]{3})\s+(\d{4})\s+(\d{4})\s+([A-Z]{3})'   # dep ab an arr
     r'\s+([0-9][0-9A-Z]{2})\b')                  # AC-Typ (339, 32Q, 76W …)
 # LOCKERE Regex ohne AC — findet zusätzlich die Crew-Info-Echos.
 RE_LEG_LOOSE = re.compile(
-    r'\b([A-Z]{2})\s?(\d{2,4})\s+(?:R\s+)?'
+    r'\b([A-Z]{2})\s?(\d{2,4})\s*(?:/\s?\d{1,2})?\s+(?:R\s+)?'
     r'([A-Z]{3})\s+(\d{4})\s+(\d{4})\s+([A-Z]{3})\b')
 RE_PERIOD = re.compile(r'Period:\s*(\d{2})([A-Za-z]{3})(\d{2})\s*-\s*'
                        r'(\d{2})([A-Za-z]{3})(\d{2})')
@@ -156,7 +165,39 @@ def to_min(hhmm):
     return int(hhmm[:2]) * 60 + int(hhmm[2:])
 
 
+def selftest():
+    """Regressions-Fälle für RE_LEG (ohne PDF lauffähig): python3 … --selftest"""
+    cases = [
+        # (Zeile, erwartet: None ODER (flug, von, ab, an, nach, ac))
+        ('DE 2080 R FRA 1015 2214 LAX 339 JU',
+         ('DE', '2080', 'FRA', '1015', '2214', 'LAX', '339')),
+        ('DE 2455 YVR 0037 1028 FRA 339',
+         ('DE', '2455', 'YVR', '0037', '1028', 'FRA', '339')),
+        # Upload #24: Condor-Tages-Suffix MIT Leerzeichen vor dem Slash
+        ('DE 2144 /17 SDQ 0240 1144 FRA 339',
+         ('DE', '2144', 'SDQ', '0240', '1144', 'FRA', '339')),
+        # OffBlock-Schreibweise ohne Leerzeichen
+        ('DE2199/14 FRA 0800 1000 PMI 32Q',
+         ('DE', '2199', 'FRA', '0800', '1000', 'PMI', '32Q')),
+        # Crew-Info-Echo: KEIN AC-Typ ⇒ darf NICHT matchen
+        ('Sat06 DE 2454 FRA 1252 2236 YVR', None),
+        # Bodenaktivität: keine Flugnummer ⇒ kein Leg
+        ('Sat13 DL4_330 FRA 0700 1500', None),
+    ]
+    bad = 0
+    for line, want in cases:
+        m = RE_LEG.search(line)
+        got = m.groups() if m else None
+        ok = got == want
+        bad += 0 if ok else 1
+        print(f'  [{"ok " if ok else "FAIL"}] {line}\n         -> {got}')
+    print('SELFTEST', 'OK' if not bad else f'{bad} FEHLER')
+    sys.exit(0 if not bad else 1)
+
+
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == '--selftest':
+        selftest()
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(2)
