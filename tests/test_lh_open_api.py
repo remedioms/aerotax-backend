@@ -255,7 +255,7 @@ def test_denied_calls_are_counted_too(monkeypatch):
     fuer die Frage „warum ueberm Limit?" blind. Abgewiesene mitzaehlen."""
     calls = []
     monkeypatch.setattr(lh, '_token', lambda: 'tok')
-    monkeypatch.setattr(lh, '_budget_ok', lambda: False)
+    monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: False)
     monkeypatch.setattr(lh, 'budget_inc',
                         lambda prefix, caller=None, units=1:
                         calls.append((prefix, caller)))
@@ -273,7 +273,7 @@ def test_get_books_a_call_in_the_shared_counter(monkeypatch):
     LH danach 404/403 liefert (der Call ist verbraucht)."""
     calls = []
     monkeypatch.setattr(lh, '_token', lambda: 'tok')
-    monkeypatch.setattr(lh, '_budget_ok', lambda: True)
+    monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: True)
     monkeypatch.setattr(lh, 'budget_inc',
                         lambda prefix, caller=None, units=1:
                         calls.append((prefix, caller)))
@@ -288,7 +288,7 @@ def test_get_books_a_call_in_the_shared_counter(monkeypatch):
 def test_get_books_blocked_calls_as_denied_not_as_sent(monkeypatch):
     calls = []
     monkeypatch.setattr(lh, '_token', lambda: 'tok')
-    monkeypatch.setattr(lh, '_budget_ok', lambda: False)
+    monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: False)
     monkeypatch.setattr(lh, 'budget_inc',
                         lambda prefix, caller=None, units=1:
                         calls.append((prefix, caller)))
@@ -312,7 +312,7 @@ def test_facts_memo_alias_defragments_cache(monkeypatch):
     monkeypatch.setattr(lh, '_leg_to_facts',
                         lambda leg: {'reg': 'D-AIKP', 'dep_iata': 'FRA',
                                      'arr_iata': 'JFK'})
-    monkeypatch.setattr(lh, '_budget_ok', lambda: True)
+    monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: True)
 
     def _fake_legs(path, caller=None):
         return {'FlightStatusResource': {'Flights': {'Flight': [{'Departure': {}, 'Arrival': {}}]}}}
@@ -396,7 +396,7 @@ def test_last_call_answered_separates_outage_from_answer(monkeypatch):
     werden darf."""
     import urllib.error
     monkeypatch.setattr(lh, '_token', lambda: 'tok')
-    monkeypatch.setattr(lh, '_budget_ok', lambda: True)
+    monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: True)
     monkeypatch.setattr(lh, 'budget_inc', lambda *a, **k: None)
 
     def _raise(code):
@@ -412,7 +412,7 @@ def test_last_call_answered_separates_outage_from_answer(monkeypatch):
 
 def test_denied_call_is_not_an_answer(monkeypatch):
     monkeypatch.setattr(lh, '_token', lambda: 'tok')
-    monkeypatch.setattr(lh, '_budget_ok', lambda: False)
+    monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: False)
     monkeypatch.setattr(lh, 'budget_inc', lambda *a, **k: None)
     assert lh._get('/x') is None
     assert lh.last_call_answered() is False
@@ -433,8 +433,15 @@ def _ttl(date_str, facts, at='2026-07-27T09:00:00'):
 
 
 def test_facts_ttl_other_day_unchanged():
+    """ZUKUNFT unverändert 6 h. Der zweite Fall (GESTERN) hat sich am
+    2026-07-30 bewusst geändert: ein Flug, dessen Abflug 25 h zurückliegt, ist
+    endgültig vorbei — seine Fakten ändern sich nie wieder und werden seither
+    14 Tage gehalten statt alle 6 h neu gekauft (s.
+    tests/test_lh_open_quota_diet.py). Das war der grösste Einzelposten der
+    24-h-Messung: 454 der 1.860 Legs im Warm-Fenster sind Vortagsflüge."""
     assert _ttl('2026-07-28', {'sched_dep': '2026-07-28T10:00:00+02:00'}) == 6 * 3600
-    assert _ttl('2026-07-26', {'sched_dep': '2026-07-26T10:00:00+02:00'}) == 6 * 3600
+    assert (_ttl('2026-07-26', {'sched_dep': '2026-07-26T10:00:00+02:00'})
+            == lh._TTL_FINAL)
 
 
 def test_facts_ttl_falls_back_to_the_old_120s_when_in_doubt():

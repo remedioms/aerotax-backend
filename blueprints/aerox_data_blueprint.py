@@ -1369,7 +1369,16 @@ def lh_quota_snapshot(hours=6):
     = Seq-Scan über eine ewig wachsende Tabelle):
       lhopen:<YYYYMMDDHH>[:<caller>]         LH Open API (gesendet)
       lhopen_denied:<YYYYMMDDHH>[:<grund>]   vom eigenen Throttle ABGEWIESEN
+      lhopen_skip:<YYYYMMDDHH>[:<grund>]     GAR NICHT ERST GEFRAGT (2026-07-30)
       lhfo:<YYYYMMDDHH>[:<service>]          LH FlightOps (EIGENER LH-Key!)
+
+    `lhopen_skip` ist bewusst eine EIGENE Familie und keine Unterart von
+    `lhopen_denied`: „abgewiesen" heißt, ein Aufrufer stand am Gate und wurde
+    weggeschickt (Bedarf, der nicht gedeckt wurde); „skip" heißt, die Frage
+    wurde erst gar nicht gestellt, weil die Antwort schon bekannt war
+    (`shared_hit`, `final`) oder die Frage sinnlos war (`horizon`,
+    `dedup_hour`, `gate_closed`). Die beiden zu vermischen würde genau die
+    Kennzahl unbrauchbar machen, an der der Umbau gemessen wird.
     Wirft nie. Liest NUR (der Puffer-Flush läuft im eigenen Daemon-Thread —
     ein Force-Flush hier würde einen Request-Thread an Supabase hängen), die
     Zahlen können also bis zu 30 s nachlaufen."""
@@ -1387,7 +1396,7 @@ def lh_quota_snapshot(hours=6):
     rows = []
     if sb is not None:
         for st in stamps:
-            for fam in ('lhopen', 'lhopen_denied', 'lhfo'):
+            for fam in ('lhopen', 'lhopen_denied', 'lhopen_skip', 'lhfo'):
                 try:
                     r = (sb.table('ax_api_budget').select('month,n')
                          .like('month', f'{fam}:{st}%')
