@@ -169,8 +169,63 @@ def _sector_topic_dates(sector):
 
 
 # Schlankes Select: NUR die Sektoren via jsonb-Pfad, nicht das ganze
-# raw_event (Voll-Payload wäre ~4× größer — Egress).
-_SECTOR_SELECT = 'token,datum,sectors:raw_event->ical_sectors'
+# raw_event (Voll-Payload wäre ~4× größer — Egress). `updated_at` kam
+# 2026-07-30 für die Frische-Schranke dazu (s. _drop_stale_rows).
+_SECTOR_SELECT = 'token,datum,updated_at,sectors:raw_event->ical_sectors'
+
+# ── FRISCHE-SCHRANKE (Birgit Münch, 2026-07-30) ─────────────────────────────
+# Der Fanout wählt seine Empfänger ALLEIN danach, ob ein Flug in den
+# gespeicherten Sektoren steht. Wie alt diese Zeile ist, spielte keine Rolle —
+# und genau daran hing Birgits Beschwerde: Sie bekam einen Flug aus der Reserve,
+# ihr Umlauf wurde gestrichen, ihr Handy-Kalender war korrekt — aber unsere
+# Server-Kopie stand seit vier Tagen still. Also lief die Meldungs-Kette weiter
+# für Flüge, aus denen sie längst rausgenommen war.
+#
+# Die Aussage des Pushes ist „du bist auf diesem Flug". Der einzige Beleg dafür
+# IST diese Zeile. Hat sie seit Tagen niemand bestätigt, ist der Beleg wertlos —
+# dann lieber schweigen als etwas Falsches behaupten (Owner-Regel: keine
+# erfundenen Werte).
+#
+# Gemessen am 2026-07-30 über die Roster-Tage der nächsten drei Tage:
+#   · LH-FlightOps-User:  max 9,2 h alt  → 0 Zeilen betroffen
+#   · Kalender-Link-User: 17 % älter als 72 h
+#   · Nur-Gerät-User:     51 % älter als 72 h (Server kann sie NICHT nachladen —
+#     der Hintergrund-Task liest bewusst kein EventKit, weil iOS dabei
+#     systemweite Passwortdialoge auslösen kann)
+# Die Schwelle liegt deshalb bei 72 h und nicht bei 24 h: Wer serverseitig
+# nachgeladen wird, ist nach spätestens 9 h wieder frisch — 72 h trifft
+# ausschließlich Zeilen, deren Quelle nachweislich nicht mehr antwortet.
+_STALE_ROW_MAX_AGE_H = 72
+
+
+def _drop_stale_rows(rows):
+    """Zeilen aussortieren, die seit >72 h niemand mehr bestätigt hat. Fehlt
+    `updated_at` oder ist es unparsebar, bleibt die Zeile DRIN (fail-open —
+    lieber ein Push zu viel als eine echte Änderung verschluckt). Wirft nie."""
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        out, dropped = [], 0
+        for row in (rows or []):
+            ts = (row or {}).get('updated_at')
+            if not ts:
+                out.append(row)
+                continue
+            try:
+                when = _dt.fromisoformat(str(ts).replace('Z', '+00:00'))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=_tz.utc)
+                if (now - when).total_seconds() / 3600.0 > _STALE_ROW_MAX_AGE_H:
+                    dropped += 1
+                    continue
+            except Exception:
+                pass                       # unparsebar → fail-open, drin lassen
+            out.append(row)
+        if dropped:
+            log.info('[lh_mqtt] stale rows dropped: %d von %d', dropped, len(rows or []))
+        return out
+    except Exception:
+        return rows or []
 
 
 def _sb():
@@ -204,7 +259,7 @@ def _sector_rows(dates):
                 break
     except Exception as e:
         log.warning('[lh_mqtt] sector rows fail: %s', type(e).__name__)
-    return out
+    return _drop_stale_rows(out)
 
 
 def _rows_for_flight(dates, carrier, num):
@@ -238,8 +293,8 @@ def _rows_for_flight(dates, carrier, num):
             log.warning('[lh_mqtt] flight rows cs fail %s: %s', v,
                         type(e).__name__)
     if not ok:
-        return _sector_rows(dates)
-    return out
+        return _sector_rows(dates)         # filtert selbst
+    return _drop_stale_rows(out)
 
 
 def _rows_from_station(dates, station):
@@ -256,11 +311,11 @@ def _rows_from_station(dates, station):
              .filter('raw_event->ical_sectors', 'cs',
                      f'[{{"from":"{station}"}}]')
              .execute())
-        return r.data or []
+        return _drop_stale_rows(r.data or [])
     except Exception as e:
         log.warning('[lh_mqtt] station rows cs fail %s: %s', station,
                     type(e).__name__)
-        return _sector_rows(dates)
+        return _sector_rows(dates)         # filtert selbst
 
 
 def _iter_sectors(rows):

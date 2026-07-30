@@ -3224,6 +3224,15 @@ def flightops_import(token):
     else:
         fd = body.get('from_date') or (today - _td(days=7)).strftime('%Y-%m-%d')
         td = body.get('to_date') or (today + _td(days=45)).strftime('%Y-%m-%d')
+    # HISTORIEN-IMPORT (Owner 2026-07-30 „Ältere Daten laden"): der Knopf holt
+    # abgeschlossene Monate nach. Zwei Zugaben, die nur für das LAUFENDE
+    # Fenster Sinn ergeben, entfallen dabei bewusst — beide kosten LH-Calls:
+    #   · Hotel-Pickup (COMMON_CREW_ROTATION) ist Horizont-gebunden (Stunden),
+    #     für einen Monat aus der Vergangenheit also per Definition leer.
+    #   · Crew-Prefetch wärmt die Crew-Listen der NÄCHSTEN Legs vor.
+    # Der Roster-Import selbst bleibt identisch — nur die Zugaben schweigen.
+    # (Gemessen 2026-07-30: LH liefert rund 6 Monate zurück, davor leer.)
+    _history = bool(body.get('history'))
     # Interaktiv = alles, was NICHT der refresh-all-Hintergrundlauf ist
     # (der markiert sich via body.background) — Connect-Erstimport und
     # manuelles „Jetzt aktualisieren" bekommen die höhere Budget-Grenze,
@@ -3252,16 +3261,17 @@ def flightops_import(token):
     # etwas fehl, läuft der Roster-Import unverändert weiter — der Pickup ist
     # eine Zugabe, nie eine Vorbedingung.
     _pickups = None
-    try:
-        # `known_anchors` schaltet den Fern-Horizont (30→36 h) NUR für Legs frei,
-        # für die noch kein Pickup bekannt ist — siehe _ROT_PICKUP_HORIZON_FAR_H.
-        _rns = pickup_rotation_ids(
-            resp, known_anchors=pickup_last_good_anchors(token))
-        if _rns:
-            _pickups = rotation_pickups_for(token, _rns)
-    except Exception as e:
-        log.warning('[lh_flightops] pickup lookup: %s', type(e).__name__)
-        _pickups = None
+    if not _history:
+        try:
+            # `known_anchors` schaltet den Fern-Horizont (30→36 h) NUR für Legs frei,
+            # für die noch kein Pickup bekannt ist — siehe _ROT_PICKUP_HORIZON_FAR_H.
+            _rns = pickup_rotation_ids(
+                resp, known_anchors=pickup_last_good_anchors(token))
+            if _rns:
+                _pickups = rotation_pickups_for(token, _rns)
+        except Exception as e:
+            log.warning('[lh_flightops] pickup lookup: %s', type(e).__name__)
+            _pickups = None
     ics = duty_events_to_ics(resp, pickups=_pickups)
     if not ics:
         return jsonify({'ok': True, 'events_count': 0, 'source': 'flightops',
@@ -3269,11 +3279,15 @@ def flightops_import(token):
     # FALLBACK-EBENE (Owner 2026-07-27): fehlt der Pickup in der Primärquelle,
     # holt ihn der gespeicherte Kalender-Link (myTime) nach — pro Tag, nur wo
     # oben nichts stand. Siehe apply_ical_pickup_fallback. Nie eine Vorbedingung.
-    ics = apply_ical_pickup_fallback(token, ics, body.get('pickup_ical_url'))
-    # NIE-LÖSCHEN-RIEGEL (Owner 2026-07-29): schweigen BEIDE Quellen, hängt der
-    # zuletzt ausgelieferte Marker wieder dran — aber nur bei unverändertem
-    # Anker-Leg. Schreibt danach den neuen Stand ins Profil fort (deploy-fest).
-    ics = apply_pickup_last_good(token, ics)
+    # HISTORIE: beide Pickup-Ebenen bleiben aus. `apply_pickup_last_good`
+    # schreibt seinen Stand ins Profil FORT — ein Monat aus der Vergangenheit
+    # würde damit den Anker des laufenden Umlaufs überschreiben.
+    if not _history:
+        ics = apply_ical_pickup_fallback(token, ics, body.get('pickup_ical_url'))
+        # NIE-LÖSCHEN-RIEGEL (Owner 2026-07-29): schweigen BEIDE Quellen, hängt der
+        # zuletzt ausgelieferte Marker wieder dran — aber nur bei unverändertem
+        # Anker-Leg. Schreibt danach den neuen Stand ins Profil fort (deploy-fest).
+        ics = apply_pickup_last_good(token, ics)
     try:
         import app as _app
         with _app.app.test_request_context(json={'ics_text': ics}):
@@ -3290,7 +3304,10 @@ def flightops_import(token):
         # Crew-Button nach dem Verbinden sofort (und offline) gefüllt ist.
         # Fire-and-forget mit eigenem, tieferem Budget-Deckel; siehe Banner
         # über _crew_prefetch_kick. Nie eine Vorbedingung für den Import.
-        _crew_prefetch_kick(token, resp)
+        # Beim Historien-Import aus: die Crew-Liste eines abgeflogenen Monats
+        # wärmt nichts vor, kostet aber pro Leg einen LH-Call.
+        if not _history:
+            _crew_prefetch_kick(token, resp)
     return jsonify(payload), status
 
 

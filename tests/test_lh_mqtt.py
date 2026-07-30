@@ -762,3 +762,44 @@ def test_found_reg_is_shared_with_its_own_ttl(_clean_reg, monkeypatch):
     assert ttl == lh_mqtt._reg_ttl(dep, time.time())
     memo_expiry, _v = lh_mqtt._reg_memo[key]
     assert abs((memo_expiry - time.time()) - ttl) < 2
+
+
+# ── Frische-Schranke (Birgit Münch, 2026-07-30) ─────────────────────────────
+# Ihr Umlauf wurde gestrichen, ihre Server-Kopie stand vier Tage still — und der
+# Fanout pushte weiter zu Flügen, aus denen sie rausgenommen war. Der Fanout
+# darf „du bist auf diesem Flug" nur behaupten, solange der Beleg dafür frisch
+# ist.
+
+def _row(hours_ago, token='AT-X'):
+    ts = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return {'token': token, 'datum': '2026-07-30',
+            'updated_at': ts.isoformat(), 'sectors': [{'flight': 'LH400'}]}
+
+
+def test_frische_schranke_wirft_veraltete_zeilen_raus():
+    """Birgits Fall: eine vier Tage alte Zeile ist kein Beleg mehr."""
+    rows = [_row(2, 'frisch'), _row(96, 'birgit')]
+    out = lh_mqtt._drop_stale_rows(rows)
+    assert [r['token'] for r in out] == ['frisch']
+
+
+def test_frische_schranke_laesst_server_gepflegte_zeilen_in_ruhe():
+    """LH-verbundene User werden serverseitig nachgeladen (gemessen: max 9,2 h
+    alt). Die Schranke bei 72 h darf sie NIE treffen — sonst verschluckt sie
+    echte Verspätungs-Pushes."""
+    rows = [_row(1), _row(9), _row(24), _row(71)]
+    assert len(lh_mqtt._drop_stale_rows(rows)) == 4
+
+
+def test_frische_schranke_ist_fail_open():
+    """Ohne oder mit kaputtem `updated_at` bleibt die Zeile drin — lieber ein
+    Push zu viel als eine echte Änderung still verschluckt."""
+    rows = [{'token': 'A', 'sectors': []},
+            {'token': 'B', 'updated_at': 'kein-datum', 'sectors': []}]
+    assert len(lh_mqtt._drop_stale_rows(rows)) == 2
+    assert lh_mqtt._drop_stale_rows(None) == []
+
+
+def test_updated_at_wird_ueberhaupt_gelesen():
+    """Die Schranke kann nur greifen, wenn das Select das Feld mitbringt."""
+    assert 'updated_at' in lh_mqtt._SECTOR_SELECT
