@@ -776,11 +776,45 @@ def _row(hours_ago, token='AT-X'):
             'updated_at': ts.isoformat(), 'sectors': [{'flight': 'LH400'}]}
 
 
-def test_frische_schranke_wirft_veraltete_zeilen_raus():
-    """Birgits Fall: eine vier Tage alte Zeile ist kein Beleg mehr."""
+def test_frische_schranke_wirft_veraltete_zeilen_raus(monkeypatch):
+    """Birgits Fall: vier Tage alt UND ohne nachladbare Quelle — erst BEIDES
+    zusammen entwertet den Beleg."""
+    monkeypatch.setattr(lh_mqtt, '_tokens_without_refreshable_source',
+                        lambda toks: {'birgit'} & set(toks))
     rows = [_row(2, 'frisch'), _row(96, 'birgit')]
     out = lh_mqtt._drop_stale_rows(rows)
     assert [r['token'] for r in out] == ['frisch']
+
+
+def test_alt_aber_nachladbar_bleibt_drin(monkeypatch):
+    """OWNER-KORREKTUR 30.07.: „aelter als 3 Tage ist oft Ruhezeiten, gehen
+    5 Tage, Urlaub etc." Wer eine nachladbare Quelle hat (LH-Grant oder
+    Kalender-Link), dessen alter Plan ist UNVERAENDERT, nicht falsch — er
+    darf seine Verspaetungsmeldung nicht verlieren. Die erste Fassung schaltete
+    live 650 von 5005 Empfaengern stumm; das war der Fehler."""
+    monkeypatch.setattr(lh_mqtt, '_tokens_without_refreshable_source',
+                        lambda toks: set())
+    rows = [_row(2), _row(96), _row(24 * 14)]
+    assert len(lh_mqtt._drop_stale_rows(rows)) == 3
+
+
+def test_quellen_abfrage_gestoert_bleibt_fail_open(monkeypatch):
+    """Kann die Quelle nicht geprueft werden, wird NICHT stummgeschaltet."""
+    def _boom(toks):
+        raise RuntimeError('sb down')
+    monkeypatch.setattr(lh_mqtt, '_tokens_without_refreshable_source', _boom)
+    rows = [_row(96, 'a'), _row(200, 'b')]
+    assert len(lh_mqtt._drop_stale_rows(rows)) == 2
+
+
+def test_frische_zeilen_kosten_keinen_zusaetzlichen_read(monkeypatch):
+    """Ist nichts alt, darf die Schranke die Quellen-Abfrage gar nicht erst
+    stellen — sonst zahlt der Normalfall fuer den Sonderfall."""
+    gerufen = []
+    monkeypatch.setattr(lh_mqtt, '_tokens_without_refreshable_source',
+                        lambda toks: gerufen.append(toks) or set())
+    lh_mqtt._drop_stale_rows([_row(1), _row(5), _row(70)])
+    assert gerufen == []
 
 
 def test_frische_schranke_laesst_server_gepflegte_zeilen_in_ruhe():

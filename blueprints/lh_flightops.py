@@ -3334,7 +3334,29 @@ def flightops_import(token):
         fd = body.get('from_date') or _MOCK_WINDOW[0]
         td = body.get('to_date') or _MOCK_WINDOW[1]
     else:
-        fd = body.get('from_date') or (today - _td(days=7)).strftime('%Y-%m-%d')
+        # FENSTER-ANFANG = MONATSANFANG, mindestens aber −7 Tage (Owner
+        # 2026-07-30: „aktuellen Monat so rausgeben wie Lufthansa ihn hat,
+        # da immer golden truth").
+        #
+        # Vorher stand hier hart −7 Tage. Am 30. eines Monats begann das
+        # Fenster damit am 23. — der 1. bis 22. wurde NIE wieder abgeglichen.
+        # Trägt LH rückwirkend etwas in den laufenden Monat ein (Krankmeldung,
+        # gestrichener Umlauf, nachgetragene Ist-Zeiten), sah AeroX das nicht.
+        #
+        # Und es hängt am Reconcile: der zieht den Räum-Anfang ohnehin auf den
+        # MONATSANFANG hoch und friert nur GANZ vergangene Monate ein. Solange
+        # das Import-Fenster erst am 23. begann, lag der Monatsanfang außerhalb
+        # der Feed-Spanne — es wurde dort also weder geschrieben noch geräumt.
+        # Mit dem Monatsanfang als Fensterstart deckt sich beides, und der
+        # laufende Monat wird zur exakten Kopie dessen, was LH hat: was LH
+        # nicht mehr führt, verschwindet auch bei uns.
+        #
+        # KOSTET KEINEN EINZIGEN CALL EXTRA: duty_events nimmt eine Spanne,
+        # das Fenster wird nur breiter, nicht die Anzahl der Abrufe.
+        _month_start = today.replace(day=1)
+        _minus7 = today - _td(days=7)
+        fd = (body.get('from_date')
+              or min(_month_start, _minus7).strftime('%Y-%m-%d'))
         td = body.get('to_date') or (today + _td(days=45)).strftime('%Y-%m-%d')
     # HISTORIEN-IMPORT (Owner 2026-07-30 „Ältere Daten laden"): der Knopf holt
     # abgeschlossene Monate nach. Zwei Zugaben, die nur für das LAUFENDE

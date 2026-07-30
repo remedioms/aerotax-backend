@@ -192,37 +192,142 @@ _SECTOR_SELECT = 'token,datum,updated_at,sectors:raw_event->ical_sectors'
 #   · Nur-Gerät-User:     51 % älter als 72 h (Server kann sie NICHT nachladen —
 #     der Hintergrund-Task liest bewusst kein EventKit, weil iOS dabei
 #     systemweite Passwortdialoge auslösen kann)
-# Die Schwelle liegt deshalb bei 72 h und nicht bei 24 h: Wer serverseitig
-# nachgeladen wird, ist nach spätestens 9 h wieder frisch — 72 h trifft
-# ausschließlich Zeilen, deren Quelle nachweislich nicht mehr antwortet.
+#
+# ── KORREKTUR NOCH AM SELBEN TAG (Owner): ALTER ALLEIN IST KEIN BELEG ───────
+# Erste Fassung schaltete jede Zeile >72 h stumm. Live gemessen waren das
+# **650 von 5005** bzw. **797 von 5007** Empfängern pro Fanout-Ereignis —
+# 13–16 %. Owner dazu: „älter als 3 Tage ist oft Ruhezeiten, gehen 5 Tage,
+# Urlaub etc. … es muss eher einen Weg geben, diesen zu aktualisieren statt
+# zu stummen."
+#
+# Er hat recht, und die Logik war schief: Ein Plan, den seit fünf Tagen
+# niemand angefasst hat, ist meistens nicht FALSCH — er ist UNVERÄNDERT, weil
+# der Mensch frei hatte. Wer danach fliegt, verlöre seine Verspätungsmeldung
+# für nichts.
+#
+# Der Belegwert einer alten Zeile hängt nicht am Alter, sondern daran, ob wir
+# sie überhaupt hätten auffrischen KÖNNEN:
+#   · LH-Grant vorhanden        → der Refresher holt den Plan alle paar Stunden;
+#                                 ist die Zeile trotzdem alt, hat LH sie eben
+#                                 nicht geändert. Beleg gültig.
+#   · Kalender-Link vorhanden   → wird serverseitig bzw. vom Gerät nachgeladen.
+#                                 Beleg gültig.
+#   · WEDER NOCH                → der Server kann diesen Plan gar nicht
+#                                 nachladen (der Hintergrund-Task liest bewusst
+#                                 kein EventKit — iOS kann dabei systemweite
+#                                 Passwortdialoge auslösen). Hier, und NUR
+#                                 hier, heißt alt tatsächlich „wir wissen es
+#                                 nicht". Genau Birgits Lage: kein Link, keine
+#                                 LH-Verbindung, Kopie vier Tage alt.
+# Deshalb greift die Schranke jetzt ausschließlich bei Nutzern OHNE
+# nachladbare Quelle (gemessen 182 von 2404).
 _STALE_ROW_MAX_AGE_H = 72
+
+# Kurzes Memo für die Quellen-Abfrage: ein Fanout-Ereignis prüft dieselben
+# Tokens mehrfach, und Ereignisse kommen in Wellen. TTL bewusst klein — wer
+# sich neu verbindet, soll nicht minutenlang als quellenlos gelten.
+_SRC_MEMO_TTL_S = 300
+_src_memo_lock = threading.Lock()
+_src_memo = {}
+
+
+def _tokens_without_refreshable_source(tokens):
+    """Teilmenge der Tokens OHNE nachladbare Roster-Quelle (kein lebender
+    LH-Grant, kein Kalender-Link). EIN gebündelter Read je Block, Ergebnis
+    kurz gememot. Wirft nie — im Fehlerfall die LEERE Menge, damit die
+    Schranke fail-open bleibt und niemand fälschlich verstummt."""
+    want = {t for t in (tokens or []) if t}
+    if not want:
+        return set()
+    out, ask = set(), []
+    now = time.time()
+    with _src_memo_lock:
+        for t in want:
+            hit = _src_memo.get(t)
+            if hit and (now - hit[0]) < _SRC_MEMO_TTL_S:
+                if hit[1]:
+                    out.add(t)
+            else:
+                ask.append(t)
+    if not ask:
+        return out
+    client = _sb()
+    if client is None:
+        return set()                      # fail-open
+    try:
+        for i in range(0, len(ask), 60):
+            chunk = ask[i:i + 60]
+            r = (client.table('user_profiles')
+                 .select('token,metadata')
+                 .in_('token', chunk).execute())
+            seen = {}
+            for row in (r.data or []):
+                if not isinstance(row, dict):
+                    continue
+                md = row.get('metadata') or {}
+                fo = md.get('flightops_tokens') or {}
+                cf = md.get('calendar_feed') or {}
+                has_lh = bool(fo.get('access')) and not fo.get('needs_relogin')
+                has_url = str(cf.get('url') or '').startswith(
+                    ('http://', 'https://', 'webcal://', 'webcals://'))
+                seen[row.get('token')] = not (has_lh or has_url)
+            with _src_memo_lock:
+                for t in chunk:
+                    # Kein Profil gefunden ⇒ NICHT als quellenlos werten
+                    # (fail-open); nur ein belegtes „weder noch" zählt.
+                    val = bool(seen.get(t, False))
+                    _src_memo[t] = (now, val)
+                    if val:
+                        out.add(t)
+        if len(_src_memo) > 8000:
+            with _src_memo_lock:
+                _src_memo.clear()
+        return out
+    except Exception as e:
+        log.warning('[lh_mqtt] source lookup fail: %s', type(e).__name__)
+        return set()                      # fail-open
 
 
 def _drop_stale_rows(rows):
-    """Zeilen aussortieren, die seit >72 h niemand mehr bestätigt hat. Fehlt
-    `updated_at` oder ist es unparsebar, bleibt die Zeile DRIN (fail-open —
-    lieber ein Push zu viel als eine echte Änderung verschluckt). Wirft nie."""
+    """Zeilen aussortieren, die seit >72 h niemand bestätigt hat UND deren
+    Nutzer gar keine nachladbare Quelle hat. Fehlt `updated_at`, ist es
+    unparsebar oder ist die Quellen-Abfrage gestört, bleibt die Zeile DRIN
+    (fail-open — lieber ein Push zu viel als eine echte Änderung
+    verschluckt). Wirft nie."""
     try:
         from datetime import datetime as _dt, timezone as _tz
         now = _dt.now(_tz.utc)
-        out, dropped = [], 0
-        for row in (rows or []):
+
+        def _too_old(row):
             ts = (row or {}).get('updated_at')
             if not ts:
-                out.append(row)
-                continue
+                return False               # kein Stempel → fail-open
             try:
                 when = _dt.fromisoformat(str(ts).replace('Z', '+00:00'))
                 if when.tzinfo is None:
                     when = when.replace(tzinfo=_tz.utc)
-                if (now - when).total_seconds() / 3600.0 > _STALE_ROW_MAX_AGE_H:
-                    dropped += 1
-                    continue
+                return ((now - when).total_seconds() / 3600.0
+                        > _STALE_ROW_MAX_AGE_H)
             except Exception:
-                pass                       # unparsebar → fail-open, drin lassen
-            out.append(row)
+                return False               # unparsebar → fail-open
+
+        rows = rows or []
+        old = [r for r in rows if _too_old(r)]
+        if not old:
+            return rows
+        # ERST JETZT die Quellen-Frage stellen — nur für die alten Zeilen, und
+        # gebündelt. Im Normalfall (alles frisch) kostet die Schranke keinen
+        # einzigen zusätzlichen Read.
+        blind = _tokens_without_refreshable_source({r.get('token') for r in old})
+        if not blind:
+            return rows
+        out = [r for r in rows
+               if not (_too_old(r) and r.get('token') in blind)]
+        dropped = len(rows) - len(out)
         if dropped:
-            log.info('[lh_mqtt] stale rows dropped: %d von %d', dropped, len(rows or []))
+            log.info('[lh_mqtt] stale rows dropped: %d von %d '
+                     '(alt: %d, davon ohne nachladbare Quelle: %d)',
+                     dropped, len(rows), len(old), dropped)
         return out
     except Exception:
         return rows or []
