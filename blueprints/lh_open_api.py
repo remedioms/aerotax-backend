@@ -392,12 +392,22 @@ def _budget_thread_start():
         return
 
     def _run():
+        last_prune = 0.0
         while True:
             time.sleep(_BUDGET_FLUSH_S)
             try:
                 budget_flush()
             except Exception:
                 pass
+            # Einmal pro Stunde im OHNEHIN laufenden, langlebigen Thread —
+            # kein neuer Cron, kein neuer Thread, kein Schema-Schritt.
+            now = time.time()
+            if now - last_prune > 3600:
+                last_prune = now
+                try:
+                    _shared_prune()
+                except Exception:
+                    pass
 
     _budget_thread = threading.Thread(target=_run, daemon=True,
                                       name='lh-budget-flush')
@@ -936,6 +946,40 @@ def _shared_write_warm_block(fn, d, dep, arr, ttl, reason):
     }])
 
 
+def _shared_prune():
+    """Abgelaufene EIGENE Einträge wegräumen. Wirft nie.
+
+    WARUM ES DAS BRAUCHT: `ax_paid_call_cache` hat zwar einen opportunistischen
+    Prune — der steckt aber in den RPCs `ax_paid_call_acquire/complete`, und die
+    ruft im ganzen Backend niemand auf (geprüft 2026-07-30). Die Tabelle wächst
+    also rein additiv: 1.690 `lhreg:`-Zeilen in drei Tagen. Dieser Umbau
+    verdreifacht die Schreibrate, deshalb räumt er auch auf.
+
+    BEWUSST NUR DIE EIGENEN SCHLÜSSEL (`lhfacts:` / `lhwarm:`): der Reg-Cache
+    des MQTT-Daemons gehört `lh_mqtt.py` und hat seine eigene Politik — fremde
+    Zeilen mitzulöschen wäre genau die Art stiller Nebenwirkung, die man später
+    nicht mehr findet.
+    Gelöscht wird nur, was ABGELAUFEN ist und seit über einem Tag nicht mehr
+    angefasst wurde — ein gültiger Eintrag ist damit nie in Gefahr."""
+    client = _shared_sb()
+    if client is None:
+        return
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    now_dt = _dt.now(_tz.utc)
+    stale = (now_dt - _td(days=1)).isoformat()
+    now_iso = now_dt.isoformat()
+    for pfx, until_col in (('lhfacts:', 'result_until'),
+                           ('lhwarm:', 'negative_until')):
+        try:
+            (client.table('ax_paid_call_cache').delete()
+             .like('call_key', pfx + '%')
+             .lt(until_col, now_iso)
+             .lt('updated_at', stale).execute())
+        except Exception as e:
+            log.warning('[lh_open] shared-cache prune %s: %s', pfx,
+                        type(e).__name__)
+
+
 # ── Hintergrund-Warmup (Incident-Fix 2026-07-22, umgebaut 2026-07-30) ───────
 # Fan-out-Consumer (cached_only=True) blockieren NIE auf LH-HTTP: Memo-Miss
 # → {} sofort zurück + EIN dedupliziertes Warmup; der nächste Read innerhalb
@@ -979,9 +1023,9 @@ def _warm_horizon_ok(d, now=None):
     """Datums-Horizont für spekulative Warms: heute−1 … heute+2 (UTC). Pure."""
     now = time.time() if now is None else now
     try:
-        from datetime import datetime as _dt
+        from datetime import datetime as _dt, timezone as _tz
         dd = _dt.strptime(str(d)[:10], '%Y-%m-%d').date()
-        t0 = _dt.utcfromtimestamp(now).date()
+        t0 = _dt.fromtimestamp(now, _tz.utc).date()
         return -1 <= (dd - t0).days <= 2
     except Exception:
         return False

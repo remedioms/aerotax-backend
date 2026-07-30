@@ -538,3 +538,62 @@ def test_user_paths_are_untouched_when_budget_is_free(monkeypatch):
     for c in ('obs_merge', 'mqtt_event', 'mqtt_inbound', 'mqtt_leg_reg',
               'warm_obs_overlay', 'warm_obs_merge'):
         assert lh._global_budget_check(now, caller=c) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aufräumen: der geteilte Cache darf nicht rein additiv wachsen
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _FakeDelete:
+    def __init__(self, log):
+        self.log, self.f = log, {}
+
+    def like(self, col, val):
+        self.f['like'] = (col, val)
+        return self
+
+    def lt(self, col, val):
+        self.f.setdefault('lt', []).append(col)
+        return self
+
+    def execute(self):
+        self.log.append(dict(self.f))
+        return type('R', (), {'data': []})()
+
+
+class _FakeDelTable:
+    def __init__(self, log):
+        self.log = log
+
+    def delete(self):
+        return _FakeDelete(self.log)
+
+
+class _FakeDelSB:
+    def __init__(self):
+        self.log = []
+
+    def table(self, _n):
+        return _FakeDelTable(self.log)
+
+
+def test_prune_only_touches_our_own_keys(monkeypatch):
+    """Der Reg-Cache des MQTT-Daemons (`lhreg:`) gehört lh_mqtt.py und hat
+    eine eigene Politik — ihn mitzulöschen wäre eine stille Nebenwirkung."""
+    _reset(monkeypatch)
+    fake = _FakeDelSB()
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    lh._shared_prune()
+    prefixes = [c['like'][1] for c in fake.log]
+    assert prefixes == ['lhfacts:%', 'lhwarm:%']
+    assert not any(p.startswith('lhreg') for p in prefixes)
+    # und immer BEIDE Schranken: abgelaufen UND seit über einem Tag kalt
+    for c in fake.log:
+        assert len(c['lt']) == 2
+        assert 'updated_at' in c['lt']
+
+
+def test_prune_is_a_noop_without_a_client(monkeypatch):
+    _reset(monkeypatch)
+    monkeypatch.setattr(lh, '_shared_sb', lambda: None)
+    lh._shared_prune()          # darf nicht werfen
