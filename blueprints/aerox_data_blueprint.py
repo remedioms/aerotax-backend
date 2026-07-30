@@ -5499,13 +5499,19 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
     # Regel: nur für den HEUTIGEN (UTC-)Betriebstag darf der Live-Schnappschuss
     # den Tail stellen; sonst gewinnt die date-exakte Quelle. Für heute bleibt
     # das Verhalten byte-identisch.
-    # Rangfolge: (heutiger) Live-Schnappschuss → date-exakte Board-/LH-Fakten →
-    # date-exakter Warehouse-Tail. Der letzte Schritt lohnt NUR für Tage, die
-    # der Live-Schnappschuss ohnehin nicht abdecken darf (Vergangenheit) — für
-    # heute spart er sich den Extra-Read.
     reg = reg or facts.get('reg')
-    if not reg and not _live_snapshot_covers_date(date):
-        reg = _warehouse_day_tail(flight_no, date)
+    # VERGANGENHEIT: der board-verifizierte Tail des Servicetags aus `flights`
+    # schlägt hier ALLES — auch die sonst autoritative LH-Reg. Nachgemessen am
+    # Owner-Fall (30.07.): für LH454/28.07. lieferte die Fakten-Kette D-ABYF,
+    # eine Maschine, die das Warehouse an dem Tag nirgends gesehen hat, während
+    # `flights` D-ABYH führt (bestätigt über tail-history: D-ABYH flog am 28.07.
+    # LH454 FRA→SFO). LHs `flightstatus` gibt für zurückliegende Tage
+    # offenbar die AKTUELLE Equipment-Zuweisung zurück, nicht die historische —
+    # die Zeiten desselben Aufrufs sind dagegen date-exakt und bleiben es.
+    # Für HEUTE bleibt alles beim Alten (der Live-Schnappschuss ist dort die
+    # frischeste Quelle) und es wird kein zusätzlicher Read gemacht.
+    if not _live_snapshot_covers_date(date):
+        reg = _warehouse_day_tail(flight_no, date) or reg
     ac_type = ac_type or facts.get('type')
     # Museums-Tail-Wächter (Owner 2026-07-12, LH781→D-ABTL): auch die Reg aus
     # der Routen-Kaskade (Warehouse-`flights`.tail) kann die Board-Altlast

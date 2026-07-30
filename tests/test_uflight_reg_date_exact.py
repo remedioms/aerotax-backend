@@ -135,7 +135,7 @@ def _resolve(date, facts=None, warehouse_tail=None):
 
 def test_past_day_does_not_serve_todays_tail():
     """DER Owner-Fall: der Jetzt-Schnappschuss (DABYP) darf für den 28.07.
-    nicht gelten — die date-exakten Fakten (DABYH) gewinnen."""
+    nicht gelten — die date-exakte Quelle (DABYH) gewinnt."""
     res = _resolve(_past(), facts={'reg': 'DABYH', 'type': 'B748'})
     assert res['identity']['reg'] == 'DABYH'
     assert res['aircraft']['reg'] == 'DABYH'
@@ -146,6 +146,16 @@ def test_past_day_falls_back_to_the_warehouse_tail():
     Jetzt-Schnappschuss."""
     res = _resolve(_past(), facts={}, warehouse_tail='DABYH')
     assert res['identity']['reg'] == 'DABYH'
+
+
+def test_past_day_warehouse_tail_beats_the_lh_reg():
+    """Live nachgemessen (30.07.): für LH454/28.07. lieferte die Fakten-Kette
+    D-ABYF — eine Maschine, die das Warehouse an dem Tag nie gesehen hat —
+    während `flights` D-ABYH führt. Für Vergangenheits-Tage gewinnt darum der
+    board-verifizierte Tail des Servicetags."""
+    res = _resolve(_past(), facts={'reg': 'DABYF'}, warehouse_tail='DABYH')
+    assert res['identity']['reg'] == 'DABYH'
+    assert res['aircraft']['reg'] == 'DABYH'
 
 
 def test_past_day_without_any_dated_source_stays_empty():
