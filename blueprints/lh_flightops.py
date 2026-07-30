@@ -2814,7 +2814,57 @@ def _store_own_pk(user_token, pk):
         log.warning('[lh_flightops] store_pk: %s', type(e).__name__)
 
 
-def _match_aerox_profiles(members):
+def _abbrev_parts(name):
+    """„Marco C." → ('Marco', 'C'); voller Name/Einzelwort → None.
+
+    Das LETZTE Token muss ein einzelner Buchstabe sein (optional mit Punkt) —
+    genau so kürzt LH ab. Pure/testbar.
+    """
+    toks = [t for t in str(name or '').split() if t]
+    if len(toks) < 2:
+        return None
+    last = toks[-1].rstrip('.')
+    if len(last) != 1 or not last.isalpha():
+        return None
+    return toks[0], last.upper()
+
+
+def _roster_tokens_for_leg(flight, date):
+    """Tokens der AeroX-User, die DIESEN Flug an DIESEM Tag im EIGENEN Roster
+    stehen haben.
+
+    ⚠️ DAS IST DER BEWEIS, DEN DER NAME NICHT LIEFERN KANN. Die Crew-Liste
+    nennt Kollegen abgekürzt („Marco C.") und ohne Personalnummer — daraus ist
+    eine Identität nicht ableitbar (s. Banner in `_match_aerox_profiles`). Aber
+    wer seinen Dienstplan in AeroX hat, hat SELBST hinterlegt, dass er auf
+    diesem Leg sitzt. Das ist eine Aussage aus eigener Quelle statt einer
+    Vermutung über fremde Daten — und es ist genau die Tatsache, an der die
+    Marco-Verwechslung gescheitert wäre: Marco Christ stand nie auf LH762.
+
+    Läuft über `payload @> {...}` (jsonb-Containment) und damit über den GIN-
+    Index `roster_snapshots_payload_gin`: 2,6 ms statt 212 ms Seq-Scan. Ohne
+    den Index gehört dieser Aufruf NICHT in den Serve-Pfad.
+
+    Wirft nie — ohne Treffer bleibt es beim pk-Beweis.
+    """
+    try:
+        import app as _app
+        if not getattr(_app, 'SB_AVAILABLE', False):
+            return []
+        f = re.sub(r'\s+', '', str(flight or '')).upper()
+        d = str(date or '')[:10]
+        if not f or not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+            return []
+        probe = {'tage': [{'datum': d, 'ical_sectors': [{'flight': f}]}]}
+        r = (_app.sb.table('roster_snapshots').select('token')
+             .contains('payload', probe).limit(60).execute())
+        return [row.get('token') for row in (r.data or []) if row.get('token')]
+    except Exception as e:
+        log.warning('[lh_flightops] roster_probe: %s', type(e).__name__)
+        return []
+
+
+def _match_aerox_profiles(members, flight=None, date=None):
     """Crew-Listen-Mitglieder → AeroX-PUBLIC-Profile (best-effort, wirft nie).
     Primär EXAKT über die LH-Personalnummer (metadata.lh_pk_number — beim
     Duty-Events-Import jedes verbundenen Users gespeichert), Fallback exakter
@@ -2912,9 +2962,72 @@ def _match_aerox_profiles(members):
         # (`FlightCrewSheet`: `m.aerox == nil` ⇒ `CrewMemberDetailView`), also
         # genau das gewünschte Verhalten.
         #
-        # Wer das wieder aufwerten will, braucht eine echte Identitätsquelle
-        # (z. B. pk-Rückschreibung für Nicht-Verbundene) — NICHT mehr Heuristik
-        # auf einem Buchstaben.
+        # Wer das wieder aufwerten will, braucht eine echte Identitätsquelle —
+        # NICHT mehr Heuristik auf einem Buchstaben. Genau das ist der Weg
+        # unten.
+
+        # ══════════════════════════════════════════════════════════════════
+        #  DRITTER WEG: ROSTER-BEWEIS (30.07.)
+        # ══════════════════════════════════════════════════════════════════
+        # Owner-Befund 30.07.: „mit dem neusten update sehe ich keinen mehr auf
+        # AeroX". Stimmt — und die Zahlen erklären warum: von 25.874 gecachten
+        # Crew-Einträgen sind 22.584 (87 %) abgekürzt OHNE pk, also aus LHs
+        # Daten grundsätzlich nicht auflösbar. Von den 3.291 mit pk sind 2.847
+        # die EIGENE Nummer des Abrufers — LH verrät einem also fast nur, wer
+        # man selbst ist. Das alte Fuzzy-Matching hat diese Lücke mit Raten
+        # gefüllt; das ist weg und bleibt weg.
+        #
+        # Aber es gibt eine zweite Quelle, die NICHT geraten ist: den Roster,
+        # den unsere Nutzer selbst mitbringen. Wer LH762 am 30.07. im eigenen
+        # Dienstplan stehen hat, sitzt nachweislich auf diesem Leg. Das ist
+        # eine Aussage über sich selbst, kein Rückschluss auf einen fremden
+        # Namen — und es ist die Tatsache, die den Vorfall verhindert hätte:
+        # Marco Christ stand nie auf LH762, er wäre hier nie Kandidat.
+        #
+        # DREI BEDINGUNGEN, alle nötig:
+        #   1. Der Mensch steht mit diesem Flug an diesem Tag im eigenen Roster.
+        #   2. Vorname exakt, und das Initial passt auf IRGENDEIN Nachnamen-
+        #      Token — LH kürzt Doppelnachnamen auf den ERSTEN ab
+        #      („Comajuncosas Grether" ⇒ „C."), ein Vergleich nur gegen das
+        #      letzte Token verfehlt genau diese Menschen.
+        #   3. Unter den Roster-Belegten bleibt GENAU EINER übrig, und sein
+        #      Profil ist nicht schon an ein anderes Mitglied vergeben.
+        by_roster = {}
+        abbrev_need = [m for m in need
+                       if m['name'].strip().lower() not in by_name
+                       and _abbrev_parts(m.get('name'))]
+        if abbrev_need and flight and date:
+            rostered = []
+            tokens = _roster_tokens_for_leg(flight, date)
+            if tokens:
+                try:
+                    r = (_app.sb.table('user_profiles').select(sel)
+                         .in_('token', tokens[:60]).limit(60).execute())
+                    rostered = list(r.data or [])
+                except Exception:
+                    rostered = []
+            # Schon per pk/Name belegte Profile sind vergeben — dieselbe Person
+            # darf nicht zweimal in derselben Liste stehen.
+            taken = {str((row or {}).get('token'))
+                     for row in list(by_pk.values()) + list(by_name.values())}
+            for m in abbrev_need:
+                first, initial = _abbrev_parts(m.get('name'))
+                if len(first) < 2:
+                    continue          # zu kurzer Vorname → zu unspezifisch
+                cand = []
+                for row in rostered:
+                    if str(row.get('token')) in taken:
+                        continue
+                    ntoks = [t for t in str(row.get('name') or '').split() if t]
+                    if len(ntoks) < 2 or ntoks[0].lower() != first.lower():
+                        continue
+                    if not any(t[:1].upper() == initial for t in ntoks[1:]):
+                        continue
+                    cand.append(row)
+                uniq = {row.get('token') for row in cand}
+                if len(uniq) == 1:
+                    by_roster[m['name'].strip().lower()] = cand[0]
+                    taken.add(str(cand[0].get('token')))
 
         def _pub(row):
             md = row.get('metadata') or {}
@@ -2931,7 +3044,8 @@ def _match_aerox_profiles(members):
         out = {}
         for m in members:
             row = (by_pk.get(str(m.get('pk') or '').strip())
-                   or by_name.get(str(m.get('name') or '').strip().lower()))
+                   or by_name.get(str(m.get('name') or '').strip().lower())
+                   or by_roster.get(str(m.get('name') or '').strip().lower()))
             p = _pub(row) if row else None
             if p:
                 out[str(m.get('pk') or m.get('name') or '')] = p
@@ -3677,7 +3791,7 @@ def _crew_pick_best(rows, date):
     return None
 
 
-def _crew_reenrich(crew):
+def _crew_reenrich(crew, flight=None, date=None):
     """Gecachte Liste → Kopie mit FRISCH gematchten AeroX-Profilen.
 
     VERIFIZIERT 2026-07-28: `_match_aerox_profiles` ist VIEWER-UNABHÄNGIG — sie
@@ -3691,13 +3805,17 @@ def _crew_reenrich(crew):
           „nur Freunde zeigen"), servierte der geteilte Cache sonst fremde
           Sicht — dieser Re-Match verhindert das strukturell.
       (b) Frische: wer nach dem Cache-Schreiben zu AeroX gekommen ist,
-          erscheint sofort. Kostet nur Supabase-Reads, KEINEN LH-Call."""
+          erscheint sofort. Kostet nur Supabase-Reads, KEINEN LH-Call.
+
+    `flight`/`date` schalten den Roster-Beweis frei (s. `_match_aerox_profiles`).
+    Ohne sie bleibt es beim pk-/Namens-Beweis — nie wird geraten."""
     out = []
     for m in crew or []:
         out.append({k: v for k, v in m.items() if k != 'aerox'}
                    if isinstance(m, dict) else m)
     try:
-        matches = _match_aerox_profiles([m for m in out if isinstance(m, dict)])
+        matches = _match_aerox_profiles(
+            [m for m in out if isinstance(m, dict)], flight=flight, date=date)
     except Exception:
         matches = {}
     for m in out:
@@ -3724,7 +3842,7 @@ def _crew_shared_serve(token, flight, date, dep=None, arr=None, now=None):
         if not best or not _crew_shared_fresh(best.get('flight_date'),
                                               best.get('cached_at'), now):
             return None
-        crew = _crew_reenrich(best.get('crew') or [])
+        crew = _crew_reenrich(best.get('crew') or [], flight=flight, date=date)
         if not crew:
             return None
         shared = str(best.get('token') or '') != token
@@ -4037,7 +4155,9 @@ def flightops_crewlist(token):
             # Pfad reicherte längst an, dieser Eigen-Cache-Pfad NICHT: die
             # „Auf AeroX"-Zeile verschwand. Gleiche Funktion, gleiche Kosten
             # (nur Supabase-Reads, KEIN LH-Call).
-            return jsonify({'ok': True, 'crew': _crew_reenrich(e['crew']),
+            return jsonify({'ok': True,
+                            'crew': _crew_reenrich(e['crew'], flight=flight,
+                                                   date=date),
                             'cached': True, 'cached_at': e.get('cached_at')})
         return None
 
@@ -4077,7 +4197,7 @@ def flightops_crewlist(token):
         return _cached() or jsonify({'ok': True, 'crew': []})
     # AeroX-Profil-Verknüpfung (Owner 2026-07-23): wer aus der Crew ist selbst
     # auf AeroX? → Avatar/Profil direkt aus der Liste öffnen.
-    matches = _match_aerox_profiles(crew)
+    matches = _match_aerox_profiles(crew, flight=flight, date=date)
     for m in crew:
         p = matches.get(str(m.get('pk') or m.get('name') or ''))
         if p:

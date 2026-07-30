@@ -729,7 +729,7 @@ def test_crewlist_success_populates_cache(monkeypatch):
     monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: {'crewMembers': []})
     monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [
         {'name': 'MUSTERMANN, MAX', 'pk': '1', 'category': 'CPT'}])
-    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda crew: {})
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda crew, **_kw: {})
     put = {}
     monkeypatch.setattr(fo, '_crew_cache_put',
                         lambda tok, f, d, crew: put.update(
@@ -985,7 +985,7 @@ def test_crewlist_uses_interactive_key_budget(monkeypatch):
                         lambda *a, **k: seen.update(crew=k.get('interactive'))
                         or {'crewMembers': []})
     monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'MAX'}])
-    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda crew: {})
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda crew, **_kw: {})
     monkeypatch.setattr(fo, '_crew_cache_put', lambda *a: None)
     import app as backend
     r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
@@ -1276,7 +1276,7 @@ def test_crewlist_endpoint_attaches_aerox_profiles(monkeypatch):
                         lambda tok: fo.extract_duty_links(DUTY_LINKS))
     monkeypatch.setattr(fo, 'crew_list',
                         lambda tok, f, d, dep, arr, ac, **k: REAL_CREWLIST)
-    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {
         '095599C': {'token': 'AT-SOEREN', 'name': 'Soeren Roenelt',
                     'airline': 'Lufthansa', 'homebase': 'FRA',
                     'position': 'CP', 'avatar_url': 'https://cdn/x.jpg'}})
@@ -3079,7 +3079,7 @@ def test_crewlist_shared_hit_serves_without_lh_call(monkeypatch):
     # Vergangenes Flugdatum ⇒ PAST-TTL, die Zeile ist frisch genug.
     monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
         AssertionError('geteilter Cache muss den LH-Call sparen')))
-    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {
         '095599C': {'token': 'AT-MAX', 'name': 'Max Mustermann',
                     'airline': 'Lufthansa', 'homebase': 'FRA',
                     'position': 'CP', 'avatar_url': None}})
@@ -3110,7 +3110,7 @@ def test_crewlist_shared_hit_reenriches_and_drops_cached_aerox(monkeypatch):
         AssertionError('kein LH-Call erwartet')))
     seen = []
     monkeypatch.setattr(fo, '_match_aerox_profiles',
-                        lambda members: seen.append(members) or {})
+                        lambda members, **_kw: seen.append(members) or {})
     import app as backend
     d = backend.app.test_client().post(
         '/api/lh/flightops/crewlist/AT-ICH',
@@ -3155,7 +3155,7 @@ def test_crewlist_stale_shared_entry_is_not_served(monkeypatch):
     monkeypatch.setattr(fo, 'crew_list',
                         lambda *a, **k: calls.append(a) or {'crewMembers': []})
     monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'FRISCH, FRIDA'}])
-    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {})
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {})
     import app as backend
     d = backend.app.test_client().post(
         '/api/lh/flightops/crewlist/AT-ICH',
@@ -3173,7 +3173,7 @@ def test_crewlist_force_bypasses_shared_cache(monkeypatch):
          'crew': [{'name': 'CACHE, CARLA'}], 'cached_at': _t.time() - 60}])
     monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: {'crewMembers': []})
     monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'LIVE, LARS'}])
-    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members: {})
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {})
     import app as backend
     d = backend.app.test_client().post(
         '/api/lh/flightops/crewlist/AT-ICH',
@@ -3595,3 +3595,135 @@ def test_family_accounts_never_linked(monkeypatch):
     _profiles(monkeypatch, [fam])
     assert fo._match_aerox_profiles([{'name': 'Marco Christ',
                                       'pk': '709758B'}]) == {}
+
+
+# ── Dritter Weg: ROSTER-BEWEIS (30.07.) ────────────────────────────────────
+# Owner: „mit dem neusten update sehe ich keinen mehr auf AeroX" — richtig, denn
+# 87 % der Crew-Eintraege sind abgekuerzt OHNE pk und aus LHs Daten nicht
+# aufloesbar. Statt wieder zu raten kommt der Beweis aus EIGENER Quelle: wer
+# diesen Flug an diesem Tag im eigenen Roster stehen hat, sitzt nachweislich
+# drauf. Genau daran waere die Verwechslung gescheitert — Marco Christ stand
+# nie auf LH762.
+
+class _RosterProfTbl:
+    """user_profiles + roster_snapshots, nur was der Matcher benutzt."""
+
+    def __init__(self, profiles, rostered_tokens):
+        self.profiles = list(profiles)
+        self.rostered = list(rostered_tokens)
+        self.probes = []
+
+    def table(self, name):
+        self._t = name
+        self._mode = self._vals = self._pat = None
+        return self
+
+    def select(self, *_a, **_k):
+        return self
+
+    def contains(self, col, probe):
+        assert col == 'payload', col
+        self._mode, = ('contains',)
+        self.probes.append(probe)
+        return self
+
+    def in_(self, col, vals):
+        self._mode = ('in', col)
+        self._vals = [str(v) for v in vals]
+        return self
+
+    def ilike(self, col, pat):
+        assert col == 'name', col
+        self._mode, self._pat = 'ilike', pat
+        return self
+
+    def limit(self, _n):
+        return self
+
+    def execute(self):
+        if self._t == 'roster_snapshots':
+            return _R([{'token': t} for t in self.rostered])
+        m = self._mode
+        if isinstance(m, tuple) and m[0] == 'in':
+            if m[1] == 'token':
+                return _R([p for p in self.profiles
+                           if p.get('token') in self._vals])
+            return _R([p for p in self.profiles
+                       if str((p.get('metadata') or {}).get('lh_pk_number')
+                              or '') in self._vals])
+        if m == 'ilike':
+            pat = str(self._pat or '').strip().lower()
+            return _R([p for p in self.profiles
+                       if str(p.get('name') or '').strip().lower() == pat])
+        return _R([])
+
+
+def _roster_setup(monkeypatch, profiles, rostered):
+    import app as backend
+    tbl = _RosterProfTbl(profiles, rostered)
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(backend, 'sb', tbl, raising=False)
+    return tbl
+
+
+_ANITA = {'token': 'AT-ANITA', 'name': 'Anita Davis', 'airline': 'Lufthansa',
+          'homebase': 'FRA', 'position': 'FA', 'metadata': {}}
+_MARCO_REAL = {'token': 'AT-REAL', 'name': 'Marco Comajuncosas Grether',
+               'airline': 'Lufthansa', 'homebase': 'FRA', 'position': 'P2',
+               'metadata': {}}
+
+
+def test_roster_proof_links_abbreviated_name(monkeypatch):
+    """„Anita D." steht als Anita Davis selbst auf LH762 → belegt, verknuepft."""
+    tbl = _roster_setup(monkeypatch, [_ANITA], ['AT-ANITA'])
+    out = fo._match_aerox_profiles([{'name': 'Anita D.', 'pk': ''}],
+                                   flight='LH762', date='2026-07-30')
+    assert out.get('Anita D.', {}).get('token') == 'AT-ANITA'
+    # Der Beweis wird wirklich am konkreten Leg gezogen, nicht global.
+    assert tbl.probes and tbl.probes[0]['tage'][0]['datum'] == '2026-07-30'
+    assert (tbl.probes[0]['tage'][0]['ical_sectors'][0]['flight'] == 'LH762')
+
+
+def test_roster_proof_handles_double_surname(monkeypatch):
+    """LH kuerzt „Comajuncosas Grether" auf den ERSTEN Nachnamen („C.").
+    Das Initial muss deshalb gegen JEDES Nachnamen-Token passen."""
+    _roster_setup(monkeypatch, [_MARCO_REAL], ['AT-REAL'])
+    out = fo._match_aerox_profiles([{'name': 'Marco C.', 'pk': ''}],
+                                   flight='LH762', date='2026-07-30')
+    assert out.get('Marco C.', {}).get('token') == 'AT-REAL'
+
+
+def test_incident_stays_fixed_marco_christ_is_not_on_the_flight(monkeypatch):
+    """DIE REGRESSION: Marco Christ ist auf AeroX und heisst passend — steht
+    aber nicht im Roster dieses Legs. Kein Beweis, kein Match."""
+    _roster_setup(monkeypatch, [_MARCO_CHRIST], [])
+    assert fo._match_aerox_profiles([{'name': 'Marco C.', 'pk': ''}],
+                                    flight='LH762',
+                                    date='2026-07-30') == {}
+
+
+def test_roster_proof_requires_uniqueness(monkeypatch):
+    """Zwei belegte Kandidaten auf dasselbe Kuerzel → lieber niemand."""
+    zwei = dict(_MARCO_REAL, token='AT-ZWEI', name='Marco Conrad')
+    _roster_setup(monkeypatch, [_MARCO_REAL, zwei], ['AT-REAL', 'AT-ZWEI'])
+    assert fo._match_aerox_profiles([{'name': 'Marco C.', 'pk': ''}],
+                                    flight='LH762',
+                                    date='2026-07-30') == {}
+
+
+def test_no_roster_proof_without_flight_and_date(monkeypatch):
+    """Ohne Leg-Bezug gibt es nichts zu beweisen — dann lieber kein Match."""
+    _roster_setup(monkeypatch, [_ANITA], ['AT-ANITA'])
+    assert fo._match_aerox_profiles([{'name': 'Anita D.', 'pk': ''}]) == {}
+
+
+def test_same_profile_is_never_linked_twice(monkeypatch):
+    """Steht dieselbe Person schon per pk in der Liste, darf ein abgekuerzter
+    Eintrag sie nicht ein zweites Mal bekommen."""
+    anita_pk = dict(_ANITA, metadata={'lh_pk_number': '111222A'})
+    _roster_setup(monkeypatch, [anita_pk], ['AT-ANITA'])
+    out = fo._match_aerox_profiles(
+        [{'name': 'Anita Davis', 'pk': '111222A'}, {'name': 'Anita D.', 'pk': ''}],
+        flight='LH762', date='2026-07-30')
+    assert out.get('111222A', {}).get('token') == 'AT-ANITA'
+    assert 'Anita D.' not in out
