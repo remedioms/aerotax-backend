@@ -19144,7 +19144,7 @@ def _build_logbook_html(token, standard='EASA'):
 <table><thead><tr>{head}</tr></thead><tbody>
 {''.join(rows_html) if rows_html else '<tr><td colspan="9" style="text-align:center;color:#5e6679;padding:30px">Keine Flugtage vorhanden.</td></tr>'}
 </tbody></table>
-<div class="foot">Erzeugt: {datetime.now().strftime('%Y-%m-%d %H:%M')} · Standard: {std_esc} · Tage gesamt: {len(rows_html)}</div>
+<div class="foot">Erzeugt: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC · Standard: {std_esc} · Tage gesamt: {len(rows_html)}</div>
 <div class="sig">Unterschrift: ____________________________ Datum: ______________</div>
 </body></html>"""
     return html
@@ -22113,8 +22113,16 @@ def take_roster_snapshot(token):
 
 
 def _rc_local_hhmm(iso, iata):
-    """UTC-ISO → station-lokale HH:MM (airport_tz, Fallback Europe/Berlin). '' bei
-    Parse-Fehler. Wirft nie."""
+    """UTC-ISO → station-lokale HH:MM. '' bei Parse-Fehler ODER unbekannter
+    Station. Wirft nie.
+
+    ZEITZONENREGEL (Sweep 2026-07-29): kein Berlin-Fallback mehr für
+    UNBEKANNTE Stationen — diese Zeiten landen als „Abflug 12:30 → 13:00"
+    direkt in Push-Bodies, und eine Berliner Uhr als angebliche Stationszeit
+    ist schlimmer als keine Zeile (Regel 4). Alle Aufrufer prüfen `if da and
+    db` und fallen bei '' auf die generische Formulierung zurück — der Push
+    kommt weiterhin, nur ohne falsche Zahl. FRA/EDDF/'' bleiben wie gehabt
+    Europe/Berlin (Homebase-Konvention der LH-Roster-Keys)."""
     try:
         s = str(iso or '').strip()
         if not s:
@@ -22123,9 +22131,12 @@ def _rc_local_hhmm(iso, iata):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         ap = _DE_ICAO_TO_IATA.get((iata or '').upper(), (iata or '').upper())
-        tzname = ('Europe/Berlin' if ap in ('FRA', 'EDDF', '') else airport_tz(ap))
+        tzname = ('Europe/Berlin' if ap in ('FRA', 'EDDF', '')
+                  else airport_tz(ap))
+        if not tzname:
+            return ''
         from zoneinfo import ZoneInfo as _ZI
-        return dt.astimezone(_ZI(tzname or 'Europe/Berlin')).strftime('%H:%M')
+        return dt.astimezone(_ZI(tzname)).strftime('%H:%M')
     except Exception:
         return ''
 
@@ -47003,7 +47014,16 @@ _EMOJI_PREFIX_RE = re.compile(r'^[^A-Za-z0-9]+\s*')
 
 
 def _ics_local_hhmm_at(iso_utc, iata):
-    """UTC-ISO → 'HH:MM' in der TZ der Station (None bei Fehler)."""
+    """UTC-ISO → 'HH:MM' in der TZ der Station (None bei Fehler).
+
+    ZEITZONENREGEL (Sweep 2026-07-29): kennt `airport_tz` die Station NICHT,
+    kommt None zurück — KEIN Berlin-Fallback mehr. Die Aufrufer beschriften
+    das Ergebnis ausdrücklich als Stations-Ortszeit („HH:MM LT Briefing PEK",
+    „PU @ 06:50lcl"); eine Berliner Uhr unter diesem Label war die schlimmste
+    Kombination: falsche Zahl MIT falscher Beschriftung. Alle Aufrufer
+    behandeln None bereits (Zeile/Umbenennung fällt weg — Regel 4: lieber
+    keine Zeit als eine falsche).
+    """
     try:
         from zoneinfo import ZoneInfo as _ZI
         dt = datetime.fromisoformat((iso_utc or '').replace('Z', '+00:00'))
@@ -47014,7 +47034,9 @@ def _ics_local_hhmm_at(iso_utc, iata):
             tzname = airport_tz(iata) if iata else None
         except Exception:
             tzname = None
-        return dt.astimezone(_ZI(tzname or 'Europe/Berlin')).strftime('%H:%M')
+        if not tzname:
+            return None
+        return dt.astimezone(_ZI(tzname)).strftime('%H:%M')
     except Exception:
         return None
 

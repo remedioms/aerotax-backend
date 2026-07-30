@@ -1403,8 +1403,10 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         # Leg wird als frisch gelandet gezeigt (nicht Layover) — s.o. muell_landed.
         recent = (now - eff_arr) <= _dt.timedelta(minutes=_LANDED_RECENT_MIN) \
             or bool(leg.get('muell_landed'))
-        landed_sub = (f'Gelandet {hhmm(eff_arr, dest)}'
-                      if not leg['arr_synth'] else None)
+        # `hhmm` darf None liefern (unbekannte Stations-TZ, Zeitzonenregel
+        # 2026-07-29) — dann fällt die Zeit weg statt „Gelandet None"/UTC.
+        _landed_t = hhmm(eff_arr, dest) if not leg['arr_synth'] else None
+        landed_sub = f'Gelandet {_landed_t}' if _landed_t else None
         if hb and dest == hb:
             if recent:
                 return _result(STATE_LANDED, leg=leg, idx=len(legs) - 1,
@@ -1853,7 +1855,13 @@ def build_live_lookup():
 def build_local_hhmm(airport_tz_fn):
     """local_hhmm-Adapter: aware-UTC → 'HH:MM' in der STATIONS-Ortszeit
     (airport_tz; FRA/EDDF-Fallback Europe/Berlin wie app._board_local_to_utc_iso).
-    Unbekannte TZ → UTC (nie None-Zeit wegen TZ-Lücke)."""
+
+    ZEITZONENREGEL (Sweep 2026-07-29): unbekannte TZ → **None** statt UTC.
+    Die Ergebnisse landen als nackte Wanduhr in Widget-/Feed-Texten („Nächster
+    Flug · LH400 · 12:35") — eine UTC-Zahl ohne Label ist dort eine falsche
+    Ortszeit-Behauptung (Regel 4: lieber keine Zeit als eine falsche). Alle
+    Text-Kompositionen in diesem Modul prüfen `if t` und lassen die Zeit dann
+    weg; der Status-Text selbst bleibt erhalten."""
     def _fmt(d, iata):
         try:
             ap = str(iata or '').strip().upper()
@@ -1865,5 +1873,5 @@ def build_local_hhmm(airport_tz_fn):
                 return d.astimezone(ZoneInfo(tzname)).strftime('%H:%M')
         except Exception:
             pass
-        return _default_hhmm(d)
+        return None
     return _fmt

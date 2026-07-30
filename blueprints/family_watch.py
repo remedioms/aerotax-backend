@@ -2366,9 +2366,38 @@ def _load_crew_roster_days(crew_token, days_limit):
                      .gte('datum', start).lte('datum', end)
                      .order('datum').limit(150).execute())
 
+                # TZ-FIX (Zeitzonen-Sweep 2026-07-29): der alte Regex-Slice
+                # T(\d{2}:\d{2}) gab ROHES UTC als Wanduhr aus (05:35 statt
+                # 07:35 FRA) — exakt der Bug, der im Freunde-Kalender-Zwilling
+                # (app.py `_hhmm`, Fix 2026-07-25) bereits behoben war und hier
+                # nie nachgezogen wurde. Gleicher Kontrakt wie dort: ISO →
+                # Homebase-TZ der CREW; offsetlose ical_start-Strings sind
+                # bereits UTC (Backend schreibt +00:00).
+                from zoneinfo import ZoneInfo as _FwZI
+                from datetime import datetime as _FwDT, timezone as _FwTZ
+                _crew_hb = None
+                try:
+                    _hb_fn = _app_attr('_profile_homebase_cached')
+                    _crew_hb = _hb_fn(crew_token) if callable(_hb_fn) else None
+                except Exception:
+                    _crew_hb = None
+                try:
+                    _tz_fn = _app_attr('airport_tz')
+                    _crew_tz = _FwZI((_tz_fn(_crew_hb) if callable(_tz_fn)
+                                      else None) or 'Europe/Berlin')
+                except Exception:
+                    _crew_tz = _FwZI('Europe/Berlin')
+
                 def _hhmm(x):
-                    m = re.search(r'T(\d{2}:\d{2})', str(x or ''))
-                    return m.group(1) if m else None
+                    s = str(x or '')
+                    try:
+                        dt = _FwDT.fromisoformat(s.replace('Z', '+00:00'))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=_FwTZ.utc)
+                        return dt.astimezone(_crew_tz).strftime('%H:%M')
+                    except Exception:
+                        m = re.search(r'T(\d{2}:\d{2})', s)
+                        return m.group(1) if m else None
 
                 for row in (r.data or []):
                     d = row.get('datum')
