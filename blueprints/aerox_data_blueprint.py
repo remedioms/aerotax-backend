@@ -5334,6 +5334,59 @@ def _plan_times_for_date(leg, date):
     return out
 
 
+def _live_snapshot_covers_date(date, now=None):
+    """Darf ein `aircraft_live`-Schnappschuss (DATUMSLOS, max. 40 min alt) als
+    Quelle für den angefragten Betriebstag gelten?
+
+    True nur für den heutigen UTC-Tag. Ein Schnappschuss von JETZT sagt nichts
+    über den 28.07., und genau daran hing die falsche Reg (Owner 2026-07-30:
+    `uflight/LH454?date=2026-07-28` → DABYP, dem HEUTIGEN Tail, statt DABYH).
+    Kein Datum angefragt ⇒ True (der Aufrufer meint „jetzt").
+    Ein Datum, das nicht der heutige UTC-Tag IST — auch ein unparsbares —
+    ⇒ False. Bewusst fail-CLOSED, und zwar nur für diese eine Frage: die
+    Antwort schaltet keine Quelle ab, sie schickt die Kaskade lediglich auf die
+    date-exakten Quellen (Fakten/Warehouse). Schlimmstenfalls fehlt eine Reg;
+    das ist billiger als die falsche Maschine zu behaupten."""
+    d = (str(date or '').strip()[:10]) or None
+    if not d:
+        return True
+    try:
+        today = time.strftime('%Y-%m-%d',
+                              time.gmtime(now if now is not None else time.time()))
+    except Exception:
+        return True
+    return d == today
+
+
+def _warehouse_day_tail(flight_no, date):
+    """Date-EXAKTER Tail aus dem Flight-Warehouse: `flights` (op_flight_no +
+    service_date → tail). Die verlässlichste Quelle für Vergangenheits-Tage —
+    board-verifiziert und pro Servicetag geführt (LH454/2026-07-28 → DABYH).
+
+    Bewusst OHNE jede Datums-Aufweitung: gefragt ist EIN Tag, geliefert wird der
+    Tail DIESES Tages oder None. Nie raten, nie den Nachbartag borgen. Gibt die
+    normalisierte Reg ohne Bindestrich zurück (Schema wie `_sb_day_reg`).
+    Wirft nie."""
+    fn = (flight_no or '').replace(' ', '').upper().strip()
+    d = (str(date or '').strip()[:10]) or None
+    if len(fn) < 3 or not d:
+        return None
+    sb = _sb()
+    if sb is None:
+        return None
+    try:
+        rows = (sb.table('flights').select('tail')
+                .eq('op_flight_no', fn).eq('service_date', d)
+                .order('sched_dep', desc=True).limit(3).execute()).data or []
+    except Exception:
+        return None
+    for r in rows:
+        t = re.sub(r'[^A-Z0-9]', '', str(r.get('tail') or '').upper())
+        if t:
+            return t
+    return None
+
+
 def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
                                  date_auto=False):
     """Der eigentliche Free-First-Zusammenbau (q/date bereits normalisiert):
@@ -5354,10 +5407,20 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
     alf = alf or {}
     callsign = alf.get('callsign') or (q if callsign_query else None)
     flight_no = alf.get('flight') or (None if callsign_query else q)
-    reg = alf.get('reg')
+    # DATUMS-TREUE REG (Owner 2026-07-30, `uflight/LH454?date=2026-07-28` gab
+    # DABYP = den HEUTIGEN Tail, statt DABYH): `aircraft_live` ist ein
+    # DATUMSLOSER Jetzt-Schnappschuss (einziger Filter: updated_at > now−40 min).
+    # Für einen Vergangenheits-Tag beschreibt er die Maschine von heute — und
+    # weil `reg` unten mit `or` gegen die date-exakten Fakten läuft, gewann der
+    # Schnappschuss immer. Der Museums-Wächter kann das nicht abfangen: der
+    # heutige Tail IST aktiv. Für den heutigen Tag ändert sich nichts.
+    # Route/Callsign bleiben bewusst unberührt — eine Flugnummer fliegt Tag für
+    # Tag dieselbe Strecke, die MASCHINE wechselt täglich.
+    _live_ok = _live_snapshot_covers_date(date)
+    reg = alf.get('reg') if _live_ok else None
     origin = alf.get('dep_iata')
     dest = alf.get('arr_iata')
-    ac_type = alf.get('aircraft')
+    ac_type = alf.get('aircraft') if _live_ok else None
     route_src = 'aircraft_live' if (origin and dest) else None
     route_conf = 'confirmed' if route_src else None
 
@@ -5425,7 +5488,24 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
     facts = {}
     if flight_no:
         facts = _flight_facts_from_obs(flight_no, date, dep_iata=origin, arr_iata=dest)
+    # DATUMS-TREUE REG (Owner 2026-07-30, `uflight/LH454?date=2026-07-28`
+    # lieferte DABYP statt DABYH): `reg` kommt oben aus `_aircraft_live_flight`
+    # — einem DATUMSLOSEN Jetzt-Schnappschuss (einziger Filter: updated_at >
+    # now−40 min). Für einen Vergangenheits-Tag beschreibt der die MASCHINE VON
+    # HEUTE, und `reg or facts.get('reg')` schnitt die eine date-exakte Quelle
+    # (`_flight_facts_from_obs`: `.eq('date', d)` + LH-flightstatus für genau
+    # diesen Tag) kurz. Der Museums-Wächter unten kann das nicht abfangen:
+    # der heutige Tail IST aktiv.
+    # Regel: nur für den HEUTIGEN (UTC-)Betriebstag darf der Live-Schnappschuss
+    # den Tail stellen; sonst gewinnt die date-exakte Quelle. Für heute bleibt
+    # das Verhalten byte-identisch.
+    # Rangfolge: (heutiger) Live-Schnappschuss → date-exakte Board-/LH-Fakten →
+    # date-exakter Warehouse-Tail. Der letzte Schritt lohnt NUR für Tage, die
+    # der Live-Schnappschuss ohnehin nicht abdecken darf (Vergangenheit) — für
+    # heute spart er sich den Extra-Read.
     reg = reg or facts.get('reg')
+    if not reg and not _live_snapshot_covers_date(date):
+        reg = _warehouse_day_tail(flight_no, date)
     ac_type = ac_type or facts.get('type')
     # Museums-Tail-Wächter (Owner 2026-07-12, LH781→D-ABTL): auch die Reg aus
     # der Routen-Kaskade (Warehouse-`flights`.tail) kann die Board-Altlast
@@ -9296,6 +9376,70 @@ def ax_plane_rotation(flight):
     return jsonify(payload)
 
 
+def _live_arrival_fields(merged, facts):
+    """PURE (trivial testbar): die ANKUNFTS-Seite der flight-live-Antwort aus
+    Board-Merge (`_flight_obs_merged`-Shape) + kanonischen Fakten
+    (`_flight_facts_from_obs`-Shape). Reiner Lücken-Füller — der Board-Merge
+    behält immer Vorrang, die Fakten liefern NUR, was er nicht hat.
+
+    RANGFOLGE (Owner-Regel „keine Fake-Werte", Memory aerox-unified-flight-info):
+      1. echtes `est_arr`  — Ist/Erwartet aus Board bzw. LH Open API
+      2. `sched_arr`       — Fahrplan
+      3. NICHTS (None)     — es wird NIE etwas abgeleitet (kein Großkreis, kein
+                             progress-ETA, keine Roster-Zeit). Fehlt die Zahl,
+                             fehlt sie; der Client lässt die Zeile weg.
+
+    Warum überhaupt zwei Quellen (Owner-Fall LH454 FRA→SFO, 2026-07-30):
+    `_flight_obs_merged` ist auf der arr-Seite board-/warehouse-gebunden. Für
+    eine OUTSTATION, deren Ankunftstafel niemand scraped (SFO), gibt es keine
+    arr-Row → sched_arr/esti_arr/arr_delay_min/gate_arr blieben alle None,
+    obwohl `/api/ax/uflight` für denselben Flug est_arr 12:36 auslieferte. Die
+    Ankunftswahrheit steckt dort in den LH-Open-API-Fakten, die
+    `_flight_facts_from_obs` schon merged (`_merge_lh_into_facts`).
+    """
+    m = merged if isinstance(merged, dict) else {}
+    f = facts if isinstance(facts, dict) else {}
+    # Delay nur, wenn er als BEKANNT belegt ist: der Board-Merge sagt das über
+    # `delay_known`, die Fakten-Seite rechnet ihn aus sched/est (LH `_delay_min`)
+    # und liefert ihn nur dann. Ein „0" ohne Beleg wäre eine Behauptung.
+    arr_delay = (m.get('arr_delay_min') if m.get('delay_known') else None)
+    if arr_delay is None:
+        arr_delay = f.get('arr_delay_min')
+    return {
+        'sched_arr': m.get('sched_arr') or f.get('sched_arr'),
+        'est_arr': m.get('esti_arr') or f.get('est_arr'),
+        'arr_delay_min': arr_delay,
+        'dest_gate': m.get('gate_arr') or f.get('arr_gate'),
+    }
+
+
+def _live_arrival_facts(flight_no, date, dep, dest, merged):
+    """Gated impure Hülle um `_live_arrival_fields`: die kanonischen Fakten NUR
+    ziehen, wenn dem Board-Merge auf der Ankunftsseite wirklich etwas fehlt.
+
+    KOSTEN-GATE (iOS pollt diese Route alle 30–60 s):
+      · `_flight_facts_from_obs` ist prozessweit 30 s memoisiert — GENAU der
+        Schlüssel `(flight,date,dep,arr)`, den auch /api/ax/uflight und das
+        Detail-Aggregat benutzen. Wir erben also deren bereits bezahlte Arbeit,
+        statt eine zweite Quelle aufzumachen.
+      · `lh_cached_only=True` ⇒ der LH-Open-API-Call ist auf diesem Pfad
+        UNERREICHBAR: ein Memo-Treffer liefert, ein Miss wärmt nur im
+        Hintergrund. Damit kostet der Poll NULL zusätzliche LH-Gateway-Calls —
+        Pflicht, denn der Stunden-Deckel ist real (gemessen 30.07., Stunde 16
+        UTC: 869 Calls durch, 1026 abgewiesen).
+    Wirft nie — die Ankunftsseite bleibt im Fehlerfall exakt wie der Board-Merge
+    sie hatte."""
+    out = _live_arrival_fields(merged, None)
+    if out['est_arr'] and out['sched_arr']:
+        return out                      # Board vollständig → kein Fakten-Read
+    try:
+        facts = _flight_facts_from_obs(flight_no, date, dep_iata=dep,
+                                       arr_iata=dest, lh_cached_only=True)
+    except Exception:
+        return out
+    return _live_arrival_fields(merged, facts)
+
+
 @aerox_data_bp.route('/api/ax/flight-live/<token>', methods=['GET'])
 def ax_flight_live(token):
     """#3 Live-Track der EIGENEN Maschine für die In-Flight-Karte. Query:
@@ -9304,7 +9448,13 @@ def ax_flight_live(token):
     dep_iata/arr_iata (optional, Leg-Airports fürs Board-/Store-Keying).
     Reg→Hex→OpenSky-Position + free-first-Route,
     dazu dep/dest (IATA+Stadt), sched/est-Ankunft, Ankunfts-Delay, Ziel-Gate und
-    Großkreis-Fortschritt 0..1. Gratis, cachebar, iOS pollt ~30–60 s."""
+    Großkreis-Fortschritt 0..1. Gratis, cachebar, iOS pollt ~30–60 s.
+
+    ANKUNFTS-SEITE (`sched_arr`/`est_arr`/`arr_delay_min`/`dest_gate`): Board-
+    Merge zuerst, Lücken aus derselben kanonischen Fakten-Quelle wie
+    /api/ax/uflight (`_live_arrival_facts`, gecacht + `lh_cached_only` ⇒ kein
+    zusätzlicher LH-Call pro Poll). Rangfolge: echtes est_arr > sched_arr >
+    nichts — es wird NIE eine Ankunft geschätzt oder abgeleitet."""
     from flask import request
     flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
     date = (request.args.get('date') or '').strip()[:10] or None
@@ -9370,6 +9520,10 @@ def ax_flight_live(token):
     # Ankunfts-Seite (Zeiten/Delay/Gate) frisch für die konkrete Strecke.
     merged = (merged_fn(flight_no, date=date, dep_iata=dep, arr_iata=dest,
                         free_only=True) if merged_fn else None) or my or {}
+    # …und die Lücken daraus aus DERSELBEN kanonischen Fakten-Quelle füllen, die
+    # /api/ax/uflight benutzt (s. `_live_arrival_facts`). Ohne das blieb die
+    # Ankunft für jede ungescrapte Outstation leer, während uflight sie kannte.
+    arr_fields = _live_arrival_facts(flight_no, date, dep, dest, merged)
     in_flight = bool(pos and not pos.get('on_ground'))
     payload = {
         'ok': True, 'flight': flight_no, 'date': date,
@@ -9386,11 +9540,12 @@ def ax_flight_live(token):
         'dep_delay_min': (merged.get('dep_delay_min')
                           if merged.get('delay_known') else None),
         'dep_gate': merged.get('gate_dep'),
-        'sched_arr': merged.get('sched_arr'),
-        'est_arr': merged.get('esti_arr'),
-        'arr_delay_min': (merged.get('arr_delay_min')
-                          if merged.get('delay_known') else None),
-        'dest_gate': merged.get('gate_arr'),
+        # ANKUNFT Soll/Ist/Delay/Gate — Board-Merge zuerst, kanonische Fakten
+        # füllen die Lücken. Rangfolge: echtes est_arr > sched_arr > nichts.
+        'sched_arr': arr_fields['sched_arr'],
+        'est_arr': arr_fields['est_arr'],
+        'arr_delay_min': arr_fields['arr_delay_min'],
+        'dest_gate': arr_fields['dest_gate'],
         'live': pos,
         'in_flight': in_flight,
         'progress': (_progress_along_route(dep, dest, pos) if in_flight else None),
@@ -9411,7 +9566,12 @@ def ax_flight_live(token):
             _fs_keys = _fs_bk(
                 flight_no, date, dep, dest, roster_tail=reg, callsign=cs,
                 sched_dep_iso=(_to_utc(merged.get('sched_dep'), dep) if _to_utc else None),
-                sched_arr_iso=(_to_utc(merged.get('sched_arr'), dest) if (_to_utc and dest) else None),
+                # Soll-Ankunft aus DEM Feld, das auch die Antwort trägt (Board
+                # ODER kanonische Fakten) — sonst rechnete die Engine für jede
+                # ungescrapte Outstation ohne Fahrplan-Anker und lieferte
+                # eta_iso=None, obwohl die Zahl im Payload steht.
+                sched_arr_iso=(_to_utc(arr_fields['sched_arr'], dest)
+                               if (_to_utc and dest) else None),
                 dep_ll=_iata_latlon(dep or ''), arr_ll=_iata_latlon(dest or ''),
                 dep_elev_ft=_iata_elev_ft(dep or ''))
             _fs_obs = _fs_obm(merged, _fs_keys, board_to_iso=_to_utc)
