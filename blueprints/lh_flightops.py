@@ -4505,18 +4505,33 @@ def _internal_secret_ok():
 def _connected_tokens(limit=2000):
     """Alle AeroX-User-Tokens mit gespeicherten FlightOps-Tokens. Quelle:
     Supabase user_profiles.metadata->flightops_tokens (SB ist prod-primary).
-    PostgREST kappt bei 1000 → paginiert lesen. Leer ohne SB (Dev)."""
+    PostgREST kappt bei 1000 → paginiert lesen. Leer ohne SB (Dev).
+
+    KADENZ-HYDRATION (2026-07-30): liest den durablen Sync-Stempel
+    metadata->fo_bg_sync_at GLEICH MIT (gleiche Query, keine Zusatz-Kosten)
+    und füllt damit die prozess-lokale Kadenz-Map nach Neustarts wieder auf.
+    Messbefund 30.07.: der 16:23-Lauf lief mit deferred=0 über 927 User,
+    weil ein Worker-Restart zwischen zwei Cron-Läufen die Map geleert hatte
+    — die adaptive Kadenz war damit wirkungslos und JEDER Lauf plante die
+    volle Flotte ein."""
     try:
         import app as _app
         if not getattr(_app, 'SB_AVAILABLE', False):
             return []
         out, page, size = [], 0, 500
+        _now = time.time()
         while len(out) < limit:
-            r = (_app.sb.table('user_profiles').select('token')
+            r = (_app.sb.table('user_profiles')
+                 .select('token,metadata->' + _FO_SYNC_STAMP_KEY)
                  .filter('metadata->flightops_tokens', 'not.is', 'null')
                  .range(page * size, page * size + size - 1).execute())
             rows = r.data or []
-            out += [row.get('token') for row in rows if row.get('token')]
+            for row in rows:
+                tok = row.get('token')
+                if not tok:
+                    continue
+                out.append(tok)
+                _fo_hydrate_stamp(tok, row.get(_FO_SYNC_STAMP_KEY), _now)
             if len(rows) < size:
                 break
             page += 1
@@ -4535,16 +4550,33 @@ def _connected_tokens(limit=2000):
 _FO_SYNC_NEAR_S = 3.5 * 3600
 _FO_SYNC_FAR_S = 11.5 * 3600
 _FO_DUTY_NEAR_S = 48 * 3600
-# Letzter Sync je Token — bewusst PROZESS-LOKAL (der refresh-all-Lauf lebt
-# ohnehin nur im Poll-Container). Nach einem Neustart/Deploy ist die Map leer
-# ⇒ jeder Token ist einmal fällig. Das ist gewollt: nach einem Deploy einmal
-# alle synchronisieren ist billig (1 Lauf) und stellt Frische her.
+# Letzter Sync je Token. Die Prozess-Map ist der Schnellpfad; DURABEL lebt
+# der Stempel seit 2026-07-30 zusätzlich im Profil (metadata.fo_bg_sync_at,
+# atomarer Merge) und wird in _connected_tokens kostenlos mitgelesen.
+# WARUM: „nach einem Deploy einmal alle synchronisieren ist billig" stimmte
+# nicht — der Poll-Worker startet auch ZWISCHEN Deploys neu (gunicorn-Recycle,
+# OOM), und jede leere Map heißt volle Flotte „first" = 900+ Extra-Imports.
+# Gemessen 30.07.: 16:23-Lauf mit deferred=0 über 927 User, Tagesdeckel 5000
+# um 16:49 gerissen, Abend-Primetime flottenweit ohne Hintergrund-Sync.
 _fo_last_sync = {}
 _FO_LAST_SYNC_CAP = 8000
-# Demand-Vorlauf: wie lange ein Lauf auf die Rotation abgelaufener Grants
-# wartet, bevor er sie überspringt (Refresher-Tick ist 60 s).
-_FO_DEMAND_WAIT_S = 120
-_FO_DEMAND_WAIT_STEP_S = 5
+_FO_SYNC_STAMP_KEY = 'fo_bg_sync_at'
+# Wellen-Steuerung des Laufs (ersetzt den blinden 120-s-Demand-Vorlauf):
+# harte Lauf-Obergrenze deutlich unter dem 2-h-Cron-Takt, Pause zwischen zwei
+# Wellen etwas über dem Refresher-Tick (60 s), Stall-Limit gegen Grants, deren
+# Rotation im Backoff hängt (bis 1 h — darauf wartet kein Lauf).
+_FO_RUN_DEADLINE_S = 90 * 60
+_FO_WAVE_WAIT_S = 75.0
+_FO_WAVE_STEP_S = 5.0
+_FO_WAVE_STALL_MAX = 3
+# Sanfte Schrittweite zwischen zwei _access_state-Reads auf pending-Grants
+# (reiner Supabase-Read — aber 400+ davon ohne Pause wären eine Lastspitze).
+_FO_PENDING_CHECK_GAP_S = 0.05
+# Tages-Reserve für die lockere Kadenz-Klasse (far_due): User OHNE Dienst in
+# Sicht syncen nur, solange bis zum Hintergrund-Tagesdeckel mindestens diese
+# Zahl Calls frei ist — das Restbudget gehört den Usern mit Dienst in <48 h
+# (deren Roster ist das Kernprodukt, s. Kadenz-Banner oben).
+_FO_FAR_DAY_HEADROOM = 800
 
 
 def _fo_day_has_duty(ev):
@@ -4623,134 +4655,250 @@ def _fo_should_sync(token, now=None):
 
 
 def _fo_mark_synced(token, now=None):
-    """Sync-Versuch stempeln. Bewusst beim VERSUCH, nicht erst beim Erfolg:
-    der LH-Call ist raus und hat Kontingent gekostet — ein 502 darf nicht dazu
-    führen, dass derselbe Token in jedem 2-h-Lauf erneut dagegenläuft."""
+    """Sync-ERFOLG stempeln — im Prozess UND durabel im Profil
+    (metadata.fo_bg_sync_at, atomarer Top-Level-Merge, nie der ganze Blob).
+    Der durable Stempel repariert das deferred=0-Loch vom 30.07.: die
+    Prozess-Map stirbt mit jedem Worker-Restart, und ohne Stempel galt danach
+    die GANZE Flotte als „first" — die adaptive Kadenz existierte nur auf dem
+    Papier. Gestempelt wird seit dem Review-Fund 2026-07-28 nur der Erfolg:
+    ein LH-Schluckauf darf den User nicht 3,5–11,5 h ohne Retry lassen.
+    Wirft nie."""
     try:
-        _fo_last_sync[token] = now or time.time()
+        now = now or time.time()
+        _fo_last_sync[token] = now
         if len(_fo_last_sync) > _FO_LAST_SYNC_CAP:
             for k in sorted(_fo_last_sync,
                             key=lambda k: _fo_last_sync[k])[:_FO_LAST_SYNC_CAP // 2]:
                 _fo_last_sync.pop(k, None)
+        try:
+            import app as _app
+            if getattr(_app, 'SB_AVAILABLE', False):
+                _app._profile_metadata_merge_sb(
+                    token, {_FO_SYNC_STAMP_KEY: int(now)})
+        except Exception:
+            pass
     except Exception:
         pass
 
 
-def _fo_demand_prephase(tokens):
-    """Demand-Vorlauf vor der Import-Schleife: alle Tokens, deren Access-Token
-    abgelaufen ist, beim Refresher anmelden und ihm kurz Zeit geben.
+def _fo_hydrate_stamp(token, stamp, now=None):
+    """Durablen Sync-Stempel (metadata.fo_bg_sync_at) in die Prozess-Map
+    übernehmen. Der neuere Stand gewinnt; Zukunfts- und Müll-Werte werden
+    verworfen (ein kaputter Stempel darf einen User nie dauerhaft aus der
+    Kadenz drängen). Wirft nie."""
+    try:
+        ts = float(stamp)
+    except (TypeError, ValueError):
+        return
+    try:
+        now = now or time.time()
+        if ts <= 0 or ts > now + 3600:
+            return
+        if ts > (_fo_last_sync.get(token) or 0):
+            _fo_last_sync[token] = ts
+    except Exception:
+        pass
 
-    WARUM: seit der Lazy Rotation hält der Refresher ATs nicht mehr auf Vorrat
-    frisch — ohne diesen Vorlauf würde der 2-h-Lauf reihenweise 'pending' sehen
-    und die Roster gar nicht erst holen. Der Refresher tickt alle 60 s im
-    SELBEN Container, 120 s Wartezeit decken also einen vollen Tick plus
-    Rotationsdauer ab. Drain-aware (Deploy killt uns sonst mitten drin).
-    Returns Anzahl der noch immer abgelaufenen Grants."""
-    pend = []
-    for tok in tokens:
-        try:
-            if _access_state(tok)[0] == 'pending':
-                _refresher_demand_add(tok)
-                # Best-effort auch übers Netz — falls refresh-all je aus einem
-                # Container ohne Refresher angestoßen wird.
-                _rotate_poke_remote(tok)
-                pend.append(tok)
-        except Exception:
-            pass
-    if not pend:
-        return 0
-    log.info('[flightops-refresh-all] demand-vorlauf: %d abgelaufene Grants '
-             'angemeldet, warte max %ds', len(pend), _FO_DEMAND_WAIT_S)
-    waited = 0
-    while waited < _FO_DEMAND_WAIT_S and pend:
-        if _refresh_all_state.get('drain'):
-            break
-        time.sleep(_FO_DEMAND_WAIT_STEP_S)
-        waited += _FO_DEMAND_WAIT_STEP_S
-        # Zustand nur alle 15 s nachlesen — jeder Check ist ein Profil-Read
-        # pro Token, ein 5-s-Takt wäre reine Supabase-Last.
-        if waited % 15:
-            continue
-        try:
-            pend = [t for t in pend if _access_state(t)[0] == 'pending']
-        except Exception:
-            break
-    if pend:
-        log.info('[flightops-refresh-all] demand-vorlauf: %d Grants weiter '
-                 'pending -> werden übersprungen', len(pend))
-    return len(pend)
+
+def _fo_background_budget_open(far=False):
+    """(offen, grund) — ist im Stunden-/Tages-Gate noch Hintergrund-Budget
+    frei? Spiegelt exakt die Deckel aus _api_get (dort fällt weiterhin die
+    finale Entscheidung) — hier geht es darum, einen Lauf gar nicht erst
+    durch hunderte Imports zu treiben, deren Calls das Key-Gate ohnehin
+    verwirft: am 30.07. produzierte genau das 228 `fail` in einem Lauf,
+    und der Demand-Vorlauf ließ den Refresher parallel hunderte Grants für
+    Imports rotieren, die nie stattfanden.
+
+    `far=True` (Kadenz-Grund far_due) hält zusätzlich _FO_FAR_DAY_HEADROOM
+    Calls Abstand zum Tagesdeckel: lockere Roster syncen nur, solange der
+    Tag entspannt ist. Im Zweifel (Zählerfehler) offen — das Key-Gate in
+    _api_get bleibt die letzte Instanz. Wirft nie."""
+    try:
+        if _rot_hour_used() >= _LHFO_HOUR_BACKGROUND_CEILING:
+            return False, 'budget_hour'
+        limit = _LHFO_DAY_BACKGROUND_CEILING - (_FO_FAR_DAY_HEADROOM
+                                                if far else 0)
+        if _lhfo_day_used() >= limit:
+            return False, ('budget_day_far_reserve' if far else 'budget_day')
+        return True, ''
+    except Exception:
+        return True, ''
 
 
 def _refresh_all_work(tokens):
+    """Der 2-h-Hintergrund-Sync — seit 2026-07-30 in WELLEN statt mit blindem
+    120-s-Demand-Vorlauf.
+
+    MESSBEFUND 30.07. (16:23-UTC-Lauf): 927 geplant, 570 Grants abgelaufen,
+    nach 120 s Wartezeit waren erst 138 rotiert — der Refresher braucht für
+    570 Grants ~24 min (~2,5 s/Grant), der Importer wartete 120 s. Ergebnis:
+    561 skipped, und die trotzdem angestoßenen Rotationen liefen für Imports,
+    die nie stattfanden. Dazu 228 `fail` ohne Grund-Aufschlüsselung (großteils
+    Tagesdeckel-Verwurf im Key-Gate, s. _fo_background_budget_open).
+
+    NEU: Welle 1 importiert sofort alle Grants mit gültigem AT und meldet
+    abgelaufene beim Refresher an (die Import-Arbeit IST die Wartezeit);
+    jede Folgewelle nimmt die inzwischen rotierten mit. Budget-Stopp bricht
+    den Lauf ab statt hunderte Zombie-Fails zu produzieren, und jeder fail/
+    skip trägt seinen Grund in die done-Zeile (nie wieder „228 fail und
+    niemand weiß warum")."""
     ok = fail = skipped = deferred = 0
+    fail_reasons, skip_reasons, waves = {}, {}, 0
     try:
         import app as _app
-        # KADENZ-PLANUNG vor allem anderen: was dieser Lauf ohnehin nicht
-        # synct, braucht auch keinen Demand-Vorlauf und keine Rotation.
         _now0 = time.time()
+        _deadline = _now0 + _FO_RUN_DEADLINE_S
+
+        def _note_skip(reason, n=1):
+            nonlocal skipped
+            skipped += n
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + n
+
+        def _note_fail(reason):
+            nonlocal fail
+            fail += 1
+            fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+
+        # KADENZ-PLANUNG vor allem anderen: was dieser Lauf ohnehin nicht
+        # synct, braucht auch keinen Demand und keine Rotation. Reihenfolge
+        # nach Dringlichkeit: Dienst in Sicht zuerst, dann Erstkontakt, dann
+        # die lockere 11,5-h-Klasse — wird das Budget knapp, trifft es die
+        # User, denen Frische am wenigsten fehlt.
+        _prio = {'duty_near': 0, 'first': 1}
         plan = []
         for _tok in tokens:
             _do, _why = _fo_should_sync(_tok, _now0)
             if _do:
-                plan.append(_tok)
+                plan.append((_prio.get(_why, 2), _tok, _why))
             else:
                 deferred += 1
-        if plan and not _refresh_all_state.get('drain'):
-            _fo_demand_prephase(plan)
-        for tok in plan:
-            # DEPLOY-DRAIN (Grant-Burn #3, 2026-07-26): dieser Daemon-Thread
-            # wurde beim Container-Recreate HART gekillt — traf der Kill das
-            # Fenster zwischen LH-Rotation und _tokens_save, war der neue
-            # Refresh-Token weg und der naechste Versuch verbrannte per
-            # Reuse-Detection die ganze Familie (29/126 Grants, Cluster exakt
-            # an den Deploy-Zeitpunkten). deploy-hetzner.sh setzt vor dem
-            # Recreate das drain-Flag und wartet bis running=False — hier
-            # deshalb VOR jedem Grant pruefen und sauber abbrechen (der
-            # aktuelle Grant persistiert fertig, kein neuer LH-Call startet).
-            if _refresh_all_state.get('drain'):
-                log.info('[flightops-refresh-all] drain angefordert — '
-                         'Abbruch nach %d/%d Grants', ok + fail + skipped,
-                         len(plan))
-                break
-            try:
-                _st, _acc = _access_state(tok)
-                if _st != 'ok':
-                    # needs_relogin / Tokens weg / AT abgelaufen (dann ist der
-                    # Grant beim Refresher vorgemerkt — dieser Lauf importiert
-                    # nur, refresht seit dem Umbau 2026-07-27 NIE selbst).
-                    skipped += 1
-                    continue
-                # background-Flag → niedrigere Budget-Grenze im Key-Gate
-                # (interaktive Connects/Refreshes behalten Headroom).
-                with _app.app.test_request_context(json={'background': 1}):
-                    rv = flightops_import(tok)
-                status = rv[1] if isinstance(rv, tuple) else 200
-                if status == 200:
-                    ok += 1
-                    # NUR Erfolg stempelt den Sync (Review-Fund 2026-07-28):
-                    # ein LH-Schluckauf darf den User nicht 3,5–11,5 h ohne
-                    # Retry lassen — Fehlläufe bleiben fällig für den
-                    # nächsten 2-h-Cron-Lauf.
-                    _fo_mark_synced(tok)
+        plan.sort(key=lambda e: e[0])
+        remaining = [(t, w) for _p, t, w in plan]
+        demanded = set()
+        stall = 0
+        aborted = None
+        while remaining and aborted is None:
+            waves += 1
+            next_wave, progressed = [], False
+            for i, (tok, why) in enumerate(remaining):
+                # DEPLOY-DRAIN (Grant-Burn #3, 2026-07-26): dieser Daemon-
+                # Thread wurde beim Container-Recreate HART gekillt — traf der
+                # Kill das Fenster zwischen LH-Rotation und _tokens_save, war
+                # der neue Refresh-Token weg und der naechste Versuch
+                # verbrannte per Reuse-Detection die ganze Familie (29/126
+                # Grants, Cluster exakt an den Deploy-Zeitpunkten).
+                # deploy-hetzner.sh setzt vor dem Recreate das drain-Flag und
+                # wartet bis running=False — hier deshalb VOR jedem Grant
+                # pruefen und sauber abbrechen (der aktuelle Grant persistiert
+                # fertig, kein neuer LH-Call startet).
+                if _refresh_all_state.get('drain'):
+                    aborted = 'drain'
                 else:
-                    fail += 1
-            except Exception as e:
-                fail += 1
-                log.warning('[flightops-refresh-all] tok=%s %s',
-                            (tok or '')[:8], type(e).__name__)
-            # Service-QPS-Schonung (Sandbox zeigte 2/sec pro Service → 403
-            # „Developer Over Qps"; Prod-Plan 20/sec, trotzdem sanft bleiben).
-            time.sleep(0.7)
+                    # BUDGET-STOPP: ist das Hintergrund-Budget zu, würde JEDER
+                    # weitere Call im Key-Gate verworfen (16:23-Lauf 30.07.:
+                    # 200+ sinnlose fails). far_due-User halten zusätzlich die
+                    # Tages-Reserve für die Dienst-in-Sicht-Klasse frei — sie
+                    # werden einzeln übersprungen, der Lauf läuft weiter.
+                    _open, _bwhy = _fo_background_budget_open(
+                        far=(why == 'far_due'))
+                    if not _open:
+                        if _bwhy == 'budget_day_far_reserve':
+                            _note_skip(_bwhy)
+                            continue
+                        aborted = _bwhy
+                if aborted:
+                    next_wave.extend(remaining[i:])
+                    break
+                try:
+                    _st, _acc = _access_state(tok)
+                    if _st == 'pending':
+                        # AT abgelaufen: EINMAL beim Refresher anmelden (falls
+                        # dessen Demand-Deckel Platz hat) und in die nächste
+                        # Welle — importiert wird, sobald die Rotation durch
+                        # ist. Rotiert wird hier NIE selbst (Umbau 2026-07-27).
+                        if tok not in demanded and _refresher_demand_add(tok):
+                            demanded.add(tok)
+                            # Best-effort auch übers Netz — falls refresh-all
+                            # je aus einem Container ohne Refresher läuft.
+                            _rotate_poke_remote(tok)
+                        next_wave.append((tok, why))
+                        time.sleep(_FO_PENDING_CHECK_GAP_S)
+                        continue
+                    if _st != 'ok':
+                        # needs_relogin / Tokens weg — heilt nur ein Re-Login.
+                        _note_skip('disconnected')
+                        continue
+                    # background-Flag → niedrigere Budget-Grenze im Key-Gate
+                    # (interaktive Connects/Refreshes behalten Headroom).
+                    with _app.app.test_request_context(json={'background': 1}):
+                        rv = flightops_import(tok)
+                    status = rv[1] if isinstance(rv, tuple) else 200
+                    progressed = True
+                    if status == 200:
+                        ok += 1
+                        # NUR Erfolg stempelt den Sync (Review-Fund
+                        # 2026-07-28): ein LH-Schluckauf darf den User nicht
+                        # 3,5–11,5 h ohne Retry lassen — Fehlläufe bleiben
+                        # fällig für den nächsten 2-h-Cron-Lauf.
+                        _fo_mark_synced(tok)
+                    else:
+                        _reason = 'http_%s' % status
+                        try:
+                            _body = rv[0] if isinstance(rv, tuple) else rv
+                            _get = getattr(_body, 'get_json', None)
+                            _payload = _get(silent=True) if _get else None
+                            _reason = ((_payload or {}).get('error')
+                                       or _reason)
+                        except Exception:
+                            pass
+                        _note_fail(_reason)
+                except Exception as e:
+                    _note_fail(type(e).__name__)
+                    log.warning('[flightops-refresh-all] tok=%s %s',
+                                (tok or '')[:8], type(e).__name__)
+                # Service-QPS-Schonung (Sandbox zeigte 2/sec pro Service → 403
+                # „Developer Over Qps"; Prod-Plan 20/sec, trotzdem sanft).
+                time.sleep(0.7)
+            if aborted:
+                log.info('[flightops-refresh-all] %s — Abbruch, %d/%d Grants '
+                         'unbearbeitet (bleiben fällig)', aborted,
+                         len(next_wave), len(plan))
+                _note_skip(aborted, len(next_wave))
+                break
+            if not next_wave:
+                break
+            if time.time() >= _deadline:
+                _note_skip('deadline', len(next_wave))
+                break
+            # Stall-Erkennung: eine komplette Welle ohne einen einzigen
+            # Import und ohne Schrumpfen heißt: die Rotationen kommen nicht
+            # (Refresher-Backoff bis 1 h / degradiert). Darauf wartet kein
+            # Lauf — die Grants bleiben für den nächsten Cron fällig.
+            stall = (0 if progressed or len(next_wave) < len(remaining)
+                     else stall + 1)
+            if stall >= _FO_WAVE_STALL_MAX:
+                _note_skip('rotation_pending', len(next_wave))
+                break
+            # WELLEN-PAUSE: dem Refresher einen vollen Tick (60 s) Zeit
+            # geben, bevor die pending-Grants erneut geprüft werden.
+            _wt = 0.0
+            while _wt < _FO_WAVE_WAIT_S and not _refresh_all_state.get('drain'):
+                time.sleep(_FO_WAVE_STEP_S)
+                _wt += _FO_WAVE_STEP_S
+            remaining = next_wave
     finally:
         with _refresh_all_lock:
             _refresh_all_state['running'] = False
             _refresh_all_state['last'] = {
                 'ts': time.time(), 'users': len(tokens),
                 'ok': ok, 'fail': fail, 'skipped': skipped,
-                'deferred': deferred}
+                'deferred': deferred, 'waves': waves,
+                'fail_reasons': fail_reasons, 'skip_reasons': skip_reasons}
         log.info('[flightops-refresh-all] done users=%d ok=%d fail=%d '
-                 'skipped=%d deferred=%d',
-                 len(tokens), ok, fail, skipped, deferred)
+                 'skipped=%d deferred=%d waves=%d fail_reasons=%s '
+                 'skip_reasons=%s',
+                 len(tokens), ok, fail, skipped, deferred, waves,
+                 fail_reasons or '{}', skip_reasons or '{}')
 
 
 @lh_flightops_bp.route('/api/internal/flightops/refresh-drain', methods=['POST'])
