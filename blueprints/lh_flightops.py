@@ -2818,7 +2818,14 @@ def _match_aerox_profiles(members):
     """Crew-Listen-Mitglieder → AeroX-PUBLIC-Profile (best-effort, wirft nie).
     Primär EXAKT über die LH-Personalnummer (metadata.lh_pk_number — beim
     Duty-Events-Import jedes verbundenen Users gespeichert), Fallback exakter
-    Name (case-insensitiv, NUR eindeutige Treffer) + Lufthansa-Airline.
+    VOLLER Name (case-insensitiv, NUR eindeutige Treffer) + Lufthansa-Airline.
+
+    ⚠️ ABGEKÜRZTE NAMEN („Marco C.") VERKNÜPFEN NIE — kein unscharfer
+    Namens-Match mehr (Owner-Entscheid 2026-07-30 nach der Marco-C.-
+    Verwechslung; ausführliche Begründung im Rumpf unten). Ohne Treffer bleibt
+    das Mitglied einfach ohne `aerox`-Feld, und die App zeigt es ohne Badge
+    und ohne Profil-Link.
+
     Response-Felder = exakt die Public-Shape von /api/user/search (token/name/
     airline/homebase/position/avatar_url) — nie email/apple_sub/internal;
     Family-Accounts nie. Rückgabe: {pk-oder-name-Key: public_profile}."""
@@ -2851,56 +2858,63 @@ def _match_aerox_profiles(members):
             except Exception:
                 continue
 
-        # UNSCHARFER FALLBACK (Owner 2026-07-26, „sieht man wirklich wer auf
-        # AeroX ist?" — Live-Check: 1/76 gematcht). LH-Crew-Listen führen
-        # ABGEKÜRZTE Namen („Markus K."), AeroX-Profile den vollen Namen
-        # („Markus Krause") → der exakte ilike-Match oben traf fast nie.
-        # Regel (Owner-Entscheid „nur eindeutige Treffer"): letztes Token =
-        # Nachname-Initial (1 Buchstabe, ggf. mit Punkt) → Vorname + Initial +
-        # Airline Lufthansa; NUR übernehmen, wenn GENAU EIN Profil passt (kein
-        # Falsch-Treffer-Risiko bei zwei „Markus K." an derselben Base).
-        def _abbrev_parts(name):
-            toks = [t for t in str(name or '').split() if t]
-            if len(toks) < 2:
-                return None
-            last = toks[-1].rstrip('.')
-            if len(last) != 1 or not last.isalpha():
-                return None          # kein abgekürzter Nachname → nicht fuzzy
-            return toks[0], last.upper()   # (Vorname, Initial)
-
-        fuzzy_need = [m for m in need
-                      if m['name'].strip().lower() not in by_name]
-        for m in fuzzy_need[:12]:
-            parts = _abbrev_parts(m.get('name'))
-            if not parts:
-                continue
-            first, initial = parts
-            if len(first) < 2:
-                continue             # zu kurzer Vorname → zu unspezifisch
-            try:
-                # Vorname als Präfix (deckt Zweit-Vornamen im Profil mit ab).
-                r = (_app.sb.table('user_profiles').select(sel)
-                     .ilike('name', first + ' %').limit(8).execute())
-            except Exception:
-                continue
-            cand = []
-            for row in (r.data or []):
-                if 'lufthansa' not in str(row.get('airline') or '').lower():
-                    continue
-                ntoks = [t for t in str(row.get('name') or '').split() if t]
-                if len(ntoks) < 2:
-                    continue
-                # Vorname exakt + Nachname beginnt mit dem Initial.
-                if ntoks[0].lower() != first.lower():
-                    continue
-                if not ntoks[-1][:1].upper() == initial:
-                    continue
-                cand.append(row)
-            # Eindeutigkeit über den Token (dieselbe Person kann mehrfach
-            # zurückkommen ist hier ausgeschlossen, aber sicher ist sicher).
-            uniq_tokens = {row.get('token') for row in cand if row.get('token')}
-            if len(uniq_tokens) == 1:
-                by_name[m['name'].strip().lower()] = cand[0]
+        # ══════════════════════════════════════════════════════════════════
+        #  KEIN UNSCHARFER NAMENS-FALLBACK MEHR — ABGEKÜRZTE NAMEN
+        #  VERKNÜPFEN NIE (Owner-Entscheid 2026-07-30).
+        # ══════════════════════════════════════════════════════════════════
+        # Hier stand ein Fuzzy-Match: aus „Marco C." wurden Vorname + Nachname-
+        # Initial gezogen und mit LH-Profilen verglichen; bei GENAU EINEM
+        # Kandidaten wurde verknüpft.
+        #
+        # ⚠️ DER VORFALL (30.07.): Die Kabinen-Crew-Liste führte „Marco C." —
+        # in Wahrheit **Marco Comajuncosas Grether** (pk 450460I), der GAR
+        # NICHT auf AeroX ist. Von den LH-Marcos auf AeroX (Pravisani, Sturm,
+        # Reitsema, Sunday, Christ, Saas) hat nur **Marco Christ** einen
+        # „C"-Nachnamen → genau ein Kandidat → verknüpft. Die App zeigte
+        # „Auf AeroX" und öffnete beim Tap das ECHTE Profil eines Unbeteiligten.
+        # Eine AeroX-Mitgliedschaft wurde also frei erfunden.
+        #
+        # ⚠️ WARUM DIE „EINDEUTIGKEIT" NICHTS TAUGTE — SIE PRÜFTE DIE FALSCHE
+        # SEITE. Geprüft wurde, ob der Treffer INNERHALB VON AEROX eindeutig
+        # ist, nicht ob die Abkürzung selbst eindeutig ist. „Marco C." kann bei
+        # LH Comajuncosas, Christ, Conrad, Clausen sein. Damit wird die
+        # Absicherung STÄRKER, je mehr Marcos fehlen — je WENIGER AeroX-User es
+        # gibt, desto „eindeutiger" der falsche Treffer. Das ist genau verkehrt.
+        #
+        # Zweiter, unabhängiger Defekt derselben Zeilen: verglichen wurde
+        # `ntoks[-1]`, also das LETZTE Namens-Token. LH kürzt Doppelnachnamen
+        # auf den ERSTEN ab („Comajuncosas Grether" ⇒ „C."), der echte Mensch
+        # wäre also auf „Grether" geprüft worden und hätte seine eigene
+        # Abkürzung nie treffen können.
+        #
+        # ⚠️ WARUM ES KEINEN ERSATZ MIT „ZWEITEM SIGNAL" GIBT (geprüft, bewusst
+        # verworfen): Die Idee war, unscharf nur mit Bestätigung durch Homebase
+        # UND Position zu verknüpfen. **Die Crew-Liste trägt keine Homebase** —
+        # `parse_crew_list` liefert ausschliesslich {position, name, pk, duty}.
+        # Bleibt die Position, und die identifiziert niemanden: auf einem Flug
+        # sitzen viele FB, und mehrere Marcos an derselben Base teilen sie sich.
+        # Ein zweites Signal, das nichts beweist, erzeugt nur teurere
+        # Fehltreffer.
+        #
+        # ⚠️ UND ES BRAUCHT IHN NICHT (Owner 2026-07-30: „wenn mensch sich mit
+        # LH verbindet weiß man doch wer wer genau ist"): Genau so ist es. Die
+        # Crew-Liste liefert `pkNumber` für JEDES Mitglied, und `_store_own_pk`
+        # legt sie beim LH-Connect jedes Users ab (Stand 30.07.: 876 von 1734
+        # LH-Profilen haben `lh_pk_number`). Wer verbunden ist, wird oben EXAKT
+        # und fehlerfrei getroffen. Wer nicht verbunden ist, ist über den Namen
+        # nicht beweisbar — für den existiert schlicht keine Wahrheit, die man
+        # matchen könnte. Ein Raten ist dann kein „best effort", sondern eine
+        # Behauptung über die Identität eines Menschen.
+        #
+        # Owner-Regel, die hier entscheidet: „lieber keine Zeile als ein
+        # falscher Wert" — für Identitäten erst recht. Fehlt der Match, zeigt
+        # iOS den abgekürzten Namen ohne „Auf AeroX"-Badge und ohne Profil-Tap
+        # (`FlightCrewSheet`: `m.aerox == nil` ⇒ `CrewMemberDetailView`), also
+        # genau das gewünschte Verhalten.
+        #
+        # Wer das wieder aufwerten will, braucht eine echte Identitätsquelle
+        # (z. B. pk-Rückschreibung für Nicht-Verbundene) — NICHT mehr Heuristik
+        # auf einem Buchstaben.
 
         def _pub(row):
             md = row.get('metadata') or {}

@@ -3459,3 +3459,139 @@ def test_erstverbindung_zaehlt_keinen_reconnect(monkeypatch):
                                    json={'code': 'C', 'state': 'S'})
     assert saved['reconnects'] == 0
     assert saved['connected_at'] == saved['first_connected_at']
+
+
+# ── Identitäts-Verknüpfung: abgekürzte Namen verknüpfen NIE ─────────────────
+# Anlass (Owner 2026-07-30): Die Kabinen-Liste führte „Marco C." — in Wahrheit
+# Marco Comajuncosas Grether (pk 450460I), der GAR NICHT auf AeroX ist. Der
+# frühere Fuzzy-Match (Vorname + Nachname-Initial, „genau ein Kandidat")
+# verknüpfte ihn mit Marco CHRIST und öffnete beim Tap dessen echtes Profil.
+# Die Eindeutigkeit war auf der FALSCHEN Seite geprüft: je weniger AeroX-User,
+# desto „eindeutiger" der falsche Treffer.
+# Diese Tests nageln fest, dass nur BEWEISE verknüpfen (pk oder voller Name).
+
+class _R:
+    def __init__(self, data):
+        self.data = data
+
+
+class _ProfTbl:
+    """Minimal-Supabase für user_profiles — nur was _match_aerox_profiles nutzt.
+    Merkt sich alle ilike-Muster, damit ein wiederkehrender Fuzzy-Query
+    (Muster „Vorname %") im Test AUFFÄLLT statt still zurückzukommen."""
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.ilike_calls = []
+
+    def table(self, name):
+        assert name == 'user_profiles', name
+        self._mode = self._pks = self._pat = None
+        return self
+
+    def select(self, *_a, **_k):
+        return self
+
+    def in_(self, col, vals):
+        assert col == 'metadata->>lh_pk_number', col
+        self._mode, self._pks = 'pk', [str(v) for v in vals]
+        return self
+
+    def ilike(self, col, pat):
+        assert col == 'name', col
+        self._mode, self._pat = 'name', pat
+        self.ilike_calls.append(pat)
+        return self
+
+    def limit(self, _n):
+        return self
+
+    def execute(self):
+        if self._mode == 'pk':
+            return _R([r for r in self.rows
+                       if str((r.get('metadata') or {}).get('lh_pk_number')
+                              or '') in self._pks])
+        if self._mode == 'name':
+            pat = str(self._pat or '')
+            if pat.endswith(' %'):          # Fuzzy-Präfix — darf nie vorkommen
+                pre = pat[:-2].lower()
+                return _R([r for r in self.rows
+                           if str(r.get('name') or '').lower()
+                           .startswith(pre + ' ')])
+            return _R([r for r in self.rows
+                       if str(r.get('name') or '').strip().lower()
+                       == pat.strip().lower()])
+        return _R([])
+
+
+def _profiles(monkeypatch, rows):
+    import app as backend
+    tbl = _ProfTbl(rows)
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(backend, 'sb', tbl, raising=False)
+    return tbl
+
+
+_MARCO_CHRIST = {'token': 'AT-CHRIST', 'name': 'Marco Christ',
+                 'airline': 'Lufthansa', 'homebase': 'FRA', 'position': 'PU',
+                 'metadata': {'lh_pk_number': '709758B'}}
+
+
+def test_abbrev_name_never_links_the_wrong_person(monkeypatch):
+    """DER VORFALL: „Marco C." darf Marco Christ NICHT bekommen."""
+    tbl = _profiles(monkeypatch, [_MARCO_CHRIST])
+    out = fo._match_aerox_profiles([{'name': 'Marco C.', 'pk': '',
+                                     'position': 'P2'}])
+    assert out == {}
+    # Und der Fuzzy-Query selbst ist weg (kein „Marco %"-Präfix-Lookup mehr).
+    assert not [p for p in tbl.ilike_calls if p.endswith(' %')]
+
+
+def test_abbrev_name_never_links_even_when_the_real_person_is_on_aerox(monkeypatch):
+    """Doppelnachname: LH kürzt auf den ERSTEN Nachnamen („Comajuncosas
+    Grether" ⇒ „C."). Auch wenn der ECHTE Mensch auf AeroX wäre, wird auf
+    einen Buchstaben nicht verknüpft — sonst hinge die Identität an der
+    Frage, wer sonst noch zufällig passt."""
+    real = dict(_MARCO_CHRIST, token='AT-REAL',
+                name='Marco Comajuncosas Grether', metadata={})
+    _profiles(monkeypatch, [real])
+    assert fo._match_aerox_profiles(
+        [{'name': 'Marco C.', 'pk': '', 'position': 'P2'}]) == {}
+
+
+def test_pk_counterevidence_never_links(monkeypatch):
+    """Die Crew-Liste nennt pk 450460I, das einzige Kandidaten-Profil trägt
+    709758B — eine ABWEICHENDE pk ist ein aktiver Gegenbeweis."""
+    _profiles(monkeypatch, [_MARCO_CHRIST])
+    assert fo._match_aerox_profiles(
+        [{'name': 'Marco C.', 'pk': '450460I', 'position': 'P2'}]) == {}
+
+
+def test_exact_pk_still_links_and_only_public_fields(monkeypatch):
+    """Der Beweis-Pfad bleibt unangetastet — wer mit LH verbunden ist, wird
+    exakt getroffen. Und es verlässt NUR die Public-Shape das Backend."""
+    _profiles(monkeypatch, [_MARCO_CHRIST])
+    out = fo._match_aerox_profiles([{'name': 'Marco Christ',
+                                     'pk': '709758B'}])
+    assert list(out) == ['709758B']
+    p = out['709758B']
+    assert p['token'] == 'AT-CHRIST' and p['homebase'] == 'FRA'
+    assert set(p) == {'token', 'name', 'airline', 'homebase', 'position',
+                      'avatar_url'}
+    assert 'metadata' not in p
+
+
+def test_exact_full_name_still_links(monkeypatch):
+    """Voller, eindeutiger Name bleibt ein zulässiger Beweis (kein Buchstabe)."""
+    _profiles(monkeypatch, [_MARCO_CHRIST])
+    out = fo._match_aerox_profiles([{'name': 'Marco Christ', 'pk': ''}])
+    assert out.get('Marco Christ', {}).get('token') == 'AT-CHRIST'
+
+
+def test_family_accounts_never_linked(monkeypatch):
+    """Family-Accounts sind keine Crew und erscheinen nie in einer Crew-Liste."""
+    fam = dict(_MARCO_CHRIST,
+               metadata={'lh_pk_number': '709758B', 'account_type': 'family'})
+    _profiles(monkeypatch, [fam])
+    assert fo._match_aerox_profiles([{'name': 'Marco Christ',
+                                      'pk': '709758B'}]) == {}
