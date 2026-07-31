@@ -990,9 +990,14 @@ def test_push_for_affected_est_arr_updates_arrival_countdown(sb, auth, apns):
     sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
               'dep_iso': '2026-07-28T08:25:00Z',
               'arr_iso': '2026-07-28T19:40:00Z'}
+    # `dep_status` ergaenzt 2026-07-31: est_arr behauptet `inFlight` nur noch
+    # mit ABFLUG-BELEG (Owner: „nur nicht Fake-Abflug wenn keins"). Genau das
+    # liefert LH fuer einen Flieger in der Luft — auf Prod gemessen tragen
+    # 4 von 4 laufenden Langstrecken 'Flight Departed'.
     facts = {'est_dep': '2026-07-28T08:40:00Z',
              'sched_arr': '2026-07-28T19:40:00Z',
-             'est_arr': '2026-07-28T19:58:00Z'}
+             'est_arr': '2026-07-28T19:58:00Z',
+             'dep_status': 'Flight Departed'}
     sent = LA.push_for_affected([(TOKEN, sector)], 'est_arr', 'LH454',
                                 '2026-07-28', facts=facts)
     assert sent == 1
@@ -1139,7 +1144,8 @@ def test_stale_date_wandert_mit_jeder_neuen_schaetzung_mit(client, sb, auth,
                          '2026-07-22')
     first = apns['client'].sent[-1]['payload']['aps']['stale-date']
     LA.push_for_affected([(TOKEN, _sector(-6, 4, base))], 'est_arr', 'LH433',
-                         '2026-07-22')
+                         '2026-07-22',
+                         facts={'dep_status': 'Flight Departed'})
     second = apns['client'].sent[-1]['payload']['aps']['stale-date']
     # +/-2 s: `aps.timestamp` MUSS strikt monoton steigen, zwei Pushes in
     # derselben Sekunde bekommen deshalb last+1 (s. _next_timestamp).
@@ -1362,3 +1368,155 @@ def test_sweep_endpoint_secret_gate(client, sb, auth, monkeypatch):
     r = client.post('/api/internal/live-activity/sweep',
                     headers={'X-Poll-Secret': 'geheim'})
     assert r.status_code == 200 and r.get_json()['ok'] is True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Owner-Nachschaerfung 2026-07-31 — Ultra-Langstrecke + kein Fake-Abflug
+# ════════════════════════════════════════════════════════════════════════════
+# Woertlich: „ne Langstrecke die 12h geht kann sie mit guten Werten schon
+# zeigen auch ohne Internet — nur nicht Fake-Abflug wenn keins."
+#
+# Zwei getrennte Forderungen:
+#   1. Der stale-date-Deckel haengt an der ANKUNFT, nicht an einem festen
+#      Fenster ab jetzt — sonst graut eine 14-h-Strecke mitten im Flug aus.
+#   2. `inFlight` NUR mit echtem Abflug-Beleg. Eine verstrichene Planzeit ist
+#      keiner.
+
+def _seed_row(sb_fake):
+    """Aktive update-Zeile ohne den HTTP-Registrierungsweg."""
+    sb_fake._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                     'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                     'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                     'p_device_id': None, 'p_platform': 'ios'})
+
+
+# ── 1) Deckel an der Ankunft ────────────────────────────────────────────────
+
+def test_ultralangstrecke_graut_nicht_mitten_im_flug_aus():
+    """LH715 HND-MUC, 14h20 Block — stand real im R1-Beweis-Set dieser Runde.
+    Mit dem alten 12-h-Deckel waere die Marke 2h20 VOR der Landung gefallen."""
+    now = 1_800_000_000.0
+    block_s = int(14.333 * 3600)
+    stale = LA._stale_after_s(now + block_s, now_ts=now)
+    assert stale > block_s, 'Karte veraltet VOR ihrer eigenen Ankunft'
+    assert stale == block_s + LA._LA_STALE_GRACE_S
+
+
+@pytest.mark.parametrize('block_h', [12.5, 13, 14.333, 15, 17, 19])
+def test_kein_linienflug_laeuft_in_den_not_deckel(block_h):
+    """Der Deckel ist gegen Datenmuell da, nicht gegen Fluege. Keine reale
+    Blockzeit darf ihn beruehren."""
+    now = 1_800_000_000.0
+    block_s = int(block_h * 3600)
+    assert LA._stale_after_s(now + block_s, now_ts=now) == \
+        block_s + LA._LA_STALE_GRACE_S
+
+
+def test_not_deckel_greift_erst_bei_datenmuell():
+    """Ankunft im naechsten Jahr (verrutschtes Datum) wird geklemmt."""
+    now = 1_800_000_000.0
+    assert LA._stale_after_s(now + 365 * 24 * 3600, now_ts=now) \
+        == LA._LA_STALE_MAX_S
+    assert LA._LA_STALE_MAX_S == LA._LA_STALE_MAX_BLOCK_H * 3600 \
+        + LA._LA_STALE_GRACE_S
+
+
+def test_boden_bleibt_fuer_den_luegen_fall():
+    """Die Gegenrichtung darf sich NICHT gelockert haben: eine Ankunft, die
+    laengst vorbei ist (verlorenes arrived), graut weiter schnell aus."""
+    now = 1_800_000_000.0
+    assert LA._stale_after_s(now - 6 * 3600, now_ts=now) == LA._LA_STALE_MIN_S
+    assert LA._LA_STALE_MIN_S == 15 * 60
+
+
+# ── 2) Kein Fake-Abflug ─────────────────────────────────────────────────────
+
+def test_departure_is_proven_nur_mit_echtem_signal():
+    assert LA._departure_is_proven('departed', None) is True
+    assert LA._departure_is_proven('arrived', None) is True
+    assert LA._departure_is_proven('diverted', None) is True
+    # Board-Actual (LH FlightStatus.Definition), englisch wie deutsch
+    for s in ('Flight Departed', 'Abgeflogen', 'Landed', 'Gelandet',
+              'In Flight', 'Diverted'):
+        assert LA._departure_is_proven('est_arr', {'dep_status': s}) is True, s
+    # VOR-Abflug-Zustaende belegen nichts — auch wenn die Planzeit durch ist
+    for s in ('Scheduled', 'On Time', 'Delayed', 'Boarding', 'Gate Closed',
+              'Cancelled', '', None):
+        assert LA._departure_is_proven('est_arr', {'dep_status': s}) is False, s
+    assert LA._departure_is_proven('est_arr', {}) is False
+    assert LA._departure_is_proven('est_arr', None) is False
+
+
+def test_est_arr_am_gate_behauptet_keinen_flugzustand(sb, auth, apns):
+    """DER FAKE-ABFLUG-FALL: LH schickt eine ETA-Korrektur, waehrend der
+    Flieger noch am Gate steht. Vorher sprang die Karte damit auf `inFlight` —
+    die „Flug-Animation ohne Pushback"."""
+    _seed_row(sb)
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2026-07-28T08:25:00Z',
+              'arr_iso': '2026-07-28T19:40:00Z'}
+    facts = {'est_dep': '2026-07-28T09:40:00Z',
+             'est_arr': '2026-07-28T20:58:00Z',
+             'dep_status': 'Delayed'}
+    LA.push_for_affected([(TOKEN, sector)], 'est_arr', 'LH454', '2026-07-28',
+                         facts=facts)
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['phase'] != 'inFlight'
+    assert cs['phase'] == 'briefing'
+    # Die Karte zeigt weiter auf den ABFLUG …
+    assert cs['mainTime'] == cs['estDep'] == cs['countdownTarget']
+    # … die frische Ankunftsschaetzung wird trotzdem mitgeliefert (die
+    # 28.07.-Reparatur bleibt intakt, nur die Behauptung faellt weg).
+    assert cs['estArr'] == LA._to_apple_date(facts['est_arr'])
+
+
+def test_verstrichene_planzeit_ohne_ereignis_macht_keinen_inflight(sb, auth,
+                                                                   apns):
+    """Owner-Regel woertlich: eine verstrichene PLAN-Abflugzeit ist KEIN Beleg
+    — die Maschine kann am Gate stehen."""
+    _seed_row(sb)
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2020-01-01T08:25:00Z',      # Jahre her
+              'arr_iso': '2020-01-01T19:40:00Z'}
+    LA.push_for_affected([(TOKEN, sector)], 'est_arr', 'LH454', '2020-01-01',
+                         facts={'est_dep': '2020-01-01T08:40:00Z',
+                                'est_arr': '2020-01-01T19:58:00Z'})
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['phase'] != 'inFlight'
+
+
+def test_keine_phase_haengt_an_der_uhr():
+    """VERIFIZIERTER NICHT-BEFUND, festgenagelt: die Phase kommt
+    ausschliesslich aus der Ereignis-Tabelle. Kaeme je eine Uhr-Ableitung
+    dazu, muss dieser Test brechen und jemand muss sie gegen die Owner-Regel
+    pruefen."""
+    assert set(LA._MQTT_PHASE_KICKER) == {
+        'est_dep', 'cancelled', 'diverted', 'departed', 'est_arr', 'arrived'}
+    # Jede Art, die `inFlight` behauptet, ist ENTWEDER selbst ein Abflug-Beleg
+    # ODER muss in push_for_affected gegated sein. Kommt eine neue inFlight-Art
+    # dazu, faellt sie hier auf — und jemand muss entscheiden, welches von
+    # beidem gilt. `_GUARDED` ist die vollstaendige Liste der gegateten Arten.
+    _GUARDED = {'est_arr'}
+    ungedeckt = {k for k, (p, _) in LA._MQTT_PHASE_KICKER.items()
+                 if p == 'inFlight'
+                 and not LA._departure_is_proven(k, None)
+                 and k not in _GUARDED}
+    assert not ungedeckt, f'inFlight ohne Beleg und ohne Gate: {ungedeckt}'
+    # …und das Gate muss auch wirklich greifen (nicht nur gelistet sein).
+    for kind in _GUARDED:
+        assert LA._departure_is_proven(kind, {'dep_status': 'Scheduled'}) \
+            is False
+
+
+def test_departed_ereignis_bleibt_der_direkte_weg_in_den_flugzustand(sb, auth,
+                                                                     apns):
+    """Gegenprobe: das ECHTE Abflug-Ereignis braucht keinen dep_status."""
+    _seed_row(sb)
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2026-07-28T08:25:00Z',
+              'arr_iso': '2026-07-28T19:40:00Z'}
+    LA.push_for_affected([(TOKEN, sector)], 'departed', 'LH454', '2026-07-28',
+                         facts={'est_arr': '2026-07-28T19:55:00Z'})
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['phase'] == 'inFlight' and cs['kicker'] == 'GESTARTET'
+    assert cs['mainTime'] == cs['estArr']

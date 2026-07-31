@@ -996,6 +996,60 @@ _MQTT_PHASE_KICKER = {
 # Event-Arten, deren Karten-Zeitpunkt die ANKUNFT ist (nicht der Abflug).
 _MQTT_ARRIVAL_KINDS = ('departed', 'diverted', 'est_arr', 'arrived')
 
+# ── KEIN FAKE-ABFLUG (Owner 2026-07-31) ─────────────────────────────────────
+#
+# Owner-Regel: „nur nicht Fake-Abflug wenn keins". Die Phase `inFlight` darf
+# NUR aus einem echten Abflug-Beleg entstehen — einem departed-Ereignis oder
+# einem Board-Actual. Eine verstrichene PLANZEIT belegt gar nichts: die
+# Maschine kann am Gate stehen.
+#
+# ZEITBASIERTEN FLIP GIBT ES HIER NICHT — geprüft und festgenagelt.
+# Die Phase kommt ausschliesslich aus `_MQTT_PHASE_KICKER`, also aus dem
+# Ereignis-Typ des Brokers; nirgends im Backend wird eine Phase aus „jetzt >
+# geplanter Abflug" abgeleitet (`test_keine_phase_haengt_an_der_uhr`,
+# `test_verstrichene_planzeit_ohne_ereignis_macht_keinen_inflight`).
+#
+# WAS ES ABER GAB: `est_arr` stand in der Tabelle auf `inFlight`. LH schickt
+# „New Estimated Arrival" aber auch, während der Flieger noch AM GATE steht —
+# eine ETA-Korrektur wegen einer bekannten Abflugverspätung ist genau so ein
+# Ereignis. Die Karte sprang damit ohne einen einzigen Abflug-Beleg in den
+# Flugzustand: der Fehler „Flug-Animation ohne Pushback".
+#
+# Deshalb: `est_arr` aktualisiert weiterhin die ANKUNFTSZEITEN (das war der
+# Sinn der 28.07.-Reparatur „arrival time was wrong the whole time"), behauptet
+# aber nur dann `inFlight`, wenn der Abflug BELEGT ist. Ist er es nicht, bleibt
+# die Karte ehrlich im Vor-Abflug-Zustand und zeigt weiter auf den Abflug —
+# und veraltet dann von selbst über das `stale-date`.
+#
+# Beleg-Quellen (beide sind ECHTE Signale, keine Uhr):
+#   1. das Ereignis selbst — departed/arrived/diverted kann es ohne Abflug
+#      nicht geben (divert und landen setzt Fliegen voraus);
+#   2. `facts['dep_status']` = LHs `FlightStatus.Definition`, also der
+#      Board-Actual. Dieselbe Quelle, die aerox_data_blueprint schon als
+#      Off-Block-Beleg auswertet.
+_DEPARTURE_PROVING_KINDS = ('departed', 'arrived', 'diverted')
+
+# Substrings eines dep_status, die einen ERFOLGTEN Abflug belegen (LH liefert
+# die Definition mal englisch, mal deutsch). Bewusst NICHT dabei: „Scheduled",
+# „On Time", „Delayed", „Boarding", „Gate Closed", „Cancelled" — das sind alles
+# Zustände VOR dem Abflug, auch wenn die Planzeit längst durch ist.
+_DEP_PROVEN_STATUS_HINTS = ('departed', 'abgeflog', 'airborne', 'in flight',
+                            'im flug', 'en route', 'enroute', 'unterwegs',
+                            'landed', 'gelandet', 'arrived', 'angekommen',
+                            'diverted', 'umgeleitet')
+
+
+def _departure_is_proven(kind, facts):
+    """Ist der Abflug BELEGT? Pure, wirft nie.
+
+    Nur Ereignis oder Board-Actual zählen — nie eine verstrichene Planzeit.
+    Im Zweifel False: dann behauptet die Karte lieber zu wenig als zu viel.
+    """
+    if kind in _DEPARTURE_PROVING_KINDS:
+        return True
+    status = str((facts or {}).get('dep_status') or '').lower()
+    return any(h in status for h in _DEP_PROVEN_STATUS_HINTS)
+
 
 # ── R2a: `stale-date` — die Karte darf nicht ewig „im Flug" behaupten ────────
 #
@@ -1017,9 +1071,31 @@ _MQTT_ARRIVAL_KINDS = ('departed', 'diverted', 'est_arr', 'arrived')
 # nicht „jetzt + fixe Dauer": eine Karte, die auf eine Ankunft in 9 h zeigt,
 # darf nicht nach 2 h als veraltet gelten, und eine, die auf eine Ankunft vor
 # 10 min zeigt, soll nicht noch stundenlang frisch wirken.
+#
+# ⚠️ DER DECKEL HÄNGT AN DER ANKUNFT, NICHT AN EINEM FESTEN FENSTER AB JETZT
+# (Owner-Nachschärfung 2026-07-31: „ne Langstrecke die 12h geht kann sie mit
+# guten Werten schon zeigen auch ohne Internet — nur nicht Fake-Abflug wenn
+# keins").
+#
+# Erste Fassung klemmte bei 12 h ab jetzt. Das war zu eng und hätte genau die
+# Flüge beschädigt, für die R1 gebaut wurde: LH715 HND–MUC mit 14 h 20 Block
+# stand im Beweis-Set dieser Runde. Beim Abflug wäre die Marke auf jetzt + 12 h
+# gefallen — also **2 h 20 VOR der Landung** — und die Karte wäre mitten über
+# Sibirien ausgegraut, obwohl der Abflug bestätigt und die Ankunft bekannt ist.
+#
+# Bei bestätigtem Abflug IST der Countdown auf die bekannte Ankunft eine
+# ehrliche Extrapolation — dafür braucht das Gerät kein Netz. Der Deckel darf
+# die Karte deshalb nie VOR ihrer eigenen Ankunft veralten lassen. Was bleibt,
+# ist ein reiner Not-Deckel gegen Datenmüll (arr im nächsten Jahr): 20 h
+# maximale Blockzeit — dieselbe Schranke wie `lh_mqtt._SUB_BLOCK_MAX_H` — plus
+# die Kulanz. Es gibt keinen Linienflug, der das überschreitet.
+#
+# Der 15-min-BODEN bleibt unangetastet: er ist der Lügen-Fall (Ankunft längst
+# vorbei, `arrived` verlorengegangen) und soll weiterhin schnell ausgrauen.
 _LA_STALE_GRACE_S = 45 * 60      # nach dem gezeigten Zeitpunkt noch „frisch"
 _LA_STALE_MIN_S = 15 * 60        # nie sofort veraltet (Zeitpunkt schon vorbei)
-_LA_STALE_MAX_S = 12 * 3600      # länger als eine Activity überhaupt lebt
+_LA_STALE_MAX_BLOCK_H = 20       # Not-Deckel gegen Datenmüll, nicht gegen Flüge
+_LA_STALE_MAX_S = _LA_STALE_MAX_BLOCK_H * 3600 + _LA_STALE_GRACE_S
 
 
 def _to_unix(value):
@@ -1067,6 +1143,12 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
         return 0
     facts = facts or {}
     phase, kicker = _MQTT_PHASE_KICKER[kind]
+    shows_arrival = kind in _MQTT_ARRIVAL_KINDS
+    if kind == 'est_arr' and not _departure_is_proven(kind, facts):
+        # ETA-Korrektur, während die Maschine noch am Gate steht: Zeiten
+        # aktualisieren ja, Flugzustand behaupten nein (s. Block oben).
+        phase, kicker = _MQTT_PHASE_KICKER['est_dep']
+        shows_arrival = False
     now_iso = datetime.now(timezone.utc)
     sent = 0
     for entry in affected:
@@ -1087,9 +1169,8 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             # (und für jedes ETA-Update) ist das die ANKUNFT — mit frisch
             # geforcten `facts` (lh_mqtt) also die echte LH-Schätzung, nicht
             # mehr die beim Abflug eingefrorene Plan-Zeit.
-            'mainTime': est_arr if kind in _MQTT_ARRIVAL_KINDS else est_dep,
-            'countdownTarget': (est_arr if kind in _MQTT_ARRIVAL_KINDS
-                                else est_dep),
+            'mainTime': est_arr if shows_arrival else est_dep,
+            'countdownTarget': est_arr if shows_arrival else est_dep,
             'route': f'{frm}–{to}' if frm and to else None,
             'deltaMin': delta if isinstance(delta, int) else None,
             'generatedAt': now_iso,
