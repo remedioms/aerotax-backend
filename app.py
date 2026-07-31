@@ -46450,10 +46450,12 @@ def _ev_is_flight_leg(summary):
     return False
 
 
-def _ev_extends_duty(summary):
+def _ev_extends_duty(summary, ev=None):
     """False für Layover/Off — diese erweitern das Duty-Fenster NICHT. Sonst
     zählt die Layover-Endzeit (nächster Morgen) als Duty-Ende → Belastung 2-4×
-    zu hoch (2026-06 Audit, gegen echten myTime-Roster bewiesen)."""
+    zu hoch (2026-06 Audit, gegen echten myTime-Roster bewiesen).
+
+    `ev` (optional): das Event-Dict — nur für die Off-Day-Ausnahme unten."""
     up = (summary or '').upper()
     # OFF nur als eigenständiges Wort matchen (Tages-OFF), NICHT als Präfix —
     # sonst frisst `startswith('OFF')` ein „Office Day" und nullt dessen echte
@@ -46461,9 +46463,26 @@ def _ev_extends_duty(summary):
     # VISUM/VISA (2026-07-17): ein Botschafts-/Visum-Termin ist KEIN Dienst und
     # kein Airport-Weg — er darf das Duty-Fenster nicht aufspannen (sonst wird
     # der Tag wie ein Office-Dienst behandelt und löst einen Smart-Pickup aus).
-    if 'LAYOVER' in up or 'OFF DAY' in up or 'ABSENCE' in up \
-            or 'VISUM' in up or 'VISA' in up \
-            or re.match(r'^OFF(?!ICE)', up):
+    if 'LAYOVER' in up or 'ABSENCE' in up or 'VISUM' in up or 'VISA' in up:
+        return False
+    if 'OFF DAY' in up or re.match(r'^OFF(?!ICE)', up):
+        # AUDIT 2026-07-31 Befund 2: myTime etikettiert auch GETIMTE Schulungs-/
+        # Medical-Termine als „Off Day (LMN_DM1)" etc. — deren geliefertes DTEND
+        # (19.04. 12:00–16:00Z, 25.05. LMN_AI1, 30.08. LMHS 07:00–14:00Z) wurde
+        # hier pauschal verworfen und die Endzeit ging verloren (end=None in der
+        # DB, obwohl LH die endTime nachweislich liefert). Ein Termin mit echtem
+        # Anfang UND Ende AM SELBEN Tag ist etwas anderes als ein Ganztages-/
+        # Übernacht-Eintrag: er darf sein Ende behalten. Die Original-Fälle der
+        # Regel bleiben geschützt — Ganztages-Freitage sind DATE-only (kein
+        # Ende), Übernacht-Spannen scheitern am Same-Bucket-Check, und ein
+        # DTEND==DTSTART (FlightOps „en or st"-Fallback) an dur>0.
+        if isinstance(ev, dict) \
+                and not ev.get('_is_date_only_start') \
+                and not ev.get('_is_date_only_end') \
+                and ev.get('start') and ev.get('start') == ev.get('end'):
+            dur = _iso_minutes_between(ev.get('start_iso'), ev.get('end_iso'))
+            if dur is not None and dur > 0:
+                return True
         return False
     return True
 
@@ -47658,8 +47677,9 @@ def _ics_events_to_briefings(events, existing=None):
             # earliest start, latest end — ABER nur duty-relevante Events
             # (Flug/Briefing/Standby) erweitern das Fenster; Layover/Off NICHT
             # (sonst zählt das Layover-Ende am nächsten Morgen als Duty-Ende →
-            # Block/Belastung 2-4× zu hoch).
-            ev_extends = _ev_extends_duty(day_summary)
+            # Block/Belastung 2-4× zu hoch). `ev` reist mit für die Off-Day-
+            # Ausnahme (getimter Termin mit echtem Ende, Audit-Befund 2).
+            ev_extends = _ev_extends_duty(day_summary, ev=ev)
             # START: IMMER die früheste verfügbare Zeit übernehmen — auch von
             # Nicht-Duty-Events (z.B. „EM ab 13:00"). Vorher ging die Tages-
             # Startzeit verloren, wenn der einzige/erste Eintrag des Tages kein
