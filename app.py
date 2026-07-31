@@ -113,6 +113,7 @@ for _bp_path, _bp_name in [
     ('blueprints.daily_briefing',            'daily_briefing_bp'),  # Daily Briefing nach Florians Spez (P10, README = fachliche Wahrheit)
     ('blueprints.lh_mqtt',                   'lh_mqtt_bp'),  # LH MQTT-Push-Notifications — Topics/Event-Fanout (Engine A2)
     ('blueprints.live_activity',             'live_activity_bp'),  # Live Activities — ActivityKit-Token-Registry + APNs-Push (P6)
+    ('blueprints.flight_checkins',           'flight_checkins_bp'),  # für einen Flug einchecken → Ereignis-Pushes (abgeflogen/landet in 1h/gelandet)
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
@@ -11589,6 +11590,15 @@ _PUSH_TYPE_TO_PREF = {
     'inbound_departure': 'roster_change',
     'inbound_arrival': 'roster_change',
     'inbound_delay': 'roster_change',
+    # Für einen Flug EINGECHECKT (Crew-Bordkarte, 2026-07-31): abgeflogen /
+    # landet voraussichtlich in etwa einer Stunde / gelandet. Bewusst KEIN
+    # neuer Pref-Key — der Owner will keinen vierten Schalter, und die
+    # Nutzer-Erwartung ist dieselbe wie bei den anderen Flug-Ereignissen
+    # oben (`_PUSH_PREF_KEYS` bleibt deshalb unverändert; ein Wert, den
+    # /api/push/prefs gar nicht kennt, wäre ein toter Schalter).
+    'flight_departed': 'roster_change',
+    'flight_eta_1h': 'roster_change',
+    'flight_landed': 'roster_change',
 }
 
 # ── Per-Freund-Push-Steuerung (2026-07-27) ──────────────────────────

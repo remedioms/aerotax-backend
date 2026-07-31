@@ -1055,6 +1055,13 @@ def inbound_topics_for_rows(rows, now_utc, deadline=None):
     return topics
 
 
+def checkin_topics_for(now_utc):
+    """Topics der eingecheckten Flüge (Test-Seam um
+    `flight_checkins.checkin_topics`). Leere Menge, wenn das Modul fehlt."""
+    from blueprints.flight_checkins import checkin_topics
+    return checkin_topics(now_utc)
+
+
 def _topics_snapshot():
     """(ts, topics) des letzten Schnappschusses. ts=0.0 ⇒ noch keiner da."""
     with _topics_lock:
@@ -1086,6 +1093,17 @@ def _topics_compute(budget_s=None):
         return [], False
     roster = set(topics_for_rows(rows, now_utc))
     tset = set(roster)
+    # EINGECHECKTE FLÜGE (2026-07-31): wer sich auf der Crew-Bordkarte für
+    # einen Flug anmeldet, verfolgt oft einen Flug, der in seinem EIGENEN
+    # Roster gar nicht steht. Ohne dieses Abo käme für so einen Flug nie ein
+    # Broker-Event — der Nutzer hätte eingecheckt und bekäme stillschweigend
+    # nie eine Meldung. Fehlschlag ist unkritisch: dann bleibt es beim
+    # Roster-Stand (der die Bordkarten-Fälle ohnehin abdeckt), es geht kein
+    # bestehendes Abo verloren.
+    try:
+        tset |= checkin_topics_for(now_utc)
+    except Exception as e:
+        log.warning('[lh_mqtt] checkin topics fail: %s', type(e).__name__)
     complete = True
     inbound = set()
     try:
@@ -1195,11 +1213,28 @@ def _kick_live_activity_sweep():
         log.warning('[lh_mqtt] la sweep kick fail: %s', type(e).__name__)
 
 
+def _kick_flight_checkin_sweep():
+    """Den Check-in-Sweep („landet in etwa einer Stunde", Aufräumen)
+    mitlaufen lassen. Wirft nie.
+
+    GLEICHER GRUND WIE OBEN: es gibt an dieser Stelle bereits einen
+    verlässlichen 300-s-Takt. Ein eigener Cron-Eintrag oder ein eigener
+    Dauer-Thread pro Feature wäre Infrastruktur, die niemand überwacht. Der
+    Sweep deckelt sich selbst (`_SWEEP_MIN_GAP_S`) und läuft im Hintergrund —
+    dieser Request wartet nie auf ihn."""
+    try:
+        from blueprints.flight_checkins import kick_sweep as _fc_kick
+        _fc_kick()
+    except Exception as e:
+        log.warning('[lh_mqtt] checkin sweep kick fail: %s', type(e).__name__)
+
+
 @lh_mqtt_bp.route('/api/internal/lh-mqtt/topics', methods=['GET'])
 def lh_mqtt_topics():
     if not _secret_ok():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
     _kick_live_activity_sweep()
+    _kick_flight_checkin_sweep()
     ts, topics = _topics_snapshot()
     age = time.time() - ts if ts else None
     if ts and age < _TOPICS_TTL_S:
@@ -1543,6 +1578,20 @@ def lh_mqtt_event():
         except Exception as e:
             log.warning('[lh_mqtt] live-activity fanout fail %s: %s',
                         flight_disp, type(e).__name__)
+    if kind in ('departed', 'arrived'):
+        # CHECK-IN-MELDUNGEN (Forum-Wunsch 2026-07-31): wer sich auf der
+        # Crew-Bordkarte für genau diesen Flug angemeldet hat, bekommt jetzt
+        # „abgeflogen" bzw. „gelandet". DIESES EVENT IST DER BELEG — eine
+        # verstrichene Planzeit wäre keiner (die Maschine kann am Gate
+        # stehen). Bewusst UNABHÄNGIG von `affected`: eingecheckt hat
+        # typischerweise jemand, der selbst NICHT auf dem Flug sitzt.
+        try:
+            from blueprints.flight_checkins import notify_flight_event
+            pushed += notify_flight_event(kind, flight_disp, topic_date,
+                                          facts=facts or None)
+        except Exception as e:
+            log.warning('[lh_mqtt] checkin push fail %s: %s', flight_disp,
+                        type(e).__name__)
     if kind in ('departed', 'arrived', 'est_dep'):
         # Inbound-Watch: diese Maschine ist der Zubringer für wen? est_dep
         # zusätzlich zur Direkt-Crew — der Zubringer eines ANDEREN Legs kann
