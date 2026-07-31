@@ -4,7 +4,7 @@ Deckt ab:
   • _flight_status_bucket   — Board-Status → landed/airborne/grounded/None
   • _enrich_leg_delays      — Pro-Leg-Anreicherung der ical_sectors[]
   • _flight_obs_merged      — echter Dual-Side-Merge (mit gemockten Board/Store)
-  • get_briefings           — Serve-Time-Enrichment nur today/today+1
+  • get_briefings           — Serve-Time-Enrichment nur gestern/heute/morgen
   • get_friends_today       — lay_eff Echter-Status-Kaskade (Tibor-Fall)
 
 KEIN echter Netz-/DB-Zugriff: _flight_from_free_board / _flight_from_live_board /
@@ -1077,7 +1077,7 @@ def test_merged_explicit_delay_not_overwritten_by_text():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# get_briefings — Serve-Time-Enrichment (nur today/today+1)
+# get_briefings — Serve-Time-Enrichment (nur gestern/heute/morgen)
 # ══════════════════════════════════════════════════════════════════════════════
 @pytest.fixture
 def client():
@@ -1113,6 +1113,45 @@ def test_get_briefings_enriches_today_and_tomorrow_only(client):
     assert body[tomorrow]['ical_sectors'][0]['delay_min'] == 17
     # Ferner Tag (>today+1) NICHT angefasst.
     assert 'delay_known' not in body[far]['ical_sectors'][0]
+
+
+def test_get_briefings_overnight_leg_on_yesterdays_daykey_gets_landing(client):
+    """Owner-Beleg LH455 SFO→FRA (30./31.07.2026): ein Übernacht-Leg keyt am
+    ABFLUGTAG. Nach UTC-Mitternacht ist sein Tag-Key „gestern" — mit dem alten
+    {heute, morgen}-Serve-Fenster fiel er ab 00:00 UTC aus der Anreicherung und
+    die Landung kam NIE am Sektor an (status/est_* blieben leer), obwohl
+    SFO-DEP ('Departed', est 15:27) und FRA#ARR ('baggage delivery finished',
+    est 10:35 lokal, Reg DABYP) im Warehouse standen. Die Live-Activity-Kette
+    (depConfirmed/arrConfirmed aus status/est_*) bekam so bei jedem West-
+    Nachtflug keine Bestätigung. Seit dem Fix wird auch GESTERN angereichert.
+
+    Zeiten = die ECHTEN Werte des Belegs, auf die eingefrorene Uhr geschoben:
+    dep 21:50Z am Vortag, arr 08:35Z heute, „jetzt" 10:00Z = nach der Landung
+    (exakt die Geometrie des Owner-Falls am Morgen des 31.07.)."""
+    yday = (_today() - timedelta(days=1)).isoformat()
+    today = _today().isoformat()
+    data = {yday: {'ical_sectors': [_sector(
+        flight='LH455', frm='SFO', to='FRA',
+        dep_iso=f'{yday}T21:50:00Z', arr_iso=f'{today}T08:35:00Z')]}}
+    with _patch_coords(), \
+            patch.object(A, '_maybe_refresh_calendar_feed', return_value=None), \
+            patch.object(A, '_manual_briefings_load', return_value=data), \
+            patch.object(A, '_ical_briefings_load', return_value={}), \
+            patch.object(A, '_flight_obs_merged', return_value=_merged(
+                delay_known=True, delay_min=10, delay_side='arr',
+                dep_delay_min=47, arr_delay_min=10, status='landed',
+                esti_dep=f'{yday}T15:27:00',            # SFO-Board, naiv-lokal
+                esti_arr=f'{today}T10:35:00+02:00',     # FRA#ARR, Offset-ISO
+                reg='DABYP')):
+        r = client.get('/api/user/briefing/TESTTOKEN')
+    assert r.status_code == 200
+    sec = r.get_json()['briefings'][yday]['ical_sectors'][0]
+    # Landebestätigung kommt jetzt an: Status terminal + echte Ist-Zeiten.
+    assert sec['status'] == 'landed'
+    assert sec['est_dep_iso'] == f'{yday}T22:27:00Z'    # 15:27 PDT → echt-UTC
+    assert sec['est_arr_iso'] == f'{today}T08:35:00Z'   # 10:35 CEST → echt-UTC
+    assert sec['delay_min'] == 10 and sec['delay_side'] == 'arr'
+    assert sec['reg'] == 'DABYP'
 
 
 def test_get_briefings_single_datum_enriched(client):

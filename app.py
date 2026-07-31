@@ -20777,20 +20777,37 @@ def get_briefings(token):
         # Defensiv: iCal-Read-Fehler darf User-PUT-Daten nicht blocken
         pass
     # LIVE-DELAY-ANREICHERUNG (Owner 2026-07-04) — SERVE-TIME, nicht Import-Time:
-    # pro Leg des HEUTIGEN und MORGIGEN Tages Delay/Status/Cancelled/Ist-Zeiten
-    # aus dem Dual-Side-Resolver anhängen (ical_sectors[]). NUR today/today+1 →
-    # der ganze Monat würde sonst pro Request Boards scannen. free_only=True +
-    # ~90 s-Memo halten den Fan-out kostenlos; die Zahlen bleiben pro Request
-    # frisch statt beim letzten iCal-Sync eingefroren. Rein additiv, defensiv.
+    # pro Leg des GESTRIGEN, HEUTIGEN und MORGIGEN Tages Delay/Status/Cancelled/
+    # Ist-Zeiten aus dem Dual-Side-Resolver anhängen (ical_sectors[]). NUR diese
+    # 3 Tage → der ganze Monat würde sonst pro Request Boards scannen.
+    # free_only=True + ~90 s-Memo halten den Fan-out kostenlos; die Zahlen
+    # bleiben pro Request frisch statt beim letzten iCal-Sync eingefroren.
+    # Rein additiv, defensiv.
+    # GESTERN GEHÖRT DAZU (Owner LH455 SFO→FRA, 31.07.): ein Übernacht-Leg keyt
+    # am ABFLUGTAG. Mit nur {heute, morgen} fiel der Tag-Key um 00:00 UTC aus
+    # dem Fenster — der Rest des Fluges (hier 8,5 von 10,75 h) UND die Landung
+    # wurden UNangereichert ausgeliefert (status/est_* fehlten), obwohl SFO-DEP
+    # ('Departed', est 15:27) und FRA#ARR ('baggage delivery finished', est
+    # 10:35, Reg DABYP) längst im Warehouse standen. Die Live-Activity-Kette
+    # (depConfirmed/arrConfirmed aus status/est_*) bekam so bei JEDEM West-
+    # Nachtflug NIE eine Bestätigung. Gemessen 24.–30.07.: 706/5149 Sektoren
+    # (13,7 %) sind solche Übernacht-Legs (arr-UTC-Tag > Tag-Key), 618 Token
+    # betroffen; Stichprobe 40: 39× lag die Landung beweisbar in aircraft_track.
+    # Reihenfolge heute→gestern→morgen: das gemeinsame Budget trifft zuerst die
+    # wahrscheinlich aktiven Legs; der 30-h-Vergangenheits-Horizont in
+    # _enrich_leg_delays hält den gestrigen Tag billig (nur noch relevante,
+    # d. h. junge Legs erreichen einen Board-/Warehouse-Read).
     try:
         from datetime import date as _bd, timedelta as _btd2
         _today = _bd.today()
-        _live_days = {_today.isoformat(), (_today + _btd2(days=1)).isoformat()}
+        _live_days = [_today.isoformat(),
+                      (_today - _btd2(days=1)).isoformat(),
+                      (_today + _btd2(days=1)).isoformat()]
         _hb = None   # lazy: nur laden, wenn wirklich Sektoren angereichert werden
         # EIN gemeinsames Budget über beide Tage — sonst könnte jeder Tag es
         # einzeln ausschöpfen und die Antwort trotzdem doppelt so lange dauern.
         _enrich_deadline = time.time() + _BRIEFING_ENRICH_BUDGET_S
-        for _k in list(_live_days):
+        for _k in _live_days:
             _day = data.get(_k)
             if isinstance(_day, dict) and isinstance(_day.get('ical_sectors'), list):
                 # Echte Profil-Homebase für die Tail-Turnaround-Weitergabe
