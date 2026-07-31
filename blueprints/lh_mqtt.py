@@ -1179,10 +1179,27 @@ def _topics_kick_refresh():
                     type(e).__name__)
 
 
+def _kick_live_activity_sweep():
+    """Den Live-Activity-Stale-Sweep (R2b) mitlaufen lassen. Wirft nie.
+
+    WARUM HIER: der Sweep braucht einen verlässlichen Takt, und den gibt es an
+    dieser Stelle schon — der MQTT-Daemon fragt diesen Endpoint alle 300 s.
+    Damit kostet das zeitbasierte Ende der Live Activities KEINE neue
+    Infrastruktur, keinen neuen Cron-Eintrag auf dem Host und keinen LH-Call.
+    Der Sweep selbst deckelt sich (`_LA_SWEEP_MIN_GAP_S`) und läuft im
+    Hintergrund — dieser Request wartet nie auf ihn."""
+    try:
+        from blueprints.live_activity import kick_sweep
+        kick_sweep()
+    except Exception as e:
+        log.warning('[lh_mqtt] la sweep kick fail: %s', type(e).__name__)
+
+
 @lh_mqtt_bp.route('/api/internal/lh-mqtt/topics', methods=['GET'])
 def lh_mqtt_topics():
     if not _secret_ok():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    _kick_live_activity_sweep()
     ts, topics = _topics_snapshot()
     age = time.time() - ts if ts else None
     if ts and age < _TOPICS_TTL_S:

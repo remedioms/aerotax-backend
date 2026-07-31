@@ -93,7 +93,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, jsonify, request
 
@@ -997,6 +997,55 @@ _MQTT_PHASE_KICKER = {
 _MQTT_ARRIVAL_KINDS = ('departed', 'diverted', 'est_arr', 'arrived')
 
 
+# ── R2a: `stale-date` — die Karte darf nicht ewig „im Flug" behaupten ────────
+#
+# Audit 2026-07-31: `push_for_affected` ist der EINZIGE Produzent dieser
+# Live Activities, und er hat nie ein `stale_after_s` gesetzt. Geht ein
+# `arrived`-Event verloren — und das passiert regelmäßig, weil der Broker mit
+# QoS 0 und clean session arbeitet (kein Replay) und jeder Deploy des Daemons
+# 50–60 s blind ist (~10×/Tag) —, bleibt die Karte für IMMER im Zustand
+# „inFlight". Sie zählt dann auf eine Ankunft herunter, die längst vorbei ist.
+#
+# `aps.stale-date` ist das einzige Mittel, das OHNE App-Update wirkt: ActivityKit
+# liest den Header selbst und markiert die Activity ab diesem Zeitpunkt als
+# veraltet (`ActivityViewState.isStale`) — der Client muss dafür nichts können
+# und nichts wissen. Es beendet die Karte NICHT; das macht der serverseitige
+# Sweep weiter unten (R2b). Die beiden gehören zusammen: stale-date wirkt
+# sofort und auch dann, wenn das Gerät offline ist, der Sweep räumt auf.
+#
+# Bezugspunkt ist bewusst `mainTime` (der Moment, auf den die Karte zeigt) und
+# nicht „jetzt + fixe Dauer": eine Karte, die auf eine Ankunft in 9 h zeigt,
+# darf nicht nach 2 h als veraltet gelten, und eine, die auf eine Ankunft vor
+# 10 min zeigt, soll nicht noch stundenlang frisch wirken.
+_LA_STALE_GRACE_S = 45 * 60      # nach dem gezeigten Zeitpunkt noch „frisch"
+_LA_STALE_MIN_S = 15 * 60        # nie sofort veraltet (Zeitpunkt schon vorbei)
+_LA_STALE_MAX_S = 12 * 3600      # länger als eine Activity überhaupt lebt
+
+
+def _to_unix(value):
+    """Zeitangabe → Unix-Sekunden (float) oder None. Nutzt bewusst dieselbe
+    einzige Umrechnungsstelle wie der Payload (`_to_apple_date`), damit hier
+    nie eine zweite Datumsinterpretation entsteht."""
+    apple = _to_apple_date(value)
+    return None if apple is None else apple + _APPLE_EPOCH_OFFSET
+
+
+def _stale_after_s(target, now_ts=None):
+    """Sekunden ab JETZT bis `aps.stale-date`. Pure. None ⇒ kein stale-date
+    (unbekannter Bezugszeitpunkt — dann wird nichts behauptet).
+
+    Geklemmt: mindestens `_LA_STALE_MIN_S` (ein bereits vergangener Zeitpunkt
+    darf die Karte nicht rückwirkend veralten lassen, sonst flackert sie beim
+    ersten Update nach der Landung), höchstens `_LA_STALE_MAX_S`.
+    """
+    unix = _to_unix(target)
+    if unix is None:
+        return None
+    now_ts = time.time() if now_ts is None else now_ts
+    secs = int(unix + _LA_STALE_GRACE_S - now_ts)
+    return max(_LA_STALE_MIN_S, min(_LA_STALE_MAX_S, secs))
+
+
 def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
     """Live-Activity-Fanout für ein LH-MQTT-Event. Returns Anzahl gesendeter
     Pushes (unverändert/skip zählt NICHT).
@@ -1071,8 +1120,13 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             # Ohne Ziel-Zeitpunkt gibt es keine ehrliche Karte.
             continue
         try:
-            res = push_live_activity(user_token, state, event='update',
-                                     priority='10')
+            # stale-date bei JEDEM Update nachschieben: solange Events kommen,
+            # wandert die Verfallsmarke mit der aktuellen Schätzung mit. Bleiben
+            # sie aus, läuft genau diese zuletzt gesetzte Marke ab — und die
+            # Karte sagt selbst, dass sie nichts Neues mehr weiß.
+            res = push_live_activity(
+                user_token, state, event='update', priority='10',
+                stale_after_s=_stale_after_s(state['mainTime']))
             sent += int(res.get('sent') or 0)
         except Exception as exc:
             log.warning('[live-activity] mqtt fanout failed user_ref=%s: %s',
@@ -1081,3 +1135,306 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
         log.info('[live-activity] mqtt fanout flight=%s date=%s kind=%s sent=%d',
                  flight_disp, topic_date, kind, sent)
     return sent
+
+
+# ── R2b: zeitbasiertes ENDE — wer nichts mehr weiß, hört auf zu behaupten ────
+#
+# `stale-date` (oben) markiert die Karte nur als veraltet; sie bleibt liegen.
+# Owner-Entscheid dazu ist eindeutig: „muss schon richtig sein sonst weg."
+# Also beendet dieser Sweep Live Activities, für die es keine Grundlage mehr
+# gibt — mit `event='end'` und sofortiger `dismissal-date`, die Karte
+# VERSCHWINDET. Sie wird nicht mit einer erfundenen Landezeit „abgeschlossen"
+# (Owner-Regel: lieber keine Zeile als ein synthetisierter Wert).
+#
+# WOHER DIE ZEIT KOMMT — und woher nicht:
+# Die Registry-Zeile weiß nicht, welchen Flug sie zeigt (es gibt keine
+# Flug-Spalte, und eine neue Spalte hieße Migration). Der Sweep fragt deshalb
+# den GESPEICHERTEN Roster desselben Users: läuft irgendein Sektor gerade noch,
+# darf die Karte bleiben. Das ist ein reiner Supabase-Read — KEIN LH-Call, kein
+# neuer Datenpfad, keine neue Tabelle.
+#
+# DREI SCHUTZSCHALTUNGEN, weil eine fälschlich beendete Karte schlimmer ist als
+# eine, die 90 min zu lang steht:
+#   1. Kein Roster-Eintrag für den User im Fenster ⇒ NICHTS TUN. Keine Daten
+#      sind kein Beleg für „ist vorbei" (dieselbe Regel wie bei der
+#      Frische-Schranke in lh_mqtt).
+#   2. Der Plausibilitäts-Rahmen ist großzügig: von 4 h VOR dem Abflug
+#      (Briefing/Report, dann startet der Client die Activity) bis zum Ende des
+#      MQTT-Abo-Fensters (Ankunft +1 h, bei fehlender Ankunft konservative
+#      Blockannahme) PLUS 90 min Kulanz. Effektiv also erst ~2,5 h nach der
+#      geplanten Ankunft.
+#   3. Reißleine für Zeilen ohne Roster-Beleg: eine Activity, die seit
+#      `_LA_SWEEP_HARD_MAX_AGE_H` niemand angefasst hat, KANN nichts Aktuelles
+#      mehr zeigen — ActivityKit beendet Activities ohnehin nach spätestens
+#      8 h Laufzeit (12 h auf dem Lockscreen). Diese Zeile ist dann nur noch
+#      ein toter Push-Empfänger.
+#
+# Takt: der Sweep braucht keine neue Infrastruktur. Der MQTT-Daemon fragt alle
+# 300 s `/api/internal/lh-mqtt/topics`; dieser Aufruf stößt den Sweep im
+# Hintergrund an (gedeckelt über `_LA_SWEEP_MIN_GAP_S`). Zusätzlich gibt es den
+# Endpoint `/api/internal/live-activity/sweep` für die Host-Cron und für
+# manuelle Läufe. Kill-Switch: `AEROX_LA_SWEEP=0`.
+_LA_SWEEP_LEAD_S = 4 * 3600         # so früh startet der Client die Activity
+_LA_SWEEP_GRACE_S = 90 * 60         # Kulanz NACH dem Abo-Fenster des Legs
+_LA_SWEEP_HARD_MAX_AGE_H = 14       # Reißleine ohne Roster-Beleg
+_LA_SWEEP_MIN_GAP_S = 600           # höchstens alle 10 min (pro Prozess)
+_LA_SWEEP_MAX_ROWS = 500
+_LA_SWEEP_TOKEN_CHUNK = 60
+
+_SWEEP_SELECT = _ROW_SELECT + ',updated_at'
+
+_sweep_lock = threading.Lock()
+_sweep_state = {'last': 0.0, 'running': False}
+
+
+def _sweep_enabled():
+    return (os.environ.get('AEROX_LA_SWEEP', '').strip() or '1') != '0'
+
+
+def _active_update_rows_all(limit=_LA_SWEEP_MAX_ROWS):
+    """ALLE aktiven update-Zeilen (über alle User). Wirft nie; [] bei
+    SB-Ausfall — und [] heißt für den Sweep „nichts tun", nicht „alles weg"."""
+    client = _sb()
+    if client is None:
+        return []
+    try:
+        rows = (client.table('live_activities').select(_SWEEP_SELECT)
+                .eq('kind', 'update').eq('active', True)
+                .limit(limit).execute().data or [])
+        return [r for r in rows if (r or {}).get('la_token')]
+    except Exception as exc:
+        log.warning('[live-activity] sweep rows read failed: %s',
+                    type(exc).__name__)
+        return []
+
+
+def _roster_sectors_by_token(tokens, now_utc):
+    """{token: [sector, …]} aus den gespeicherten Briefings (heute ±1 Tag).
+    Nur ein Supabase-Read, gebündelt. Wirft nie; bei Störung ein LEERES Dict —
+    dann findet der Sweep keinen Beleg und lässt (bis auf die Reißleine) alles
+    in Ruhe."""
+    want = sorted({t for t in (tokens or []) if t})
+    if not want:
+        return {}
+    client = _sb()
+    if client is None:
+        return {}
+    try:
+        from blueprints.lh_mqtt import _SECTOR_SELECT, _iter_sectors
+    except Exception:                                   # pragma: no cover
+        return {}
+    dates = [(now_utc.date() + timedelta(days=off)).isoformat()
+             for off in (-1, 0, 1)]
+    out = {}
+    for i in range(0, len(want), _LA_SWEEP_TOKEN_CHUNK):
+        chunk = want[i:i + _LA_SWEEP_TOKEN_CHUNK]
+        try:
+            rows = (client.table('user_ical_briefings').select(_SECTOR_SELECT)
+                    .in_('token', chunk).in_('datum', dates)
+                    .execute().data or [])
+        except Exception as exc:
+            log.warning('[live-activity] sweep roster read failed: %s',
+                        type(exc).__name__)
+            continue
+        for tok, sector in _iter_sectors(rows):
+            if tok:
+                out.setdefault(tok, []).append(sector)
+    return out
+
+
+def _duty_still_plausible(sectors, now_utc):
+    """True, wenn IRGENDEIN Sektor des Users gerade noch laufen kann.
+
+    Das Ende kommt aus `lh_mqtt.sector_sub_end` — bewusst dieselbe Definition
+    wie beim MQTT-Abo-Fenster (Ankunft +1 h, ohne bekannte Ankunft konservative
+    Blockannahme), damit es nicht zwei Auffassungen davon gibt, wie lange ein
+    Leg laufen kann. Plus `_LA_SWEEP_GRACE_S` Kulanz.
+    """
+    try:
+        from blueprints.lh_mqtt import _parse_iso_utc, sector_sub_end
+    except Exception:                                   # pragma: no cover
+        return True                                     # fail-safe
+    for s in sectors or []:
+        if not isinstance(s, dict):
+            continue
+        dep = _parse_iso_utc(s.get('dep_iso'))
+        if dep is None:
+            continue
+        start = dep - timedelta(seconds=_LA_SWEEP_LEAD_S)
+        end = sector_sub_end(s, dep) + timedelta(seconds=_LA_SWEEP_GRACE_S)
+        if start <= now_utc <= end:
+            return True
+    return False
+
+
+def _last_known_arrival(sectors):
+    """Späteste bekannte ECHTE Ankunftszeit der Sektoren (aware) oder None.
+    Nur `arr_iso` — nichts Geschätztes, nichts Gerechnetes."""
+    try:
+        from blueprints.lh_mqtt import _parse_iso_utc
+    except Exception:                                   # pragma: no cover
+        return None
+    best = None
+    for s in sectors or []:
+        if not isinstance(s, dict):
+            continue
+        arr = _parse_iso_utc(s.get('arr_iso'))
+        if arr is not None and (best is None or arr > best):
+            best = arr
+    return best
+
+
+def _row_age_h(row, now_utc):
+    """Alter der Zeile in Stunden (float) oder None, wenn unlesbar."""
+    ts = (row or {}).get('updated_at')
+    if not ts:
+        return None
+    try:
+        when = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return (now_utc - when).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def _end_row(row, mark_time, reason):
+    """EINE Zeile beenden: `event='end'` mit sofortiger dismissal-date, danach
+    die Registry-Zeile stilllegen. Die Zeile wird AUCH dann stillgelegt, wenn
+    der APNs-Push scheitert — sonst pusht der Fanout weiter gegen eine Karte,
+    die nachweislich nichts Richtiges mehr zeigt."""
+    state = {
+        'stateVersion': 2,
+        # BEWUSST ein bereits im Vertrag benutzter Phasen-Wert. Ein neuer String
+        # („ended") wäre riskant: ist `phase` in Swift ein enum mit String-
+        # rawValue, verwirft der Decoder ein unbekanntes ContentState KOMPLETT
+        # und STILL — das Ende käme dann nie an. Sichtbar wird der Wert nicht,
+        # die Karte wird im selben Push sofort ausgeblendet.
+        'phase': 'turnaround',
+        'kicker': 'BEENDET',
+        # Echter, bekannter Zeitpunkt — keine erfundene Landezeit.
+        'mainTime': mark_time,
+        'generatedAt': datetime.now(timezone.utc),
+    }
+    normalized, problems = _normalize_content_state(state)
+    if _fatal_problems(problems):                       # pragma: no cover
+        log.warning('[live-activity] sweep end state invalid: %s', problems)
+        return False
+    ok = False
+    try:
+        res = _push_row(row, normalized, event='end', dismiss_after_s=0)
+        ok = res.get('status') == 'sent'
+    except Exception as exc:
+        log.warning('[live-activity] sweep end push failed user_ref=%s: %s',
+                    _token_ref(row.get('user_token')), type(exc).__name__)
+    _rpc('end_live_activity', {
+        'p_user_token': row.get('user_token'),
+        'p_activity_id': row.get('activity_id'),
+        'p_reason': reason})
+    with _state_lock:
+        _LAST_SENT.pop(row.get('id'), None)
+    log.info('[live-activity] sweep ended user_ref=%s activity=%s reason=%s '
+             'pushed=%s', _token_ref(row.get('user_token')),
+             (row.get('activity_id') or '-')[:24], reason, ok)
+    return True
+
+
+def sweep_stale_live_activities(now_utc=None):
+    """Beendet Live Activities ohne Grundlage. Returns Zähler-Dict. Wirft nie.
+
+    KEIN LH-Call — ausschließlich gespeicherte Roster-Zeiten.
+    """
+    counts = {'checked': 0, 'ended': 0, 'kept': 0, 'no_roster': 0,
+              'hard_age': 0}
+    if not _sweep_enabled():
+        counts['disabled'] = True
+        return counts
+    now_utc = now_utc or datetime.now(timezone.utc)
+    rows = _active_update_rows_all()
+    counts['checked'] = len(rows)
+    if not rows:
+        return counts
+    by_token = _roster_sectors_by_token({r.get('user_token') for r in rows},
+                                        now_utc)
+    for row in rows:
+        try:
+            sectors = by_token.get(row.get('user_token'))
+            if sectors:
+                if _duty_still_plausible(sectors, now_utc):
+                    counts['kept'] += 1
+                    continue
+                if _end_row(row, _last_known_arrival(sectors) or
+                            row.get('last_timestamp') or now_utc,
+                            'stale_no_running_leg'):
+                    counts['ended'] += 1
+                continue
+            # Kein Roster-Beleg: nur die Reißleine greift.
+            counts['no_roster'] += 1
+            age = _row_age_h(row, now_utc)
+            if age is not None and age > _LA_SWEEP_HARD_MAX_AGE_H:
+                if _end_row(row, row.get('last_timestamp') or now_utc,
+                            'stale_max_age'):
+                    counts['ended'] += 1
+                    counts['hard_age'] += 1
+            else:
+                counts['kept'] += 1
+        except Exception as exc:                        # pragma: no cover
+            log.warning('[live-activity] sweep row failed: %s',
+                        type(exc).__name__)
+    if counts['ended']:
+        log.info('[live-activity] sweep: %d von %d beendet (kein laufendes '
+                 'Leg: %d, Reißleine: %d)', counts['ended'], counts['checked'],
+                 counts['ended'] - counts['hard_age'], counts['hard_age'])
+    return counts
+
+
+def kick_sweep():
+    """Sweep im Hintergrund anstoßen, höchstens alle `_LA_SWEEP_MIN_GAP_S`.
+    Gedacht für Aufrufer, die ohnehin regelmäßig vorbeikommen (der
+    MQTT-Topic-Poll). Blockiert nie, wirft nie, liefert True wenn gestartet."""
+    if not _sweep_enabled():
+        return False
+    now = time.time()
+    with _sweep_lock:
+        if _sweep_state['running']:
+            return False
+        if (now - _sweep_state['last']) < _LA_SWEEP_MIN_GAP_S:
+            return False
+        _sweep_state['running'] = True
+        _sweep_state['last'] = now
+
+    def _work():
+        try:
+            sweep_stale_live_activities()
+        except Exception as exc:
+            log.warning('[live-activity] sweep crashed: %s', type(exc).__name__)
+        finally:
+            with _sweep_lock:
+                _sweep_state['running'] = False
+            try:
+                from app import _close_current_thread_supabase_client
+                _close_current_thread_supabase_client()
+            except Exception:
+                pass
+
+    try:
+        threading.Thread(target=_work, daemon=True,
+                         name='la-stale-sweep').start()
+        return True
+    except Exception as exc:
+        # Ohne das bliebe das Flag für immer True und dieser Worker würde nie
+        # wieder aufräumen (gleiche Falle wie in lh_mqtt._topics_kick_refresh).
+        with _sweep_lock:
+            _sweep_state['running'] = False
+        log.warning('[live-activity] sweep thread start fail: %s',
+                    type(exc).__name__)
+        return False
+
+
+@live_activity_bp.route('/api/internal/live-activity/sweep', methods=['POST'])
+def internal_live_activity_sweep():
+    """NUR intern (Cron/manuell). Beendet Live Activities ohne laufendes Leg.
+    Läuft synchron und liefert die Zähler — als Beleg nach einem Deploy."""
+    if not _secret_ok():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    return jsonify({'ok': True, **sweep_stale_live_activities()})

@@ -51,9 +51,15 @@ class _Res:
 
 
 class _Table:
-    def __init__(self, sb):
+    """`in_`/`limit` kamen 2026-07-31 fuer den Stale-Sweep dazu (er liest ALLE
+    aktiven Zeilen und dazu die Roster-Sektoren der betroffenen Tokens)."""
+
+    def __init__(self, sb, attr='rows'):
         self.sb = sb
+        self.attr = attr
         self.filters = {}
+        self.ins = {}
+        self._limit = None
 
     def select(self, _cols):
         return self
@@ -62,9 +68,20 @@ class _Table:
         self.filters[key] = value
         return self
 
+    def in_(self, key, values):
+        self.ins[key] = list(values)
+        return self
+
+    def limit(self, n):
+        self._limit = n
+        return self
+
     def execute(self):
-        rows = [dict(r) for r in self.sb.rows
-                if all(r.get(k) == v for k, v in self.filters.items())]
+        rows = [dict(r) for r in getattr(self.sb, self.attr)
+                if all(r.get(k) == v for k, v in self.filters.items())
+                and all(r.get(k) in v for k, v in self.ins.items())]
+        if self._limit is not None:
+            rows = rows[:self._limit]
         return _Res(rows)
 
 
@@ -82,12 +99,15 @@ class _FakeSB:
 
     def __init__(self):
         self.rows = []
+        self.briefings = []          # user_ical_briefings (nur der Sweep)
         self.rpc_calls = []
         self._seq = 0
         self.fail_rpc = set()
 
     # ── Client-Oberfläche ────────────────────────────────────────────────
     def table(self, name):
+        if name == 'user_ical_briefings':
+            return _Table(self, 'briefings')
         assert name == 'live_activities', name
         return _Table(self)
 
@@ -1037,3 +1057,308 @@ def test_blueprint_is_registered_on_the_real_app():
     assert '/api/push/register-live-activity' in rules
     assert '/api/live-activity/end' in rules
     assert '/api/internal/live-activity/push' in rules
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# R2 — die Karte darf nicht ewig „im Flug" luegen (Audit 2026-07-31)
+# ════════════════════════════════════════════════════════════════════════════
+# `push_for_affected` ist der EINZIGE Produzent dieser Live Activities. Geht ein
+# `arrived`-Event verloren — QoS 0 + clean session (kein Replay), dazu ~10
+# Daemon-Deploys/Tag mit je 50-60 s Blindfenster —, blieb die Karte fuer IMMER
+# im Zustand „inFlight" und zaehlte auf eine laengst vergangene Ankunft.
+#
+#   (a) `aps.stale-date` wirkt OHNE App-Update: ActivityKit liest den Header
+#       selbst und markiert die Karte ab dann als veraltet.
+#   (b) Der Sweep beendet Karten, fuer die es keine Grundlage mehr gibt —
+#       mit einem ECHTEN letzten bekannten Zeitpunkt, nie mit einer erfundenen
+#       Landezeit.
+
+from datetime import timedelta                                    # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _clock_freeze import FROZEN_UTC, apply_frozen_clock          # noqa: E402
+
+
+# ── (a) stale-date ──────────────────────────────────────────────────────────
+
+def test_stale_after_bezieht_sich_auf_den_gezeigten_zeitpunkt():
+    """Nicht „jetzt + fixe Dauer": eine Karte, die auf eine Ankunft in 9 h
+    zeigt, darf nicht nach zwei Stunden als veraltet gelten."""
+    now = 1_800_000_000.0
+    target = now + 9 * 3600
+    assert LA._stale_after_s(target, now_ts=now) == 9 * 3600 + LA._LA_STALE_GRACE_S
+
+
+def test_stale_after_klemmt_nach_unten():
+    """Ein bereits vergangener Zeitpunkt darf die Karte nicht rueckwirkend
+    veralten lassen — sonst flackert sie beim ersten Update nach der Landung."""
+    now = 1_800_000_000.0
+    assert LA._stale_after_s(now - 10 * 3600, now_ts=now) == LA._LA_STALE_MIN_S
+
+
+def test_stale_after_klemmt_nach_oben():
+    now = 1_800_000_000.0
+    assert LA._stale_after_s(now + 40 * 3600, now_ts=now) == LA._LA_STALE_MAX_S
+
+
+def test_stale_after_ohne_bezugszeitpunkt_behauptet_nichts():
+    assert LA._stale_after_s(None) is None
+    assert LA._stale_after_s('kein-datum') is None
+
+
+def _sector(dep_h, arr_h, base=None):
+    base = base or datetime.now(timezone.utc)
+    return {'from': 'MUC', 'to': 'ORD',
+            'dep_iso': (base + timedelta(hours=dep_h)).isoformat(),
+            'arr_iso': (base + timedelta(hours=arr_h)).isoformat()}
+
+
+def test_fanout_setzt_stale_date_auf_ankunft_plus_kulanz(client, sb, auth,
+                                                          apns):
+    """Der Kern von R2a: jedes Fanout-Update traegt jetzt eine Verfallsmarke."""
+    _register(client)
+    base = datetime.now(timezone.utc)
+    sector = _sector(-6, 3, base)                 # mitten im Langstreckenflug
+    LA.push_for_affected([(TOKEN, sector)], 'departed', 'LH433', '2026-07-22')
+    aps = apns['client'].sent[-1]['payload']['aps']
+    arr = base + timedelta(hours=3)
+    assert 'stale-date' in aps
+    assert abs(aps['stale-date']
+               - (arr.timestamp() + LA._LA_STALE_GRACE_S)) <= 5
+    # Unix-Sekunden, NICHT Apple-Referenzdatum (zwei Epochen im selben Payload).
+    assert aps['stale-date'] > APPLE_EPOCH
+
+
+def test_stale_date_wandert_mit_jeder_neuen_schaetzung_mit(client, sb, auth,
+                                                           apns):
+    """Solange Events kommen, wird die Marke nachgeschoben. Bleiben sie aus,
+    laeuft genau die zuletzt gesetzte ab."""
+    _register(client)
+    base = datetime.now(timezone.utc)
+    LA.push_for_affected([(TOKEN, _sector(-6, 3, base))], 'departed', 'LH433',
+                         '2026-07-22')
+    first = apns['client'].sent[-1]['payload']['aps']['stale-date']
+    LA.push_for_affected([(TOKEN, _sector(-6, 4, base))], 'est_arr', 'LH433',
+                         '2026-07-22')
+    second = apns['client'].sent[-1]['payload']['aps']['stale-date']
+    # +/-2 s: `aps.timestamp` MUSS strikt monoton steigen, zwei Pushes in
+    # derselben Sekunde bekommen deshalb last+1 (s. _next_timestamp).
+    assert abs((second - first) - 3600) <= 2
+
+
+def test_stale_date_erzeugt_keinen_zusaetzlichen_push(client, sb, auth, apns):
+    """Die Marke steht im aps-Block, nicht im content-state — sie darf den
+    Digest-Schutz nicht aushebeln (Apple drosselt Live-Activity-Pushes hart)."""
+    _register(client)
+    base = datetime.now(timezone.utc)
+    sector = _sector(-6, 3, base)
+    LA.push_for_affected([(TOKEN, sector)], 'departed', 'LH433', '2026-07-22')
+    assert len(apns['client'].sent) == 1
+    LA.push_for_affected([(TOKEN, sector)], 'departed', 'LH433', '2026-07-22')
+    assert len(apns['client'].sent) == 1          # unveraendert ⇒ kein Push
+
+
+# ── (b) zeitbasiertes Ende ──────────────────────────────────────────────────
+
+@pytest.fixture
+def frozen(monkeypatch):
+    """EINE eingefrorene Uhr fuer Blueprint, lh_mqtt (liefert die Fenster-
+    Definition) und dieses Testmodul — sonst rechnen Test-Eingabe und
+    Produktion gegen verschiedene „jetzt"."""
+    from blueprints import lh_mqtt as _mqtt
+    apply_frozen_clock(monkeypatch,
+                       extra_modules=(LA, _mqtt, sys.modules[__name__]),
+                       app_module=A)
+    LA._sweep_state['last'] = 0.0
+    LA._sweep_state['running'] = False
+    yield FROZEN_UTC
+    LA._sweep_state['last'] = 0.0
+    LA._sweep_state['running'] = False
+
+
+def _brief(sectors, token=TOKEN, day_offset=0):
+    d = (FROZEN_UTC.date() + timedelta(days=day_offset)).isoformat()
+    return {'token': token, 'datum': d,
+            'updated_at': FROZEN_UTC.isoformat(), 'sectors': sectors}
+
+
+def _age_row(sb_fake, hours):
+    row = sb_fake.row()
+    row['updated_at'] = (FROZEN_UTC - timedelta(hours=hours)).isoformat()
+    return row
+
+
+def test_sweep_beendet_karte_ohne_laufendes_leg(client, sb, auth, apns, frozen):
+    """Der Fall aus dem Audit: `arrived` ist verlorengegangen, die Karte stuende
+    sonst bis in alle Ewigkeit auf „im Flug"."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-11, -5, FROZEN_UTC)]))
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts['ended'] == 1 and counts['kept'] == 0
+    aps = apns['client'].sent[-1]['payload']['aps']
+    assert aps['event'] == 'end'
+    # sofort weg — Owner: „muss schon richtig sein sonst weg."
+    assert aps['dismissal-date'] == aps['timestamp']
+    assert sb.row()['active'] is False
+    assert sb.row()['end_reason'] == 'stale_no_running_leg'
+
+
+def test_sweep_laesst_langstrecke_mitten_im_flug_in_ruhe(client, sb, auth, apns,
+                                                         frozen):
+    """DIE Gegenprobe. Genau diese Karten waren der Grund fuer R1 — der Sweep
+    darf sie unter keinen Umstaenden abraeumen."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-6, 3, FROZEN_UTC)]))
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts == {'checked': 1, 'ended': 0, 'kept': 1, 'no_roster': 0,
+                      'hard_age': 0}
+    assert not apns['client'].sent
+    assert sb.row()['active'] is True
+
+
+def test_sweep_laesst_die_karte_vor_dem_abflug_in_ruhe(client, sb, auth, apns,
+                                                       frozen):
+    """Der Client startet die Activity zum Briefing, also Stunden VOR dem
+    Abflug. Ein Sweep, der nur „laeuft gerade" kennt, wuerde sie sofort
+    wegraeumen."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(3, 12, FROZEN_UTC)], day_offset=0))
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['kept'] == 1
+    assert not apns['client'].sent
+
+
+def test_sweep_gibt_der_geplanten_ankunft_kulanz(client, sb, auth, apns,
+                                                 frozen):
+    """Nicht auf die Minute: erst nach dem Abo-Fenster (Ankunft +1 h) PLUS
+    90 min Kulanz wird beendet. Eine verspaetete Landung darf die Karte nicht
+    verlieren."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-8, -2, FROZEN_UTC)]))   # arr vor 2 h
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['kept'] == 1
+    assert not apns['client'].sent
+
+
+def test_sweep_erfindet_keine_zeit(client, sb, auth, apns, frozen):
+    """Owner-Regel: lieber keine Zeile als ein synthetisierter Wert. Der
+    Abschluss traegt die LETZTE BEKANNTE Ankunft — nicht „jetzt" und keine
+    geschaetzte Landung."""
+    _register(client)
+    _age_row(sb, 0)
+    arr = FROZEN_UTC - timedelta(hours=5)
+    sb.briefings.append(_brief([_sector(-11, -5, FROZEN_UTC)]))
+    LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    state = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert abs(state['mainTime'] - (arr.timestamp() - APPLE_EPOCH)) < 2
+
+
+def test_sweep_ohne_roster_beleg_beendet_nichts(client, sb, auth, apns, frozen):
+    """Keine Daten sind kein Beleg fuer „ist vorbei" — dieselbe Regel wie bei
+    der Frische-Schranke im MQTT-Fanout."""
+    _register(client)
+    _age_row(sb, 2)
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts['no_roster'] == 1 and counts['ended'] == 0
+    assert not apns['client'].sent
+    assert sb.row()['active'] is True
+
+
+def test_sweep_reissleine_bei_uralter_zeile(client, sb, auth, apns, frozen):
+    """Ohne Roster-Beleg greift nur die Reissleine: eine Activity, die seit
+    14 h niemand angefasst hat, KANN nichts Aktuelles mehr zeigen — ActivityKit
+    beendet sie ohnehin nach spaetestens 8 h Laufzeit."""
+    _register(client)
+    _age_row(sb, LA._LA_SWEEP_HARD_MAX_AGE_H + 2)
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts['ended'] == 1 and counts['hard_age'] == 1
+    assert sb.row()['end_reason'] == 'stale_max_age'
+
+
+def test_sweep_zaehlt_fremde_tokens_nicht_als_beleg(client, sb, auth, apns,
+                                                    frozen):
+    """Der Roster-Read ist gebuendelt — ein laufender Flug eines ANDEREN Users
+    darf die Karte hier nicht am Leben halten."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-6, 3, FROZEN_UTC)], token='AT-FREMD'))
+    sb.briefings.append(_brief([_sector(-11, -5, FROZEN_UTC)]))
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['ended'] == 1
+
+
+def test_sweep_legt_die_zeile_auch_bei_apns_fehler_still(client, sb, auth,
+                                                         apns, frozen):
+    """Sonst pusht der Fanout weiter gegen eine Karte, die nachweislich nichts
+    Richtiges mehr zeigt."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-11, -5, FROZEN_UTC)]))
+    apns['script'](lambda host, idx: (500, 'InternalServerError'))
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['ended'] == 1
+    assert sb.row()['active'] is False
+
+
+def test_sweep_ruehrt_beendete_zeilen_nicht_mehr_an(client, sb, auth, apns,
+                                                    frozen):
+    """Idempotenz: ein zweiter Lauf darf nicht noch einmal pushen."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-11, -5, FROZEN_UTC)]))
+    LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    n = len(apns['client'].sent)
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['checked'] == 0
+    assert len(apns['client'].sent) == n
+
+
+def test_sweep_macht_keinen_lh_call(client, sb, auth, apns, frozen,
+                                    monkeypatch):
+    """Der Sweep rechnet AUSSCHLIESSLICH gegen gespeicherte Roster-Zeiten. Ein
+    LH-Call pro Karte waere genau die Quota-Falle, aus der dieses Modul kommt."""
+    from blueprints import lh_mqtt as _mqtt
+    monkeypatch.setattr(_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: pytest.fail('Sweep ruft LH'))
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-11, -5, FROZEN_UTC)]))
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['ended'] == 1
+
+
+def test_sweep_ohne_supabase_tut_nichts(monkeypatch, frozen):
+    """SB-Ausfall heisst „ich weiss nichts" — nicht „alle Karten weg"."""
+    monkeypatch.setattr(LA, '_sb', lambda: None)
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['ended'] == 0
+
+
+def test_sweep_killswitch(client, sb, auth, apns, frozen, monkeypatch):
+    monkeypatch.setenv('AEROX_LA_SWEEP', '0')
+    _register(client)
+    _age_row(sb, 99)
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts.get('disabled') is True and counts['ended'] == 0
+    assert LA.kick_sweep() is False
+
+
+def test_kick_sweep_deckelt_sich(monkeypatch, frozen):
+    """Drei Gunicorn-Worker mal alle 300 s Topic-Poll — ohne Deckel liefe der
+    Sweep dauernd."""
+    started = []
+    monkeypatch.setattr(LA.threading, 'Thread',
+                        lambda **kw: started.append(kw) or _NoopThread())
+    assert LA.kick_sweep() is True
+    assert LA.kick_sweep() is False
+    assert len(started) == 1
+
+
+class _NoopThread:
+    def start(self):
+        return None
+
+
+def test_sweep_endpoint_secret_gate(client, sb, auth, monkeypatch):
+    monkeypatch.setenv('ADSB_POLL_SECRET', 'geheim')
+    assert client.post('/api/internal/live-activity/sweep').status_code == 403
+    r = client.post('/api/internal/live-activity/sweep',
+                    headers={'X-Poll-Secret': 'geheim'})
+    assert r.status_code == 200 and r.get_json()['ok'] is True
