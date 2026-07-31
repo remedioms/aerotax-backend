@@ -531,12 +531,20 @@ def _get(path, caller=None):
         _note_answer(True)
         return d
     except urllib.error.HTTPError as e:
-        if e.code == 403:
-            # „Developer Over Rate": kurzer Voll-Stopp statt 403-Salve —
-            # jeder weitere Call verbrennt nur Budget gegen dieselbe Wand.
+        if e.code in (403, 429):
+            # „Account Over Rate Limit"/„Over Queries Per Second" meldet LH als
+            # 403; ein blankes 429 kommt vom Mashery-Gateway davor. Beides heisst
+            # dasselbe: kurzer Voll-Stopp statt Salve — jeder weitere Call
+            # verbrennt nur Budget gegen dieselbe Wand.
             _rate_penalty_until = time.time() + _RATE_PENALTY_SEC
         if e.code == 404:            # 404 = Flug an dem Tag nicht geflogen (normal)
             _note_answer(True)
+        elif e.code == 596:
+            # 596 = Mashery-Gateway („Service Not Found"), NICHT von LH
+            # dokumentiert und nicht die Aussage der API. Bleibt bewusst
+            # `answered=False` → RETRYBAR, wird nirgends negativ gecacht.
+            log.warning('[lh_open] GET %s -> 596 Gateway (retrybar)',
+                        path.split('?')[0])
         else:
             log.warning('[lh_open] GET %s -> HTTP %s', path.split('?')[0], e.code)
         return None
@@ -599,8 +607,70 @@ def _delay_min(sched_iso, est_iso):
         return None
 
 
-def _leg_to_facts(leg):
-    """Ein FlightStatus-Leg → Fakten-Dict (Shape wie _obs_rows_to_facts)."""
+def _norm_designator(val):
+    """'LH 0400' / 'lh400' → 'LH400'. Führende Nullen der Nummer fallen weg
+    (LH liefert mal 400, mal '0400'), ein Operational-Suffix bleibt erhalten
+    ('LH400D'). Pure; None wenn nichts Verwertbares übrig bleibt."""
+    t = re.sub(r'[^A-Z0-9]', '', str(val or '').upper())
+    if not t:
+        return None
+    m = re.match(r'^([A-Z0-9]{2})0*(\d+)([A-Z]?)$', t)
+    return (m.group(1) + m.group(2) + m.group(3)) if m else t
+
+
+def _carrier_designator(node):
+    """LH-Carrier-Knoten → Flug-Designator oder None. Pure, skalar-hart:
+    `FlightNumber` kommt je nach Antwort als int (8840) ODER als String
+    ('08840'); beides muss dieselbe Zeichenkette ergeben, sonst dedupliziert
+    die Codeshare-Liste nicht."""
+    if not isinstance(node, dict):
+        return None
+    al = re.sub(r'[^A-Z0-9]', '', str(node.get('AirlineID') or '').upper())
+    if not al:
+        return None
+    num = re.sub(r'\D', '', str(node.get('FlightNumber') or '')).lstrip('0')
+    sfx = re.sub(r'[^A-Z]', '', str(node.get('OperationalSuffix') or '').upper())
+    return _norm_designator(al + num + sfx) if num else al
+
+
+def _leg_codeshares(leg, flight_no=None):
+    """(codeshares, operated_by) eines FlightStatus-Legs. Pure, wirft nie.
+
+    `MarketingCarrierList` (wer den Flug VERKAUFT — 'UA8840', 'AC9092') und
+    `OperatingCarrier` (wer ihn FLIEGT) liegen in derselben Antwort, die wir
+    ohnehin schon für Zeiten/Gate/Reg bezahlen — sie kosten also KEINEN
+    zusätzlichen Call.
+
+    Regeln (keine erfundenen Werte):
+      • der eigene Flug fällt raus: sowohl die abgefragte Nummer als auch der
+        Operating-Designator (LH listet sich selbst mit in der Marketing-Liste)
+      • dedupliziert, Reihenfolge wie von LH geliefert (stabile Anzeige)
+      • `operated_by` NUR, wenn der Operating-Designator vom abgefragten
+        Marketing-Flug abweicht (Wet-Lease/Franchise: LH… wird von EN…
+        geflogen). Ohne bekannte Marketing-Nummer gibt es keinen Vergleich —
+        dann bleibt das Feld weg, statt „LH400 wird von LH400 geflogen".
+    """
+    mkt = (leg.get('MarketingCarrierList') or {}).get('MarketingCarrier')
+    if isinstance(mkt, dict):            # Ein-Element-Listen kommen als Objekt
+        mkt = [mkt]
+    op = _carrier_designator(leg.get('OperatingCarrier'))
+    own = _norm_designator(flight_no)
+    skip = {x for x in (op, own) if x}
+    shares = []
+    for m in (mkt if isinstance(mkt, (list, tuple)) else []):
+        d = _carrier_designator(m)
+        if d and d not in skip and d not in shares:
+            shares.append(d)
+    operated_by = op if (op and own and op != own) else None
+    return shares, operated_by
+
+
+def _leg_to_facts(leg, flight_no=None):
+    """Ein FlightStatus-Leg → Fakten-Dict (Shape wie _obs_rows_to_facts).
+
+    `flight_no` (optional, seit 2026-07-31) ist die ABGEFRAGTE Marketing-
+    Nummer — nur damit lassen sich der eigene Flug aus der Codeshare-Liste
+    streichen und ein Wet-Lease erkennen. Ohne sie bleibt alles wie vorher."""
     dep = leg.get('Departure') or {}
     arr = leg.get('Arrival') or {}
     facts = {}
@@ -651,6 +721,15 @@ def _leg_to_facts(leg):
         facts['dep_iata'] = dep['AirportCode']
     if arr.get('AirportCode'):
         facts['arr_iata'] = arr['AirportCode']
+    # Codeshares + Wet-Lease — OPTIONALE Zusatzfakten aus derselben Antwort
+    # (kein zusätzlicher Call). Leere Werte werden weggelassen, nie als [] oder
+    # None geschrieben: „keine Codeshares" und „nicht gefragt" sehen downstream
+    # sonst gleich aus.
+    shares, operated_by = _leg_codeshares(leg, flight_no)
+    if shares:
+        facts['codeshares'] = shares
+    if operated_by:
+        facts['operated_by'] = operated_by
     return facts
 
 
@@ -1467,7 +1546,7 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
                 chosen = lg if len(legs) == 1 else None
                 break
         if chosen is not None:
-            facts = _leg_to_facts(chosen)
+            facts = _leg_to_facts(chosen, fn)
     except Exception as e:
         log.warning('[lh_open] parse %s/%s: %s', fn, d, type(e).__name__)
         facts = {}

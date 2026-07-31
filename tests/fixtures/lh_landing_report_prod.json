@@ -1,0 +1,27 @@
+{
+  "_source": "COMMON_LANDING_REPORT, PROD, live gezogen 2026-07-31 (Probe 01/10). pkNumber redigiert — sonst unveraendert.",
+  "departureAirport": "FRA",
+  "destinationAirport": "BUD",
+  "events": {
+    "aircraft": {
+      "in": "2026-06-24T06:43:00Z",
+      "off": "2026-06-24T05:24:00Z",
+      "on": "2026-06-24T06:38:00Z",
+      "out": "2026-06-24T05:15:00Z"
+    },
+    "flightLog": {
+      "in": "2026-06-24T06:43:00Z",
+      "out": "2026-06-24T05:15:00Z"
+    },
+    "opsData": {
+      "off": "2026-06-24T05:24:00Z",
+      "out": "2026-06-24T05:15:00Z"
+    }
+  },
+  "flightDate": "2026-06-24Z",
+  "flightDesignator": "LH1334",
+  "landingPerformed": "false",
+  "lowVisibilityApproach": "unknown",
+  "pkNumber": "REDACTED",
+  "tailsign": "DAISU"
+}

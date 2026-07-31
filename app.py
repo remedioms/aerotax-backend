@@ -20828,6 +20828,24 @@ def get_briefings(token):
                 _enrich_leg_delays(_day['ical_sectors'], _k,
                                    homebase=(_hb or None),
                                    deadline=_enrich_deadline)
+                # BOARDING-ZEIT (Owner-Nachforderung 27.07., verdrahtet 30.07.):
+                # `boardingBegin` aus COMMON_CHECK_IN_TIMES ist die einzige
+                # ECHTE Boarding-Zeit im System und wurde bisher serverseitig
+                # geparst und weggeworfen. Sie hängt jetzt als `boarding_iso`
+                # am fälligen Sektor, damit die Widget-/Live-Activity-Kette
+                # ihren dritten Schritt bekommt.
+                #
+                # ⚠️ KEIN NETZ AUF DIESEM PFAD. Die Funktion liest hier nur
+                # ihren Cache; ein Miss wärmt im Hintergrund-Thread (Details +
+                # Quoten-Begründung an `enrich_sectors_boarding`). Deshalb
+                # steht sie auch NICHT unter `_enrich_deadline` — sie kostet
+                # keine Zeit, die zu budgetieren wäre.
+                try:
+                    from blueprints.lh_flightops import (
+                        enrich_sectors_boarding as _enrich_boarding)
+                    _enrich_boarding(token, _day['ical_sectors'])
+                except Exception:
+                    pass
     except Exception:
         pass
     datum = request.args.get('datum')
@@ -46357,6 +46375,29 @@ def _parse_ics_to_events(text):
                 current['description'] = v[:400]
             elif k == 'LOCATION':
                 current['location'] = v[:80]
+            # ── AeroX-X-Props (Welle 0 „LH-Gratis-Ernte", 2026-07-31) ────────
+            # Der LH-FlightOps-ICS-Builder hängt Fakten an, die in den ohnehin
+            # geholten LH-Antworten liegen und im SUMMARY nichts verloren haben
+            # (der ist iOS-Regex-Kontrakt). Additiv: Feeds ohne diese Props
+            # bleiben byte-identisch, alle bestehenden Konsumenten ignorieren
+            # unbekannte Event-Keys.
+            elif k == 'X-AEROX-DH':
+                if v.strip() in ('1', 'true', 'TRUE', 'True'):
+                    current['ax_dh'] = True
+            elif k == 'X-AEROX-ACCHG':
+                if v.strip() in ('1', 'true', 'TRUE', 'True'):
+                    current['ax_ac_change'] = True
+            elif k == 'X-AEROX-DOS':
+                try:
+                    _dos = int(v.strip())
+                except (TypeError, ValueError):
+                    _dos = None
+                if _dos is not None and 1 <= _dos <= 99:
+                    current['ax_day_of_shift'] = _dos
+            elif k == 'X-AEROX-HOTEL':
+                _hn = v.strip()[:60]
+                if _hn:
+                    current['ax_hotel'] = _hn
             elif k == 'STATUS':
                 if v.upper() == 'CANCELLED':
                     current['_cancelled'] = True
@@ -48001,6 +48042,22 @@ def _build_ical_sectors(events):
         # bleibt leer → _strip_inferred_tails lässt es stehen).
         if leon_reg:
             _sec['tail'] = leon_reg
+        # ── Welle 0 „LH-Gratis-Ernte": X-Props → optionale Sektor-Felder ─────
+        # NUR gesetzt, wenn der Feed sie wirklich trägt — ein Feed ohne diese
+        # Props erzeugt byte-identisch dieselben Sektor-Dicts wie vorher. Das
+        # ist Absicht: `ical_sectors` wird per jsonb-Containment gematcht
+        # (blueprints/lh_mqtt._rows_for_flight/_rows_from_station), und
+        # Containment prüft „enthält mindestens diese Keys" — zusätzliche
+        # optionale Keys stören dort nicht, geänderte oder immer-vorhandene
+        # (null-)Keys hätten die Row nur unnötig aufgebläht.
+        if ev.get('ax_dh') is True:
+            _sec['dh'] = True
+        if isinstance(ev.get('ax_day_of_shift'), int):
+            _sec['day_of_shift'] = ev['ax_day_of_shift']
+        if ev.get('ax_ac_change') is True:
+            _sec['ac_change'] = True
+        if ev.get('ax_hotel'):
+            _sec['hotel'] = str(ev['ax_hotel'])[:60]
         sec_by_day.setdefault(d, []).append(_sec)
     for d in sec_by_day:
         sec_by_day[d].sort(key=lambda x: x.get('dep_iso') or '')

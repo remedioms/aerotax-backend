@@ -940,9 +940,27 @@ def _lhfo_day_used():
     return used
 
 
-def _api_get(user_token, path, params=None, interactive=False):
+def _api_get(user_token, path, params=None, interactive=False, status_out=None):
+    """LH-Call mit Budget-Gate. Return: Response-Dict oder None.
+
+    `status_out` (optionales dict, additiv 2026-07-31): der Aufrufer bekommt
+    darin die KLASSE des Ausgangs — sonst ist `None` mehrdeutig und ein
+    HTTP-404 („die Ressource gibt es (noch) nicht") wäre von „LH war kaputt"
+    nicht unterscheidbar. Das ist für den Landing Report entscheidend: 404 =
+    Report noch nicht da (später nachladen), NIEMALS „nicht gelandet".
+        kind: 'ok' | 'no_access' | 'hour_budget' | 'day_budget' | 'http' | 'error'
+        code: HTTP-Status (nur bei kind='http')
+    Bestandsaufrufer übergeben nichts und sehen keinerlei Verhaltensänderung."""
+    def _note(kind, code=None):
+        if isinstance(status_out, dict):
+            status_out['kind'] = kind
+            if code is not None:
+                status_out['code'] = code
+
+    _note('error')          # bis zum Beweis des Gegenteils
     access = _valid_access(user_token)
     if not access:
+        _note('no_access')
         return None
     _used = _rot_hour_used()
     _ceiling = (_LHFO_HOUR_INTERACTIVE_CEILING if interactive
@@ -951,6 +969,7 @@ def _api_get(user_token, path, params=None, interactive=False):
         log.warning('[lh_flightops] lhfo-Stundenbudget %s >= %s — %s-Call %s '
                     'übersprungen', _used, _ceiling,
                     'interaktiver' if interactive else 'Hintergrund', path)
+        _note('hour_budget')
         return None
     _dused = _lhfo_day_used()
     _dceiling = (_LHFO_DAY_INTERACTIVE_CEILING if interactive
@@ -959,6 +978,7 @@ def _api_get(user_token, path, params=None, interactive=False):
         log.warning('[lh_flightops] lhfo-Tagesbudget %s >= %s — %s-Call %s '
                     'übersprungen', _dused, _dceiling,
                     'interaktiver' if interactive else 'Hintergrund', path)
+        _note('day_budget')
         return None
     _flightops_budget_inc(path)
     url = _BASE + path
@@ -969,12 +989,16 @@ def _api_get(user_token, path, params=None, interactive=False):
                       'Accept': 'application/json'})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode('utf-8'))
+            out = json.loads(r.read().decode('utf-8'))
+        _note('ok')
+        return out
     except urllib.error.HTTPError as e:
         log.warning('[lh_flightops] api %s -> HTTP %s', path, e.code)
+        _note('http', getattr(e, 'code', None))
         return None
     except Exception as e:
         log.warning('[lh_flightops] api %s -> %s', path, type(e).__name__)
+        _note('error')
         return None
 
 
@@ -1057,11 +1081,19 @@ def crew_rotation(user_token, *rotation_numbers):
     return _api_get(user_token, '/COMMON_CREW_ROTATION', params)
 
 
-def landing_report(user_token, flight, date, dep):
-    """COMMON_LANDING_REPORT — u. a. `landingPerformed` (Bool) für dieses Leg."""
+def landing_report(user_token, flight, date, dep, interactive=False,
+                   status_out=None):
+    """COMMON_LANDING_REPORT — OOOI-Zeiten + `landingPerformed` für ein Leg.
+
+    `landingPerformed` ist PER-USER (die ANFRAGENDE Person hat die Landung
+    durchgeführt) und kommt als STRING 'true'/'false' — siehe
+    `landing_report_parse`. `status_out` (dict) nimmt die Abruf-Klasse auf
+    (siehe `_api_get`), damit der Aufrufer 404 („Report noch nicht da") von
+    einem echten Fehler unterscheiden kann."""
     return _api_get(user_token, '/COMMON_LANDING_REPORT', {
         'flightDesignator': (flight or '').upper().replace(' ', ''),
-        'flightDate': _date_z(date), 'departureAirport': (dep or '').upper()})
+        'flightDate': _date_z(date), 'departureAirport': (dep or '').upper()},
+        interactive=interactive, status_out=status_out)
 
 
 def flight_leg_details(user_token, flight, date=None, dep=None, arr=None):
@@ -1097,28 +1129,72 @@ def _truthy(v):
     return None
 
 
-def landing_report_facts(user_token, flight, date, dep):
-    """Landing Report → normalisierte Fakten (gegen ECHTE Mock-Shape 2026-07-22):
-    {landed: bool|None, tail, dep_iso, arr_iso, block_min}. OUT/IN = Block
-    (aircraft.out/in), off/on = Flugzeit. None-Werte weggelassen. Pure-nah."""
-    r = landing_report(user_token, flight, date, dep)
-    if not isinstance(r, dict) or r.get('processingErrors'):
+def landing_report_parse(resp):
+    """COMMON_LANDING_REPORT-Response → normalisierte Fakten. PURE/testbar,
+    verifiziert gegen die ECHTE PROD-Shape (10 Live-Calls 2026-07-31, Fixture
+    `tests/fixtures/lh_landing_report_prod.json`, PII/pkNumber redigiert).
+
+        {self_landed: bool|None,   # PER-USER, s.u.
+         tail, arr,                # Flug-Fakten
+         dep_iso, arr_iso,         # = aircraft.out / aircraft.in (BLOCK)
+         off_iso, on_iso,          # = aircraft.off / aircraft.on (FLUG)
+         block_min, air_min}
+
+    `self_landed` (LH-Feld `landingPerformed`) heißt WÖRTLICH: „die ANFRAGENDE
+    Person hat die Landung durchgeführt". Es ist damit
+      · ein PER-USER-Fakt — dieselbe Response desselben Legs sagt für einen
+        anderen Account etwas anderes; er darf deshalb NIE aus einem geteilten
+        Cache stammen (s. `_lr_shared_put`), und
+      · KEIN Flug-Status: 'false' heißt NICHT „der Flug ist nicht gelandet"
+        (empirisch: Kabinen-Account ⇒ 9 gelandete Flüge, überall 'false'),
+      · KEIN Ownership-Check: der Service ist nicht auf den eigenen Roster
+        gescoped, fremde LH-Flüge liefern Daten.
+    Der Wert kommt als STRING 'true'/'false' (→ `_truthy`).
+
+    Block = out→in, **Flugzeit = off→on** (FCL.050-Kern). Beide Spannen werden
+    aus absoluten ISO-Zeitstempeln gerechnet, der Mitternachts-Rollover ist
+    damit inhärent abgedeckt (off 23:50Z → on 01:10Z Folgetag = 80 min).
+
+    `lowVisibilityApproach` wird BEWUSST NICHT übernommen: LH führt das Feld
+    als deprecated, PROD liefert konstant 'unknown' (die Doku schreibt es
+    'unkown' — beide Schreibweisen laufen hier ins Leere, nicht in einen
+    Fehler). None-Werte werden weggelassen."""
+    if not isinstance(resp, dict) or resp.get('processingErrors'):
         return {}
-    ev = (r.get('events') or {}).get('aircraft') or {}
+    ev = (resp.get('events') or {}).get('aircraft') or {}
     out = _valid_iso(ev.get('out'))
     _in = _valid_iso(ev.get('in'))
-    facts = {'landed': _truthy(r.get('landingPerformed'))}
-    tail = _norm_reg(r.get('tailsign'))
+    off = _valid_iso(ev.get('off'))
+    on = _valid_iso(ev.get('on'))
+    facts = {'self_landed': _truthy(resp.get('landingPerformed'))}
+    tail = _norm_reg(resp.get('tailsign'))
     if tail:
         facts['tail'] = tail
+    # Ankunftsflughafen: der Landing Report trägt ihn selbst — der Leg-Key ist
+    # damit ohne Extra-Call vollständig (Leg-Key-Kollisions-Falle, Flugbuch).
+    arr = (resp.get('destinationAirport') or '').strip().upper()
+    if arr:
+        facts['arr'] = arr
     if out:
         facts['dep_iso'] = out
     if _in:
         facts['arr_iso'] = _in
+    if off:
+        facts['off_iso'] = off
+    if on:
+        facts['on_iso'] = on
     bm = _block_min_iso(out, _in)
     if bm is not None:
         facts['block_min'] = bm
+    am = _block_min_iso(off, on)
+    if am is not None:
+        facts['air_min'] = am
     return facts
+
+
+def landing_report_facts(user_token, flight, date, dep):
+    """Landing Report ABRUFEN und normalisieren (s. `landing_report_parse`)."""
+    return landing_report_parse(landing_report(user_token, flight, date, dep))
 
 
 def _valid_iso(v):
@@ -1148,8 +1224,9 @@ def _block_min_iso(a, b):
 
 
 def landing_performed(user_token, flight, date, dep):
-    """True/False/None — hat der eingeloggte Crew das Leg gelandet?"""
-    return landing_report_facts(user_token, flight, date, dep).get('landed')
+    """True/False/None — hat DIE ANFRAGENDE Person dieses Leg gelandet?
+    PER-USER-Fakt, kein Flug-Status (s. `landing_report_parse`)."""
+    return landing_report_facts(user_token, flight, date, dep).get('self_landed')
 
 
 def parse_crew_list(resp):
@@ -1479,6 +1556,75 @@ def parse_rotation_pickups(resp):
     return out
 
 
+def parse_rotation_legs(resp):
+    """COMMON_CREW_ROTATION-Response → {leg_key: {…}} mit den GRATIS-Fakten,
+    die schon in derselben Antwort liegen wie `pickupTime`. Pure/testbar,
+    KOSTET KEINEN zusätzlichen LH-Call (Welle 0 „LH-Gratis-Ernte").
+
+    Schlüssel-Schema IDENTISCH zu parse_rotation_pickups (inkl. Entfernen des
+    flugnummernlosen Route-Schlüssels bei mehrfach geflogener Route) — beide
+    werden über denselben `_pickup_for_leg`-Matcher gelesen.
+
+    Wert (Felder FEHLEN, wenn LH nichts hergibt — nie null, nie geraten):
+      'dh'        True  ← legs[].dutyCode == 'DH' (Deadhead, Crew sitzt als Pax)
+      'ac_change' True  ← legs[].aircraftChanged is True. Das Flag sitzt am
+                  VORHERIGEN Leg und heißt „nach DIESEM Leg wechselt das Gerät"
+                  (daily_briefing.py-Header, an PROD-Payloads mehrfach belegt:
+                  LH027 DAIRO→True, nächstes Leg LH332 DAIWJ). Gesetzt wird es
+                  deshalb am Leg, das das Flag trägt — aber NUR, wenn in
+                  derselben Schicht noch ein Leg folgt; am letzten Leg der
+                  Schicht gäbe es kein „danach", auf das sich der Chip beziehen
+                  könnte.
+      'hotel'     str   ← legs[].hotelName, unverändert an dem Leg, an dem LH
+                  ihn führt: dem HINFLUG zur Layover-Station. Das `hotel`-Flag
+                  daneben ist unbrauchbar (False trotz gesetztem Namen) und
+                  wird NIE ausgewertet."""
+    out = {}
+    if not isinstance(resp, dict):
+        return out
+    _route_seen = {}
+    for rot in _as_list(resp.get('rotations')):
+        if not isinstance(rot, dict):
+            continue
+        for sh in _as_list(rot.get('shifts')):
+            if not isinstance(sh, dict):
+                continue
+            _legs = [lg for lg in _as_list(sh.get('legs')) if isinstance(lg, dict)]
+            for _i, lg in enumerate(_legs):
+                dep = str(lg.get('departureAirport') or '').upper().strip()
+                arr = str(lg.get('arrivalAirport') or '').upper().strip()
+                if len(dep) != 3 or len(arr) != 3:
+                    continue
+                dd = ''
+                for k in _ROT_DEP_KEYS:
+                    if str(lg.get(k) or '').strip():
+                        dd = str(lg[k]).strip()
+                        break
+                if len(dd) < 10:
+                    continue
+                day8 = dd[:10].replace('-', '')
+                rkey = ('', dep, arr, day8)
+                _route_seen[rkey] = _route_seen.get(rkey, 0) + 1
+                val = {}
+                if str(lg.get('dutyCode') or '').strip().upper() == 'DH':
+                    val['dh'] = True
+                if lg.get('aircraftChanged') is True and (_i + 1) < len(_legs):
+                    val['ac_change'] = True
+                hn = str(lg.get('hotelName') or '').strip()
+                if hn:
+                    val['hotel'] = hn
+                if not val:
+                    continue
+                flt = re.sub(r'\s', '',
+                             str(lg.get('flightDesignator') or '').upper())
+                out[(flt, dep, arr, day8)] = val
+                out.setdefault(rkey, val)
+    for rkey, n in _route_seen.items():
+        if n > 1:
+            out.pop(rkey, None)
+    return out
+
+
 def _pickup_for_leg(pickups, flt, frm, to, st):
     """Pickup-Eintrag für EIN Duty-Flug-Event oder None. `st` ist das bereits
     ICS-formatierte DTSTART ('YYYYMMDDTHHMMSSZ'), sein Datum ist der Anker.
@@ -1509,6 +1655,23 @@ def _pickup_for_leg(pickups, flt, frm, to, st):
         if hit:
             return hit
     return None
+
+
+def _rot_fact_for_leg(facts, flt, frm, to, st):
+    """Rotations-Fakten (parse_rotation_legs) für EIN Duty-Flug-Event oder None.
+    Bewusst DERSELBE Matcher wie beim Pickup — beide Dicts tragen dasselbe
+    Schlüssel-Schema, und ein zweiter, leicht anderer Matcher wäre genau die
+    Sorte Divergenz, die später still falsche Legs beschriftet."""
+    return _pickup_for_leg(facts, flt, frm, to, st)
+
+
+def _ics_text_value(v, cap=60):
+    """Freitext → ICS-tauglicher Einzeiler ('' wenn nichts übrig bleibt).
+    Zeilenumbrüche würden das VEVENT zerreißen; die Kappung hält die Zeile
+    unter der RFC-5545-Faltgrenze, ohne dass wir falten müssen."""
+    s = re.sub(r'[\r\n\t]+', ' ', str(v or ''))
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    return s[:cap].strip()
 
 
 # Vorlauf-Fenster wie iOS RosterLabels.maxLeadWindowMinutes und
@@ -1732,9 +1895,15 @@ def _rot_hour_used():
     return used
 
 
-def rotation_pickups_for(user_token, rotation_ids):
+def rotation_pickups_for(user_token, rotation_ids, facts_out=None):
     """rotationIds → gemergtes Pickup-Dict (siehe parse_rotation_pickups).
     Cache pro (Token, rotationId) mit kurzer TTL.
+
+    `facts_out` (optional, dict) wird zusätzlich mit den GRATIS-Fakten derselben
+    Antwort gefüllt (parse_rotation_legs: dh/ac_change/hotel). Bewusst als
+    Out-Parameter statt als geänderter Rückgabewert — der Rückgabe-Shape ist
+    Vertrag für die bestehenden Aufrufer/Tests, und die Fakten kosten KEINEN
+    zusätzlichen Call: sie liegen in genau derselben Response wie pickupTime.
 
     KOSTEN: COMMON_CREW_ROTATION nimmt bis zu SECHS rotationIds pro Request
     (`RN`, `RN_2` … `RN_6`, siehe crew_rotation). Alle Cache-Misses eines
@@ -1768,6 +1937,12 @@ def rotation_pickups_for(user_token, rotation_ids):
             hit = _rot_cache.get((user_token, rn))
             if hit and (now - hit[0]) < _ROT_CACHE_TTL_S:
                 out.update(hit[1] or {})
+                # Alt-Einträge (2-Tupel) können nach einem Deploy noch im
+                # Prozess-Cache liegen — dann gibt es für diesen Umlauf in
+                # dieser halben Stunde eben keine Zusatz-Fakten. Kein Grund,
+                # einen Call nachzuschieben.
+                if isinstance(facts_out, dict) and len(hit) > 2:
+                    facts_out.update(hit[2] or {})
             else:
                 misses.append(rn)
     if not misses:
@@ -1799,16 +1974,25 @@ def rotation_pickups_for(user_token, rotation_ids):
                     'Negativ-Cache)', batch)
         return out
     got = parse_rotation_pickups(raw)
+    # GRATIS aus DERSELBEN Antwort (Welle 0): dh/ac_change/hotel pro Leg.
+    try:
+        got_facts = parse_rotation_legs(raw)
+    except Exception as e:
+        log.warning('[lh_flightops] rotation legs %s: %s', batch,
+                    type(e).__name__)
+        got_facts = {}
     # Ein geparstes, aber pickupfreies Ergebnis WIRD gecacht — sonst fragt jeder
     # Sync denselben Umlauf erneut ab. Die kurze TTL sorgt dafür, dass ein spät
     # nachgetragener Wert trotzdem ankommt.
     with _rot_cache_lock:
         for rn in batch:
-            _rot_cache[(user_token, rn)] = (time.time(), got)
+            _rot_cache[(user_token, rn)] = (time.time(), got, got_facts)
         if len(_rot_cache) > 4000:
             for k in sorted(_rot_cache, key=lambda k: _rot_cache[k][0])[:2000]:
                 _rot_cache.pop(k, None)
     out.update(got or {})
+    if isinstance(facts_out, dict):
+        facts_out.update(got_facts or {})
     return out
 
 
@@ -2306,7 +2490,81 @@ def apply_pickup_last_good(user_token, ics, now=None):
     return ics
 
 
-def duty_events_to_ics(resp, pickups=None):
+def _tz_offset_min_east(iso_utc, iata):
+    """Eigene Stations-TZ → Minuten ÖSTLICH von UTC zum Zeitpunkt `iso_utc`
+    (FRA im Juli = +120). None, wenn die Station unbekannt ist — dieselbe
+    Quelle wie `app._ics_local_hhmm_at` (airport_tz), damit das Audit genau die
+    Tabelle prüft, die der Roster auch wirklich benutzt."""
+    try:
+        from datetime import datetime as _d
+        from zoneinfo import ZoneInfo as _ZI
+        from airport_tz import airport_tz as _atz
+        tzname = _atz(iata) if iata else None
+        if not tzname:
+            return None
+        dt = _d.fromisoformat(str(iso_utc or '').replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_ZI('UTC'))
+        off = dt.astimezone(_ZI(tzname)).utcoffset()
+        return None if off is None else int(off.total_seconds() // 60)
+    except Exception:
+        return None
+
+
+def tz_audit(resp, max_lines=60):
+    """TELEMETRIE, sonst NICHTS. Vergleicht `startTimeZoneOffset`/
+    `endTimeZoneOffset` der Duty-Events mit der Verschiebung, die unsere eigene
+    Stations-Tabelle (airport_tz) für denselben Zeitpunkt rechnet, und loggt
+    Abweichungen mit MAX EINER Zeile pro Station und Import-Lauf.
+
+    VORZEICHEN: LH liefert die JavaScript-Konvention (`getTimezoneOffset`) —
+    Minuten, die man zur ORTSZEIT addiert, um UTC zu bekommen. FRA im Juli
+    kommt deshalb als -120, obwohl die Station UTC+2 liegt. Verglichen und
+    geloggt wird einheitlich in Minuten ÖSTLICH von UTC (also `-lh`), sonst
+    liest sich jede Zeile wie ein Fehler.
+
+    Ändert NICHTS am Import. Rückgabe (für Tests): Liste der Abweichungen als
+    [{'station','own','lh','event'}]. Wirft nie."""
+    out = []
+    try:
+        seen = set()
+        for d in _as_list((resp or {}).get('rosterDays')
+                          if isinstance(resp, dict) else None):
+            if not isinstance(d, dict):
+                continue
+            for ev in _as_list(d.get('events')):
+                if not isinstance(ev, dict):
+                    continue
+                label = str(ev.get('eventDetails')
+                            or ev.get('eventType') or '').strip()[:40]
+                for t_key, loc_key, off_key in (
+                        ('startTime', 'startLocation', 'startTimeZoneOffset'),
+                        ('endTime', 'endLocation', 'endTimeZoneOffset')):
+                    stn = str(ev.get(loc_key) or '').upper().strip()
+                    iso = str(ev.get(t_key) or '').strip()
+                    raw = ev.get(off_key)
+                    if len(stn) != 3 or not iso or stn in seen:
+                        continue
+                    try:
+                        lh_east = -int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    own_east = _tz_offset_min_east(iso, stn)
+                    if own_east is None or own_east == lh_east:
+                        continue
+                    seen.add(stn)
+                    out.append({'station': stn, 'own': own_east,
+                                'lh': lh_east, 'event': label})
+                    log.info('[tz-audit] station=%s own=%s lh=%s event=%s',
+                             stn, own_east, lh_east, label)
+                    if len(out) >= max_lines:
+                        return out
+    except Exception as e:
+        log.warning('[lh_flightops] tz-audit: %s', type(e).__name__)
+    return out
+
+
+def duty_events_to_ics(resp, pickups=None, rot_legs=None, enrich=True):
     """FlightOps-Duty-Events → ICS-String (oder None). Pure/testbar.
     Flight-Events → VEVENT im LH-Summary-Format ('LH400: FRA-JFK'), Off/Vac/
     Standby/Hotel → Marker-/Layover-Events. Zeiten kommen als UTC-ISO. NICHTS
@@ -2314,7 +2572,21 @@ def duty_events_to_ics(resp, pickups=None):
 
     `pickups` (optional) = Ergebnis von parse_rotation_pickups/
     rotation_pickups_for. Ist es leer oder trägt es für ein Leg keinen Wert,
-    entsteht KEIN Pickup-Event — geraten wird nie."""
+    entsteht KEIN Pickup-Event — geraten wird nie.
+
+    `rot_legs` (optional) = Ergebnis von parse_rotation_legs (dieselbe, ohnehin
+    geholte COMMON_CREW_ROTATION-Antwort). `enrich=False` schaltet ALLE Welle-0-
+    Zusätze ab (Historien-Import).
+
+    ── WELLE-0-ZUSÄTZE (X-Props, SUMMARY bleibt UNVERÄNDERT!) ────────────────
+    Der SUMMARY jedes VEVENTs ist iOS-Regex-Kontrakt („HH:MM LT Pickup XXX",
+    „DH LH 1623: KRK-MUC"). Neue Information reist deshalb AUSSCHLIESSLICH als
+    X-Prop (und beim Pickup zusätzlich als DESCRIPTION-Zeile) mit:
+      X-AEROX-DH:1        Deadhead-Leg
+      X-AEROX-DOS:<n>     eventAttributes.dayOfShift (Rotationstag)
+      X-AEROX-ACCHG:1     nach diesem Leg wechselt das Gerät
+      X-AEROX-HOTEL:<name>  Layover-Hotel (Pickup-VEVENT + ankommendes Leg)
+    Fehlt ein Wert, fehlt die ZEILE — nie ein Platzhalter."""
     if not isinstance(resp, dict):
         return None
     days = _as_list(resp.get('rosterDays'))
@@ -2485,6 +2757,25 @@ def duty_events_to_ics(resp, pickups=None):
         except Exception:
             return None
 
+    def _day_of_shift(ev):
+        """eventAttributes.dayOfShift → int oder None. Über `_as_list`, weil LH
+        Ein-Element-Arrays als Skalar rendert (Known-Issue) — käme
+        eventAttributes je als [{…}], ginge das Feld sonst lautlos dunkel
+        (dieselbe Härtung wie beim rotationId-Lesen in pickup_rotation_ids)."""
+        for ea in _as_list(ev.get('eventAttributes')):
+            if not isinstance(ea, dict):
+                continue
+            v = ea.get('dayOfShift')
+            if v in (None, ''):
+                continue
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= n <= 99:
+                return n
+        return None
+
     for d in days:
         if not isinstance(d, dict):
             continue
@@ -2590,14 +2881,48 @@ def duty_events_to_ics(resp, pickups=None):
                         if _berlin_day(_pu.get('pickup_utc')) != _berlin_day(
                                 ev.get('startTime')):
                             _pst = st
+                        # HOTELNAME (Welle 0): parse_rotation_pickups trägt ihn
+                        # längst mit, der ICS-Builder hat ihn bisher verworfen.
+                        # SUMMARY bleibt byte-identisch (iOS-Regex-Kontrakt) —
+                        # der Name reist als DESCRIPTION-Zeile + X-Prop.
+                        _pu_hotel = (_ics_text_value(_pu.get('hotel'))
+                                     if enrich else '')
                         lines += ['BEGIN:VEVENT', f'UID:pu-{uid}',
                                   f'DTSTART:{_pst}', f'DTEND:{_pst}',
-                                  f'SUMMARY:{_hh} LT Pickup {frm}',
-                                  'END:VEVENT']
+                                  f'SUMMARY:{_hh} LT Pickup {frm}'] \
+                            + ([f'DESCRIPTION:Hotel: {_pu_hotel}',
+                                f'X-AEROX-HOTEL:{_pu_hotel}']
+                               if _pu_hotel else []) \
+                            + ['END:VEVENT']
+                # ── WELLE-0-X-PROPS am Flug-VEVENT ──────────────────────────
+                # Reihenfolge: DH → DOS → ACCHG → HOTEL. Jede Zeile fällt weg,
+                # wenn LH den Wert nicht hergibt (keine Platzhalter).
+                _x = []
+                if enrich:
+                    _rf = _rot_fact_for_leg(rot_legs, flt, frm, to, st) or {}
+                    # DH-QUELLE: die Duty-Events selbst (`eventDetails` beginnt
+                    # mit 'DH ', z.B. 'DH LH1623' — Tim/KRK 25.07., dieselbe
+                    # Quelle, aus der schon der SUMMARY sein 'DH ' bezieht).
+                    # Sie deckt ALLE Tage des Fensters ab. Der Rotations-
+                    # `dutyCode == 'DH'` ist nur der Nachschlag für die wenigen
+                    # Legs im Pickup-Fenster — er kann bestätigen, nie
+                    # widersprechen.
+                    if is_dh or _rf.get('dh') is True:
+                        _x.append('X-AEROX-DH:1')
+                    _dos = _day_of_shift(ev)
+                    if _dos is not None:
+                        _x.append(f'X-AEROX-DOS:{_dos}')
+                    if _rf.get('ac_change') is True:
+                        _x.append('X-AEROX-ACCHG:1')
+                    # hotelName sitzt laut LH am HINFLUG-Leg zur Layover-
+                    # Station — also genau an DIESEM ankommenden Leg.
+                    _hn = _ics_text_value(_rf.get('hotel'))
+                    if _hn:
+                        _x.append(f'X-AEROX-HOTEL:{_hn}')
                 lines += ['BEGIN:VEVENT', f'UID:{uid}',
                           f'DTSTART:{st}', f'DTEND:{en}',
                           f'SUMMARY:{summary}',
-                          f'LOCATION:{frm} - {to}', 'END:VEVENT']
+                          f'LOCATION:{frm} - {to}'] + _x + ['END:VEVENT']
                 continue
             # BRIEFING (Miguel/Thomas 2026-07-24 „falsche Briefing-Zeiten seit
             # dem Update"): FlightOps liefert Briefings MIT startTime, aber
@@ -3196,6 +3521,329 @@ def parse_check_in_times(resp):
     return {k: resp.get(k) for k in keys if resp.get(k) is not None}
 
 
+# ── LH-Platzhalter (Keine-Fake-Werte-Regel) ─────────────────────────────────
+#
+# LH füllt Namens-/Raumfelder statt mit `null` mit LITERALEN Platzhaltern
+# ('N/A', live am `briefingRoom` DUS gesehen) oder mit internen Codes
+# ('H9941671', so in der Doku-Fixture beim Hotelnamen). Beides sieht wie ein
+# echter Wert aus und stand ungegated schon einmal als „Hotel | N/A (0:30*)"
+# auf der Karte (adversarialer Review 27.07.). Die Regel lebte bis heute nur
+# in `daily_briefing._valid_lh_hotel_name`; sie ist aber eine Eigenschaft der
+# LH-ANTWORT, nicht des Daily Briefings — deshalb steht sie jetzt hier, und
+# daily_briefing benutzt genau DIESE Funktion weiter (eine Wahrheit, kein
+# Klon, der beim nächsten Platzhalter-Fund auseinanderläuft).
+_LH_PLACEHOLDER_RE = re.compile(r'^(H\d{4,}|N/?A|NA|TBD|UNKNOWN|[-.]+)$',
+                                re.IGNORECASE)
+
+
+def is_lh_placeholder(value):
+    """True für literale LH-Platzhalter, interne Codes und Leerwerte. Pure."""
+    s = re.sub(r'\s', '', str(value or ''))
+    if not s:
+        return True
+    return bool(_LH_PLACEHOLDER_RE.match(s))
+
+
+# ── BOARDING-ZEIT für Widget/Live-Aktivität (Owner 2026-07-27 nachgefordert) ─
+#
+# DIE QUELLE. `boardingBegin` aus COMMON_CHECK_IN_TIMES ist die EINZIGE echte
+# Boarding-Zeit, die dieses System kennt. Sie war bis heute serverseitig
+# geparst und wurde weggeworfen: die beiden Aufrufer von
+# `parse_check_in_times` sind der Endpoint `/api/lh/flightops/checkin` (den
+# ruft kein Client) und `daily_briefing._checkin` (der liest nur
+# `briefingRoom`). Der iOS-Roster-Pfad (`/api/user/briefing/<token>`) kannte
+# sie gar nicht — deshalb fehlte der Schritt „Boarding" in der Kette.
+#
+# WARUM NUR `boardingBegin` UND NICHT `paxOnBoard`. Das sind zwei
+# verschiedene Ereignisse: Beginn des Einsteigens gegenüber „Passagiere an
+# Bord" (= Boarding fertig). LH liefert am Layover oft nur das zweite (Beleg
+# im Docstring von `check_in_times`: BOM 19:37Z paxOnBoard, kein
+# boardingBegin). Es als „Boarding" auf den Sperrbildschirm zu schreiben wäre
+# eine falsch beschriftete Zeit — dieselbe Klasse Fehler wie „Abflug minus
+# 30 min". Fehlt `boardingBegin`, FÄLLT DER SCHRITT WEG.
+#
+# WARUM DAS DIE LH-QUOTE NICHT REISST (Tagesdeckel am 29.07. gerissen):
+#  · HINTERGRUND-Call (`interactive=False`). Bei gerissenem Deckel stirbt er
+#    ZUERST und lässt den reservierten Headroom echter Taps unangetastet.
+#    Folge: kein Boarding-Schritt — genau das richtige Verhalten.
+#  · NIE synchron im Request. Der Serve-Pfad liest ausschliesslich den Cache;
+#    ein Miss WÄRMT im Daemon-Thread, der nächste Roster-Poll sieht den Wert.
+#    Ein Render löst damit nie einen Call aus, auf den jemand wartet.
+#  · Enges Fenster: nur das nächste noch nicht abgeflogene Leg und nur, wenn
+#    der Abflug in `_BOARDING_LEAD_MAX_S` (6 h) bevorsteht. Die Live-Aktivität
+#    beginnt ~45 min vor dem Pickup (~2–2,5 h vor Abflug); früher braucht die
+#    Zahl niemand.
+#  · NEGATIV-Cache. LH trägt Check-in-Zeiten erst spät nach; ohne ihn würde
+#    jeder Poll dieselbe Leere erneut erfragen.
+# Grössenordnung: ≤ 1 Treffer-Call je User und Dienst (6 h TTL) plus höchstens
+# zwei Fehlversuche (3 h TTL) im 6-h-Fenster.
+# WELLE 2 (Owner 31.07.): DIESELBE bezahlte Antwort trägt mehr als
+# `boardingBegin`. `crewAtSecurityCheck`, `crewBusDeparture` (= APRON-Bus
+# Briefing→Flieger, NICHT der Hotel-Transfer!) und `briefingRoom` hängen jetzt
+# additiv am selben Sektor — 0 zusätzliche LH-Calls, derselbe Fetch, derselbe
+# Cache-Eintrag, dasselbe enge Fenster. `paxOnBoard` bleibt bewusst DRAUSSEN
+# (Plan-Korrektur 31.07.: es ist die Zeit „Boarding fertig", keine Anzahl, und
+# als zweite „Boarding"-Marke nur verwirrend).
+#
+# KONTRAKT zur App: genau diese optionalen Sektor-Felder können entstehen —
+# nie mit `null`, nie leer, jedes einzeln fehlend (dann lässt die Kette den
+# Schritt weg). ISO-Zeiten 1:1 von LH (UTC).
+_SECTOR_MARK_FIELDS = ('boarding_iso', 'security_iso', 'crewbus_iso',
+                       'briefing_room')
+_BOARDING_CACHE = {}                     # key -> (ts, marks-dict)
+_BOARDING_LOCK = threading.Lock()
+_BOARDING_HIT_TTL_S = 6 * 3600           # gefundene Zeit
+_BOARDING_MISS_TTL_S = 3 * 3600          # NEGATIV-Cache (LH trägt spät nach)
+_BOARDING_CACHE_MAX = 500
+_BOARDING_LEAD_MAX_S = 6 * 3600          # so früh interessiert Boarding
+_BOARDING_LEAD_MIN_S = -3600             # bis 1 h nach dem Plan-Abflug
+_BOARDING_INFLIGHT = set()               # laufende Wärm-Threads (kein Sturm)
+
+
+def _boarding_key(user_token, flight, date, dep):
+    return '|'.join([(user_token or '')[:64],
+                     (flight or '').upper().replace(' ', ''),
+                     (date or '')[:10], (dep or '').upper()])
+
+
+def _boarding_marks_normalize(payload):
+    """Cache-Nutzlast → Marken-Dict. TOLERANT gegenüber dem ALTEN Format
+    (`iso|None`): der Cache ist rein prozess-lokal (ein Modul-Dict, nichts
+    davon liegt auf Disk oder in Supabase), ein Deploy startet ihn also
+    ohnehin leer. Die Toleranz kostet drei Zeilen und deckt den einzigen Fall
+    ab, in dem beide Formate je zusammentreffen könnten — ein Reload im
+    laufenden Prozess."""
+    if isinstance(payload, dict):
+        return {k: v for k, v in payload.items()
+                if k in _SECTOR_MARK_FIELDS and v}
+    if isinstance(payload, str) and payload.strip():
+        return {'boarding_iso': payload.strip()}
+    return {}
+
+
+def _boarding_cache_get(key, now=None):
+    """(hit, marks) — `hit=False` heisst „noch nie gefragt bzw. TTL abgelaufen".
+    Ein Treffer mit leerem `marks` ist der NEGATIV-Cache und zählt als hit."""
+    now = now if now is not None else time.time()
+    with _BOARDING_LOCK:
+        e = _BOARDING_CACHE.get(key)
+    if not e:
+        return False, {}
+    ts, payload = e
+    marks = _boarding_marks_normalize(payload)
+    ttl = _BOARDING_HIT_TTL_S if marks else _BOARDING_MISS_TTL_S
+    if (now - ts) > ttl:
+        return False, {}
+    return True, marks
+
+
+def _boarding_cache_put(key, marks, now=None):
+    now = now if now is not None else time.time()
+    with _BOARDING_LOCK:
+        _BOARDING_CACHE[key] = (now, _boarding_marks_normalize(marks))
+        if len(_BOARDING_CACHE) > _BOARDING_CACHE_MAX:
+            for k in sorted(_BOARDING_CACHE,
+                            key=lambda k: _BOARDING_CACHE[k][0])[:100]:
+                _BOARDING_CACHE.pop(k, None)
+
+
+def boarding_begin_from_times(times):
+    """`boardingBegin` aus einer `parse_check_in_times`-Map — oder None.
+    Bewusst OHNE Fallback auf `paxOnBoard` (siehe Kommentarblock). Pure."""
+    if not isinstance(times, dict):
+        return None
+    v = times.get('boardingBegin')
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v or None
+
+
+_BRIEFING_ROOM_MAX_LEN = 40
+
+
+def briefing_room_from_times(times):
+    """`briefingRoom` — aber NUR, wenn es ein plausibler Raum ist ('B4.123',
+    'C2.007', 'Cabin Briefing 3'). Literale Platzhalter ('N/A') und interne
+    LH-Codes ('H9941671') fallen durch `is_lh_placeholder` — dieselbe
+    Filterlogik, die am Hotelnamen schon einen 'N/A' von der Karte geholt hat.
+    Lieber KEINE Raumzeile als eine erfundene (Keine-Fake-Werte-Regel). Pure."""
+    if not isinstance(times, dict):
+        return None
+    r = str(times.get('briefingRoom') or '').strip()
+    if not r or len(r) > _BRIEFING_ROOM_MAX_LEN:
+        return None
+    if is_lh_placeholder(r):
+        return None
+    if not re.search(r'[A-Za-z0-9]', r):
+        return None
+    return r
+
+
+def _checkin_iso(times, key):
+    """Zeitfeld aus der Check-in-Map — nur bei PARSBAREM ISO. LH schreibt in
+    Zeitfelder gelegentlich denselben Müll wie in Namensfelder; eine Zeile
+    'Security · N/A' im Widget wäre exakt der Fehler, den die Owner-Regel
+    verbietet. Pure."""
+    if not isinstance(times, dict):
+        return None
+    v = times.get(key)
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    if not v or _boarding_dep_epoch(v) is None:
+        return None
+    return v
+
+
+def duty_marks_from_times(times):
+    """Check-in-Map → alle Sektor-Felder, die EINE Antwort hergibt. Nur echte
+    Werte, nie ein `None`-Schlüssel. `boardingBegin` behält seinen bisherigen
+    1:1-Pfad (`boarding_begin_from_times`) — die Welle-2-Felder sind additiv
+    und ändern an der Boarding-Semantik nichts. `paxOnBoard` bleibt draussen
+    (Zeit „Boarding fertig", keine Anzahl — Plan-Korrektur 31.07.). Pure."""
+    out = {}
+    if not isinstance(times, dict):
+        return out
+    iso = boarding_begin_from_times(times)
+    if iso:
+        out['boarding_iso'] = iso
+    for field, key in (('security_iso', 'crewAtSecurityCheck'),
+                       ('crewbus_iso', 'crewBusDeparture')):
+        v = _checkin_iso(times, key)
+        if v:
+            out[field] = v
+    room = briefing_room_from_times(times)
+    if room:
+        out['briefing_room'] = room
+    return out
+
+
+def _boarding_fetch(user_token, flight, date, dep, arr):
+    """EIN COMMON_CHECK_IN_TIMES-Call im HINTERGRUND-Budget → Cache.
+    Wirft nie. Läuft ausschliesslich im Daemon-Thread. Aus DERSELBEN Antwort
+    fallen seit Welle 2 alle Marken (`duty_marks_from_times`) — ein Call, ein
+    Cache-Eintrag, mehrere Felder."""
+    key = _boarding_key(user_token, flight, date, dep)
+    marks = {}
+    try:
+        p = _resolve_link_params(user_token, 'checkintimes', flight, date,
+                                 dep, arr)
+        if p:
+            resp = service_get(user_token, 'COMMON_CHECK_IN_TIMES', p)
+        else:
+            resp = check_in_times(user_token, flight, date, dep, arr)
+        marks = duty_marks_from_times(parse_check_in_times(resp))
+    except Exception as e:
+        log.warning('[lh_flightops] boarding_fetch: %s', type(e).__name__)
+    finally:
+        _boarding_cache_put(key, marks)
+        with _BOARDING_LOCK:
+            _BOARDING_INFLIGHT.discard(key)
+    return marks
+
+
+def _boarding_warm_async(user_token, flight, date, dep, arr):
+    """Wärmt den Cache im Daemon-Thread. Pro Schlüssel höchstens ein Lauf."""
+    key = _boarding_key(user_token, flight, date, dep)
+    with _BOARDING_LOCK:
+        if key in _BOARDING_INFLIGHT:
+            return False
+        _BOARDING_INFLIGHT.add(key)
+    try:
+        threading.Thread(target=_boarding_fetch,
+                         args=(user_token, flight, date, dep, arr),
+                         daemon=True).start()
+        return True
+    except Exception:
+        with _BOARDING_LOCK:
+            _BOARDING_INFLIGHT.discard(key)
+        return False
+
+
+def _boarding_dep_epoch(iso):
+    """ISO-UTC → Epoch, oder None. Toleriert 'Z' und Sekundenbruchteile."""
+    s = (iso or '').strip()
+    if not s:
+        return None
+    try:
+        return _dt.datetime.fromisoformat(
+            s.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return None
+
+
+def boarding_candidate_index(sectors, now_ts):
+    """Index des Legs, für das eine Boarding-Zeit ÜBERHAUPT interessiert —
+    das erste, dessen Plan-Abflug im Fenster
+    `[now - 1 h, now + 6 h]` liegt. Sonst None. Pure/testbar.
+
+    Ein Index statt „alle Legs": ein Umlauf mit vier Sektoren würde sonst
+    vier LH-Calls kosten, und die Kette zeigt ohnehin nur den nächsten
+    Abflug."""
+    if not isinstance(sectors, list):
+        return None
+    for i, s in enumerate(sectors):
+        if not isinstance(s, dict):
+            continue
+        ep = _boarding_dep_epoch(s.get('dep_iso'))
+        if ep is None:
+            continue
+        lead = ep - now_ts
+        if _BOARDING_LEAD_MIN_S <= lead <= _BOARDING_LEAD_MAX_S:
+            return i
+    return None
+
+
+def enrich_sectors_boarding(user_token, sectors, now_ts=None):
+    """Hängt die Duty-Marken (`boarding_iso`, `security_iso`, `crewbus_iso`,
+    `briefing_room`; alle ISO-UTC bzw. Raum-String 1:1 von LH) an den EINEN
+    Sektor, für den sie zeitlich relevant sind. Rein additiv; fehlt ein Wert,
+    wird sein Schlüssel NICHT gesetzt (die App lässt den Schritt dann weg —
+    nie 'N/A', nie eine abgeleitete Zeit).
+
+    Das Fenster-Gating gilt unverändert für ALLE Felder: nur das nächste noch
+    nicht abgeflogene Leg, nur im 6-h-Vorlauf. Diese Marken sind für die
+    Widget-/NextDutyHero-Kette am Diensttag, nicht für die Historie. Ob am
+    Layover überhaupt Briefing/Security/Crewbus gezeigt werden, entscheidet
+    die Anzeige (iOS/daily_briefing) — das Backend reicht durch, was LH für
+    dieses Leg wirklich liefert.
+
+    Liest im Request NUR den Cache. Ein Miss startet einen Hintergrund-Lauf und
+    liefert für DIESEN Request nichts — der nächste Roster-Poll trägt die Zahl.
+    Kein Netz auf dem Antwortpfad, kein Warten des Users. Wirft nie."""
+    try:
+        now_ts = now_ts if now_ts is not None else time.time()
+        i = boarding_candidate_index(sectors, now_ts)
+        if i is None:
+            return False
+        sec = sectors[i]
+        flight = (sec.get('flight') or '').strip()
+        dep = (sec.get('from') or '').strip().upper()
+        arr = (sec.get('to') or '').strip().upper()
+        date = (sec.get('dep_iso') or '')[:10]
+        if not flight or not dep or not date:
+            return False
+        # Kein Grant, kein Call. `_access_state` refresht selbst nie.
+        if _access_state(user_token)[0] != 'ok':
+            return False
+        key = _boarding_key(user_token, flight, date, dep)
+        hit, marks = _boarding_cache_get(key, now=now_ts)
+        if not hit:
+            _boarding_warm_async(user_token, flight, date, dep, arr)
+            return False
+        wrote = False
+        for field in _SECTOR_MARK_FIELDS:
+            v = marks.get(field)
+            if v:
+                sec[field] = v
+                wrote = True
+        return wrote
+    except Exception as e:
+        log.warning('[lh_flightops] enrich_boarding: %s', type(e).__name__)
+        return False
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 @lh_flightops_bp.route('/api/lh/flightops/oauth/start', methods=['GET'])
 def flightops_oauth_start():
@@ -3413,6 +4061,7 @@ def flightops_import(token):
     # etwas fehl, läuft der Roster-Import unverändert weiter — der Pickup ist
     # eine Zugabe, nie eine Vorbedingung.
     _pickups = None
+    _rot_facts = None
     if not _history:
         try:
             # `known_anchors` schaltet den Fern-Horizont (30→36 h) NUR für Legs frei,
@@ -3420,11 +4069,23 @@ def flightops_import(token):
             _rns = pickup_rotation_ids(
                 resp, known_anchors=pickup_last_good_anchors(token))
             if _rns:
-                _pickups = rotation_pickups_for(token, _rns)
+                # WELLE 0: dh/ac_change/hotel fallen in DERSELBEN Antwort ab —
+                # kein zusätzlicher Call, kein erweiterter Horizont.
+                _rot_facts = {}
+                _pickups = rotation_pickups_for(token, _rns,
+                                                facts_out=_rot_facts)
         except Exception as e:
             log.warning('[lh_flightops] pickup lookup: %s', type(e).__name__)
             _pickups = None
-    ics = duty_events_to_ics(resp, pickups=_pickups)
+            _rot_facts = None
+        # TZ-AUDIT (Welle 0, Phase 1): reine Telemetrie gegen unsere eigene
+        # Stations-Tabelle. Keine Verhaltensänderung, max. 1 Zeile pro Station.
+        try:
+            tz_audit(resp)
+        except Exception:
+            pass
+    ics = duty_events_to_ics(resp, pickups=_pickups, rot_legs=_rot_facts,
+                             enrich=not _history)
     if not ics:
         return jsonify({'ok': True, 'events_count': 0, 'source': 'flightops',
                         'detail': 'no_events'}), 200
@@ -4482,6 +5143,389 @@ def flightops_hotel(token):
                       interactive=True)
     return jsonify({'ok': True, 'hotels': parse_crew_hotel(resp),
                     'station': (b.get('station') or '').upper()})
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# LANDING REPORT → FLUGBUCH-ABGLEICH (Welle 1, 2026-07-31)
+# ════════════════════════════════════════════════════════════════════════════
+# Das Flugbuch ist ein RECHTSDOKUMENT. Dieser Pfad SCHREIBT NICHTS: er liefert
+# ausschließlich VORSCHLÄGE („LH sagt zu diesem Leg: …"). Die Übernahme macht
+# die App über den bestehenden Leg-Save-Endpoint nach einem Nutzer-Tap —
+# einzeln oder als Monats-Batch. Kein Auto-Write, kein Auto-Merge.
+#
+# BEWUSST OHNE CRON/HINTERGRUND-ANBINDUNG (Plan-Doc, Welle 1): der Abruf hängt
+# NUR am Nutzer-Tap „Mit LH abgleichen". Eine Hintergrund-Anbindung kommt erst
+# nach dem Beweis der Quota-Diät (Verbrauch < 5.000/Tag) — heute (31.07.) lag
+# der lhfo-Tagesstand mittags schon bei ~3.900 von 5.900.
+#
+# DREI GATES, alle drei nötig:
+#   1. FRISCHE (Doku + live belegt): ein frisch gelandetes Leg liefert HTTP 404
+#      bzw. response:null — der Report ist erst ~24 h nach Ankunft da. Wir
+#      fragen deshalb gar nicht erst. 404 heißt NIE „nicht gelandet", sondern
+#      immer 'pending'.
+#   2. EIGENER TAGESZÄHLER `lhfoD-landing:<YYYYMMDD>` (ax_api_budget-Muster,
+#      Deckel 400). Der globale lhfo-Tagesdeckel schützt die LH-Quote; dieser
+#      hier schützt die ANDEREN Features davor, dass ein neuer Verbraucher
+#      ihnen das gemeinsame Kontingent wegfrisst. Ist er erreicht, sagt der
+#      Endpoint das (status 'budget' pro Leg + Log) — er kappt nicht still.
+#   3. HARTER DECKEL pro Aufruf (30 Calls), Rest als 'skipped_budget'.
+#
+# CACHE-SEMANTIK — die wichtigste Regel dieses Blocks:
+#   · OOOI-Zeiten, tailsign, destinationAirport sind FLUG-Fakten. Eine gelandete
+#     Zeit ändert sich nie ⇒ geteilter Disk-Cache pro (flight,date,dep), TTL 30
+#     Tage. Zwei Kollegen desselben Legs teilen sie legitim.
+#   · `landingPerformed`/`pkNumber` sind PER-USER („die ANFRAGENDE Person hat
+#     gelandet"). Sie dürfen NIEMALS in den geteilten Cache — sonst stünde im
+#     Flugbuch eines Kabinenmitglieds die Landung des Kapitäns. Der geteilte
+#     Cache filtert beim LESEN auf eine Whitelist von Flug-Fakt-Keys: selbst
+#     eine von Hand vergiftete Datei kann `self_landed` nicht einschleusen.
+#     Das eigene Flag liegt in einer PRO-USER-Datei und kommt sonst nur aus der
+#     user-eigenen Live-Response.
+_LB_BUDGET_PREFIX = 'lhfoD-landing:'
+_LB_DAY_CEILING = 400            # eigener Tagesdeckel dieses Verbrauchers
+_LB_MAX_CALLS = 30               # harter Deckel je Endpoint-Aufruf
+_LB_SPACING_S = 0.7              # Abstand zwischen zwei LH-Calls (Quota-Diät)
+_LB_DEFAULT_DAYS = 14
+_LB_MAX_DAYS = 31
+# Frische-Gate in TAGEN auf dem Flugdatum. Der Link-Cache trägt nur das
+# Flugdatum, keine Ankunftszeit — als Ankunfts-Anker gilt deshalb das ENDE des
+# UTC-Flugtags. `days_back >= 2` heißt: der Flugtag ist mindestens 24 h vorbei.
+# Live belegt (31.07.): ein Leg von gestern (days_back=1) liefert response:null,
+# eines von vorgestern/älter liefert den Report.
+_LB_MIN_AGE_DAYS = 2
+_LB_SHARED_TTL_S = 30 * 86400    # gelandete Zeiten ändern sich nie
+_LB_SHARED_MAX = 4000            # Einträge in der geteilten Datei
+_LB_SELF_MAX = 800               # Einträge je User-Datei
+# Was aus dem GETEILTEN Cache überhaupt gelesen werden darf (Whitelist!).
+_LB_SHARED_KEYS = ('arr', 'tail', 'dep_iso', 'arr_iso', 'off_iso', 'on_iso',
+                   'block_min', 'air_min')
+
+_lb_day_memo = {'ts': 0.0, 'day': '', 'used': 0}
+_LB_DAY_MEMO_S = 60.0
+_lb_day_local = {'day': '', 'n': 0}      # in DIESEM Prozess gebuchte Calls
+
+
+def _lb_utc_day(now=None):
+    return time.strftime('%Y%m%d', time.gmtime(now))
+
+
+def _lb_budget_key(now=None):
+    return _LB_BUDGET_PREFIX + _lb_utc_day(now)
+
+
+def _lb_day_used(now=None):
+    """Tagesstand des EIGENEN Landing-Report-Zählers (max aus persistiertem
+    Stand und dem, was dieser Prozess seit dem letzten Flush gebucht hat —
+    der Flusher schreibt nur alle 30 s, ein einzelner Aufruf darf den Deckel
+    aber nicht in einem Rutsch überrennen). Wirft nie."""
+    day = _lb_utc_day(now)
+    if _lb_day_local['day'] != day:
+        _lb_day_local['day'], _lb_day_local['n'] = day, 0
+    ts = time.time()
+    if _lb_day_memo['day'] != day or (ts - _lb_day_memo['ts']) >= _LB_DAY_MEMO_S:
+        try:
+            from blueprints.aerox_data_blueprint import _budget_key_used
+            used = int(_budget_key_used(_lb_budget_key(now)) or 0)
+        except Exception:
+            used = 0
+        _lb_day_memo['ts'], _lb_day_memo['day'] = ts, day
+        _lb_day_memo['used'] = used
+    return max(_lb_day_memo['used'], _lb_day_local['n'])
+
+
+def _lb_budget_book(now=None):
+    """Einen Landing-Report-Call im Tageszähler buchen. Wirft nie."""
+    day = _lb_utc_day(now)
+    if _lb_day_local['day'] != day:
+        _lb_day_local['day'], _lb_day_local['n'] = day, 0
+    _lb_day_local['n'] += 1
+    try:
+        from blueprints.lh_open_api import budget_inc_key
+        budget_inc_key(_lb_budget_key(now))
+    except Exception:
+        pass
+
+
+# ── Cache-Dateien (Muster: folinks_-Disk-Cache) ─────────────────────────────
+def _lb_key(flight, date, dep):
+    return '%s|%s|%s' % ((flight or '').upper().replace(' ', ''),
+                         (date or '')[:10], (dep or '').upper())
+
+
+def _lb_json_load(path):
+    try:
+        if path and os.path.exists(path):
+            with open(path) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _lb_json_save(path, obj):
+    """Atomar schreiben (tmp + replace) — mehrere gunicorn-Worker teilen sich
+    die geteilte Datei; ein halb geschriebenes JSON wäre schlimmer als ein
+    verlorener Eintrag. Einträge sind unveränderliche Fakten, „last writer
+    wins" ist damit unkritisch. Wirft nie."""
+    try:
+        if not path:
+            return
+        tmp = path + '.tmp%d' % os.getpid()
+        with open(tmp, 'w') as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning('[lh_flightops] landing cache save: %s', type(e).__name__)
+
+
+def _lb_prune(d, cap, now=None):
+    """Abgelaufene (TTL) und überzählige Einträge entfernen. Pure-nah."""
+    ts = now if now is not None else time.time()
+    live = {k: v for k, v in (d or {}).items()
+            if isinstance(v, dict) and (ts - float(v.get('ts') or 0)) < _LB_SHARED_TTL_S}
+    if len(live) > cap:
+        keep = sorted(live.items(), key=lambda kv: float(kv[1].get('ts') or 0),
+                      reverse=True)[:cap]
+        live = dict(keep)
+    return live
+
+
+def _lb_shared_path():
+    return os.path.join(_flow_dir(), 'folanding_shared.json')
+
+
+def _lb_shared_get(key, now=None):
+    """Flug-Fakten eines Legs aus dem GETEILTEN Cache oder None.
+    Liest ausschließlich die Whitelist `_LB_SHARED_KEYS` — `self_landed`/
+    `pkNumber` können hier konstruktiv nicht herauskommen."""
+    e = _lb_json_load(_lb_shared_path()).get(key)
+    if not isinstance(e, dict):
+        return None
+    ts = now if now is not None else time.time()
+    if (ts - float(e.get('ts') or 0)) >= _LB_SHARED_TTL_S:
+        return None
+    return {k: e[k] for k in _LB_SHARED_KEYS if e.get(k) is not None}
+
+
+def _lb_shared_put(key, facts, now=None):
+    """Flug-Fakten teilen. Nimmt NUR die Whitelist auf — der per-User-Anteil
+    (self_landed/pkNumber) wird hier hart abgeschnitten, nicht „vergessen"."""
+    if not key or not isinstance(facts, dict):
+        return
+    row = {k: facts[k] for k in _LB_SHARED_KEYS if facts.get(k) is not None}
+    if not row:
+        return
+    row['ts'] = now if now is not None else time.time()
+    d = _lb_json_load(_lb_shared_path())
+    d[key] = row
+    _lb_json_save(_lb_shared_path(), _lb_prune(d, _LB_SHARED_MAX, now))
+
+
+def _lb_self_path(user_token):
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', user_token or '')[:64]
+    return os.path.join(_flow_dir(), f'folanding_{safe}.json') if safe else None
+
+
+def _lb_self_get(user_token, key, now=None):
+    """Das EIGENE `self_landed`-Flag für ein Leg (True/False) oder None, wenn
+    unbekannt. Strikt pro User — eigene Datei, nie geteilt."""
+    e = _lb_json_load(_lb_self_path(user_token)).get(key)
+    if not isinstance(e, dict) or not isinstance(e.get('self_landed'), bool):
+        return None
+    ts = now if now is not None else time.time()
+    if (ts - float(e.get('ts') or 0)) >= _LB_SHARED_TTL_S:
+        return None
+    return e['self_landed']
+
+
+def _lb_self_put(user_token, key, self_landed, now=None):
+    p = _lb_self_path(user_token)
+    if not p or not isinstance(self_landed, bool):
+        return       # None = „unbekannt" wird NICHT als Tatsache konserviert
+    d = _lb_json_load(p)
+    d[key] = {'self_landed': self_landed,
+              'ts': now if now is not None else time.time()}
+    _lb_json_save(p, _lb_prune(d, _LB_SELF_MAX, now))
+
+
+def _lb_candidates(links, days, today=None):
+    """Link-Cache (`extract_duty_links`) → Kandidaten-Legs fürs Flugbuch:
+    [{flight, date, dep, arr}], aufsteigend nach Datum, dedupliziert.
+    PURE/testbar.
+
+    Die landingReport-Referenzen liegen seit jeher in `folinks_<token>.json`
+    (jeder Roster-Import schreibt sie mit) und wurden bisher NIE genutzt — sie
+    tragen flightDesignator/flightDate/departureAirport fix und fertig.
+
+    FRISCHE-GATE: nur Legs, deren Flugtag `_LB_MIN_AGE_DAYS`…`days` Tage
+    zurückliegt. Untergrenze = „Ankunft ≥ 24 h her" (s. Banner), Obergrenze =
+    das vom Client gewünschte Fenster."""
+    try:
+        ref = today or _dt.datetime.now(_dt.timezone.utc).date()
+    except Exception:
+        return []
+    out, seen = [], set()
+    for l in links or []:
+        if not isinstance(l, dict) or l.get('service') != 'landingreport':
+            continue
+        p = l.get('params') or {}
+        flight = (p.get('flightDesignator') or '').upper().replace(' ', '')
+        date = (p.get('flightDate') or '')[:10]
+        dep = (p.get('departureAirport') or '').upper()
+        if not (flight and date and dep):
+            continue
+        try:
+            d = _dt.date(int(date[0:4]), int(date[5:7]), int(date[8:10]))
+        except Exception:
+            continue
+        back = (ref - d).days
+        if back < _LB_MIN_AGE_DAYS or back > days:
+            continue
+        k = (flight, date, dep)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({'flight': flight, 'date': date, 'dep': dep,
+                    'arr': (p.get('arrivalAirport') or '').upper() or None})
+    out.sort(key=lambda c: (c['date'], c['flight']))
+    return out
+
+
+def _lb_leg_row(cand, facts, self_landed, status):
+    """Ein Ergebnis-Leg in der vertraglich fixen Shape. Fehlendes bleibt None —
+    ein Flugbuch-Vorschlag mit erfundenen Werten wäre schlimmer als keiner."""
+    f = facts or {}
+    return {'flight': cand['flight'], 'date': cand['date'], 'dep': cand['dep'],
+            'arr': f.get('arr') or cand.get('arr'),
+            'tail': f.get('tail'),
+            'block_min': f.get('block_min'), 'air_min': f.get('air_min'),
+            'off_iso': f.get('off_iso'), 'on_iso': f.get('on_iso'),
+            'out_iso': f.get('dep_iso'), 'in_iso': f.get('arr_iso'),
+            'self_landed': self_landed, 'status': status}
+
+
+@lh_flightops_bp.route('/api/lh/flightops/logbook-verify/<token>',
+                       methods=['POST'])
+def flightops_logbook_verify(token):
+    """Flugbuch-Abgleich mit dem LH Landing Report — VORSCHLÄGE, kein Write.
+
+    Body (optional): {"days": N}  — Rückschau-Fenster, Default 14, max 31.
+
+    Antwort:
+        {ok, days, legs: [{flight, date, dep, arr, tail, block_min, air_min,
+                           off_iso, on_iso, out_iso, in_iso, self_landed,
+                           status}], calls, budget: {...}}
+    `status` je Leg:
+        'ok'             — Report da, Werte gültig
+        'pending'        — LH hat (noch) keinen Report (HTTP 404 / null). NIE
+                           als „nicht gelandet" lesen!
+        'budget'         — eigener Tagesdeckel erreicht, heute nicht mehr
+        'skipped_budget' — Deckel von 30 Calls je Aufruf erreicht, erneut tappen
+        'error'          — LH-/Netzfehler
+    Nur bei 'ok' ist `self_landed` belastbar; sonst None. Flug-Fakten können
+    auch ohne 'ok' gefüllt sein — dann stammen sie aus dem geteilten
+    Flug-Fakten-Cache (echte Werte desselben Legs, nur nicht aus DIESEM Call).
+
+    `self_landed` = „die anfragende Person hat die Landung durchgeführt"
+    (PER-USER, Landungs-Zähler fürs Cockpit-Flugbuch) — KEIN Flug-Status.
+
+    Auth wie die übrigen owner-scoped FlightOps-Routen (Pfad-Token + Bearer,
+    Gate in app.py) + Grant-Zustand hier."""
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+    if _st != 'ok':
+        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+    b = request.get_json(silent=True) or {}
+    try:
+        days = int(b.get('days') or _LB_DEFAULT_DAYS)
+    except Exception:
+        days = _LB_DEFAULT_DAYS
+    days = max(_LB_MIN_AGE_DAYS, min(_LB_MAX_DAYS, days))
+
+    cands = _lb_candidates(_links_load(token), days)
+    if not cands:
+        # MISS wie im crewlist-Pfad: das Fenster EINMAL nachladen (1 Call) —
+        # der Link-Cache liegt auf der ungemounteten Container-Disk und ist
+        # nach jedem Deploy leer. duty_events nimmt eine Spanne, das kostet
+        # also genau einen Call für das ganze Fenster.
+        today = _dt.datetime.now(_dt.timezone.utc).date()
+        resp = duty_events(token,
+                           (today - _dt.timedelta(days=days)).isoformat(),
+                           today.isoformat(), interactive=True)
+        fresh = extract_duty_links(resp) if isinstance(resp, dict) else []
+        if fresh:
+            merged = [l for l in _links_load(token)
+                      if not any(l == g for g in fresh)] + fresh
+            _links_save(token, merged[-800:])
+        cands = _lb_candidates(fresh, days)
+
+    legs, calls, stopped = [], 0, None   # stopped = Status für den Rest
+    for c in cands:
+        key = _lb_key(c['flight'], c['date'], c['dep'])
+        shared = _lb_shared_get(key)
+        own = _lb_self_get(token, key)
+        if shared and own is not None:
+            # Beides bekannt → kein LH-Call. Zeiten geteilt, Flag aus der
+            # EIGENEN Historie — nie aus der geteilten Datei.
+            legs.append(_lb_leg_row(c, shared, own, 'ok'))
+            continue
+        if stopped:                     # zu — der Rest bekommt denselben Grund
+            legs.append(_lb_leg_row(c, shared, None, stopped))
+            continue
+        if calls >= _LB_MAX_CALLS:
+            legs.append(_lb_leg_row(c, shared, None, 'skipped_budget'))
+            continue
+        if _lb_day_used() >= _LB_DAY_CEILING:
+            log.warning('[lh_flightops] landing-Tagesdeckel %s >= %s — '
+                        'Flugbuch-Abgleich stoppt (Rest als status=budget)',
+                        _lb_day_used(), _LB_DAY_CEILING)
+            stopped = 'budget'
+            legs.append(_lb_leg_row(c, shared, None, 'budget'))
+            continue
+        if calls and _LB_SPACING_S > 0:
+            time.sleep(_LB_SPACING_S)       # 0,7 s Abstand (Quota-Diät)
+        st = {}
+        resp = landing_report(token, c['flight'], c['date'], c['dep'],
+                              interactive=True, status_out=st)
+        kind, code = st.get('kind'), st.get('code')
+        if kind not in ('no_access', 'hour_budget', 'day_budget'):
+            # Nur GESENDETE Calls buchen — exakt wie _api_get seine eigenen
+            # Zähler erst hinter den Gates füllt.
+            _lb_budget_book()
+            calls += 1
+        facts = landing_report_parse(resp)
+        if facts:
+            _lb_shared_put(key, facts)      # NUR Flug-Fakten (Whitelist)
+            _lb_self_put(token, key, facts.get('self_landed'))
+            legs.append(_lb_leg_row(c, facts, facts.get('self_landed'), 'ok'))
+            continue
+        if kind == 'ok' or (kind == 'http' and code == 404):
+            # LH kennt das Leg, hat aber (noch) keinen Report: response:null
+            # bzw. 404. Das ist „noch nicht da" — NICHT „nicht gelandet".
+            status = 'pending'
+        elif kind in ('hour_budget', 'day_budget'):
+            # Der GLOBALE lhfo-Deckel hat zugemacht — der Rest des Fensters
+            # bekommt dieselbe ehrliche Antwort statt 30 Leerläufe.
+            status = stopped = 'budget'
+            log.warning('[lh_flightops] Flugbuch-Abgleich gestoppt (%s) — '
+                        'Rest des Fensters als status=budget', kind)
+        elif kind == 'no_access':
+            # Grant zwischen Auth-Gate und Call gestorben — ehrlich 'error',
+            # aber weiterfragen bringt nichts.
+            status = stopped = 'error'
+        else:
+            status = 'error'
+        legs.append(_lb_leg_row(c, shared, None, status))
+
+    used = _lb_day_used()
+    return jsonify({'ok': True, 'days': days, 'legs': legs, 'calls': calls,
+                    'budget': {'key': _lb_budget_key(), 'used': used,
+                               'ceiling': _LB_DAY_CEILING,
+                               'max_calls_per_request': _LB_MAX_CALLS,
+                               'stopped': bool(stopped),
+                               'stop_reason': stopped}})
 
 
 # ── Periodischer Voll-Refresh (Cron → Poll-Service :8081) ────────────────────

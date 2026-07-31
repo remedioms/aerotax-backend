@@ -4356,9 +4356,18 @@ def _apply_paid_arrival_escalation(payload, flight_no, date, dep, dest, pos,
 # (est−sched) und ist damit intern konsistent. NUR die Status-Freitexte
 # ('Flight Departed' vs Board-„Abgeflogen") + die Routen-Identität bleiben Board
 # (Vokabular-/Match-Stabilität) — LH füllt sie nur, wenn das Board schweigt.
+#
+# `codeshares`/`operated_by` (2026-07-31) sind ZUSATZFAKTEN aus derselben
+# flightstatus-Antwort (MarketingCarrierList/OperatingCarrier — bisher
+# weggeworfen, kein zusätzlicher Call). Das Board kennt sie GAR NICHT, LH ist
+# also die einzige Quelle → sie stehen hier statt in `_LH_FILL_ONLY`, damit ein
+# späterer Board-Wert sie nie überschreiben kann. Rein ADDITIV: jeder Consumer
+# liest Fakten feldweise per `.get()`, ein zusätzlicher Key ist unsichtbar, bis
+# ihn jemand ausdrücklich abholt.
 _LH_AUTHORITATIVE = ('sched_dep', 'sched_arr', 'est_dep', 'est_arr',
                      'dep_delay_min', 'arr_delay_min', 'gate', 'terminal',
-                     'arr_gate', 'arr_terminal', 'reg', 'type', 'cancelled')
+                     'arr_gate', 'arr_terminal', 'reg', 'type', 'cancelled',
+                     'codeshares', 'operated_by')
 _LH_FILL_ONLY = ('dep_status', 'arr_status', 'dep_iata', 'arr_iata')
 
 
@@ -5141,6 +5150,13 @@ def _enrich_flight_status_with_obs(flight, date=None, allow_paid=True,
     _fill('arr_gate', facts.get('arr_gate'))
     _fill('arr_terminal', facts.get('arr_terminal'))
     _fill('status', facts.get('dep_status'))
+    # Codeshares + Wet-Lease (2026-07-31): der Fakten-Merge trägt sie seit
+    # heute (aus derselben LH-Antwort, 0 zusätzliche Calls) — hier ist die
+    # Whitelist, durch die sie in `resolve-flight`/`resolve-callsign` und damit
+    # ins Detail-Aggregat kommen. `_fill` = nur füllen, nie überschreiben;
+    # fehlt der Fakt, entsteht KEIN leerer Key.
+    _fill('codeshares', facts.get('codeshares'))
+    _fill('operated_by', facts.get('operated_by'))
     if flight.get('dep_delay_min') is None and facts.get('dep_delay_min') is not None:
         flight['dep_delay_min'] = facts['dep_delay_min']
     if flight.get('arr_delay_min') is None and facts.get('arr_delay_min') is not None:

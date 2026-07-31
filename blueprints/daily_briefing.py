@@ -82,6 +82,11 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, jsonify, request
 
+# LH-Platzhalter-/Raum-Filter kommen aus der API-Schicht (eine Wahrheit für
+# Hotelname UND briefingRoom). `lh_flightops` importiert auf Modulebene nur
+# Flask+Stdlib (App/DB erst lazy) — kein Zyklus.
+from blueprints import lh_flightops as _fo
+
 log = logging.getLogger('aerotax')
 daily_briefing_bp = Blueprint('daily_briefing_bp', __name__)
 
@@ -684,10 +689,6 @@ def transfer_match(iata, lh_name, directory):
             'matched': False, 'reason': 'ambiguous_multi_hotel'}
 
 
-_LH_HOTEL_PLACEHOLDER_RE = re.compile(r'^(H\d{4,}|N/?A|NA|TBD|UNKNOWN|[-.]+)$',
-                                      re.IGNORECASE)
-
-
 def _valid_lh_hotel_name(name):
     """True nur für echte Klarnamen. LH-interne Hotel-Codes ('H9941671', so in
     der Doku-Fixture), literale Platzhalter ('N/A' — beim briefingRoom live
@@ -695,11 +696,16 @@ def _valid_lh_hotel_name(name):
     Gilt für BEIDE Wege: Anzeige (hotel_block) und Verzeichnis-Schreibpfad
     (_sync_official_name). Ohne den Anzeige-Gate stand am Layover-Abend
     „Hotel | N/A (0:30*)" auf der Karte — ein Platzhalter, der wie ein
-    Hotelname aussieht (adversarialer Review 27.07.)."""
+    Hotelname aussieht (adversarialer Review 27.07.).
+
+    Die Platzhalter-Erkennung selbst wohnt seit Welle 2 in
+    `lh_flightops.is_lh_placeholder` (dieselbe Liste bediente ab da auch den
+    briefingRoom) — hier bleibt nur die HOTEL-Plausibilität (Länge, drei
+    zusammenhängende Buchstaben)."""
     s = str(name or '').strip()
     if len(s) < 3 or len(s) > 160:
         return False
-    if _LH_HOTEL_PLACEHOLDER_RE.match(re.sub(r'\s', '', s)):
+    if _fo.is_lh_placeholder(s):
         return False
     return bool(re.search(r'[A-Za-zÀ-ÿ]{3}', s))
 
@@ -1285,9 +1291,10 @@ def briefing_room_decision(duty_day_events, checkin_fetch):
     room = None
     if first_flight and callable(checkin_fetch):
         times = checkin_fetch(first_flight) or {}
-        r = str(times.get('briefingRoom') or '').strip()
-        if r and r.upper() not in ('N/A', 'NA', '-'):
-            room = r
+        # EINE Filterlogik für den Raum (Welle 2): dieselbe Funktion, die den
+        # Raum an den Sektor hängt, entscheidet auch hier — damit fallen neben
+        # 'N/A' auch interne Codes ('H9941671') raus, die vorher durchkamen.
+        room = _fo.briefing_room_from_times(times)
     return {'room': room or 'Cabin OD', 'has_briefing': True,
             'room_known': bool(room)}
 

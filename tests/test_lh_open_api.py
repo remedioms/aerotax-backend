@@ -309,9 +309,12 @@ def test_facts_memo_alias_defragments_cache(monkeypatch):
     lh._facts_memo.clear()
     monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
     monkeypatch.setattr(lh, '_get', lambda path, caller=None: {'x': 1})
+    # Mock spiegelt die ECHTE Signatur (seit 2026-07-31 mit optionaler
+    # Marketing-Flugnummer für Codeshares/Wet-Lease).
     monkeypatch.setattr(lh, '_leg_to_facts',
-                        lambda leg: {'reg': 'D-AIKP', 'dep_iata': 'FRA',
-                                     'arr_iata': 'JFK'})
+                        lambda leg, flight_no=None: {'reg': 'D-AIKP',
+                                                     'dep_iata': 'FRA',
+                                                     'arr_iata': 'JFK'})
     monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: True)
 
     def _fake_legs(path, caller=None):

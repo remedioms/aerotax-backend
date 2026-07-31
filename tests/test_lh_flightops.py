@@ -272,8 +272,8 @@ def test_all_9_services_have_client_methods():
 def test_client_methods_build_correct_paths(monkeypatch):
     calls = []
     monkeypatch.setattr(fo, '_api_get',
-                        lambda tok, path, params=None, interactive=False:
-                        calls.append((path, params)) or {})
+                        lambda tok, path, params=None, interactive=False,
+                        status_out=None: calls.append((path, params)) or {})
     fo.crew_list('T', 'LH400', '2016-10-01', 'FRA', 'JFK', 'AC1')
     fo.crew_rotation('T', '12345')
     fo.landing_report('T', 'LH400', '2016-10-01', 'FRA')
@@ -329,9 +329,16 @@ def test_landing_facts_string_bool_and_blocktime(monkeypatch):
     # landingPerformed kommt als STRING 'true' — muss echtes True werden
     monkeypatch.setattr(fo, 'landing_report', lambda *a: REAL_LANDING)
     f = fo.landing_report_facts('T', 'LH400', '2016-10-01', 'FRA')
-    assert f['landed'] is True
+    # `landed` hieß bis 31.07. so — umbenannt zu `self_landed`, weil das Feld
+    # PER-USER ist („die anfragende Person hat gelandet"), kein Flug-Status.
+    assert 'landed' not in f
+    assert f['self_landed'] is True
     assert f['tail'] == 'D-AISQ'
     assert f['block_min'] == 238          # 10:04 → 14:02 = 3:58
+    assert f['air_min'] == 206            # 10:18 → 13:44 = 3:26 (FCL.050)
+    assert f['arr'] == 'XYZ'
+    assert (f['off_iso'], f['on_iso']) == ('2016-10-01T10:18:00Z',
+                                           '2016-10-01T13:44:00Z')
     assert fo.landing_performed('T', 'LH400', '2016-10-01', 'FRA') is True
 
 
@@ -1090,6 +1097,178 @@ def test_parse_check_in_times():
                  'crewBusDeparture': '2026-07-24T08:10:00Z'}
     assert fo.parse_check_in_times({'processingErrors': [{'code': 500}]}) == {}
 
+
+# ── Welle 2: Duty-Marken aus DERSELBEN Check-in-Antwort ─────────────────────
+# Shapes 1:1 aus den zwei live gemessenen Responses im Docstring von
+# `check_in_times` (MUC Homebase / BOM Layover, 26.07.2026).
+CHECKIN_MUC = {'briefingRoom': 'B4.123',
+               'briefingBegin': '2026-07-26T08:30:00Z',
+               'crewAtSecurityCheck': '2026-07-26T08:57:00Z',
+               'crewBusDeparture': '2026-07-26T09:02:00Z',
+               'boardingBegin': '2026-07-26T09:40:00Z'}
+CHECKIN_BOM = {'briefingRoom': 'N/A',
+               'briefingBegin': '2026-07-26T18:35:00Z',
+               'crewAtSecurityCheck': '2026-07-26T19:05:00Z',
+               'crewBusDeparture': '2026-07-26T19:12:00Z',
+               'paxOnBoard': '2026-07-26T19:37:00Z'}
+
+
+def test_duty_marks_full_homebase_response():
+    m = fo.duty_marks_from_times(CHECKIN_MUC)
+    assert m == {'boarding_iso': '2026-07-26T09:40:00Z',
+                 'security_iso': '2026-07-26T08:57:00Z',
+                 'crewbus_iso': '2026-07-26T09:02:00Z',
+                 'briefing_room': 'B4.123'}
+
+
+def test_duty_marks_layover_no_boarding_and_no_pax_field():
+    """BOM: kein boardingBegin → KEIN boarding_iso; `paxOnBoard` ist eine ZEIT
+    („Boarding fertig"), keine Anzahl — Welle 2 lässt sie bewusst weg."""
+    m = fo.duty_marks_from_times(CHECKIN_BOM)
+    assert 'boarding_iso' not in m and 'briefing_room' not in m
+    assert not [k for k in m if 'pax' in k.lower()]
+    assert m == {'security_iso': '2026-07-26T19:05:00Z',
+                 'crewbus_iso': '2026-07-26T19:12:00Z'}
+
+
+def test_duty_marks_never_null_keys():
+    assert fo.duty_marks_from_times({}) == {}
+    assert fo.duty_marks_from_times(None) == {}
+    m = fo.duty_marks_from_times({'boardingBegin': '2026-07-26T09:40:00Z',
+                                  'crewAtSecurityCheck': None,
+                                  'crewBusDeparture': '',
+                                  'briefingRoom': None})
+    assert m == {'boarding_iso': '2026-07-26T09:40:00Z'}
+    assert all(v for v in m.values())
+
+
+def test_briefing_room_filter_rejects_placeholders_and_codes():
+    """LH schickt literal 'N/A' (live DUS) und interne Codes ('H9941671').
+    Keine-Fake-Werte-Regel: lieber keine Raumzeile."""
+    ok = ('B4.123', 'C2.007', 'B123', 'Cabin Briefing 3', 'A 21')
+    for r in ok:
+        assert fo.briefing_room_from_times({'briefingRoom': r}) == r
+    for bad in ('N/A', 'n/a', ' NA ', 'TBD', 'UNKNOWN', '---', '.', '',
+                'H9941671', None, 'X' * 41):
+        assert fo.briefing_room_from_times({'briefingRoom': bad}) is None
+    assert fo.briefing_room_from_times(None) is None
+
+
+def test_time_marks_require_parsable_iso():
+    for bad in ('N/A', 'irgendwann', '08:57', '2026-13-45T99:99:99Z', 12345):
+        m = fo.duty_marks_from_times({'crewAtSecurityCheck': bad,
+                                      'crewBusDeparture': bad})
+        assert m == {}
+
+
+def _reset_boarding_cache():
+    fo._BOARDING_CACHE.clear()
+    fo._BOARDING_INFLIGHT.clear()
+
+
+def _sector(dep_iso):
+    return {'flight': 'LH123', 'from': 'MUC', 'to': 'FRA', 'dep_iso': dep_iso}
+
+
+def _due_sector(now):
+    iso = _dtmod.datetime.utcfromtimestamp(now + 2 * 3600).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+    return _sector(iso)
+
+
+def test_enrich_sectors_boarding_writes_all_marks(monkeypatch):
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    now = 1785000000.0
+    sec = _due_sector(now)
+    key = fo._boarding_key('AT-U', 'LH123', sec['dep_iso'][:10], 'MUC')
+    fo._boarding_cache_put(key, fo.duty_marks_from_times(CHECKIN_MUC), now=now)
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is True
+    assert sec['boarding_iso'] == '2026-07-26T09:40:00Z'
+    assert sec['security_iso'] == '2026-07-26T08:57:00Z'
+    assert sec['crewbus_iso'] == '2026-07-26T09:02:00Z'
+    assert sec['briefing_room'] == 'B4.123'
+
+
+def test_enrich_sectors_boarding_sets_only_present_fields(monkeypatch):
+    """Layover-Antwort: nur die zwei echten Zeiten, KEINE null-Schlüssel."""
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    now = 1785000000.0
+    sec = _due_sector(now)
+    key = fo._boarding_key('AT-U', 'LH123', sec['dep_iso'][:10], 'MUC')
+    fo._boarding_cache_put(key, fo.duty_marks_from_times(CHECKIN_BOM), now=now)
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is True
+    assert sec['security_iso'] and sec['crewbus_iso']
+    assert 'boarding_iso' not in sec and 'briefing_room' not in sec
+
+
+def test_enrich_sectors_boarding_legacy_tuple_cache(monkeypatch):
+    """Alt-Format `(ts, iso)` aus einem laufenden Prozess bleibt lesbar."""
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    now = 1785000000.0
+    sec = _due_sector(now)
+    key = fo._boarding_key('AT-U', 'LH123', sec['dep_iso'][:10], 'MUC')
+    fo._BOARDING_CACHE[key] = (now, '2026-07-26T09:40:00Z')     # ALTES Format
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is True
+    assert sec['boarding_iso'] == '2026-07-26T09:40:00Z'
+    assert 'security_iso' not in sec
+    # Alt-Negativ-Cache (`None`) zählt weiter als Treffer → kein Wärm-Lauf.
+    _reset_boarding_cache()
+    warmed = []
+    monkeypatch.setattr(fo, '_boarding_warm_async',
+                        lambda *a: warmed.append(a) or True)
+    fo._BOARDING_CACHE[key] = (now, None)
+    sec2 = _due_sector(now)
+    assert fo.enrich_sectors_boarding('AT-U', [sec2], now_ts=now) is False
+    assert warmed == [] and sec2 == _due_sector(now)
+
+
+def test_enrich_sectors_boarding_miss_warms_and_writes_nothing(monkeypatch):
+    """Serve-Pfad macht NIE Netz: Miss → Hintergrund-Wärmung, Sektor bleibt."""
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    warmed = []
+    monkeypatch.setattr(fo, '_boarding_warm_async',
+                        lambda *a: warmed.append(a) or True)
+    now = 1785000000.0
+    sec = _due_sector(now)
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is False
+    assert len(warmed) == 1
+    assert sec == _due_sector(now)
+
+
+def test_enrich_sectors_boarding_window_gate_holds_for_new_fields(monkeypatch):
+    """Fenster-Gating unverändert: Leg in 20 h → kein Feld, kein Call."""
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    warmed = []
+    monkeypatch.setattr(fo, '_boarding_warm_async',
+                        lambda *a: warmed.append(a) or True)
+    now = 1785000000.0
+    far = _dtmod.datetime.utcfromtimestamp(now + 20 * 3600).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+    sec = _sector(far)
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is False
+    assert warmed == [] and sec == _sector(far)
+
+
+def test_boarding_fetch_caches_all_marks_from_one_call(monkeypatch):
+    """0 zusätzliche LH-Calls: EIN Fetch füllt alle Felder."""
+    _reset_boarding_cache()
+    calls = []
+    monkeypatch.setattr(fo, '_resolve_link_params',
+                        lambda *a, **k: {'accessCode': 'X'})
+    monkeypatch.setattr(fo, 'service_get',
+                        lambda tok, svc, p, **k:
+                        calls.append(svc) or dict(CHECKIN_MUC))
+    marks = fo._boarding_fetch('AT-U', 'LH123', '2026-07-26', 'MUC', 'FRA')
+    assert calls == ['COMMON_CHECK_IN_TIMES']
+    assert marks['briefing_room'] == 'B4.123' and marks['crewbus_iso']
+    hit, cached = fo._boarding_cache_get(
+        fo._boarding_key('AT-U', 'LH123', '2026-07-26', 'MUC'))
+    assert hit and cached == marks
 
 
 def _pass_auth_gate(monkeypatch):
@@ -3367,7 +3546,9 @@ def test_import_kicks_prefetch_after_success(monkeypatch):
     monkeypatch.setattr(fo, 'duty_events',
                         lambda tok, fd, td, interactive=False: DUTY_LINKS)
     monkeypatch.setattr(fo, 'pickup_rotation_ids', lambda resp, **kw: [])
-    monkeypatch.setattr(fo, 'duty_events_to_ics', lambda resp, pickups=None: 'ICS')
+    monkeypatch.setattr(fo, 'duty_events_to_ics',
+                        lambda resp, pickups=None, rot_legs=None,
+                        enrich=True: 'ICS')
     monkeypatch.setattr(fo, 'apply_ical_pickup_fallback',
                         lambda tok, ics, url=None: ics)
     import app as backend
@@ -3935,3 +4116,344 @@ def test_typ_schlaegt_text_und_gleiche_stationen_sind_keine_strecke():
     assert ics is not None
     assert 'FRA-MUC' not in ics             # GROUNDEVENT wird kein Leg
     assert ': FRA-FRA' not in ics           # gleiche Stationen sind keine Strecke
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WELLE 0 — „LH-Gratis-Ernte" (2026-07-31)
+# Felder, die in den OHNEHIN geholten LH-Antworten liegen: Hotelname, Deadhead,
+# dayOfShift, aircraftChanged. 0 zusätzliche LH-Calls. Der SUMMARY jedes
+# VEVENTs ist iOS-Regex-Kontrakt und bleibt byte-identisch — alles Neue reist
+# als X-Prop (Pickup zusätzlich als DESCRIPTION).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Duty-Events: DH steht in eventDetails ('DH LH1623', Tim/KRK 25.07. — dieselbe
+# Quelle, aus der schon der SUMMARY sein 'DH ' bezieht) und deckt ALLE Tage ab.
+# dayOfShift sitzt in eventAttributes (bisher ignoriert, nur rotationId gelesen).
+DUTY_W0 = {
+    "pkNumber": "123456A",
+    "rosterDays": [
+        {"day": "2026-09-10T00:00:00Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "LH500", "wholeDay": False,
+             "startTime": "2026-09-10T20:00:00Z", "startLocation": "FRA",
+             "startTimeZoneOffset": -120,
+             "endTime": "2026-09-11T06:00:00Z", "endLocation": "GRU",
+             "endTimeZoneOffset": 180,
+             "eventAttributes": {"rotationId": "9001", "dayOfShift": 1}},
+            {"eventType": "HOTEL", "eventCategory": "hotel",
+             "eventDetails": "Hotel", "wholeDay": False,
+             "startTime": None, "endTime": None,
+             "startLocation": "GRU", "endLocation": None,
+             "eventAttributes": {"rotationId": "9001", "dayOfShift": 1}}]},
+        {"day": "2026-09-12T00:00:00Z", "events": [
+            {"eventType": "FLIGHT", "eventCategory": "flight",
+             "eventDetails": "DH LH501", "wholeDay": False,
+             "startTime": "2026-09-12T22:00:00Z", "startLocation": "GRU",
+             "startTimeZoneOffset": 180,
+             "endTime": "2026-09-13T08:00:00Z", "endLocation": "FRA",
+             "endTimeZoneOffset": -120,
+             "eventAttributes": {"rotationId": "9001", "dayOfShift": 3}}]},
+    ],
+}
+
+# Rotation zum selben Umlauf — das Fenster, das der Import OHNEHIN zieht.
+# hotelName am HINFLUG (FRA-GRU), pickupTime am RÜCKFLUG (GRU-FRA);
+# aircraftChanged am VORHERIGEN Leg = „nach diesem Leg wechselt das Gerät".
+ROT_W0 = {"rotations": [{"rotationNumber": "9001", "shifts": [
+    {"shiftNumber": 1, "legs": [
+        {"dutyCode": "", "flightDesignator": "LH500",
+         "departureAirport": "FRA", "arrivalAirport": "GRU",
+         "depatureDate": "2026-09-10T20:00:00Z",
+         "aircraftChanged": True, "pickupTime": None,
+         "hotelName": "Pullman Sao Paulo Guarulhos", "hotel": False},
+        {"dutyCode": "DH", "flightDesignator": "LH501",
+         "departureAirport": "GRU", "arrivalAirport": "FRA",
+         "depatureDate": "2026-09-12T22:00:00Z",
+         "aircraftChanged": False,
+         "pickupTime": "2026-09-12T19:30:00Z",
+         "pickupTimeLT": "16:30", "hotelName": None, "hotel": False}]}]}]}
+
+
+def _summaries(ics):
+    return [l for l in (ics or '').split('\r\n') if l.startswith('SUMMARY:')]
+
+
+def test_w0_rotation_legs_parser():
+    """dutyCode/aircraftChanged/hotelName aus der Rotations-Antwort; das
+    lügende `hotel`-Flag (False trotz Name) wird nie ausgewertet."""
+    f = fo.parse_rotation_legs(ROT_W0)
+    hin = f[('LH500', 'FRA', 'GRU', '20260910')]
+    assert hin == {'ac_change': True, 'hotel': 'Pullman Sao Paulo Guarulhos'}
+    rueck = f[('LH501', 'GRU', 'FRA', '20260912')]
+    assert rueck == {'dh': True}
+    # 'dh' ist ein Flag, kein None-Feld: fehlt der Wert, fehlt der KEY.
+    assert 'dh' not in hin and 'hotel' not in rueck
+
+
+def test_w0_rotation_legs_letztes_leg_ohne_acchg():
+    """aircraftChanged am LETZTEN Leg der Schicht hat kein „danach" — kein
+    ac_change (sonst zeigte iOS einen Wechsel-Chip ins Leere)."""
+    rot = {"rotations": {"rotationNumber": "1", "shifts": {"legs": {
+        "dutyCode": "", "flightDesignator": "LH900",
+        "departureAirport": "FRA", "arrivalAirport": "MUC",
+        "depatureDate": "2026-09-10T06:00:00Z", "aircraftChanged": True}}}}
+    # Nebenbei die LH-Skalar-Array-Falle: rotations/shifts/legs kommen als
+    # nacktes Objekt statt [Objekt] — _as_list muss das tragen.
+    f = fo.parse_rotation_legs(rot)
+    # Ohne verwertbaren Fakt entsteht GAR KEIN Eintrag (kein leeres Dict).
+    assert ('LH900', 'FRA', 'MUC', '20260910') not in f
+    assert 'ac_change' not in (f.get(('LH900', 'FRA', 'MUC', '20260910')) or {})
+
+
+def test_w0_rotation_legs_skalar_array_haertung():
+    """Ein-Element-Arrays kommen bei LH als Skalar (Known-Issue) — der Parser
+    muss trotzdem liefern."""
+    rot = {"rotations": {"rotationNumber": "1", "shifts": {"legs": [
+        {"dutyCode": "DH", "flightDesignator": "LH900",
+         "departureAirport": "FRA", "arrivalAirport": "MUC",
+         "depatureDate": "2026-09-10T06:00:00Z"},
+        {"dutyCode": "", "flightDesignator": "LH901",
+         "departureAirport": "MUC", "arrivalAirport": "FRA",
+         "depatureDate": "2026-09-10T09:00:00Z"}]}}}
+    f = fo.parse_rotation_legs(rot)
+    assert f[('LH900', 'FRA', 'MUC', '20260910')] == {'dh': True}
+
+
+def test_w0_xprops_im_ics_und_summary_unveraendert():
+    """X-Props am Flug- und Pickup-VEVENT — und der SUMMARY-Block ist
+    BYTE-IDENTISCH zum Lauf ohne Anreicherung (iOS-Regex-Kontrakt)."""
+    pu = fo.parse_rotation_pickups(ROT_W0)
+    legs = fo.parse_rotation_legs(ROT_W0)
+    ics = fo.duty_events_to_ics(DUTY_W0, pickups=pu, rot_legs=legs)
+    plain = fo.duty_events_to_ics(DUTY_W0, pickups=pu)
+    assert ics is not None
+    assert _summaries(ics) == _summaries(plain)
+    assert 'SUMMARY:16:30 LT Pickup GRU' in ics
+    # Hotel am Pickup: DESCRIPTION-Zeile + X-Prop.
+    assert 'DESCRIPTION:Hotel: Pullman Sao Paulo Guarulhos' in ics
+    assert 'X-AEROX-HOTEL:Pullman Sao Paulo Guarulhos' in ics
+    # Hotel auch am ANKOMMENDEN Leg der Layover-Station (hotelName sitzt laut
+    # LH am HINFLUG zur Layover-Station).
+    hin = ics.split('SUMMARY:LH 500: FRA-GRU')[1].split('END:VEVENT')[0]
+    assert 'X-AEROX-HOTEL:Pullman Sao Paulo Guarulhos' in hin
+    assert 'X-AEROX-DOS:1' in hin
+    assert 'X-AEROX-ACCHG:1' in hin
+    assert 'X-AEROX-DH:1' not in hin
+    # Rückflug: DH + dayOfShift 3, kein ACCHG.
+    rueck = ics.split('SUMMARY:DH LH 501: GRU-FRA')[1].split('END:VEVENT')[0]
+    assert 'X-AEROX-DH:1' in rueck
+    assert 'X-AEROX-DOS:3' in rueck
+    assert 'X-AEROX-ACCHG:1' not in rueck
+    assert 'X-AEROX-HOTEL' not in rueck
+
+
+def test_w0_dh_aus_duty_events_deckt_alle_tage():
+    """Der DH-Marker der DUTY-EVENTS (eventDetails 'DH …') trägt auch OHNE
+    jede Rotations-Antwort — er deckt das ganze Fenster ab, die Rotation nur
+    das Pickup-Fenster."""
+    ics = fo.duty_events_to_ics(DUTY_W0)
+    assert 'X-AEROX-DH:1' in ics
+    rueck = ics.split('SUMMARY:DH LH 501: GRU-FRA')[1].split('END:VEVENT')[0]
+    assert 'X-AEROX-DH:1' in rueck
+
+
+def test_w0_history_import_bekommt_keine_anreicherung():
+    """history:true (LHFlightOpsHistoryLoader) → KEINE neuen X-Props, und das
+    Ergebnis ist byte-identisch zum Stand vor Welle 0."""
+    pu = fo.parse_rotation_pickups(ROT_W0)
+    legs = fo.parse_rotation_legs(ROT_W0)
+    ics = fo.duty_events_to_ics(DUTY_W0, pickups=pu, rot_legs=legs,
+                                enrich=False)
+    for prop in ('X-AEROX-DH', 'X-AEROX-DOS', 'X-AEROX-ACCHG',
+                 'X-AEROX-HOTEL', 'DESCRIPTION:'):
+        assert prop not in ics, prop
+    assert not [l for l in ics.split('\r\n') if l.startswith('X-')]
+    # Alles ANDERE bleibt Zeile für Zeile das, was der angereicherte Lauf
+    # erzeugt — die Anreicherung ergänzt nur, sie verändert nie.
+    rich = fo.duty_events_to_ics(DUTY_W0, pickups=pu, rot_legs=legs)
+    assert ics.split('\r\n') == [l for l in rich.split('\r\n')
+                                 if not l.startswith(('X-', 'DESCRIPTION:'))]
+
+
+def test_w0_sektor_felder_aus_xprops():
+    """X-Props → optionale Sektor-Felder (dh/day_of_shift/ac_change/hotel).
+    Die bestehenden Keys bleiben unverändert — jsonb-Containment (lh_mqtt)
+    matcht weiter über {'flight': …} / {'from': …}."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_W0, pickups=fo.parse_rotation_pickups(ROT_W0),
+                                rot_legs=fo.parse_rotation_legs(ROT_W0))
+    secs = backend._build_ical_sectors(backend._parse_ics_to_events(ics))
+    hin = (secs.get('2026-09-10') or [])[0]
+    assert hin['flight'] == 'LH500' and hin['from'] == 'FRA' and hin['to'] == 'GRU'
+    assert hin['dep_iso'] == '2026-09-10T20:00:00Z'
+    assert hin['day_of_shift'] == 1
+    assert hin['ac_change'] is True
+    assert hin['hotel'] == 'Pullman Sao Paulo Guarulhos'
+    assert 'dh' not in hin
+    rueck = (secs.get('2026-09-12') or [])[0]
+    assert rueck['dh'] is True and rueck['day_of_shift'] == 3
+    assert 'ac_change' not in rueck and 'hotel' not in rueck
+
+
+def test_w0_sektor_ohne_xprops_byte_identisch():
+    """Alt-Verhalten: ein Feed OHNE X-Props erzeugt exakt dieselben Sektor-
+    Dicts wie vor Welle 0 — keine neuen Keys, kein None-Ballast."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_W0)          # enrich, aber ohne Rotation
+    ics_plain = fo.duty_events_to_ics(DUTY_W0, enrich=False)
+    secs = backend._build_ical_sectors(backend._parse_ics_to_events(ics_plain))
+    assert secs['2026-09-10'] == [{
+        'flight': 'LH500', 'from': 'FRA', 'to': 'GRU',
+        'dep_iso': '2026-09-10T20:00:00Z', 'arr_iso': '2026-09-11T06:00:00Z'}]
+    assert secs['2026-09-12'] == [{
+        'flight': 'LH501', 'from': 'GRU', 'to': 'FRA',
+        'dep_iso': '2026-09-12T22:00:00Z', 'arr_iso': '2026-09-13T08:00:00Z'}]
+    # Der DH-Marker der Duty-Events allein reicht für das Sektor-Flag.
+    s_dh = backend._build_ical_sectors(backend._parse_ics_to_events(ics))
+    assert s_dh['2026-09-12'][0]['dh'] is True
+
+
+def test_w0_tz_audit_schweigt_wenn_alles_passt():
+    """Die echten LH-Offsets stimmen mit unserer Stations-Tabelle überein →
+    keine Zeile. (Vorzeichen: LH liefert die JS-Konvention, FRA im Sommer -120.)"""
+    assert fo.tz_audit(DUTY_W0) == []
+
+
+def test_w0_tz_audit_meldet_mismatch_einmal_pro_station(caplog):
+    """Künstlicher Mismatch → genau EINE [tz-audit]-Zeile pro Station, und
+    NICHTS am Verhalten ändert sich."""
+    import copy
+    import logging
+    bad = copy.deepcopy(DUTY_W0)
+    for d in bad['rosterDays']:
+        for ev in d['events']:
+            if ev.get('startTimeZoneOffset') is not None:
+                ev['startTimeZoneOffset'] = 0
+            if ev.get('endTimeZoneOffset') is not None:
+                ev['endTimeZoneOffset'] = 0
+    with caplog.at_level(logging.INFO, logger=fo.log.name):
+        hits = fo.tz_audit(bad)
+    stations = [h['station'] for h in hits]
+    assert sorted(stations) == ['FRA', 'GRU']
+    assert len(stations) == len(set(stations)), 'max 1 Zeile pro Station'
+    assert {h['own'] for h in hits} == {120, -180}
+    lines = [r for r in caplog.records if '[tz-audit]' in r.getMessage()]
+    assert len(lines) == 2
+    # KEINE Verhaltensänderung: das ICS ist identisch zum Lauf ohne Audit.
+    assert fo.duty_events_to_ics(bad) == fo.duty_events_to_ics(DUTY_W0)
+
+
+def test_w0_hotelname_wird_ics_sicher_normalisiert():
+    """Ein Hotelname mit Zeilenumbruch darf das VEVENT nicht zerreißen."""
+    rot = {"rotations": [{"rotationNumber": "9001", "shifts": [{"legs": [
+        {"dutyCode": "", "flightDesignator": "LH500",
+         "departureAirport": "FRA", "arrivalAirport": "GRU",
+         "depatureDate": "2026-09-10T20:00:00Z",
+         "hotelName": "Pullman\r\nGuarulhos   Airport"}]}]}]}
+    ics = fo.duty_events_to_ics(DUTY_W0, rot_legs=fo.parse_rotation_legs(rot))
+    assert 'X-AEROX-HOTEL:Pullman Guarulhos Airport' in ics
+    for line in ics.split('\r\n'):
+        assert '\n' not in line and '\r' not in line
+
+
+def test_w0_rotation_pickups_for_liefert_fakten_ohne_zweiten_call(monkeypatch):
+    """facts_out wird aus DERSELBEN Antwort gefüllt — crew_rotation darf genau
+    EINMAL aufgerufen werden."""
+    calls = []
+
+    def _fake(user_token, *rns):
+        calls.append(rns)
+        return ROT_W0
+
+    monkeypatch.setattr(fo, 'crew_rotation', _fake)
+    monkeypatch.setattr(fo, '_rot_hour_used', lambda: 0)
+    fo._rot_cache.clear()
+    facts = {}
+    pu = fo.rotation_pickups_for('AT-W0', ['9001'], facts_out=facts)
+    assert len(calls) == 1
+    assert ('LH501', 'GRU', 'FRA', '20260912') in pu
+    assert facts[('LH500', 'FRA', 'GRU', '20260910')]['hotel'] \
+        == 'Pullman Sao Paulo Guarulhos'
+    # Zweiter Aufruf aus dem Cache — weiterhin nur EIN Call, Fakten bleiben da.
+    facts2 = {}
+    fo.rotation_pickups_for('AT-W0', ['9001'], facts_out=facts2)
+    assert len(calls) == 1
+    assert facts2 == facts
+    fo._rot_cache.clear()
+
+
+def test_w0_import_history_schaltet_alles_ab(monkeypatch):
+    """END-TO-END am Endpoint: `history:true` schickt WEDER Rotations-Fakten
+    NOCH `enrich` in den ICS-Builder — derselbe Schalter, der schon
+    Hotel-Pickup und Crew-Prefetch stummschaltet."""
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    monkeypatch.setattr(fo, 'duty_events',
+                        lambda tok, fd, td, interactive=False: DUTY_W0)
+    seen = {}
+
+    def _spy(resp, pickups=None, rot_legs=None, enrich=True):
+        seen.update({'pickups': pickups, 'rot_legs': rot_legs,
+                     'enrich': enrich})
+        return 'ICS'
+
+    monkeypatch.setattr(fo, 'duty_events_to_ics', _spy)
+    monkeypatch.setattr(fo, 'pickup_rotation_ids',
+                        lambda resp, **kw: ['9001'])
+    monkeypatch.setattr(fo, 'rotation_pickups_for',
+                        lambda tok, rns, facts_out=None: {})
+    monkeypatch.setattr(fo, '_crew_prefetch_kick', lambda tok, resp: True)
+    audits = []
+    monkeypatch.setattr(fo, 'tz_audit', lambda resp, **kw: audits.append(1))
+    import app as backend
+    monkeypatch.setattr(backend, 'import_calendar_feed',
+                        lambda tok: backend.jsonify({'ok': True, 'events_count': 1}))
+    r = backend.app.test_client().post('/api/lh/flightops/import/AT-H',
+                                       headers={'Authorization': 'Bearer AT-H'},
+                                       json={'history': True})
+    assert r.status_code == 200
+    assert seen == {'pickups': None, 'rot_legs': None, 'enrich': False}
+    assert audits == []          # auch die Telemetrie bleibt beim Historien-Lauf still
+
+
+def test_w0_import_laufendes_fenster_reicht_fakten_durch(monkeypatch):
+    """Der NORMALE Import füllt `rot_legs` aus derselben Rotations-Antwort,
+    aus der auch der Pickup kommt — und läuft durch das TZ-Audit."""
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_KEY', 'k'); monkeypatch.setattr(fo, '_SECRET', 's')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    monkeypatch.setattr(fo, 'duty_events',
+                        lambda tok, fd, td, interactive=False: DUTY_W0)
+    seen = {}
+
+    def _spy(resp, pickups=None, rot_legs=None, enrich=True):
+        seen.update({'rot_legs': rot_legs, 'enrich': enrich})
+        return 'ICS'
+
+    def _rp(tok, rns, facts_out=None):
+        if isinstance(facts_out, dict):
+            facts_out.update(fo.parse_rotation_legs(ROT_W0))
+        return fo.parse_rotation_pickups(ROT_W0)
+
+    monkeypatch.setattr(fo, 'duty_events_to_ics', _spy)
+    monkeypatch.setattr(fo, 'pickup_rotation_ids', lambda resp, **kw: ['9001'])
+    monkeypatch.setattr(fo, 'rotation_pickups_for', _rp)
+    monkeypatch.setattr(fo, 'apply_ical_pickup_fallback',
+                        lambda tok, ics, url=None: ics)
+    monkeypatch.setattr(fo, 'apply_pickup_last_good', lambda tok, ics: ics)
+    monkeypatch.setattr(fo, 'pickup_last_good_anchors', lambda tok: set())
+    monkeypatch.setattr(fo, '_crew_prefetch_kick', lambda tok, resp: True)
+    audits = []
+    monkeypatch.setattr(fo, 'tz_audit', lambda resp, **kw: audits.append(1))
+    import app as backend
+    monkeypatch.setattr(backend, 'import_calendar_feed',
+                        lambda tok: backend.jsonify({'ok': True, 'events_count': 1}))
+    r = backend.app.test_client().post('/api/lh/flightops/import/AT-N',
+                                       headers={'Authorization': 'Bearer AT-N'},
+                                       json={})
+    assert r.status_code == 200
+    assert seen['enrich'] is True
+    assert seen['rot_legs'][('LH500', 'FRA', 'GRU', '20260910')]['hotel'] \
+        == 'Pullman Sao Paulo Guarulhos'
+    assert audits == [1]

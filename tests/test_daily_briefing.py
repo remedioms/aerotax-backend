@@ -545,6 +545,15 @@ def test_briefing_room_cabin_od_when_room_na_or_missing():
     assert dec2['room'] == 'Cabin OD'
 
 
+def test_briefing_room_rejects_internal_lh_code():
+    """Ein interner LH-Code ('H9941671') ist so wenig ein Raum wie 'N/A' —
+    seit Welle 2 filtert HIER dieselbe Funktion wie am Sektor-Feld."""
+    evs = db.duty_day_events(DE, '2026-07-26')
+    dec = db.briefing_room_decision(evs,
+                                    lambda ev: {'briefingRoom': 'H9941671'})
+    assert dec['room'] == 'Cabin OD' and dec['room_known'] is False
+
+
 def test_briefing_room_none_on_layover_morning():
     """27.07. beginnt (nach Hotel-Skip) mit dem FLUG LH075 → keine Raumangabe.
     Deckt auch „Dienst beginnt an einer Außenstation ohne Briefing" ab."""
