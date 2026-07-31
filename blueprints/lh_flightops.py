@@ -1096,8 +1096,15 @@ def landing_report(user_token, flight, date, dep, interactive=False,
         interactive=interactive, status_out=status_out)
 
 
-def flight_leg_details(user_token, flight, date=None, dep=None, arr=None):
-    """COMMON_FLIGHT_LEG_DETAILS — Reg/Muster/Gate/Blockzeit autoritativ."""
+def flight_leg_details(user_token, flight, date=None, dep=None, arr=None,
+                       interactive=False, status_out=None):
+    """COMMON_FLIGHT_LEG_DETAILS — Reg/Muster/Gate/Blockzeit autoritativ.
+
+    `status_out` (additiv 2026-07-31, wie bei `landing_report`): der Aufrufer
+    unterscheidet damit „LH kennt das Leg nicht" von „das Budget-Gate hat
+    zugemacht". Der Plan-Backfill braucht das, um einen NICHT gesendeten Call
+    nicht in seinem Tageszähler zu buchen. Bestandsaufrufer übergeben nichts
+    und sehen keinerlei Verhaltensänderung."""
     params = {'flightDesignator': (flight or '').upper().replace(' ', '')}
     if date:
         params['flightDate'] = _date_z(date)
@@ -1105,7 +1112,8 @@ def flight_leg_details(user_token, flight, date=None, dep=None, arr=None):
         params['departureAirport'] = dep.upper()
     if arr:
         params['arrivalAirport'] = arr.upper()
-    return _api_get(user_token, '/COMMON_FLIGHT_LEG_DETAILS', params)
+    return _api_get(user_token, '/COMMON_FLIGHT_LEG_DETAILS', params,
+                    interactive=interactive, status_out=status_out)
 
 
 def crew_hotel(user_token, station, provider=None, interactive=False):
@@ -4103,7 +4111,12 @@ def flightops_import(token):
         ics = apply_pickup_last_good(token, ics)
     try:
         import app as _app
-        with _app.app.test_request_context(json={'ics_text': ics}):
+        # `source` sagt der Pipeline, WER hier hereinreicht — sonst landet
+        # 'pdf' im gespeicherten calendar_feed und jede Diagnose liest die
+        # falsche Quelle (Gotcha 2026-07-31). Die Korrektur unten am
+        # `payload` betraf immer nur die HTTP-Antwort, nie das Profil.
+        with _app.app.test_request_context(json={'ics_text': ics,
+                                                 'source': 'flightops'}):
             rv = _app.import_calendar_feed(token)
         resp_obj, status = (rv if isinstance(rv, tuple) else (rv, 200))
         payload = resp_obj.get_json() or {}
@@ -5524,6 +5537,401 @@ def flightops_logbook_verify(token):
                     'budget': {'key': _lb_budget_key(), 'used': used,
                                'ceiling': _LB_DAY_CEILING,
                                'max_calls_per_request': _LB_MAX_CALLS,
+                               'stopped': bool(stopped),
+                               'stop_reason': stopped}})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAN-BLOCKZEITEN-BACKFILL (Task #23, Befund 2026-07-31)
+# ═════════════════════════════════════════════════════════════════════════════
+# Der Owner-Report Juli sagt 57:35, unsere Karte sagte 56:24. Ursache ist NICHT
+# unsere Rechnung: LH mutiert die duty_events-Zeiten selbst IN PLACE, unser
+# Import ersetzt die Zeile — der PLAN wurde nie erfasst (s. Banner über
+# `_preserve_plan_times` in app.py). Ab jetzt schreibt der Import ihn beim
+# ERSTEN Sehen mit; für alles, was VOR diesem Fix gelaufen ist, gibt es genau
+# eine belastbare Quelle:
+#
+#   COMMON_FLIGHT_LEG_DETAILS.scheduledTimeOfDeparture/-Arrival
+#   == die Zeiten des Released Reports, exakt (verifiziert 31.07.).
+#
+# BEWUSST KEIN MASSEN-BACKFILL. Der Tagesdeckel liegt bei 5.900 lhfo-Calls für
+# die ganze Flotte; ein Leg-Detail-Call pro Leg × ~690 verbundene User × Monate
+# wäre ein zweiter Grant-Burn. Deshalb:
+#   1. NUR auf Anforderung (dieser Endpoint), nie aus Cron/Hintergrund.
+#   2. Eigener Tagesdeckel `lhfoD-plan:<YYYYMMDD>` — schützt die ANDEREN
+#      Verbraucher vor diesem hier (Muster: `lhfoD-landing:`).
+#   3. Harter Deckel pro Aufruf + 0,7 s Abstand.
+#   4. Nur Legs, die (a) in der VERGANGENHEIT liegen und (b) noch KEINE
+#      gespeicherte Plan-Zeit haben. Ein Leg mit Plan wird nie nachgekauft.
+#   5. Geteilter Disk-Cache OHNE TTL: die Plan-Zeit eines vergangenen Legs
+#      ändert sich per Definition nie mehr. Zwei Kollegen desselben Legs
+#      teilen sie legitim (reine Flug-Fakten, kein Personenbezug).
+_PB_BUDGET_PREFIX = 'lhfoD-plan:'
+_PB_DAY_CEILING = 300            # eigener Tagesdeckel dieses Verbrauchers
+_PB_MAX_CALLS = 40               # harter Deckel je Endpoint-Aufruf
+_PB_SPACING_S = 0.7
+_PB_MAX_WINDOW_DAYS = 62         # zwei Monate am Stück, mehr nie auf einmal
+_PB_SHARED_MAX = 6000
+_PB_KEYS = ('sched_dep_iso', 'sched_arr_iso')
+
+_pb_day_memo = {'ts': 0.0, 'day': '', 'used': 0}
+_pb_day_local = {'day': '', 'n': 0}
+
+
+def _pb_budget_key(now=None):
+    return _PB_BUDGET_PREFIX + time.strftime('%Y%m%d', time.gmtime(now))
+
+
+def _pb_day_used(now=None):
+    """Tagesstand des EIGENEN Plan-Backfill-Zählers (Muster `_lb_day_used`:
+    max aus persistiertem Stand und dem, was dieser Prozess seit dem letzten
+    Flush gebucht hat). Wirft nie."""
+    day = time.strftime('%Y%m%d', time.gmtime(now))
+    if _pb_day_local['day'] != day:
+        _pb_day_local['day'], _pb_day_local['n'] = day, 0
+    ts = time.time()
+    if _pb_day_memo['day'] != day or (ts - _pb_day_memo['ts']) >= _LB_DAY_MEMO_S:
+        try:
+            from blueprints.aerox_data_blueprint import _budget_key_used
+            used = int(_budget_key_used(_pb_budget_key(now)) or 0)
+        except Exception:
+            used = 0
+        _pb_day_memo['ts'], _pb_day_memo['day'] = ts, day
+        _pb_day_memo['used'] = used
+    return max(_pb_day_memo['used'], _pb_day_local['n'])
+
+
+def _pb_budget_book(now=None):
+    day = time.strftime('%Y%m%d', time.gmtime(now))
+    if _pb_day_local['day'] != day:
+        _pb_day_local['day'], _pb_day_local['n'] = day, 0
+    _pb_day_local['n'] += 1
+    try:
+        from blueprints.lh_open_api import budget_inc_key
+        budget_inc_key(_pb_budget_key(now))
+    except Exception:
+        pass
+
+
+def _pb_iso_z(v):
+    """LH-Zeitstempel → '…Z'-ISO oder None. LH liefert hier durchgängig UTC mit
+    'Z' (Fixture `flightops_COMMON_FLIGHT_LEG_DETAILS.json`); ein Wert ohne
+    Zonenangabe wird als UTC gelesen, aber NIE geraten-verschoben."""
+    s = str(v or '').strip()
+    if len(s) < 16 or 'T' not in s:
+        return None
+    if s.endswith('Z'):
+        return s
+    if s[-6] in '+-' and s[-3] == ':':
+        return s
+    return s + 'Z'
+
+
+def flight_leg_details_plan(resp):
+    """COMMON_FLIGHT_LEG_DETAILS-Response → Plan-Zeiten. PURE/testbar.
+
+        {'sched_dep_iso', 'sched_arr_iso', 'dep', 'arr', 'tail'}
+
+    Gibt None, wenn KEINE der beiden Plan-Zeiten dasteht — ein halber
+    Datensatz ist hier kein Fund, sondern eine Einladung zum Raten."""
+    if not isinstance(resp, dict):
+        return None
+    d = _pb_iso_z(resp.get('scheduledTimeOfDeparture'))
+    a = _pb_iso_z(resp.get('scheduledTimeOfArrival'))
+    if not (d or a):
+        return None
+    out = {'sched_dep_iso': d, 'sched_arr_iso': a,
+           'dep': (resp.get('departureAirport') or '').upper() or None,
+           'arr': (resp.get('arrivalAirport') or '').upper() or None,
+           'tail': (resp.get('aircraftRegistration') or '').upper() or None}
+    return out
+
+
+def _pb_key(flight, date, dep, arr):
+    return '%s|%s|%s|%s' % ((flight or '').upper().replace(' ', ''),
+                            (date or '')[:10], (dep or '').upper(),
+                            (arr or '').upper())
+
+
+def _pb_shared_path():
+    return os.path.join(_flow_dir(), 'foplan_shared.json')
+
+
+def _pb_shared_get(key):
+    """Plan-Zeiten eines vergangenen Legs aus dem geteilten Cache oder None.
+    KEIN TTL — die Plan-Zeit eines gewesenen Legs ist unveränderlich."""
+    e = _lb_json_load(_pb_shared_path()).get(key)
+    if not isinstance(e, dict):
+        return None
+    row = {k: e[k] for k in _PB_KEYS if e.get(k)}
+    return row or None
+
+
+def _pb_shared_put(key, plan, now=None):
+    if not (key and isinstance(plan, dict)):
+        return
+    row = {k: plan[k] for k in _PB_KEYS if plan.get(k)}
+    if not row:
+        return
+    row['ts'] = now if now is not None else time.time()
+    d = _lb_json_load(_pb_shared_path())
+    d[key] = row
+    if len(d) > _PB_SHARED_MAX:
+        d = dict(sorted(d.items(), key=lambda kv: float(
+            (kv[1] or {}).get('ts') or 0), reverse=True)[:_PB_SHARED_MAX])
+    _lb_json_save(_pb_shared_path(), d)
+
+
+def _pb_block_min(sec):
+    """Plan-Blockminuten EINES Sektors aus sched_dep/sched_arr. None, wenn der
+    Plan fehlt oder unplausibel ist (>20 h = kein Leg, sondern ein Parser-
+    Unfall; dieselbe Grenze wie im iOS-`TariffHoursBuilder`)."""
+    try:
+        d = (sec or {}).get('sched_dep_iso')
+        a = (sec or {}).get('sched_arr_iso')
+        if not (d and a):
+            return None
+        dd = _dt.datetime.fromisoformat(str(d).replace('Z', '+00:00'))
+        aa = _dt.datetime.fromisoformat(str(a).replace('Z', '+00:00'))
+        m = int(round((aa - dd).total_seconds() / 60.0))
+        if m < 0:
+            m += 24 * 60                      # Tageswechsel im Feed
+        return m if 0 < m <= 20 * 60 else None
+    except Exception:
+        return None
+
+
+def _pb_is_flight_sector(sec):
+    """Nur echte, selbst geflogene Legs zählen in die Plan-Summe: eine Strecke
+    und KEIN Deadhead (`dh` kommt aus der Gratis-Ernte, Welle 0). Der Released
+    Report zählt Deadheads ebenfalls nicht als Blockzeit."""
+    s = sec or {}
+    return bool(s.get('from') and s.get('to')
+                and s.get('from') != s.get('to') and not s.get('dh'))
+
+
+def _pb_collect(briefings, ymd_from, ymd_to, now=None):
+    """(alle Flug-Sektoren im Fenster, offene Backfill-Kandidaten). PURE.
+
+    Kandidat ist ein Sektor, dem die Plan-Zeit fehlt UND dessen Abflug schon
+    vorbei ist — für die Zukunft schreibt der Import den Plan selbst (write-
+    once, s. app.py), da wäre ein LH-Call reine Verschwendung."""
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    all_secs, todo = [], []
+    for d in sorted((briefings or {}).keys()):
+        if not (isinstance(d, str) and ymd_from <= d[:10] <= ymd_to):
+            continue
+        day = briefings.get(d)
+        if not isinstance(day, dict):
+            continue
+        for s in (day.get('ical_sectors') or []):
+            if not (isinstance(s, dict) and _pb_is_flight_sector(s)):
+                continue
+            all_secs.append((d, s))
+            if s.get('sched_dep_iso') and s.get('sched_arr_iso'):
+                continue
+            try:
+                dep = _dt.datetime.fromisoformat(
+                    str(s.get('dep_iso') or '').replace('Z', '+00:00'))
+                if dep.tzinfo is None:
+                    dep = dep.replace(tzinfo=_dt.timezone.utc)
+            except Exception:
+                continue
+            if dep >= now:
+                continue
+            todo.append((d, s))
+    return all_secs, todo
+
+
+def _pb_plan_sum(all_secs):
+    """(Plan-Minuten, Legs mit Plan, Legs ohne Plan) über die gesammelten
+    Sektoren. Ein Leg OHNE Plan wird NICHT aus dep_iso/arr_iso rekonstruiert —
+    dann stünde eine Ist-Zeit als „Plan" in der Abrechnungsreferenz."""
+    total, have, miss = 0, 0, 0
+    for _d, s in all_secs or []:
+        m = _pb_block_min(s)
+        if m is None:
+            miss += 1
+        else:
+            total += m
+            have += 1
+    return total, have, miss
+
+
+def _pb_hhmm(minutes):
+    try:
+        m = int(minutes or 0)
+        return '%d:%02d' % (m // 60, m % 60)
+    except Exception:
+        return '0:00'
+
+
+@lh_flightops_bp.route('/api/lh/flightops/plan-backfill/<token>',
+                       methods=['POST'])
+def flightops_plan_backfill(token):
+    """Plan-Blockzeiten vergangener Legs aus COMMON_FLIGHT_LEG_DETAILS
+    nachtragen — ON DEMAND, gedrosselt, nie im Hintergrund (s. Banner oben).
+
+    Body: {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"} (max 62 Tage).
+    Ohne Angabe: der laufende Kalendermonat.
+
+    Antwort:
+        {ok, from, to, legs: [{datum, flight, from, to, status,
+                               sched_dep_iso, sched_arr_iso, block_min}],
+         calls, written,
+         plan: {block_min, block_hhmm, legs_with_plan, legs_without_plan,
+                legs_total}}
+    `status`: 'ok' (frisch von LH) · 'cache' (geteilter Plan-Cache) ·
+    'have' (Plan lag schon in der Zeile) · 'future' (Abflug noch offen — der
+    Import stempelt selbst) · 'not_found' (LH kennt das Leg nicht mehr) ·
+    'budget'/'skipped_budget' · 'error'.
+
+    Der Plan-Block wird NIE aus dep_iso/arr_iso rekonstruiert: diese Werte
+    sind nach dem Flug LH-seitig Ist-nah, und ein synthetisierter Plan in
+    einer Abrechnungsreferenz wäre schlimmer als eine Lücke."""
+    _st, _acc = _access_state(token)
+    if _st == 'pending':
+        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+    if _st != 'ok':
+        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+    b = request.get_json(silent=True) or {}
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    f_raw = str(b.get('from') or '')[:10]
+    t_raw = str(b.get('to') or '')[:10]
+    try:
+        d_from = (_dt.date.fromisoformat(f_raw) if f_raw
+                  else today.replace(day=1))
+        d_to = _dt.date.fromisoformat(t_raw) if t_raw else today
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'bad_range'}), 400
+    if d_to < d_from:
+        return jsonify({'ok': False, 'error': 'bad_range'}), 400
+    if (d_to - d_from).days + 1 > _PB_MAX_WINDOW_DAYS:
+        return jsonify({'ok': False, 'error': 'range_too_wide',
+                        'max_days': _PB_MAX_WINDOW_DAYS}), 400
+    ymd_from, ymd_to = d_from.isoformat(), d_to.isoformat()
+
+    import app as _app
+    try:
+        briefings = dict(_app._ical_briefings_load(token) or {})
+    except Exception as e:
+        log.warning('[lh_flightops] plan-backfill load: %s', type(e).__name__)
+        return jsonify({'ok': False, 'error': 'briefings_unavailable'}), 503
+
+    all_secs, todo = _pb_collect(briefings, ymd_from, ymd_to)
+    todo_ids = {id(s) for _d, s in todo}
+    rows, calls, written, stopped = [], 0, 0, None
+
+    for d, s in all_secs:
+        flight = re.sub(r'\s+', '', str(s.get('flight') or '')).upper()
+        row = {'datum': d, 'flight': flight or None,
+               'from': s.get('from'), 'to': s.get('to'),
+               'sched_dep_iso': s.get('sched_dep_iso'),
+               'sched_arr_iso': s.get('sched_arr_iso'),
+               'block_min': _pb_block_min(s)}
+        if id(s) not in todo_ids:
+            row['status'] = ('have' if (s.get('sched_dep_iso')
+                                        and s.get('sched_arr_iso'))
+                             else 'future')
+            rows.append(row)
+            continue
+        if not flight:
+            row['status'] = 'error'
+            rows.append(row)
+            continue
+        key = _pb_key(flight, d, s.get('from'), s.get('to'))
+        cached = _pb_shared_get(key)
+        if cached:
+            s.update(cached)
+            written += 1
+            row.update(cached)
+            row['block_min'] = _pb_block_min(s)
+            row['status'] = 'cache'
+            rows.append(row)
+            continue
+        if stopped:
+            row['status'] = stopped
+            rows.append(row)
+            continue
+        if calls >= _PB_MAX_CALLS:
+            row['status'] = 'skipped_budget'
+            rows.append(row)
+            continue
+        if _pb_day_used() >= _PB_DAY_CEILING:
+            log.warning('[lh_flightops] plan-Tagesdeckel %s >= %s — Backfill '
+                        'stoppt (Rest als status=budget)',
+                        _pb_day_used(), _PB_DAY_CEILING)
+            stopped = 'budget'
+            row['status'] = 'budget'
+            rows.append(row)
+            continue
+        if calls and _PB_SPACING_S > 0:
+            time.sleep(_PB_SPACING_S)
+        _lh = {}
+        try:
+            resp = flight_leg_details(token, flight, d,
+                                      s.get('from'), s.get('to'),
+                                      interactive=True, status_out=_lh)
+        except Exception as e:
+            log.warning('[lh_flightops] plan-backfill %s %s: %s',
+                        flight, d, type(e).__name__)
+            resp, _lh = None, {'kind': 'error'}
+        _kind = _lh.get('kind')
+        if _kind not in ('no_access', 'hour_budget', 'day_budget'):
+            # Nur GESENDETE Calls buchen — exakt wie im Landing-Report-Pfad.
+            _pb_budget_book()
+            calls += 1
+        plan = flight_leg_details_plan(resp)
+        if not plan:
+            # LH liefert für ein zu altes/unbekanntes Leg schlicht nichts.
+            # Das ist eine Lücke, kein Wert — nichts rekonstruieren.
+            if _kind in ('hour_budget', 'day_budget'):
+                # Der GLOBALE lhfo-Deckel hat zugemacht — der Rest des
+                # Fensters bekommt dieselbe ehrliche Antwort statt Leerläufe.
+                row['status'] = stopped = 'budget'
+                log.warning('[lh_flightops] plan-backfill gestoppt (%s) — '
+                            'Rest des Fensters als status=budget', _kind)
+            elif _kind == 'no_access':
+                row['status'] = stopped = 'error'
+            elif _kind == 'http' and _lh.get('code') == 404:
+                row['status'] = 'not_found'
+            else:
+                row['status'] = ('not_found' if (_kind == 'ok'
+                                                 or isinstance(resp, dict))
+                                 else 'error')
+            rows.append(row)
+            continue
+        keep = {k: plan[k] for k in _PB_KEYS if plan.get(k)}
+        _pb_shared_put(key, keep)
+        s.update(keep)
+        written += 1
+        row.update(keep)
+        row['block_min'] = _pb_block_min(s)
+        row['status'] = 'ok'
+        rows.append(row)
+
+    if written:
+        try:
+            _app._ical_briefings_save(token, briefings)
+        except Exception as e:
+            log.warning('[lh_flightops] plan-backfill save: %s',
+                        type(e).__name__)
+            return jsonify({'ok': False, 'error': 'briefings_persist_failed',
+                            'calls': calls}), 503
+
+    total, have, miss = _pb_plan_sum(all_secs)
+    log.info('[lh_flightops] plan-backfill %s..%s legs=%d todo=%d calls=%d '
+             'written=%d plan=%s', ymd_from, ymd_to, len(all_secs), len(todo),
+             calls, written, _pb_hhmm(total))
+    return jsonify({'ok': True, 'from': ymd_from, 'to': ymd_to,
+                    'legs': rows, 'calls': calls, 'written': written,
+                    'plan': {'block_min': total, 'block_hhmm': _pb_hhmm(total),
+                             'legs_with_plan': have, 'legs_without_plan': miss,
+                             'legs_total': len(all_secs)},
+                    'budget': {'key': _pb_budget_key(),
+                               'used': _pb_day_used(),
+                               'ceiling': _PB_DAY_CEILING,
+                               'max_calls_per_request': _PB_MAX_CALLS,
                                'stopped': bool(stopped),
                                'stop_reason': stopped}})
 

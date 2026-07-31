@@ -123,7 +123,14 @@ def test_carrier_mapping():
 
 def test_import_endpoint_ics_text_direct_path():
     """`ics_text` läuft ohne Fetch durch die volle Pipeline und markiert die
-    Quelle als pdf (url leer)."""
+    Quelle als pdf (url leer).
+
+    GEÄNDERT 31.07.: `import_calendar_feed` schreibt nicht mehr für JEDEN
+    Direkt-ICS-Import hart 'pdf' (das log für FlightOps und den Geräte-Abruf),
+    sondern das, was der Aufrufer angibt. Dieser Test spielt den PDF-Pfad
+    nach — also reicht er `source` genauso mit, wie `import_roster_pdf` es
+    real tut. Ohne Angabe wäre 'ics_direct' (Geräte-Abruf) die ehrliche
+    Antwort."""
     token = 'AT-TEST-CREWACCESS-1'
     # IDEMPOTENZ: Disk-State früherer Läufe räumen — briefings_imported zählt
     # nur NEUE Tage; ohne Cleanup wäre der zweite Lauf 0 (Suite-Ordnungs-Rot).
@@ -135,7 +142,8 @@ def test_import_endpoint_ics_text_direct_path():
             pass
     ics, err = backend._crewaccess_text_to_ics(SYN_TEXT, carrier='VL')
     assert err is None
-    with backend.app.test_request_context(json={'ics_text': ics}):
+    with backend.app.test_request_context(json={'ics_text': ics,
+                                                 'source': 'pdf'}):
         rv = backend.import_calendar_feed(token)
     resp, status = (rv if isinstance(rv, tuple) else (rv, 200))
     payload = resp.get_json()

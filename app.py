@@ -48079,8 +48079,96 @@ def _build_ical_sectors(events):
     return sec_by_day
 
 
-def _attach_sectors(briefings, events):
-    """Hängt die aus `events` gebauten Pro-Leg-Sektoren an die Tagessätze."""
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAN-BLOCKZEITEN (Befund 2026-07-31, Owner-Report Juli: 56:24 vs. LH 57:35)
+# ═════════════════════════════════════════════════════════════════════════════
+# LH mutiert die duty_events-Zeiten SELBST IN PLACE: nach dem Flug stehen dort
+# Ist-nahe (teils uniform verschobene) Werte — ohne jedes Provenienz-Feld, Plan
+# und Ist sind in der Antwort ununterscheidbar. Unser Import ersetzt die Zeile
+# komplett ⇒ der PLAN wurde nie erfasst. Das ist der eigentliche Verlust: der
+# Plan ist die ABRECHNUNGSREFERENZ (MTV Nr. 2a § 9 (4) f) rechnet Kont auf der
+# PLANMÄSSIGEN Blockzeit; `TariffHoursBuilder` liest heute `dep_iso`/`arr_iso`
+# als „Plan-Blockzeit"). `_enrich_leg_delays` ist unschuldig — rein additiv.
+#
+# Drei Regeln, bewusst eng (Owner-Regel „keine Fake-Werte"):
+#   1. WRITE-ONCE: ein einmal gespeicherter sched_* wird NIE überschrieben.
+#      Er ist der einzige Zeuge des Plans, den es gibt.
+#   2. Frisch gestempelt wird NUR, solange der Abflug noch in der ZUKUNFT
+#      liegt. Sonst würde der Historie-Loader (LH hält ~6 Monate rückwärts,
+#      dort steht längst Post-Op) diese Werte als „Plan" festschreiben — ein
+#      synthetisierter Plan wäre schlimmer als gar keiner.
+#   3. Vergangene Legs ohne gespeicherten Plan bleiben LEER. Sie sind der
+#      Backfill-Fall über COMMON_FLIGHT_LEG_DETAILS (on-demand, gedrosselt —
+#      `blueprints/lh_flightops.plan_backfill_days`), nicht der Rate-Fall.
+_PLAN_TIME_PAIRS = (('sched_dep_iso', 'dep_iso'), ('sched_arr_iso', 'arr_iso'))
+
+
+def _sector_leg_key(sec):
+    """Identität eines Sektors für den Plan-Übertrag: Flugnummer + Strecke.
+    Whitespace-/Case-normalisiert, damit „LH 440" und „LH440" dasselbe Leg
+    sind (die Quellen schreiben beides)."""
+    return (re.sub(r'\s+', '', str((sec or {}).get('flight') or '')).upper(),
+            str((sec or {}).get('from') or '').upper().strip(),
+            str((sec or {}).get('to') or '').upper().strip())
+
+
+def _preserve_plan_times(secs, prev_secs, now=None):
+    """Plan-Zeiten über einen Re-Import retten. PURE (bis auf das In-place-
+    Schreiben in `secs`) und mit Mock-Zeit testbar.
+
+    `prev_secs` sind die zuvor GESPEICHERTEN Sektoren desselben Tages. Bei
+    mehreren Sektoren mit identischem Leg-Key (Doppel-Umlauf) zählt die
+    Reihenfolge — n-ter neuer Sektor ↔ n-ter alter Sektor derselben Route.
+    Gibt `secs` zurück."""
+    try:
+        now = now or datetime.now(timezone.utc)
+        prev_by_key = {}
+        for p in (prev_secs or []):
+            if isinstance(p, dict):
+                prev_by_key.setdefault(_sector_leg_key(p), []).append(p)
+        for s in (secs or []):
+            if not isinstance(s, dict):
+                continue
+            _q = prev_by_key.get(_sector_leg_key(s))
+            prev = _q.pop(0) if _q else None
+            # (1) WRITE-ONCE: was schon einmal als Plan feststand, gewinnt.
+            for _dst, _src in _PLAN_TIME_PAIRS:
+                _v = (prev or {}).get(_dst)
+                if isinstance(_v, str) and _v.strip():
+                    s[_dst] = _v
+            if all(s.get(_dst) for _dst, _ in _PLAN_TIME_PAIRS):
+                continue
+            # (2) Erst-Stempel nur für die ZUKUNFT — ein Abflug, der bereits
+            # vorbei ist, kann in dieser Antwort schon der Ist-Wert sein.
+            _dep_dt = None
+            try:
+                _dep_raw = str(s.get('dep_iso') or '')
+                if _dep_raw:
+                    _dep_dt = datetime.fromisoformat(
+                        _dep_raw.replace('Z', '+00:00'))
+                    if _dep_dt.tzinfo is None:
+                        _dep_dt = _dep_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                _dep_dt = None
+            if not (_dep_dt and _dep_dt > now):
+                continue
+            for _dst, _src in _PLAN_TIME_PAIRS:
+                _v = s.get(_src)
+                if not s.get(_dst) and isinstance(_v, str) and _v.strip():
+                    s[_dst] = _v
+    except Exception as e:
+        app.logger.warning(f'[ical-briefings] plan-preserve-fail: {str(e)[:160]}')
+    return secs
+
+
+def _attach_sectors(briefings, events, existing=None):
+    """Hängt die aus `events` gebauten Pro-Leg-Sektoren an die Tagessätze.
+
+    `existing` = die zuvor GESPEICHERTE Briefing-Map (beide Import-Pfade haben
+    sie ohnehin geladen). Sie ist nötig, weil `_ics_events_to_briefings` jeden
+    von diesem Lauf berührten Tag FRISCH aufbaut (REPLACE-NOT-ACCUMULATE) —
+    der alte Tages-Dict inklusive seiner Plan-Zeiten ist an dieser Stelle
+    sonst schon weg."""
     try:
         for d, secs in _build_ical_sectors(events).items():
             day = briefings.get(d)
@@ -48108,6 +48196,14 @@ def _attach_sectors(briefings, events):
                                     (_s.get('to') or '').upper()))
                     if _q:
                         _s['flight'] = _q.pop(0)
+            # PLAN-BLOCKZEITEN retten — NACH dem Flugnummern-Backfill, sonst
+            # träfe der Leg-Key (flight+from+to) bei Feeds ohne Flugnummer im
+            # VEVENT daneben.
+            _prev_day = (existing or {}).get(d)
+            _preserve_plan_times(
+                secs,
+                (_prev_day.get('ical_sectors')
+                 if isinstance(_prev_day, dict) else None))
             day['ical_sectors'] = secs
     except Exception as e:
         app.logger.warning(f'[ical-briefings] sectors-attach-fail: {str(e)[:160]}')
@@ -48398,6 +48494,15 @@ def _merge_feed_events(primary, secondary):
     return out
 
 
+# Die drei Wege, auf denen ICS-TEXT direkt (ohne URL-Zyklus) hereinkommt.
+# Gemeinsam ist ihnen genau eine Eigenschaft, an der Verhalten hängt: es gibt
+# keine `url`, über die der Server nachladen könnte (kein Auto-Refresh) —
+# deshalb der 35-Tage-Schutz gegen das EK-Push-Reconcile (s.
+# upload_calendar_events). Der WERT unterscheidet sie nur noch für Diagnose
+# und UI; vor 2026-07-31 schrieben alle drei 'pdf'.
+_DIRECT_ICS_SOURCES = ('pdf', 'flightops', 'ics_direct')
+
+
 @app.route('/api/user/calendar-feed/<token>/import', methods=['POST'])
 def import_calendar_feed(token):
     """Lädt ein ICS-File von einer URL und speichert die Events als Roster-Hints.
@@ -48424,6 +48529,15 @@ def import_calendar_feed(token):
     # LEON-Off-Days). Additiv: fehlt er, greift der bestehende url_2/gespeichert-
     # Fallback unverändert.
     ics_text_2_direct = body.get('ics_text_2') if isinstance(body.get('ics_text_2'), str) else None
+    # QUELL-ETIKETT (Diagnose-Gotcha 2026-07-31): `calendar_feed.source` stand
+    # für JEDEN Direkt-ICS-Import hart auf 'pdf' — auch für den FlightOps-
+    # Import und den Geräte-Abruf. Die beiden internen Aufrufer korrigierten
+    # das nur in ihrer HTTP-ANTWORT, nie im gespeicherten Profil; jede
+    # Diagnose las danach „PDF", wo LH-FlightOps stand. Jetzt sagt der
+    # Aufrufer, was er ist; unbekannte/fehlende Angabe = der Geräte-Abruf.
+    _src_hint = str(body.get('source') or '').strip().lower()
+    if _src_hint not in _DIRECT_ICS_SOURCES:
+        _src_hint = 'ics_direct'
     if ics_text_direct and len(ics_text_direct) > 1_000_000:
         return jsonify({'ok': False, 'error': 'response_too_large'}), 413
     if ics_text_2_direct and len(ics_text_2_direct) > 1_000_000:
@@ -48621,12 +48735,15 @@ def import_calendar_feed(token):
         feed_obj.pop('refresh_fail_count', None)
         feed_obj.pop('last_refresh_fail_at', None)
         if ics_text_direct:
-            # PDF-Import: kein URL-Zyklus (Auto-Refresh hat nichts zu holen) —
-            # Quelle ehrlich markieren, damit Diagnose/UI sie unterscheiden kann.
+            # Direkt-ICS: kein URL-Zyklus (der Server-Auto-Refresh hat nichts
+            # zu holen) — Quelle ehrlich markieren, damit Diagnose/UI sie
+            # unterscheiden kann. Der WERT ist neu ehrlich ('pdf' /
+            # 'flightops' / 'ics_direct'), das VERHALTEN unverändert: alle
+            # drei zählen als Direkt-ICS (s. _DIRECT_ICS_SOURCES).
             if _prev_feed_url.startswith('https://'):
                 feed_obj['pickup_ical_url'] = _prev_feed_url
             feed_obj['url'] = ''
-            feed_obj['source'] = 'pdf'
+            feed_obj['source'] = _src_hint
         elif url.startswith('https://'):
             # Echter Link-Import → derselbe Link ist auch die Pickup-Zweitquelle.
             feed_obj['pickup_ical_url'] = url
@@ -48692,7 +48809,9 @@ def import_calendar_feed(token):
             _reconcile_dbg = _reconcile_month_briefings(
                 token, briefings, _ev_sel, full_clean=_full_clean)
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
-        _attach_sectors(briefings, _ev_sel)
+        # `existing` = gespeicherter Stand VOR diesem Import → Plan-Blockzeiten
+        # überleben den Replace (s. _preserve_plan_times).
+        _attach_sectors(briefings, _ev_sel, existing=existing)
         if not _ical_briefings_save(token, briefings):
             _persist_err = 'briefings_persist_failed'
     except Exception as e:
@@ -49281,7 +49400,8 @@ def import_roster_pdf(token):
         return jsonify({'ok': False, 'error': perr}), 422
     # Interner Dispatch in die EINE Feed-Pipeline (wallreply-Muster) — kein
     # Fetch, volles Parse/Merge/Briefings/Reconcile/Sektoren-Verhalten.
-    with app.test_request_context(json={'ics_text': ics}):
+    # `source` explizit — hier ist es WIRKLICH ein PDF (s. _DIRECT_ICS_SOURCES).
+    with app.test_request_context(json={'ics_text': ics, 'source': 'pdf'}):
         rv = import_calendar_feed(token)
     resp_obj, status = (rv if isinstance(rv, tuple) else (rv, 200))
     try:
@@ -49352,13 +49472,17 @@ def upload_calendar_events(token):
                     feed_obj_ios['imported_at'])).total_seconds()
                 if (feed_obj_ios.get('url') or '').strip():
                     _url_feed_fresh = _imp_age_s < 4 * _FEED_REFRESH_MIN_AGE_S
-                elif feed_obj_ios.get('source') == 'pdf':
-                    # PDF-Import (Discover/City, Echte-User-Befund 2026-07-22):
-                    # source='pdf' hat url='' -> der EK-Push hielt sich fuer die
-                    # Autoritaet und RAEUMTE die frisch importierten PDF-Tage
+                elif feed_obj_ios.get('source') in _DIRECT_ICS_SOURCES:
+                    # Direkt-ICS-Import (Discover/City-PDF, LH-FlightOps,
+                    # Geräte-Abruf; Echte-User-Befund 2026-07-22): diese
+                    # Quellen haben url='' -> der EK-Push hielt sich fuer die
+                    # Autoritaet und RAEUMTE die frisch importierten Tage
                     # wieder weg (User AT-553136915: 33 Events -> 4 Tage).
-                    # Ein PDF wird monatlich hochgeladen und hat KEINEN
-                    # Auto-Refresh -> 35 Tage Schutz; ?full=1 bleibt Override.
+                    # Sie haben KEINEN Server-Auto-Refresh ueber `url`
+                    # -> 35 Tage Schutz; ?full=1 bleibt Override.
+                    # (Bis 2026-07-31 schrieben ALLE DREI faelschlich 'pdf';
+                    # die Mengenpruefung haelt das Verhalten exakt gleich,
+                    # waehrend das Etikett ehrlich wird.)
                     _url_feed_fresh = _imp_age_s < 35 * 86400
         except Exception:
             pass
@@ -49445,8 +49569,9 @@ def upload_calendar_events(token):
         else:
             _reconcile_dbg = _reconcile_month_briefings(
                 token, briefings, adapted, full_clean=_full_clean)
-        # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad).
-        _attach_sectors(briefings, adapted)
+        # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad) —
+        # inkl. Plan-Blockzeiten aus dem gespeicherten Stand.
+        _attach_sectors(briefings, adapted, existing=existing_briefings)
         _persist_err = (None if _ical_briefings_save(token, briefings)
                         else 'briefings_persist_failed')
     except Exception as e:
