@@ -837,3 +837,167 @@ def test_frische_schranke_ist_fail_open():
 def test_updated_at_wird_ueberhaupt_gelesen():
     """Die Schranke kann nur greifen, wenn das Select das Feld mitbringt."""
     assert 'updated_at' in lh_mqtt._SECTOR_SELECT
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# R1 — Abo-Fenster haengt an der ANKUNFT (Audit 2026-07-31)
+# ════════════════════════════════════════════════════════════════════════════
+# Bis heute endete das Abo 4 h nach dem ABFLUG. Jeder Flug mit mehr als 4 h
+# Block verlor sein Topic MITTEN IM FLUG: 24,7 % aller Legs, Median 5,6 h
+# blind, Maximum 10,3 h — und zwar immer im Endanflug, wo die Ankunftszeit
+# gebraucht wird. 11 von 11 beobachteten `arrived`-Events waren <=2,2-h-Fluege;
+# LH433 (8,5 h Block) lieferte 0 Events. Das ist die Wurzel von „arrival time
+# was wrong the whole time".
+
+# LH433 MUC-ORD: Abflug 15:10Z, Ankunft 00:10Z am Folgetag = 9 h Block.
+LH433 = {'flight': 'LH433', 'from': 'MUC', 'to': 'ORD',
+         'dep_iso': '2026-07-22T15:10:00Z', 'arr_iso': '2026-07-23T00:10:00Z'}
+LH433_TOPIC = 'prd/FlightUpdate/LH/LH433/2026-07-22'
+
+
+def test_langstrecke_behaelt_ihr_topic_mitten_im_flug():
+    """DER Fall aus dem Audit: 6 h nach dem Abflug, 3 h vor der Landung. Mit
+    dem alten Abflug-Fenster (-4 h) war das Topic zu diesem Zeitpunkt seit zwei
+    Stunden abbestellt."""
+    now = datetime(2026, 7, 22, 21, 10, tzinfo=timezone.utc)   # dep + 6h
+    assert lh_mqtt.topics_for_rows(_rows([LH433]), now) == [LH433_TOPIC]
+    # Gegenprobe, dass der Test wirklich den Regressionsfall trifft:
+    dep = lh_mqtt._parse_iso_utc(LH433['dep_iso'])
+    assert now - dep > timedelta(hours=lh_mqtt._SUB_PAST_H)
+
+
+def test_langstrecke_behaelt_ihr_topic_bis_kurz_vor_der_landung():
+    """10 Minuten vor der geplanten Landung — genau dann kommen die
+    interessanten est_arr-Ticks."""
+    now = datetime(2026, 7, 23, 0, 0, tzinfo=timezone.utc)
+    assert lh_mqtt.topics_for_rows(_rows([LH433]), now) == [LH433_TOPIC]
+
+
+def test_abo_endet_eine_stunde_nach_der_ankunft():
+    """Danach ist es vorbei — das Fenster darf nicht ins Unendliche wachsen."""
+    arr = lh_mqtt._parse_iso_utc(LH433['arr_iso'])
+    assert lh_mqtt.topics_for_rows(
+        _rows([LH433]), arr + timedelta(minutes=59)) == [LH433_TOPIC]
+    assert lh_mqtt.topics_for_rows(
+        _rows([LH433]), arr + timedelta(minutes=61)) == []
+
+
+def test_ohne_ankunftszeit_gilt_die_konservative_blockannahme():
+    """Kein `arr_iso` in der Zeile: dann wird GROSSZUEGIG angenommen, nicht
+    knapp. Ein zu kurzes Fenster ist genau der Fehler, der hier behoben wird."""
+    s = {k: v for k, v in LH433.items() if k != 'arr_iso'}
+    dep = lh_mqtt._parse_iso_utc(s['dep_iso'])
+    assert lh_mqtt.topics_for_rows(_rows([s]), dep + timedelta(hours=10)) \
+        == [LH433_TOPIC]
+    assert lh_mqtt.topics_for_rows(_rows([s]), dep + timedelta(hours=16, minutes=59)) \
+        == [LH433_TOPIC]
+    assert lh_mqtt.topics_for_rows(_rows([s]), dep + timedelta(hours=18)) == []
+
+
+def test_kaputte_ankunftszeit_erzeugt_kein_dauer_abo():
+    """Ein verrutschtes Datum (arr im naechsten Jahr) darf nicht dazu fuehren,
+    dass ein Topic monatelang gehalten wird."""
+    s = dict(LH433, arr_iso='2027-07-23T00:10:00Z')
+    dep = lh_mqtt._parse_iso_utc(s['dep_iso'])
+    assert lh_mqtt.topics_for_rows(_rows([s]), dep + timedelta(hours=20)) \
+        == [LH433_TOPIC]
+    assert lh_mqtt.topics_for_rows(_rows([s]), dep + timedelta(hours=22)) == []
+
+
+def test_ankunft_vor_abflug_faellt_auf_die_annahme_zurueck():
+    """Unsinnige Reihenfolge (arr <= dep) ist keine Ankunft — konservativ
+    behandeln statt das Abo sofort zu beenden."""
+    s = dict(LH433, arr_iso='2026-07-22T14:00:00Z')      # vor dem Abflug
+    dep = lh_mqtt._parse_iso_utc(s['dep_iso'])
+    assert lh_mqtt.topics_for_rows(_rows([s]), dep + timedelta(hours=10)) \
+        == [LH433_TOPIC]
+
+
+def test_neues_fenster_enthaelt_immer_das_alte():
+    """Die harte Garantie dieser Aenderung: sie kann kein Abo VERLIEREN. Alles,
+    was das alte Abflug-Fenster (-4 h) drin hatte, ist auch jetzt drin — auch
+    Kurzstrecken, deren Ankunft laengst vorbei ist (dann traegt der Boden
+    `dep + _SUB_PAST_H`)."""
+    for block_min in (25, 45, 90, 240, 480, 720):
+        for age_h in (0, 0.5, 1, 2, 3, 3.9):
+            dep = NOW - timedelta(hours=age_h)
+            s = {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
+                 'dep_iso': dep.isoformat(),
+                 'arr_iso': (dep + timedelta(minutes=block_min)).isoformat()}
+            assert lh_mqtt.topics_for_rows(_rows([s]), NOW), (block_min, age_h)
+
+
+def test_vorlauf_bleibt_bei_48_stunden():
+    """Vorne aendert sich nichts: der Abflug begrenzt weiterhin."""
+    s = dict(LH433, dep_iso=(NOW + timedelta(hours=47)).isoformat(),
+             arr_iso=(NOW + timedelta(hours=56)).isoformat())
+    assert lh_mqtt.topics_for_rows(_rows([s]), NOW)
+    s = dict(LH433, dep_iso=(NOW + timedelta(hours=49)).isoformat(),
+             arr_iso=(NOW + timedelta(hours=58)).isoformat())
+    assert lh_mqtt.topics_for_rows(_rows([s]), NOW) == []
+
+
+# ── Zeitzonen-Zellen (die teuerste Fehlerklasse dieses Projekts) ────────────
+
+def test_ankunft_mit_offset_wird_als_ortszeit_gelesen():
+    """`arr_iso` mit Offset ist NICHT UTC. 02:10+02:00 ist 00:10Z — wer den
+    Offset ignoriert, haelt das Abo zwei Stunden zu lang."""
+    s = dict(LH433, arr_iso='2026-07-23T02:10:00+02:00')
+    dep = lh_mqtt._parse_iso_utc(s['dep_iso'])
+    end = lh_mqtt.sector_sub_end(s, dep)
+    assert end == datetime(2026, 7, 23, 1, 10, tzinfo=timezone.utc)
+
+
+def test_ankunft_mit_negativem_offset_wird_als_ortszeit_gelesen():
+    """Gegenprobe westwaerts (ORD = UTC-5): 19:10-05:00 ist 00:10Z."""
+    s = dict(LH433, arr_iso='2026-07-22T19:10:00-05:00')
+    dep = lh_mqtt._parse_iso_utc(s['dep_iso'])
+    assert lh_mqtt.sector_sub_end(s, dep) == datetime(
+        2026, 7, 23, 1, 10, tzinfo=timezone.utc)
+
+
+def test_naive_ankunft_gilt_als_utc():
+    """Ohne Offset gilt die Roster-Konvention: dep_iso/arr_iso sind UTC-gekeyt
+    (s. _parse_iso_utc). Keine Interpretation in der Prozess-Zeitzone."""
+    s = dict(LH433, arr_iso='2026-07-23T00:10:00')
+    dep = lh_mqtt._parse_iso_utc(s['dep_iso'])
+    assert lh_mqtt.sector_sub_end(s, dep) == datetime(
+        2026, 7, 23, 1, 10, tzinfo=timezone.utc)
+
+
+def test_abo_fenster_ist_unabhaengig_von_der_geraete_zeitzone(monkeypatch):
+    """Die Rechnung darf NUR mit aware-UTC arbeiten. Unter einer fremden
+    Prozess-Zonen-Einstellung muss dasselbe herauskommen."""
+    import os as _os
+    import time as _time
+    dep = lh_mqtt._parse_iso_utc(LH433['dep_iso'])
+    ref = lh_mqtt.sector_sub_end(LH433, dep)
+    alt = _os.environ.get('TZ')
+    try:
+        for zone in ('Pacific/Auckland', 'America/Los_Angeles', 'UTC'):
+            _os.environ['TZ'] = zone
+            try:
+                _time.tzset()
+            except AttributeError:                      # pragma: no cover
+                continue
+            assert lh_mqtt.sector_sub_end(LH433, dep) == ref, zone
+    finally:
+        if alt is None:
+            _os.environ.pop('TZ', None)
+        else:
+            _os.environ['TZ'] = alt
+        try:
+            _time.tzset()
+        except AttributeError:                          # pragma: no cover
+            pass
+
+
+def test_est_arr_schlaegt_fehlende_arr_iso():
+    """Traegt die Zeile eine SCHAETZUNG statt einer Planankunft, wird die
+    benutzt — statt auf die 16-h-Annahme zu fallen."""
+    s = {k: v for k, v in LH433.items() if k != 'arr_iso'}
+    s['est_arr'] = '2026-07-23T00:10:00Z'
+    dep = lh_mqtt._parse_iso_utc(s['dep_iso'])
+    assert lh_mqtt.sector_sub_end(s, dep) == datetime(
+        2026, 7, 23, 1, 10, tzinfo=timezone.utc)
+

@@ -17,8 +17,10 @@ Refresh, Dedupe) lebt in diesem Blueprint — offline testbar, ein Deploy-Pfad.
 Endpoints (Auth wie /api/internal/poll-boards: `X-Poll-Secret` ==
 ADSB_POLL_SECRET; ohne gesetztes Secret nur localhost):
 - GET  /api/internal/lh-mqtt/topics — Topic-Liste aus den Roster-Sektoren
-  aller User (LH-Group, Abflug −4h…+48h; Topic-Datum = LOKALES Abflugdatum
-  am Start-Airport via AIRPORT_TZ — der Broker keyt auf das operationelle
+  aller User (LH-Group; Abflug bis +48h voraus, Abo läuft bis ANKUNFT +1h —
+  s. `_SUB_ARR_GRACE_H`, das Fenster hing bis 2026-07-31 am Abflug und warf
+  Langstrecken mitten im Flug ab; Topic-Datum = LOKALES Abflugdatum am
+  Start-Airport via AIRPORT_TZ — der Broker keyt auf das operationelle
   Lokal-Datum, UTC-Datum kann daneben liegen).
 - POST /api/internal/lh-mqtt/event — ein empfangenes Broker-Event: frische
   LH-Fakten ziehen (force, umgeht den 120s-Memo) und betroffene Crews pushen
@@ -45,11 +47,44 @@ from blueprints.lh_open_api import is_lh_group, lh_flight_facts
 log = logging.getLogger('aerotax')
 lh_mqtt_bp = Blueprint('lh_mqtt_bp', __name__)
 
-# Abflug-Fenster für Subscriptions: leicht in die Vergangenheit (laufende
-# Flüge behalten ihr Topic bis zur Landung), 48h voraus (Gate-Änderungen
-# kommen ohnehin erst kurz vorher, Cancellations auch mal früher).
-_SUB_PAST_H = 4
-_SUB_FUTURE_H = 48
+# ── Abo-Fenster: es hängt an der ANKUNFT, nicht am Abflug ───────────────────
+#
+# ⚠️ HIER LAG DIE WURZEL DER BESCHWERDE „arrival time was wrong the whole time"
+# (Audit 2026-07-31, read-only, Zahlen aus ax_api_budget + 52-Event-Mitschnitt).
+#
+# Bis heute stand hier ein reines ABFLUG-Fenster: `dep ∈ [now−4h, now+48h]`.
+# Der Kommentar behauptete „laufende Flüge behalten ihr Topic bis zur Landung" —
+# das galt nur für Kurzstrecke. Jeder Flug mit mehr als 4 h Blockzeit verlor
+# sein Abo MITTEN IM FLUG:
+#   · 24,7 % aller Legs (355 von 1440) betroffen
+#   · Median 5,6 h blind, Maximum 10,3 h blind — jeweils VOR der Landung
+#   · empirisch: 11 von 11 beobachteten `arrived`-Events waren ≤2,2-h-Flüge;
+#     LH433 (8,5 h) lieferte in der ganzen Messung 0 Events
+# Genau deshalb kam auf Langstrecke nie ein est_arr/arrived an, die Live
+# Activity zählte bis zur beim Abflug eingefrorenen Zeit herunter, und der
+# Rückblick sah nie die echte Landung.
+#
+# Neu: das Fenster endet ARR+1h (echte `arr_iso` des Sektors). Kein bekanntes
+# arr ⇒ konservative Max-Blockannahme (`_SUB_BLOCK_FALLBACK_H`) statt einer
+# kurzen Annahme — lieber ein Topic zu lang halten als wieder mitten im Flug
+# abmelden. Das Ergebnis ist eine echte OBERMENGE des alten Fensters: der
+# Boden `dep + _SUB_PAST_H` bleibt als Untergrenze stehen, das Abo kann also
+# nie KÜRZER werden als es heute schon ist.
+#
+# Topic-Zahl: das Fenster verlängert im Schnitt um Stunden. Der Audit fand
+# kein beobachtetes LH-Limit (40er-Chunks fehlerfrei), trotzdem wird die Zahl
+# in `_topics_compute` geloggt — wer sie nicht misst, merkt eine Decke erst,
+# wenn Abos still fehlen.
+_SUB_PAST_H = 4                # Untergrenze: nie kürzer als das alte Fenster
+_SUB_FUTURE_H = 48             # Vorlauf (Gate/Cancel kommen früher als der Flug)
+_SUB_ARR_GRACE_H = 1           # nach der geplanten Ankunft noch zuhören
+# Kein `arr_iso` im Sektor: der längste LH-Group-Umlauf liegt deutlich unter
+# 16 h Block — diese Annahme ist bewusst zu GROSSZÜGIG, weil ein zu kurzes
+# Fenster genau der Fehler ist, den diese Änderung behebt.
+_SUB_BLOCK_FALLBACK_H = 16
+# Obergrenze gegen kaputte/verrutschte arr-Zeiten (Datumssprung im iCal, arr
+# im nächsten Jahr): ein einzelner Mülleintrag darf kein Dauer-Abo erzeugen.
+_SUB_BLOCK_MAX_H = 20
 
 # Inbound-Watch (Owner 22.07.: „was cool ist, wann der Inbound-Flieger
 # abfliegt und ankommt — dann weiß man im Layover, ob es pünktlich ist"):
@@ -439,18 +474,59 @@ def _iter_sectors(rows):
                 yield tok, s
 
 
+def sector_sub_end(sector, dep):
+    """Ende des Abo-Fensters EINES Sektors (aware UTC). Pure.
+
+    Reihenfolge der Quellen: echte `arr_iso` des Sektors → `est_arr`, falls die
+    Zeile eine geschätzte Ankunft trägt → konservative Blockannahme. Eine
+    unbrauchbare Ankunft (fehlt, nicht parsebar, nicht NACH dem Abflug, oder
+    absurd weit weg) fällt auf die Annahme zurück; sie darf das Fenster NIE
+    verkürzen.
+
+    Der Boden `dep + _SUB_PAST_H` garantiert, dass das neue Fenster jedes alte
+    enthält — diese Änderung kann kein Abo verlieren, nur welche dazugewinnen.
+    """
+    arr = None
+    for key in ('arr_iso', 'est_arr', 'arr_est'):
+        arr = _parse_iso_utc(sector.get(key))
+        if arr is not None:
+            break
+    if arr is None or arr <= dep:
+        arr = dep + timedelta(hours=_SUB_BLOCK_FALLBACK_H)
+    elif (arr - dep) > timedelta(hours=_SUB_BLOCK_MAX_H):
+        arr = dep + timedelta(hours=_SUB_BLOCK_MAX_H)
+    return max(arr + timedelta(hours=_SUB_ARR_GRACE_H),
+               dep + timedelta(hours=_SUB_PAST_H))
+
+
+def _sector_block_min(sector):
+    """Blockzeit eines Sektors in Minuten (int) oder None. Pure, wirft nie.
+    Nur aus ECHTEN Zeiten des Sektors — es wird nichts geschätzt."""
+    if not isinstance(sector, dict):
+        return None
+    dep = _parse_iso_utc(sector.get('dep_iso'))
+    arr = _parse_iso_utc(sector.get('arr_iso'))
+    if dep is None or arr is None or arr <= dep:
+        return None
+    return int((arr - dep).total_seconds() // 60)
+
+
 def topics_for_rows(rows, now_utc):
     """Pure: Briefing-Rows → sortierte Topic-Liste (dedupliziert über User —
-    ein Discover-Flug mit 8 AeroX-Crews = EIN Topic)."""
+    ein Discover-Flug mit 8 AeroX-Crews = EIN Topic).
+
+    Das Fenster endet an der ANKUNFT (+1 h), nicht am Abflug — s. den Block bei
+    `_SUB_ARR_GRACE_H`. Vorne begrenzt weiterhin der Abflug (+48 h Vorlauf)."""
     topics = set()
-    lo = now_utc - timedelta(hours=_SUB_PAST_H)
     hi = now_utc + timedelta(hours=_SUB_FUTURE_H)
     for _tok, s in _iter_sectors(rows):
         nf = _norm_flight(s.get('flight'))
         if not nf or not is_lh_group(nf[0] + nf[1]):
             continue
         dep = _parse_iso_utc(s.get('dep_iso'))
-        if dep is None or not (lo <= dep <= hi):
+        if dep is None or dep > hi:
+            continue
+        if sector_sub_end(s, dep) < now_utc:
             continue
         for d in _sector_topic_dates(s):
             topics.add(f'prd/FlightUpdate/{nf[0]}/{nf[0]}{nf[1]}/{d}')
@@ -931,15 +1007,26 @@ def _topics_compute(budget_s=None):
         # unvollständig behandeln, sonst würde ein Supabase-Aussetzer eine
         # leere Topic-Liste als gültigen Stand ablegen.
         return [], False
-    tset = set(topics_for_rows(rows, now_utc))
+    roster = set(topics_for_rows(rows, now_utc))
+    tset = set(roster)
     complete = True
+    inbound = set()
     try:
-        tset |= inbound_topics_for_rows(rows, now_utc, deadline=deadline)
+        inbound = inbound_topics_for_rows(rows, now_utc, deadline=deadline)
+        tset |= inbound
         if deadline is not None and time.time() >= deadline:
             complete = False
     except Exception as e:
         log.warning('[lh_mqtt] inbound topics fail: %s', type(e).__name__)
         complete = False
+    # ZAHL MITSCHREIBEN (2026-07-31): das Abo-Fenster hängt seit heute an der
+    # Ankunft statt am Abflug und ist damit im Schnitt Stunden länger. Ein
+    # beobachtetes LH-Limit gibt es nicht (40er-Chunks liefen fehlerfrei) —
+    # aber eine Decke, die niemand misst, merkt man erst daran, dass Abos
+    # still fehlen. Diese Zeile ist der Vorher/Nachher-Beleg.
+    log.info('[lh_mqtt] topics gerechnet: %d Roster + %d Zubringer = %d '
+             '(rows=%d, vollstaendig=%s)', len(roster),
+             len(inbound - roster), len(tset), len(rows), complete)
     return sorted(tset), complete
 
 
