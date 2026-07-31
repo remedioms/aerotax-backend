@@ -46104,6 +46104,11 @@ def _ics_parse_dt(value, params):
     if z == 'Z':
         # Explicit UTC. Lokaler Bucket = User-TZ; LH-Crew nutzt typischerweise
         # Berlin/Frankfurt als Operations-TZ, also fallback auf Europe/Berlin.
+        # ACHTUNG (Audit 2026-07-31, Befund 1): für LH-FLUG-Legs ist das die
+        # FALSCHE Tageszuordnung (LH keyed amtlich den UTC-Tag; 22:30Z = 00:30
+        # CEST rollte den Flug auf den Folgetag) — _lh_rebucket_utc_flight_days
+        # korrigiert diese Events nach dem Parsen aufs UTC-Datum. Nicht-Flug-
+        # Events (Boden-Termine, Off-Tage) bleiben bewusst Berlin-gebuckert.
         if _zi_ok:
             try:
                 utc_dt = naive.replace(tzinfo=_ZI('UTC'))
@@ -46335,6 +46340,14 @@ def _parse_ics_to_events(text):
                 if utc_dt is not None:
                     current['start_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
                 current['_is_date_only_start'] = is_date
+                # AUDIT 2026-07-31 Befund 1: explizites UTC ('…Z' OHNE TZID)
+                # markieren — NUR solche Events darf
+                # _lh_rebucket_utc_flight_days aufs UTC-Datum umkeyen. Events
+                # mit TZID sind BEWUSST stations-lokal gebuckert (F1/PDF-Pfad)
+                # und bleiben unangetastet.
+                current['_utc_z_start'] = bool(
+                    not is_date and not (params or {}).get('TZID')
+                    and v.strip().upper().endswith('Z'))
             elif k == 'DTEND':
                 utc_dt, bucket, is_date, _hhmm = _ics_parse_dt(v, params)
                 if bucket:
@@ -46342,6 +46355,9 @@ def _parse_ics_to_events(text):
                 if utc_dt is not None:
                     current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
                 current['_is_date_only_end'] = is_date
+                current['_utc_z_end'] = bool(
+                    not is_date and not (params or {}).get('TZID')
+                    and v.strip().upper().endswith('Z'))
                 # F2 (SWISS Krank/Ferien): ein TIMED-DTEND, das lokal auf
                 # 00:00 fällt (SWISS schreibt „bis 24:00" als Folgetag-Mitter-
                 # nacht, z.B. KRANK DTEND 20260623T220000Z = 24.06 00:00 CEST),
@@ -46884,6 +46900,101 @@ def _swissify_roster_events(events, token=None):
     except Exception as e:
         try:
             app.logger.warning(f'[ics-swiss] swissify-fail: {type(e).__name__}: {str(e)[:160]}')
+        except Exception:
+            pass
+    return events
+
+
+# ── LH-Tagesbucket: amtliche Zuordnung = UTC-Tag (Audit 2026-07-31, Befund 1) ─
+# LH457 LAX→FRA, dep 2026-04-26T22:30Z: PUB UND LH-Raw (rosterDays[].day)
+# keyen den Flug auf den 26.04. — die LH-Roster-Welt ist UTC-basiert (CAS-/
+# Released-Tabellen in UTC). _ics_parse_dt bucketet explizite UTC-Zeiten aber
+# aufs Europe/Berlin-Datum (22:30Z = 00:30 CEST am 27.) → der Tagestext rutschte
+# auf den Folgetag, während _build_ical_sectors denselben Flug (korrekt) aufs
+# UTC-Datum keyed — die App widersprach sich selbst UND dem amtlichen Plan.
+# Betroffen: JEDER Flug mit Abflug 22:00–24:00Z (Sommer; Winter 23:00–24:00Z).
+#
+# WICHTIG — warum NICHT der SWISS-F1-Fix (stations-lokales Datum): für LH wäre
+# das ein NEUER Fehler. LH401 ab JFK dep ~01:55Z = 21:55 Ortszeit am VORTAG —
+# LH rostert ihn amtlich auf den UTC-Tag (Audit: alle JFK-Umläufe sauber),
+# stations-lokal würde ihn auf den Vortag ziehen. SWISS keyed lokal, LH keyed
+# UTC — zwei Airlines, zwei amtliche Wahrheiten, je ein Mechanismus.
+_LH_COLON_LEG_RE = re.compile(
+    r'^\s*(?:FLT\s+)?(?:DH\s+)?(?:LH|CL|EW|EN|LX|OS|SN|4Y)\s?\d{1,4}[A-Z]?'
+    r'\s*:\s*[A-Z]{3}\s*[-–]\s*[A-Z]{3}', re.I)
+# Vorlauf-Marker (Pickup/Briefing) gehören auf den Roster-Tag IHRES Flugs.
+_LH_PREFLIGHT_MARKER_RE = re.compile(r'\b(?:PICKUP|BRIEFING)\b', re.I)
+
+
+def _lh_rebucket_utc_flight_days(events):
+    """LH-/myTime-Flug-Legs (Colon-Form 'LH 457: LAX-FRA', explizite UTC-Zeit)
+    aufs UTC-Datum keyen — die amtliche LH-Zuordnung (rosterDays[].day = UTC-
+    Tag), identisch mit dem Sektor-Keying in _build_ical_sectors. In-place,
+    wirft nie. No-op für: TZID-Events (PDF-Pfad, bewusst stations-lokal),
+    SWISS-/ITA-/Edelweiss-Formen (eigene Pfade), All-Day-Events, EK-Upload
+    (kein _utc_z_start-Flag; der Adapter keyed ohnehin schon aufs ISO-Datum).
+
+    Zweite Stufe: Pickup-/Briefing-Marker im Divergenz-Fenster (Berlin-Datum ≠
+    UTC-Datum, also 22–24Z) folgen dem Flug, dem sie vorausgehen (≤6 h) —
+    sonst stünde z.B. der von lh_flightops auf den Abflug-Zeitpunkt gezogene
+    Pickup allein auf dem Folgetag. Ohne folgenden Flug bleibt der Berlin-
+    Bucket stehen (keine geratene Zuordnung)."""
+    try:
+        flights = []
+        for ev in (events or []):
+            if not isinstance(ev, dict) or not ev.get('_utc_z_start'):
+                continue
+            if not _LH_COLON_LEG_RE.match(ev.get('summary') or ''):
+                continue
+            s_iso = (ev.get('start_iso') or '')
+            sd = s_iso[:10]
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', sd):
+                continue
+            changed = False
+            if ev.get('start') != sd:
+                ev['start'] = sd
+                changed = True
+            ed = (ev.get('end_iso') or '')[:10]
+            if ev.get('_utc_z_end') and re.match(r'^\d{4}-\d{2}-\d{2}$', ed) \
+                    and ev.get('end') != ed:
+                ev['end'] = ed
+                changed = True
+            if changed:
+                ev['_multiday_dates'] = _ics_multiday_dates(ev)
+            flights.append((s_iso, ev.get('start') or sd))
+        if not flights:
+            return events
+        flights.sort()
+        for ev in (events or []):
+            if not isinstance(ev, dict) or not ev.get('_utc_z_start'):
+                continue
+            summ = ev.get('summary') or ''
+            if _LH_COLON_LEG_RE.match(summ) \
+                    or not _LH_PREFLIGHT_MARKER_RE.search(summ):
+                continue
+            s_iso = (ev.get('start_iso') or '')
+            sd = s_iso[:10]
+            # Nur im Divergenz-Fenster (Bucket ≠ UTC-Datum) — sonst stimmen
+            # Berlin- und UTC-Tag ohnehin überein und nichts darf wandern.
+            if not re.match(r'^\d{4}-\d{2}-\d{2}$', sd) or ev.get('start') == sd:
+                continue
+            for f_iso, f_day in flights:
+                if f_iso < s_iso:
+                    continue
+                gap = _iso_minutes_between(s_iso, f_iso)
+                if gap is None or gap > 6 * 60:
+                    break
+                if ev.get('start') != f_day:
+                    # 0-Dauer-/Same-Bucket-Marker: End-Bucket mitziehen, sonst
+                    # entstünde ein 2-Tage-Marker ([f_day, alter Bucket]).
+                    if ev.get('end') == ev.get('start'):
+                        ev['end'] = f_day
+                    ev['start'] = f_day
+                    ev['_multiday_dates'] = _ics_multiday_dates(ev)
+                break
+    except Exception as e:
+        try:
+            app.logger.warning(f'[ics-lh] utc-rebucket-fail: {type(e).__name__}: {str(e)[:160]}')
         except Exception:
             pass
     return events
@@ -47750,7 +47861,11 @@ def _build_ical_sectors(events):
         # den Stations-LOKALEN Bucket (`start`, via _swissify_roster_events),
         # nicht das UTC-Datum. Sonst landet z.B. LX93 (GRU 19:52 Lokal,
         # 22:52Z) als Sektor auf einem anderen Tag als sein Tagessatz.
-        # LH-Pfad bleibt beim bisherigen UTC-Keying (verifiziertes Verhalten).
+        # LH-Pfad: UTC-Keying = amtliche LH-Zuordnung (rosterDays[].day).
+        # Seit dem Audit-Fix 2026-07-31 keyen auch die LH-TAGESTEXTE aufs
+        # UTC-Datum (_lh_rebucket_utc_flight_days) — Sektor und Tagessatz
+        # liegen damit wieder auf demselben Tag (vorher: Sektor 26.04,
+        # Tagestext 27.04 bei LH457 dep 22:30Z).
         if _ics_is_swiss_flight(ev.get('summary') or ''):
             d_bucket = (ev.get('start') or '')[:10]
             if re.match(r'^\d{4}-\d{2}-\d{2}$', d_bucket):
@@ -48333,6 +48448,11 @@ def import_calendar_feed(token):
     # Drittanbieter-Dialekte (Condor C/I+P/U, offblock ✈/ICAO) → LH-Form.
     events = _normalize_thirdparty_roster_events(events)
     events = _swissify_roster_events(events, token=token)
+    # LH-Tagesbucket (Audit 2026-07-31 Befund 1): Flug-Legs mit expliziter
+    # UTC-Zeit aufs UTC-Datum keyen (amtliche LH-Zuordnung, wie die Sektoren) —
+    # sonst rutscht z.B. LH457 LAX dep 22:30Z auf den Berlin-Folgetag. No-op
+    # für TZID-/SWISS-/ITA-/All-Day-Events; wirft nie.
+    events = _lh_rebucket_utc_flight_days(events)
     # ITA/ER-Duty-Nachbearbeitung (I1 Stations-Zeit-Fix + I2-I6) — no-op für
     # alle anderen Feeds; wirft nie.
     events = _itaify_roster_events(events, token=token)
