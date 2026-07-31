@@ -1370,6 +1370,8 @@ def lh_quota_snapshot(hours=6):
       lhopen:<YYYYMMDDHH>[:<caller>]         LH Open API (gesendet)
       lhopen_denied:<YYYYMMDDHH>[:<grund>]   vom eigenen Throttle ABGEWIESEN
       lhopen_skip:<YYYYMMDDHH>[:<grund>]     GAR NICHT ERST GEFRAGT (2026-07-30)
+      lhopen_stale_served:<...>[:<caller>]   Abweisung mit ALTER echter Antwort
+                                             aufgefangen (2026-07-31)
       lhfo:<YYYYMMDDHH>[:<service>]          LH FlightOps (EIGENER LH-Key!)
 
     `lhopen_skip` ist bewusst eine EIGENE Familie und keine Unterart von
@@ -1396,7 +1398,8 @@ def lh_quota_snapshot(hours=6):
     rows = []
     if sb is not None:
         for st in stamps:
-            for fam in ('lhopen', 'lhopen_denied', 'lhopen_skip', 'lhfo'):
+            for fam in ('lhopen', 'lhopen_denied', 'lhopen_skip',
+                        'lhopen_stale_served', 'lhfo'):
                 try:
                     r = (sb.table('ax_api_budget').select('month,n')
                          .like('month', f'{fam}:{st}%')
@@ -4371,7 +4374,13 @@ def _merge_lh_into_facts(obs, lh):
     # LH-Daten. LH ist aber date-exakt (flightstatus für genau diesen Tag) →
     # in dem Fall die stale Obs verwerfen und PUR LH nehmen (kein `stale`).
     if (obs or {}).get('stale'):
-        return dict(lh)
+        # `facts_stale`/`facts_age_s` sind INTERNE Marker der LH-Schicht
+        # (Stale-on-Deny, 31.07.). Überall sonst fallen sie durch die
+        # Feld-Allowlists; NUR dieser Durchreich-Zweig gibt das LH-Dict
+        # unverändert weiter — hier müssen sie raus, sonst tauchen sie in
+        # Antwort-Payloads auf, die sie nie erwartet haben.
+        return {k: v for k, v in lh.items()
+                if k not in ('facts_stale', 'facts_age_s')}
     out = dict(obs or {})
     for k in _LH_AUTHORITATIVE:
         if lh.get(k) is not None:

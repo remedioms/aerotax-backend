@@ -597,3 +597,209 @@ def test_prune_is_a_noop_without_a_client(monkeypatch):
     _reset(monkeypatch)
     monkeypatch.setattr(lh, '_shared_sb', lambda: None)
     lh._shared_prune()          # darf nicht werfen
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STALE-ON-DENY (Owner 2026-07-31, Morgen-Spitze)
+#
+# Nach der Diät vom 30.07. verhungert die Warm-Klasse wie gewollt (0–4
+# Abweisungen/h statt 300–1.000). Geblieben ist die USER-Klasse: in der
+# EU-Morgen-Spitze 03–10 UTC wurden weiter 184–441 `obs_merge`-Calls PRO
+# STUNDE abgewiesen (Tagessumme 7.657) — jede davon ein Loch auf einer offenen
+# Karte. Regel ab jetzt: lehnt das Gate einen user/bg-Call ab, liefert der
+# geteilte Cache die LETZTE ECHTE Antwort, markiert als alt.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _row(key, facts, until, updated, answered=True):
+    return {'call_key': key, 'result': {'facts': facts, 'answered': answered},
+            'result_until': until, 'negative_until': None,
+            'updated_at': updated}
+
+
+def _stale_sb(monkeypatch, facts, age_s, answered=True):
+    """Fake-Cache mit EINEM abgelaufenen Eintrag dieses Alters."""
+    fake = _FakeSB()
+    now = time.time()
+    k = lh._shared_key('lhfacts', 'LH400', '2026-07-31', 'FRA', 'JFK')
+    fake.store[k] = _row(k, facts, _iso(now - 60), _iso(now - age_s), answered)
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    return fake
+
+
+def _deny_setup(monkeypatch):
+    """Konfiguriert, Token da, aber das Gate sagt Nein."""
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_token', lambda: 'tok')
+    monkeypatch.setattr(lh, '_budget_ok', lambda *a, **k: False)
+
+
+def test_deny_with_fresh_cache_serves_fresh_without_marker(monkeypatch):
+    """Ist der geteilte Eintrag noch gültig, greift schon der normale
+    L2-Pfad — der Stale-Zweig kommt gar nicht dran, also auch kein Marker."""
+    _reset(monkeypatch)
+    fake = _FakeSB()
+    now = time.time()
+    k = lh._shared_key('lhfacts', 'LH400', '2026-07-31', 'FRA', 'JFK')
+    fake.store[k] = _row(k, {'reg': 'D-AIHY', 'gate': 'Z16'},
+                         _iso(now + 1800), _iso(now - 60))
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='obs_merge')
+    assert out == {'reg': 'D-AIHY', 'gate': 'Z16'}
+    assert 'facts_stale' not in out
+
+
+def test_deny_with_stale_cache_serves_stale_with_marker(monkeypatch):
+    """DER Kernfall: Gate zu, Eintrag abgelaufen — statt eines Lochs die
+    letzte echte Antwort, ehrlich als alt markiert."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIHY', 'gate': 'Z16'}, 1800)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='obs_merge')
+    assert out['reg'] == 'D-AIHY' and out['gate'] == 'Z16'
+    assert out['facts_stale'] is True
+    assert 1700 < out['facts_age_s'] < 1900
+    # zweiter, dict-freier Weg an denselben Marker
+    assert lh.last_call_stale_age() == out['facts_age_s']
+
+
+def test_deny_without_any_cache_returns_nothing_as_before(monkeypatch):
+    """Ohne echte Antwort im Cache bleibt es beim alten Verhalten — es wird
+    NICHTS erfunden."""
+    _reset(monkeypatch)
+    fake = _FakeSB()
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='obs_merge')
+    assert out == {}
+    assert lh.last_call_denied() is True
+
+
+def test_stale_beyond_the_window_is_not_served(monkeypatch):
+    """Ein nicht-finaler Eintrag jenseits von 6 h ist keine brauchbare
+    Aussage mehr — dann lieber ehrlich nichts."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIHY', 'gate': 'Z16'},
+              lh._STALE_MAX_AGE + 600)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='obs_merge')
+    assert out == {}
+
+
+def test_final_facts_are_served_at_any_age(monkeypatch):
+    """Ein gelandeter Flug ändert sich nie wieder — dort ist „alt" bedeutungslos,
+    das Fenster gilt nicht."""
+    _reset(monkeypatch)
+    now = time.time()
+    landed = {'sched_dep': _iso(now - 30 * HOUR), 'est_dep': _iso(now - 30 * HOUR),
+              'sched_arr': _iso(now - 27 * HOUR), 'est_arr': _iso(now - 27 * HOUR),
+              'dep_status': 'Flight Landed', 'reg': 'D-AIHY'}
+    _stale_sb(monkeypatch, landed, 20 * HOUR)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='obs_merge')
+    assert out['reg'] == 'D-AIHY'
+    assert out['facts_stale'] is True
+
+
+def test_warm_class_never_gets_stale_on_deny(monkeypatch):
+    """Die Priorisierung von gestern hätte keinen Zahn mehr, wenn die
+    Spekulation sich am Stale-Cache bedienen dürfte."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIHY'}, 1800)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='warm_obs_overlay')
+    assert out == {}
+    assert lh._stale_on_deny('LH400', '2026-07-31', 'FRA', 'JFK',
+                             'warm_obs_overlay', time.time()) is None
+
+
+def test_bg_class_does_get_stale_on_deny(monkeypatch):
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIHY'}, 1800)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='mqtt_leg_reg')
+    assert out.get('reg') == 'D-AIHY'
+
+
+def test_a_gap_entry_is_never_served_as_stale(monkeypatch):
+    """Ein `answered=False`-Eintrag ist eine LÜCKE (503/Throttle), kein Fakt.
+    `_shared_write_facts` schreibt so etwas gar nicht erst — diese zweite
+    Schranke hält den Vertrag auch dann, wenn doch je einer landet."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIHY'}, 1800, answered=False)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             caller='obs_merge')
+    assert out == {}
+
+
+def test_stale_serve_still_books_the_denial_and_its_own_counter(monkeypatch):
+    """Transparenz: die Abweisung bleibt gezählt (sonst sähe der Report den
+    Bedarf nicht mehr), plus ein eigener Zähler für das Auffangen."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIHY'}, 1800)
+    seen = []
+    monkeypatch.setattr(lh, 'budget_inc',
+                        lambda pfx, caller=None, units=1: seen.append((pfx, caller)))
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_token', lambda: 'tok')
+    lh._hour_window = int(time.time() // 3600)
+    lh._hour_count = lh._HOUR_BUDGET + 1          # echtes Gate, kein Mock
+    lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK', caller='obs_merge')
+    fams = [p for p, _c in seen]
+    assert 'lhopen_denied' in fams
+    assert 'lhopen_stale_served' in fams
+    assert 'lhopen' not in fams                    # kein Call ist rausgegangen
+
+
+def test_stale_result_is_memoised_so_a_denial_wave_costs_one_read(monkeypatch):
+    """Eine Abweisungs-Welle trifft denselben Flug in Sekunden dutzendfach —
+    ohne Memo wäre das ein Supabase-Read pro Treffer."""
+    _reset(monkeypatch)
+    fake = _stale_sb(monkeypatch, {'reg': 'D-AIHY'}, 1800)
+    reads = []
+    orig = lh._shared_read
+    monkeypatch.setattr(lh, '_shared_read',
+                        lambda *a, **k: (reads.append(1), orig(*a, **k))[1])
+    _deny_setup(monkeypatch)
+    for _ in range(5):
+        out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                                 caller='obs_merge')
+        assert out.get('reg') == 'D-AIHY'
+    assert len(reads) <= 2, 'Stale-Treffer muss aus dem Memo kommen'
+
+
+def test_marker_is_additive_and_stripped_in_the_passthrough(monkeypatch):
+    """Die Marker dürfen keinen Konsumenten brechen: überall fallen sie durch
+    die Feld-Allowlists, und im EINEN Durchreich-Zweig
+    (`_merge_lh_into_facts` bei stale-Board) werden sie entfernt."""
+    from blueprints import aerox_data_blueprint as adb
+    lhf = {'reg': 'D-AIHY', 'dep_iata': 'FRA', 'arr_iata': 'JFK',
+           'facts_stale': True, 'facts_age_s': 1800}
+    out = adb._merge_lh_into_facts({'stale': True}, lhf)
+    assert out['reg'] == 'D-AIHY'
+    assert 'facts_stale' not in out and 'facts_age_s' not in out
+    # normaler Merge-Zweig: Allowlist laesst die Marker ohnehin nicht durch
+    out2 = adb._merge_lh_into_facts({'reg': None}, lhf)
+    assert 'facts_stale' not in out2
+
+
+def test_memo_hit_reports_the_same_staleness_as_the_dict(monkeypatch):
+    """Beide Marker-Kanäle müssen dasselbe sagen — sonst hängt die Antwort auf
+    „ist das alt?" davon ab, welchen der Aufrufer gerade benutzt."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIHY'}, 1800)
+    _deny_setup(monkeypatch)
+    first = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                               caller='obs_merge')
+    again = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                               caller='obs_merge')          # jetzt Memo-Treffer
+    assert again['facts_age_s'] == first['facts_age_s']
+    assert lh.last_call_stale_age() == again['facts_age_s']

@@ -481,12 +481,21 @@ def last_call_denied():
     return bool(getattr(_call_state, 'denied', False))
 
 
-def _note_answer(answered, denied=False):
+def last_call_stale_age():
+    """Alter (Sekunden) der zuletzt gelieferten Fakten, wenn sie aus dem
+    Stale-Fallback kamen — sonst 0. Zweiter, dict-freier Weg an denselben
+    Marker: Aufrufer, die die Fakten nur durchreichen (und deren Allowlists
+    `facts_stale` ohnehin verwerfen), können die Alterung hier abfragen."""
+    return int(getattr(_call_state, 'stale_age', 0) or 0)
+
+
+def _note_answer(answered, denied=False, stale_age=0):
     """Zustand des letzten Versuchs setzen. Auch Memo-Treffer sind Antworten —
     ohne das hier läse ein Aufrufer nach einem Cache-Hit den Zustand eines
     ganz anderen, längst vergangenen GETs desselben Threads."""
     _call_state.answered = bool(answered)
     _call_state.denied = bool(denied)
+    _call_state.stale_age = int(stale_age or 0)
 
 
 def _get(path, caller=None):
@@ -863,9 +872,13 @@ def _shared_until(val, now_dt):
 
 def _shared_read(fn, d, dep, arr, with_warm=False):
     """EIN Query für Fakten UND (optional) die Warm-Sperre.
-    → {'facts': dict|None, 'answered': bool, 'ttl': int, 'warm_block': int}
+    → {'facts': …, 'answered': …, 'ttl': …, 'warm_block': …,
+       'stale_facts': dict|None, 'stale_age': int}
+    `stale_*` ist der ABGELAUFENE, aber echte Eintrag desselben Flugs — er
+    kostet denselben Query und ist die Rückfallebene für `_stale_on_deny`.
     Wirft nie; bei jedem Problem einfach ein Miss (dann greift LH)."""
-    out = {'facts': None, 'answered': False, 'ttl': 0, 'warm_block': 0}
+    out = {'facts': None, 'answered': False, 'ttl': 0, 'warm_block': 0,
+           'stale_facts': None, 'stale_age': 0}
     client = _shared_sb()
     if client is None:
         return out
@@ -876,23 +889,120 @@ def _shared_read(fn, d, dep, arr, with_warm=False):
         from datetime import datetime as _dt, timezone as _tz
         now_dt = _dt.now(_tz.utc)
         r = (client.table('ax_paid_call_cache')
-             .select('call_key,result,result_until,negative_until')
+             .select('call_key,result,result_until,negative_until,updated_at')
              .in_('call_key', keys).execute())
         for row in (getattr(r, 'data', None) or []):
             k = str(row.get('call_key') or '')
             if k.startswith('lhfacts:'):
                 left = _shared_until(row.get('result_until'), now_dt)
                 res = row.get('result')
-                if left > 0 and isinstance(res, dict):
+                # NUR ECHTE ANTWORTEN: `_shared_write_facts` schreibt Lücken
+                # (503, Throttle-Abweisung) gar nicht erst — die zusätzliche
+                # `answered`-Prüfung ist die zweite Schranke, damit ein
+                # Ausfall NIE als alter Fakt weitergereicht wird.
+                if not (isinstance(res, dict) and res.get('answered')):
+                    continue
+                if left > 0:
                     out['facts'] = dict(res.get('facts') or {})
-                    out['answered'] = bool(res.get('answered'))
+                    out['answered'] = True
                     out['ttl'] = left
+                else:
+                    # abgelaufen, aber echt — Alter aus `updated_at`, nicht
+                    # aus der TTL zurückgerechnet (die TTL ist je nach
+                    # Abflugnähe verschieden lang und wäre kein Alter).
+                    out['stale_facts'] = dict(res.get('facts') or {})
+                    out['stale_age'] = _shared_age(row.get('updated_at'),
+                                                   now_dt)
             elif k.startswith('lhwarm:'):
                 out['warm_block'] = _shared_until(row.get('negative_until'),
                                                   now_dt)
     except Exception as e:
         log.warning('[lh_open] shared-cache read: %s', type(e).__name__)
     return out
+
+
+def _shared_age(val, now_dt):
+    """Alter eines Cache-Eintrags in Sekunden (aus `updated_at`). Unbekannt →
+    sehr gross, damit ein unlesbarer Zeitstempel NIE als „frisch genug"
+    durchgeht."""
+    if not val:
+        return 10 ** 9
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        dv = _dt.fromisoformat(str(val).replace('Z', '+00:00'))
+        if dv.tzinfo is None:
+            dv = dv.replace(tzinfo=_tz.utc)
+        return max(0, int((now_dt - dv).total_seconds()))
+    except Exception:
+        return 10 ** 9
+
+
+# ── Stale-on-Deny (Owner 2026-07-31, Morgen-Spitze) ─────────────────────────
+# MESSUNG nach der Diät vom 30.07.: die Warm-Klasse verhungert wie gewollt
+# (0–4 Abweisungen/h statt 300–1.000), aber in der EU-Morgen-Spitze 03–10 UTC
+# wurden weiter 184–441 `obs_merge`-Calls PRO STUNDE abgewiesen — Tagessumme
+# 7.657. Das ist die USER-Klasse: jede dieser Abweisungen ist ein Loch auf
+# einer offenen Karte.
+#
+# Der saubere Hebel (den Cache VOR dem Budget-Gate lesen) sitzt in
+# `_flight_obs_merged`/`app.py` — fremde WIP, unantastbar. Was hier geht: wenn
+# das Gate einen User-Call ablehnt, statt None die LETZTE ECHTE Antwort aus dem
+# geteilten Cache liefern, auch wenn ihre TTL abgelaufen ist.
+#
+# Warum das kein Fake ist: es sind unveränderte LH-Fakten aus erster Hand, nur
+# älter — und sie werden als solche MARKIERT (`facts_stale`, `facts_age_s`).
+# Die Alternative ist nicht „frischer", sondern „gar nichts".
+#
+# Grenzen, bewusst eng:
+#   • NUR user/bg — die Warm-Klasse soll verhungern, sonst hätte die
+#     Priorisierung von gestern keinen Zahn mehr.
+#   • NUR echte Antworten (`answered`) — Lücken stehen ohnehin nicht im Cache.
+#   • FINAL (gelandet) unbegrenzt: diese Fakten ändern sich nie wieder, ein
+#     „Alter" ist dort bedeutungslos.
+#   • sonst höchstens `_STALE_MAX_AGE` — jenseits davon lieber ehrlich nichts.
+_STALE_MAX_AGE = 6 * 3600
+# Kurzes Prozess-Memo für den ausgelieferten Stale-Wert: eine Abweisungs-Welle
+# trifft denselben Flug in Sekunden dutzendfach: ohne das würde jeder dieser
+# Treffer einen eigenen Supabase-Read auslösen.
+_STALE_MEMO_TTL = 300
+
+
+def _stale_on_deny(fn, d, dep, arr, caller, now):
+    """Letzte echte Antwort für einen am Budget abgewiesenen User-Call, oder
+    None. Bucht `lhopen_stale_served`. Wirft nie.
+
+    Der Denial-Zähler bleibt unangetastet — `_get` hat ihn schon gebucht. Beide
+    Zahlen zusammen sind die Wahrheit: „wie oft war das Gate zu" UND „wie oft
+    konnten wir es auffangen"."""
+    try:
+        if _caller_class(caller) == _CLASS_WARM:
+            return None                     # Spekulation verhungert, Punkt.
+        sh = _shared_read(fn, d, dep, arr)
+        facts = sh.get('stale_facts')
+        if facts is None:
+            # Kein abgelaufener Eintrag — aber vielleicht ein frischer, den
+            # der Aufrufer wegen eines Memo-Miss noch nicht gesehen hat.
+            if sh.get('facts') is not None and sh.get('ttl', 0) > 0:
+                facts, age = sh['facts'], 0
+            else:
+                return None
+        else:
+            age = int(sh.get('stale_age') or 0)
+            if not (_facts_final(facts, now) or age <= _STALE_MAX_AGE):
+                return None                 # zu alt und nicht final → ehrlich nichts
+        if not isinstance(facts, dict) or not facts:
+            return None
+        out = dict(facts)
+        out['facts_stale'] = age > 0
+        out['facts_age_s'] = age
+        _note_answer(False, denied=True, stale_age=age)
+        with _facts_lock:
+            _facts_memo[(fn, d, dep, arr)] = (now + _STALE_MEMO_TTL, dict(out),
+                                              False)
+        budget_inc('lhopen_stale_served', caller)
+        return out
+    except Exception:
+        return None
 
 
 def _shared_write(rows):
@@ -1226,7 +1336,14 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
                 # autoritativen Aussage „dieser Flug hat keine Reg" und landete
                 # über `_legs_regs` sogar im GETEILTEN Cache
                 # (adversarialer Review 27.07.).
-                _note_answer(hit[2] if len(hit) > 2 else bool(hit[1]))
+                # Trägt der Memo-Eintrag die Stale-Marker (aus
+                # `_stale_on_deny`), muss der thread-lokale Weg dasselbe
+                # sagen wie das Dict — sonst hinge die Antwort auf die Frage
+                # „ist das alt?" davon ab, welchen der beiden Kanäle der
+                # Aufrufer gerade benutzt.
+                _hf = hit[1] if isinstance(hit[1], dict) else {}
+                _note_answer(hit[2] if len(hit) > 2 else bool(hit[1]),
+                             stale_age=int(_hf.get('facts_age_s') or 0))
                 return dict(hit[1])
     if cached_only:
         _warm_async(fn, d, dep, arr, caller)
@@ -1250,6 +1367,13 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
 
     data = _get(f'/operations/flightstatus/{urllib.parse.quote(fn)}/{d}',
                 caller=caller)
+    # STALE-ON-DENY: das Gate hat zugemacht (nicht LH war kaputt) — dann ist
+    # die letzte echte Antwort besser als ein Loch auf einer offenen Karte.
+    # Nur user/bg, nur echte Antworten, markiert. S. `_stale_on_deny`.
+    if data is None and last_call_denied():
+        _st = _stale_on_deny(fn, d, dep, arr, caller, now)
+        if _st is not None:
+            return _st
     facts = {}
     try:
         legs = (((data or {}).get('FlightStatusResource') or {})
