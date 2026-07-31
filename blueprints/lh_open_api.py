@@ -967,6 +967,68 @@ _STALE_MAX_AGE = 6 * 3600
 _STALE_MEMO_TTL = 300
 
 
+def _shared_stale_variants(fn, d):
+    """ALLE Cache-Varianten eines (Flug,Datum) → [(facts, age)]. Nur für den
+    Stale-Pfad. Wirft nie.
+
+    WARUM (gemessen 31.07., Quote stale_served/denied lag bei 0,23): der
+    Alias-Write in `lh_flight_facts` geht nur in EINE Richtung — ein Fetch ohne
+    dep/arr legt zusätzlich den Routen-Key an, ein Fetch MIT Route legt den
+    routenlosen Key NICHT an. Ergebnis im Prod-Cache: 1.424 von 2.285 Flügen
+    existieren ausschliesslich unter `lhfacts:<fn>:<date>:<dep>:<arr>`, und ein
+    Read ohne Route (`lhfacts:<fn>:<date>::`) findet sie nie. Genau diese
+    Anfragen liefen ins Loch.
+    Den Write symmetrisch zu machen wäre falsch: bei einem Mehr-Leg-Flug
+    (4Y136 FRA-MBA-JRO) würde ein Leg-Fetch die Aussage „diese Flugnummer =
+    dieses Leg" festschreiben — genau der Mehr-Leg-Guard, den
+    `lh_flight_facts` bewusst hat. Deshalb wird hier GELESEN statt geschrieben,
+    und die Auswahl unten bleibt eindeutig."""
+    client = _shared_sb()
+    if client is None:
+        return []
+    out = []
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        now_dt = _dt.now(_tz.utc)
+        r = (client.table('ax_paid_call_cache')
+             .select('call_key,result,updated_at')
+             .like('call_key', f'lhfacts:{fn}:{d}:%').limit(24).execute())
+        for row in (getattr(r, 'data', None) or []):
+            res = row.get('result')
+            if not (isinstance(res, dict) and res.get('answered')):
+                continue
+            f = dict(res.get('facts') or {})
+            if f:
+                out.append((f, _shared_age(row.get('updated_at'), now_dt)))
+    except Exception as e:
+        log.warning('[lh_open] stale-variants: %s', type(e).__name__)
+    return out
+
+
+def _pick_stale_variant(variants, dep, arr):
+    """Welche Variante darf die Anfrage beantworten? Pure.
+
+    • Anfrage MIT Route: nur eine Variante, deren Fakten exakt diese Route
+      tragen — nie eine fremde.
+    • Anfrage OHNE Route: nur wenn es GENAU EINE Route gibt. Bei einem
+      Mehr-Leg-Flug bliebe sonst offen, welches Leg gemeint ist — dann lieber
+      nichts (dieselbe Regel wie der Mehr-Leg-Guard beim Fetch).
+    Bei mehreren Treffern gewinnt der JÜNGSTE."""
+    if not variants:
+        return None
+    if dep and arr:
+        hit = [(f, a) for f, a in variants
+               if (f.get('dep_iata') or '').upper() == dep
+               and (f.get('arr_iata') or '').upper() == arr]
+        return min(hit, key=lambda fa: fa[1]) if hit else None
+    routes = {((f.get('dep_iata') or '').upper(),
+               (f.get('arr_iata') or '').upper()) for f, _a in variants}
+    routes.discard(('', ''))
+    if len(routes) > 1:
+        return None                        # mehrdeutig → nichts erfinden
+    return min(variants, key=lambda fa: fa[1])
+
+
 def _stale_on_deny(fn, d, dep, arr, caller, now):
     """Letzte echte Antwort für einen am Budget abgewiesenen User-Call, oder
     None. Bucht `lhopen_stale_served`. Wirft nie.
@@ -979,17 +1041,21 @@ def _stale_on_deny(fn, d, dep, arr, caller, now):
             return None                     # Spekulation verhungert, Punkt.
         sh = _shared_read(fn, d, dep, arr)
         facts = sh.get('stale_facts')
+        age = int(sh.get('stale_age') or 0)
+        if facts is None and sh.get('facts') is not None and sh.get('ttl', 0) > 0:
+            # Kein abgelaufener Eintrag — aber ein frischer, den der Aufrufer
+            # wegen eines Memo-Miss noch nicht gesehen hat.
+            facts, age = sh['facts'], 0
         if facts is None:
-            # Kein abgelaufener Eintrag — aber vielleicht ein frischer, den
-            # der Aufrufer wegen eines Memo-Miss noch nicht gesehen hat.
-            if sh.get('facts') is not None and sh.get('ttl', 0) > 0:
-                facts, age = sh['facts'], 0
-            else:
+            # Exakter Key leer → andere Key-Variante desselben Flugs suchen
+            # (s. `_shared_stale_variants`: 62 % der Flüge liegen NUR unter
+            # dem Routen-Key, ein routenloser Read fand sie nie).
+            picked = _pick_stale_variant(_shared_stale_variants(fn, d), dep, arr)
+            if picked is None:
                 return None
-        else:
-            age = int(sh.get('stale_age') or 0)
-            if not (_facts_final(facts, now) or age <= _STALE_MAX_AGE):
-                return None                 # zu alt und nicht final → ehrlich nichts
+            facts, age = picked
+        if age > 0 and not (_facts_final(facts, now) or age <= _STALE_MAX_AGE):
+            return None                     # zu alt und nicht final → ehrlich nichts
         if not isinstance(facts, dict) or not facts:
             return None
         out = dict(facts)

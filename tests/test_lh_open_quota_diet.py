@@ -803,3 +803,124 @@ def test_memo_hit_reports_the_same_staleness_as_the_dict(monkeypatch):
                                caller='obs_merge')          # jetzt Memo-Treffer
     assert again['facts_age_s'] == first['facts_age_s']
     assert lh.last_call_stale_age() == again['facts_age_s']
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Key-Varianten (Messung 31.07.: Quote lag bei 0,23 statt 0,9)
+#
+# Der Alias-Write geht nur in EINE Richtung: ein Fetch OHNE dep/arr legt
+# zusätzlich den Routen-Key an, ein Fetch MIT Route legt den routenlosen Key
+# nicht an. Im Prod-Cache lagen dadurch 1.424 von 2.285 Flügen ausschliesslich
+# unter `lhfacts:<fn>:<date>:<dep>:<arr>` — ein routenloser Read fand sie nie
+# und lief ins Loch. Gelöst wird das LESEND (der Write symmetrisch zu machen
+# würde den Mehr-Leg-Guard aushebeln).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pick_variant_with_route_takes_only_the_matching_one():
+    v = [({'dep_iata': 'FRA', 'arr_iata': 'JFK', 'reg': 'A'}, 100),
+         ({'dep_iata': 'MUC', 'arr_iata': 'JFK', 'reg': 'B'}, 50)]
+    got = lh._pick_stale_variant(v, 'FRA', 'JFK')
+    assert got is not None and got[0]['reg'] == 'A'
+    assert lh._pick_stale_variant(v, 'TXL', 'JFK') is None
+
+
+def test_pick_variant_without_route_needs_an_unambiguous_flight():
+    single = [({'dep_iata': 'FRA', 'arr_iata': 'JFK', 'reg': 'A'}, 100)]
+    assert lh._pick_stale_variant(single, None, None)[0]['reg'] == 'A'
+    # Mehr-Leg: welches Leg waere gemeint? -> nichts erfinden
+    multi = [({'dep_iata': 'FRA', 'arr_iata': 'MBA', 'reg': 'A'}, 100),
+             ({'dep_iata': 'MBA', 'arr_iata': 'JRO', 'reg': 'A'}, 100)]
+    assert lh._pick_stale_variant(multi, None, None) is None
+    assert lh._pick_stale_variant([], None, None) is None
+
+
+def test_pick_variant_prefers_the_youngest():
+    v = [({'dep_iata': 'FRA', 'arr_iata': 'JFK', 'reg': 'ALT'}, 5000),
+         ({'dep_iata': 'FRA', 'arr_iata': 'JFK', 'reg': 'NEU'}, 60)]
+    assert lh._pick_stale_variant(v, 'FRA', 'JFK')[0]['reg'] == 'NEU'
+
+
+class _LikeTable:
+    def __init__(self, store):
+        self.store, self._pfx = store, None
+
+    def select(self, *a, **k):
+        return self
+
+    def like(self, _col, pat):
+        self._pfx = pat.rstrip('%')
+        return self
+
+    def in_(self, _col, keys):
+        self._keys = list(keys)
+        self._pfx = None
+        return self
+
+    def limit(self, _n):
+        return self
+
+    def execute(self):
+        if self._pfx is not None:
+            data = [v for k, v in self.store.items() if k.startswith(self._pfx)]
+        else:
+            data = [self.store[k] for k in self._keys if k in self.store]
+        return type('R', (), {'data': data})()
+
+
+class _LikeSB:
+    def __init__(self):
+        self.store = {}
+
+    def table(self, _n):
+        return _LikeTable(self.store)
+
+
+def test_routeless_request_finds_the_route_key_entry(monkeypatch):
+    """DER gemessene Fall: der Flug liegt nur unter dem Routen-Key, die
+    Anfrage kommt ohne Route — vorher ein Loch, jetzt die echte alte Antwort."""
+    _reset(monkeypatch)
+    fake = _LikeSB()
+    now = time.time()
+    k = lh._shared_key('lhfacts', 'LH400', '2026-07-31', 'FRA', 'JFK')
+    fake.store[k] = _row(k, {'reg': 'D-AIHY', 'dep_iata': 'FRA',
+                             'arr_iata': 'JFK'},
+                         _iso(now - 60), _iso(now - 1800))
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    _deny_setup(monkeypatch)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', caller='obs_merge')
+    assert out.get('reg') == 'D-AIHY'
+    assert out['facts_stale'] is True
+
+
+def test_variant_fallback_still_refuses_gaps_and_foreign_routes(monkeypatch):
+    _reset(monkeypatch)
+    fake = _LikeSB()
+    now = time.time()
+    k = lh._shared_key('lhfacts', 'LH400', '2026-07-31', 'FRA', 'JFK')
+    fake.store[k] = _row(k, {'reg': 'D-AIHY', 'dep_iata': 'FRA',
+                             'arr_iata': 'JFK'},
+                         _iso(now - 60), _iso(now - 1800))
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    _deny_setup(monkeypatch)
+    # fremde Route darf NICHT bedient werden
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'MUC', 'JFK',
+                             caller='obs_merge')
+    assert out == {}
+    # Luecke bleibt Luecke
+    fake.store[k] = _row(k, {'reg': 'X', 'dep_iata': 'FRA', 'arr_iata': 'JFK'},
+                         _iso(now - 60), _iso(now - 1800), answered=False)
+    assert lh.lh_flight_facts('LH400', '2026-07-31', caller='obs_merge') == {}
+
+
+def test_variant_fallback_is_never_used_by_warm(monkeypatch):
+    _reset(monkeypatch)
+    fake = _LikeSB()
+    now = time.time()
+    k = lh._shared_key('lhfacts', 'LH400', '2026-07-31', 'FRA', 'JFK')
+    fake.store[k] = _row(k, {'reg': 'D-AIHY', 'dep_iata': 'FRA',
+                             'arr_iata': 'JFK'},
+                         _iso(now - 60), _iso(now - 1800))
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    _deny_setup(monkeypatch)
+    assert lh.lh_flight_facts('LH400', '2026-07-31',
+                              caller='warm_obs_overlay') == {}
