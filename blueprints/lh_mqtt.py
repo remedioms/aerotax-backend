@@ -574,7 +574,6 @@ def _sector_tail(s):
 _reg_lock = threading.Lock()
 _reg_memo = {}
 _REG_TTL_S = 3 * 3600          # Rückfall, wenn die Abflugzeit unbekannt ist
-_REG_NEG_TTL_S = 1800
 # Transportfehler/Throttle-Abweisung sind KEIN „hat keine Reg" — nur kurz
 # zurückhalten, damit ein LH-503 nicht 30 min als Fakt gilt (in der Stichprobe
 # vom 27.07. waren ALLE Fehlschläge 503er).
@@ -583,6 +582,76 @@ _REG_NEG_TTL_S = 1800
 # jeder Poll alle ~320 Legs erneut versucht — bei geschlossenem Gate ergab das
 # 3.901 abgewiesene Versuche/h, ohne dass je eine Reg dabei herauskam.
 _REG_UNKNOWN_TTL_S = 600
+
+# ── R8 (Audit 2026-07-31): die WIEDERHOLUNG war teurer als die Events ───────
+#
+# Gemessen: 3.789 `mqtt_leg_reg`-Calls/Tag — das DREIFACHE dessen, was die
+# MQTT-Events selbst kosten. Ursache war eine FLACHE Negativ-TTL: 1800 s über
+# ein 17-h-Beobachtungsfenster (Abflug −16 h … +1 h) sind bis zu 34
+# Wiederholungen PRO LEG, und zwar für Legs, bei denen LH gerade „ich habe
+# keine Maschine für diesen Flug" gesagt hat.
+#
+# Warum das so verschwenderisch ist: die Reg ist keine flüchtige Größe. Die
+# Messung vom 27.07. (Stichprobe 32/32) zeigt, dass LH sie meist schon 12–16 h
+# vor Abflug liefert — der Positiv-Pfad ist also längst gestaffelt (`_reg_ttl`).
+# Bleibt sie aus, taucht sie erfahrungsgemäß erst zum BOARDING-Fenster auf, wenn
+# die Maschine am Board erscheint. Alles dazwischen ist reines Nachfragen ins
+# Leere.
+#
+# Neue Staffelung — vor dem Boarding LANG, im Boarding-Fenster KURZ:
+#   · Abflug > 3 h weg  → genau bis zum Boarding-Fenster schlafen (max 14 h)
+#   · Abflug ≤ 3 h weg  → alle 2,5 h nachsehen (hier erscheint die Reg wirklich)
+#   · nach dem Abflug   → 3 h; das Fenster endet ohnehin bei Abflug +1 h
+# Worst case über die vollen 17 h: Versuch beim Eintritt (T−16 h), bei T−3 h und
+# bei T−0,5 h — also DREI statt bis zu 34 (`test_hoechstens_drei_reg_versuche_
+# pro_leg_und_tag` nagelt das fest). Die 2,5 h sind mit Absicht nicht kürzer:
+# sie legen den LETZTEN Versuch auf eine halbe Stunde vor Abflug — näher am
+# „Reg erscheint am Board"-Moment als jede der 34 alten Wiederholungen, und
+# gleichzeitig so, dass kein vierter Versuch mehr ins Fenster fällt.
+_REG_NEG_BOARDING_LEAD_S = 3 * 3600
+_REG_NEG_BOARDING_TTL_S = 150 * 60
+_REG_NEG_FAR_MAX_S = 14 * 3600
+_REG_NEG_FAR_MIN_S = 1800
+_REG_NEG_AFTER_DEP_S = 3 * 3600
+# Ohne bekannte Abflugzeit lässt sich nicht staffeln. 2 h statt der alten
+# 1800 s: auch ungestaffelt war die halbe Stunde für eine Größe, die sich über
+# Stunden nicht ändert, viel zu kurz.
+_REG_NEG_TTL_S = 2 * 3600
+# Gleiche Logik für die „wir wissen es nicht"-Sperre (LH-Fehler/Gate zu): nahe
+# am Abflug muss sich das schnell erholen, weit weg darf es ruhen. Der Nah-Wert
+# bleibt bei 600 s — er MUSS über dem 300-s-Topic-Poll liegen.
+_REG_UNKNOWN_FAR_TTL_S = 3600
+
+
+def _reg_neg_ttl(dep_utc, now_ts):
+    """TTL eines BELEGTEN „hat keine Reg" (Sekunden). Pure. `dep_utc`
+    unbekannt → flacher Rückfall."""
+    if dep_utc is None:
+        return _REG_NEG_TTL_S
+    try:
+        lead = dep_utc.timestamp() - now_ts
+    except Exception:
+        return _REG_NEG_TTL_S
+    if lead <= 0:
+        return _REG_NEG_AFTER_DEP_S
+    if lead > _REG_NEG_BOARDING_LEAD_S:
+        return int(max(_REG_NEG_FAR_MIN_S,
+                       min(_REG_NEG_FAR_MAX_S,
+                           lead - _REG_NEG_BOARDING_LEAD_S)))
+    return _REG_NEG_BOARDING_TTL_S
+
+
+def _reg_unknown_ttl(dep_utc, now_ts):
+    """TTL einer LÜCKE (LH-Fehler, eigener Throttle). Pure. Nahe am Abflug
+    kurz (schnelle Erholung), weit weg lang (nichts zu gewinnen)."""
+    if dep_utc is None:
+        return _REG_UNKNOWN_TTL_S
+    try:
+        lead = dep_utc.timestamp() - now_ts
+    except Exception:
+        return _REG_UNKNOWN_TTL_S
+    return (_REG_UNKNOWN_FAR_TTL_S if lead > _REG_NEG_BOARDING_LEAD_S
+            else _REG_UNKNOWN_TTL_S)
 _REG_CACHE_PROVIDER = 'lhopen'
 _REG_KEY_CHUNK = 80            # PostgREST-URL-Länge: in_() nicht überdehnen
 
@@ -688,9 +757,14 @@ def _reg_cache_write(items):
     Aufrufe. Nicht geschrieben werden Lücken (LH kaputt) — die kommen hier
     gar nicht erst an.
 
-    Die TTL kommt vom Aufrufer (`_reg_ttl`, abflugnah gestaffelt) und muss
-    dieselbe sein wie im Prozess-Memo — sonst wäre der geteilte Cache je nach
-    Prozess mal kürzer, mal länger gültig als der lokale."""
+    Die TTL kommt vom Aufrufer (`_reg_ttl` bzw. `_reg_neg_ttl`, beide abflugnah
+    gestaffelt) und muss dieselbe sein wie im Prozess-Memo — sonst wäre der
+    geteilte Cache je nach Prozess mal kürzer, mal länger gültig als der lokale.
+    Das galt bis 2026-07-31 NUR für positive Einträge: `negative_until` rechnete
+    mit einer eigenen Konstanten und ignorierte die übergebene TTL. Damit lief
+    die neue Negativ-Staffelung (R8) am geteilten Cache vorbei — der lokale
+    Prozess hätte 14 h geschwiegen, der geteilte Cache nach 30 min wieder
+    freigegeben."""
     client = _sb()
     if client is None or not items:
         return
@@ -706,7 +780,7 @@ def _reg_cache_write(items):
                             if pos else None,
             'negative_reason': None if pos else 'no_reg',
             'negative_until': None if pos else
-                              (now + timedelta(seconds=_REG_NEG_TTL_S)).isoformat(),
+                              (now + timedelta(seconds=int(ttl))).isoformat(),
             'updated_at': now.isoformat(),
         })
     try:
@@ -783,7 +857,7 @@ def _legs_regs(legs, dep_times=None, deadline=None):
             out[leg] = reg
             _reg_memo_put(key, reg,
                           _reg_ttl(dep_times.get(leg), now) if reg
-                          else _REG_NEG_TTL_S, now)
+                          else _reg_neg_ttl(dep_times.get(leg), now), now)
         else:
             misses.append((leg, key))
 
@@ -802,17 +876,20 @@ def _legs_regs(legs, dep_times=None, deadline=None):
             # alle ~320 Legs gegen dieselbe Wand (gemessen 3.901 abgewiesene
             # Versuche/h, kein einziger davon konnte je eine Reg liefern).
             out[leg] = None
-            _reg_memo_put(key, None, _REG_UNKNOWN_TTL_S, now)
+            _reg_memo_put(key, None, _reg_unknown_ttl(dep_times.get(leg), now),
+                          now)
             continue
         reg, answered = _fetch_leg_reg(*leg)
         out[leg] = reg
         if not answered:
             # Lücke, kein Fakt: nur kurz zurückhalten, NICHT teilen.
-            _reg_memo_put(key, None, _REG_UNKNOWN_TTL_S, now)
+            _reg_memo_put(key, None, _reg_unknown_ttl(dep_times.get(leg), now),
+                          now)
             if _leg_reg_gate_shut():
                 gate_shut = True
             continue
-        ttl = _reg_ttl(dep_times.get(leg), now) if reg else _REG_NEG_TTL_S
+        ttl = (_reg_ttl(dep_times.get(leg), now) if reg
+               else _reg_neg_ttl(dep_times.get(leg), now))
         _reg_memo_put(key, reg, ttl, now)
         fresh.append((key, reg, ttl))
     if fresh:
@@ -1461,8 +1538,23 @@ def lh_mqtt_event():
                         type(e).__name__)
 
     _record_event(topic, kind, len(affected), pushed)
-    log.info('[lh_mqtt] event %s kind=%s users=%d pushed=%d la=%d', topic,
-             kind, len(affected), pushed, la_sent)
+    # ── R9-Teilfix (Audit 2026-07-31): Events hinterlassen SPUREN ────────────
+    # Bis heute stand hier keine einzige Zeitangabe. Konsequenz laut Audit:
+    #   · die LATENZ des Push-Kanals (Broker-Timestamp → unsere Verarbeitung)
+    #     war schlicht unmessbar — `event_ts` schließt diese Lücke.
+    #   · die LANGSTRECKEN-ABDECKUNG war unmessbar. Genau daran scheiterte die
+    #     empirische Schließung des LH433-Falls (8,5 h Block, 0 Events): man
+    #     konnte nicht zeigen, dass NIE ein Event für einen langen Flug kam,
+    #     weil kein Log die Blockzeit trug. Mit `block_min` ist der R1-Beweis
+    #     trivial — tauchen `arrived`-Events mit block_min > 240 auf, wirkt das
+    #     neue Abo-Fenster.
+    # `block_min` kommt aus dem betroffenen Roster-Sektor (dep_iso→arr_iso),
+    # nicht aus einer Schätzung; ohne Sektor oder ohne Zeiten bleibt es leer.
+    block_min = _sector_block_min(affected[0][1] if affected else None)
+    log.info('[lh_mqtt] event %s kind=%s users=%d pushed=%d la=%d '
+             'event_ts=%s block_min=%s', topic, kind, len(affected), pushed,
+             la_sent, ev_ts or '-',
+             block_min if block_min is not None else '-')
     return jsonify({'ok': True, 'kind': kind, 'users': len(affected),
                     'pushed': pushed, 'la_sent': la_sent})
 

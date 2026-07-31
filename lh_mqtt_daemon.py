@@ -13,8 +13,26 @@ Username = clientID, Passwort = JWT aus dem Certificate-Manager
 (POST api.lufthansa.com/v1/flightUpdate/credentials/JWT/<prefix>/flupSubTopic
 — die LH-Doku nennt fälschlich lhgopenapi als Host; dort kommt 401
 „invalid token"). JWT ist 2 Jahre gültig; wir holen trotzdem pro
-Prozess-Start frisch (jeder Abruf erzeugt eine neue eindeutige clientID —
-kein Kollisionsrisiko zwischen Restarts).
+Prozess-Start frisch.
+
+⚠️ clientID IST STABIL — NUR EIN DAEMON GLEICHZEITIG (korrigiert 2026-07-31).
+Hier stand jahrelang das Gegenteil („jeder Abruf erzeugt eine neue eindeutige
+clientID — kein Kollisionsrisiko zwischen Restarts"). Das Audit vom 31.07. hat
+es nachgemessen: der Certificate Manager liefert über Restarts hinweg IMMER
+DIESELBE ID (`aerox_95491660`). Die Behauptung war also nicht nur falsch, sie
+lud direkt in die teuerste Falle dieses Pfades ein.
+
+Konsequenz, die jeder kennen muss, der hier etwas ändert:
+  · MQTT erlaubt pro clientID genau EINE Verbindung. Verbindet sich ein
+    zweiter Daemon, wirft der Broker den ersten hinaus — die beiden treten
+    sich dann im Sekundentakt gegenseitig weg und es kommt GAR NICHTS mehr an.
+  · Deshalb gibt es kein HA, kein blue-green und keinen Parallelbetrieb für
+    diesen Service. Ein Deploy MUSS den alten Container erst stoppen; das
+    bekannte 50–60-s-Blindfenster beim Neustart ist der Preis dafür und keine
+    Panne. Bei QoS 0 + clean session wird in dieser Zeit nichts nachgeliefert.
+  · Wer mehrere Instanzen braucht, braucht ZUERST einen zweiten
+    Certificate-Manager-Prefix (LH_MQTT_CLIENT_PREFIX) — nicht einfach eine
+    zweite Replica.
 
 Env (aus /opt/aerox/env.list, geteilt mit backend+poll):
 - LH_OPEN_API_KEY/SECRET (Fallback LH_KEY/SECRET) — wie Engine A

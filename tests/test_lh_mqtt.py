@@ -1001,3 +1001,225 @@ def test_est_arr_schlaegt_fehlende_arr_iso():
     assert lh_mqtt.sector_sub_end(s, dep) == datetime(
         2026, 7, 23, 1, 10, tzinfo=timezone.utc)
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# R8 — mqtt_leg_reg verbrannte 3x mehr als die Events selbst
+# ════════════════════════════════════════════════════════════════════════════
+# 3.789 Calls/Tag, weil eine FLACHE 1800-s-Negativ-TTL ueber ein 17-h-Fenster
+# bis zu 34 Wiederholungen pro Leg erzeugte — fuer Fluege, bei denen LH gerade
+# „ich habe keine Maschine" gesagt hat.
+
+def _now_dep(hours):
+    now = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    return now, now + timedelta(hours=hours)
+
+
+def test_neg_ttl_schlaeft_bis_ins_boarding_fenster():
+    """Weit vor dem Abflug: genau bis zum Boarding-Fenster, keine Sekunde
+    frueher aufwachen. Dort erscheint die Reg, davor ist Nachfragen sinnlos."""
+    now, dep = _now_dep(10)
+    assert lh_mqtt._reg_neg_ttl(dep, now.timestamp()) == int(
+        10 * 3600 - lh_mqtt._REG_NEG_BOARDING_LEAD_S)
+
+
+def test_neg_ttl_ist_gedeckelt():
+    """Ein Leg ganz am Rand des Fensters bekommt keine Tages-TTL."""
+    now, dep = _now_dep(40)
+    assert lh_mqtt._reg_neg_ttl(dep, now.timestamp()) == lh_mqtt._REG_NEG_FAR_MAX_S
+
+
+def test_neg_ttl_ist_im_boarding_fenster_kurz():
+    """Ab 3 h vor Abflug wird wieder haeufiger nachgesehen — sonst verpasst man
+    genau den Moment, in dem die Maschine am Board erscheint."""
+    for lead_h in (3, 2, 1, 0.25):
+        now, dep = _now_dep(lead_h)
+        assert lh_mqtt._reg_neg_ttl(dep, now.timestamp()) \
+            == lh_mqtt._REG_NEG_BOARDING_TTL_S, lead_h
+
+
+def test_neg_ttl_nach_dem_abflug():
+    now, dep = _now_dep(-0.5)
+    assert lh_mqtt._reg_neg_ttl(dep, now.timestamp()) \
+        == lh_mqtt._REG_NEG_AFTER_DEP_S
+
+
+def test_neg_ttl_ohne_abflugzeit_ist_flach_aber_nicht_mehr_winzig():
+    """Ohne Abflugzeit laesst sich nicht staffeln — aber die alten 30 min waren
+    fuer eine Groesse, die sich ueber Stunden nicht aendert, viel zu kurz."""
+    assert lh_mqtt._reg_neg_ttl(None, time.time()) == lh_mqtt._REG_NEG_TTL_S
+    assert lh_mqtt._REG_NEG_TTL_S >= 3600
+
+
+def test_hoechstens_drei_reg_versuche_pro_leg_und_tag():
+    """DIE Zahl aus dem Auftrag. Simuliert das echte Beobachtungsfenster
+    (Abflug -16 h … +1 h) mit dem echten Topic-Poll (300 s) fuer ein Leg, das
+    durchgehend „keine Reg" beantwortet bekommt."""
+    dep = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    start = (dep - timedelta(hours=lh_mqtt._INBOUND_DEP_WINDOW_H)).timestamp()
+    stop = (dep + timedelta(hours=1)).timestamp()
+    t, next_try, tries = start, start, 0
+    while t <= stop:
+        if t >= next_try:
+            tries += 1
+            next_try = t + lh_mqtt._reg_neg_ttl(dep, t)
+        t += 300
+    assert tries <= 3, tries
+
+
+def test_alte_flache_ttl_haette_das_fenster_zugemuellt():
+    """Gegenprobe zur Zahl oben — ohne die Staffelung waren es 30+ Versuche
+    fuer DASSELBE Leg. Der Test haelt fest, wovon wir wegkommen."""
+    dep = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    start = (dep - timedelta(hours=lh_mqtt._INBOUND_DEP_WINDOW_H)).timestamp()
+    stop = (dep + timedelta(hours=1)).timestamp()
+    t, next_try, tries = start, start, 0
+    while t <= stop:
+        if t >= next_try:
+            tries += 1
+            next_try = t + 1800            # die alte flache Negativ-TTL
+        t += 300
+    assert tries >= 30
+
+
+def test_letzter_versuch_liegt_noch_vor_dem_abflug():
+    """Die Staffelung darf den „Reg erscheint am Board"-Moment nicht opfern:
+    der letzte Versuch muss VOR dem Abflug liegen, nicht danach."""
+    dep = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    start = (dep - timedelta(hours=lh_mqtt._INBOUND_DEP_WINDOW_H)).timestamp()
+    stop = (dep + timedelta(hours=1)).timestamp()
+    t, next_try, last = start, start, None
+    while t <= stop:
+        if t >= next_try:
+            last = t
+            next_try = t + lh_mqtt._reg_neg_ttl(dep, t)
+        t += 300
+    assert last is not None and last < dep.timestamp()
+    assert dep.timestamp() - last <= 3600      # hoechstens 1 h vorher
+
+
+def test_unknown_ttl_bleibt_nah_am_abflug_kurz():
+    """Eine LUECKE (LH-503 / eigener Throttle) muss sich nahe am Abflug schnell
+    erholen — und weiterhin laenger sein als der 300-s-Topic-Poll."""
+    now, dep = _now_dep(1)
+    assert lh_mqtt._reg_unknown_ttl(dep, now.timestamp()) \
+        == lh_mqtt._REG_UNKNOWN_TTL_S
+    assert lh_mqtt._REG_UNKNOWN_TTL_S > 300
+
+
+def test_unknown_ttl_ruht_laenger_wenn_der_abflug_weit_weg_ist():
+    now, dep = _now_dep(12)
+    assert lh_mqtt._reg_unknown_ttl(dep, now.timestamp()) \
+        == lh_mqtt._REG_UNKNOWN_FAR_TTL_S
+
+
+def test_unknown_ttl_ohne_abflugzeit_unveraendert():
+    assert lh_mqtt._reg_unknown_ttl(None, time.time()) \
+        == lh_mqtt._REG_UNKNOWN_TTL_S
+
+
+def test_negativ_eintrag_wird_mit_gestaffelter_ttl_geteilt(_clean_reg,
+                                                          monkeypatch):
+    """Prozess-Memo UND geteilter Cache muessen dieselbe gestaffelte TTL
+    bekommen. Bis 2026-07-31 rechnete `_reg_cache_write` fuer `negative_until`
+    mit einer eigenen Konstanten — die Staffelung waere am geteilten Cache
+    vorbeigelaufen und jeder andere Worker haette nach 30 min neu gekauft."""
+    written = []
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
+    import blueprints.lh_open_api as lho
+    monkeypatch.setattr(lho, 'last_call_answered', lambda: True)
+    monkeypatch.setattr(lh_mqtt, '_sb', lambda: object())
+    monkeypatch.setattr(lh_mqtt, '_reg_cache_read', lambda keys: {})
+    monkeypatch.setattr(lh_mqtt, '_reg_cache_write',
+                        lambda items: written.extend(items))
+    now = datetime.now(timezone.utc)
+    leg = ('LH400', now.date().isoformat(), 'FRA', 'JFK')
+    dep = now + timedelta(hours=10)
+    lh_mqtt._legs_regs([leg], dep_times={leg: dep})
+    assert len(written) == 1
+    key, reg, ttl = written[0]
+    assert reg is None
+    assert ttl == lh_mqtt._reg_neg_ttl(dep, time.time())
+    assert ttl > lh_mqtt._REG_NEG_BOARDING_TTL_S
+    memo_expiry, _v = lh_mqtt._reg_memo[key]
+    assert abs((memo_expiry - time.time()) - ttl) < 2
+
+
+def test_reg_cache_write_nimmt_die_uebergebene_ttl_fuer_negative(monkeypatch):
+    """Der Schreibpfad selbst: `negative_until` muss aus der uebergebenen TTL
+    kommen, nicht aus einer Konstanten."""
+    captured = {}
+
+    class _T:
+        def upsert(self, rows, on_conflict=None):
+            captured['rows'] = rows
+            return self
+
+        def execute(self):
+            return None
+
+    class _C:
+        def table(self, _name):
+            return _T()
+
+    monkeypatch.setattr(lh_mqtt, '_sb', lambda: _C())
+    lh_mqtt._reg_cache_write([('k1', None, 9 * 3600)])
+    row = captured['rows'][0]
+    assert row['result_until'] is None and row['negative_reason'] == 'no_reg'
+    until = datetime.fromisoformat(row['negative_until'])
+    rest = (until - datetime.now(timezone.utc)).total_seconds()
+    assert 9 * 3600 - 60 < rest <= 9 * 3600
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# R9-Teilfix — Events hinterlassen endlich eine Spur
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_sector_block_min_rechnet_nur_mit_echten_zeiten():
+    assert lh_mqtt._sector_block_min(LH433) == 9 * 60
+    assert lh_mqtt._sector_block_min(
+        {k: v for k, v in LH433.items() if k != 'arr_iso'}) is None
+    assert lh_mqtt._sector_block_min(
+        dict(LH433, arr_iso='2026-07-22T14:00:00Z')) is None
+    assert lh_mqtt._sector_block_min(None) is None
+    assert lh_mqtt._sector_block_min({}) is None
+
+
+def test_event_log_traegt_event_ts_und_blockzeit(client, monkeypatch, caplog):
+    """Ohne diese beiden Werte ist weder die Latenz des Push-Kanals noch die
+    Langstrecken-Abdeckung messbar — genau daran scheiterte die empirische
+    Schliessung des LH433-Falls (8,5 h Block, 0 Events)."""
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
+                        lambda dates, c, n: _rows([LH433]))
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
+    monkeypatch.setattr(lh_mqtt, '_push_inbound', lambda *a, **k: 0)
+    with caplog.at_level('INFO', logger='aerotax'):
+        r = client.post('/api/internal/lh-mqtt/event',
+                        json=_event_body('Arrived', flight='LH433'))
+    assert r.get_json()['kind'] == 'arrived'
+    line = [m for m in caplog.messages if '[lh_mqtt] event' in m]
+    assert line, caplog.messages
+    assert 'event_ts=2026-07-22T12:48:58' in line[0]
+    assert 'block_min=540' in line[0]
+
+
+def test_event_log_ohne_betroffene_erfindet_keine_blockzeit(client, monkeypatch,
+                                                            caplog):
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    with caplog.at_level('INFO', logger='aerotax'):
+        client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Arrived', flight='LH433'))
+    line = [m for m in caplog.messages if '[lh_mqtt] event' in m]
+    assert line and 'block_min=-' in line[0]
+
+
+# ── Daemon-Docstring: die clientID-Behauptung war falsch ────────────────────
+
+def test_daemon_docstring_warnt_vor_der_clientid_kollision():
+    """Der Docstring behauptete „jeder Abruf erzeugt eine neue eindeutige
+    clientID — kein Kollisionsrisiko". Gemessen 2026-07-31: sie ist STABIL
+    (aerox_95491660). Die falsche Zusage lud direkt in den Doppel-Daemon-
+    Betrieb ein, bei dem sich zwei Prozesse gegenseitig vom Broker werfen."""
+    doc = daemon.__doc__ or ''
+    assert 'neue eindeutige clientID' not in doc
+    assert 'STABIL' in doc
+    assert 'EIN DAEMON' in doc.upper()
