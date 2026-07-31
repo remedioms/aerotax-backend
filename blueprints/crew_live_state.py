@@ -1438,7 +1438,18 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         # Ankunftszeit im Text = die EFFEKTIVE Ankunft wie der Radar sie zeigt:
         # absolute Warehouse-esti schlägt sched+delay (Owner 2026-07-13 „Live-
         # Karte 8:40, Radar paar Min später"). Fehlt beides → Plan-Ankunft.
+        #
+        # KENNZEICHNUNG (Owner 2026-07-31, Julien LH454 FRA→SFO): der Fallback auf
+        # `leg['arr']` ist die ROSTER-PLANZEIT — bisher stand sie ununterscheidbar
+        # als „Ankunft 12:40" da, während der echte est bei 12:21 lag. Eine Plan-
+        # zeit als „Ankunft" zu behaupten ist genau die verbotene Fake-Sicherheit.
+        # Rangfolge + Label exakt wie `LiveAircraftHero.landingText` in iOS
+        # (est unmarkiert > sched mit „(Soll)" > nichts) — EINE Kennzeichnung
+        # über die ganze App. KEIN neues Feld nötig: `current_leg.est_arr_iso` ist
+        # genau dann gesetzt, wenn es einen echten est gibt — die Clients, die
+        # ihre Zeile selbst bauen, leiten die Kennzeichnung daraus ab.
         eff_arr, _ = _eff_arr(leg, o)
+        arr_estimated = eff_arr is not None
         if eff_arr is None:
             eff_arr = leg['arr']
         route = f"{leg['dep_ap']} → {leg['arr_ap'] or '?'}"
@@ -1446,7 +1457,8 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
         if not leg['arr_synth']:
             t = hhmm(eff_arr, leg['arr_ap'] or leg['dep_ap'])
             if t:
-                sub = f'{route} · Ankunft {t}'
+                sub = (f'{route} · Ankunft {t}' if arr_estimated
+                       else f'{route} · Ankunft {t} (Soll)')
         return _result(STATE_FLYING, leg=leg, idx=idx,
                        position=_position(leg), title='Fliegt gerade',
                        subtitle=sub, confidence=conf)

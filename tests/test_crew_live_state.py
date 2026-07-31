@@ -75,16 +75,19 @@ def test_0700_fliegt_leg1_beobachtet():
     assert r['leg_index'] == 0
     assert r['confidence'] == CONF_OBSERVED
     assert r['text']['title'] == 'Fliegt gerade'
-    assert r['text']['subtitle'] == 'BCN → FRA · Ankunft 08:55'
+    # Nur ein airborne-Status, KEIN est/Delay ⇒ die Zahl ist die Roster-Planzeit
+    # und wird als solche gekennzeichnet (Owner 2026-07-31).
+    assert r['text']['subtitle'] == 'BCN → FRA · Ankunft 08:55 (Soll)'
     assert r['current_leg']['flight_no'] == 'LH1139'
     assert r['current_leg']['dep'] == 'BCN' and r['current_leg']['arr'] == 'FRA'
+    assert r['current_leg']['est_arr_iso'] is None
 
 
 def test_0700_fliegt_leg1_nur_plan():
     r = _resolve(_utc(7, 0))
     assert r['state'] == STATE_FLYING
     assert r['confidence'] == CONF_PLAN
-    assert r['text']['subtitle'] == 'BCN → FRA · Ankunft 08:55'
+    assert r['text']['subtitle'] == 'BCN → FRA · Ankunft 08:55 (Soll)'
 
 
 def test_0930_gelandet_wartet_auf_leg2():
@@ -104,7 +107,7 @@ def test_1059_fliegt_leg2():
     assert r['state'] == STATE_FLYING
     assert r['leg_index'] == 1
     assert r['text']['title'] == 'Fliegt gerade'
-    assert r['text']['subtitle'] == 'FRA → ARN · Ankunft 12:30'
+    assert r['text']['subtitle'] == 'FRA → ARN · Ankunft 12:30 (Soll)'
 
 
 def test_1245_gelandet_arn_wartet_auf_leg3():
@@ -121,7 +124,7 @@ def test_1400_fliegt_leg3():
                                    'LH802': {'status': 'landed'}})
     assert r['state'] == STATE_FLYING
     assert r['leg_index'] == 2
-    assert r['text']['subtitle'] == 'ARN → FRA · Ankunft 15:20'
+    assert r['text']['subtitle'] == 'ARN → FRA · Ankunft 15:20 (Soll)'
 
 
 def test_1630_frisch_gelandet_homebase_feierabend():
@@ -267,6 +270,51 @@ def test_beobachteter_delay_verschiebt_ankunft():
     r = _resolve(_utc(9, 0), obs={'LH1139': {'arr_delay_min': 30}})
     assert r['state'] == STATE_FLYING
     assert r['text']['subtitle'] == 'BCN → FRA · Ankunft 09:25'
+
+
+# ── Ist vs. Soll: die Ankunftszeit muss ehrlich gekennzeichnet sein ──────────
+#
+# Owner 2026-07-31 (Julien, LH454 FRA→SFO): die Karte „Wer fliegt gerade" zeigte
+# „Ankunft 12:40" — das war die PLANZEIT, während der echte est bei 12:21 lag.
+# Regel: est_arr > sched_arr > nichts; eine Planzeit darf NIE ununterscheidbar
+# als „Ankunft" behauptet werden. Kennzeichnung wie LiveAircraftHero.landingText.
+
+def test_absolutes_est_arr_ist_unmarkiert_und_schlaegt_den_plan():
+    """est vorhanden ⇒ est wird gezeigt, OHNE „(Soll)" (Juliens Fall)."""
+    r = _resolve(_utc(7, 0), obs={'LH1139': {
+        'status': 'airborne',
+        'est_arr_iso': '2026-07-09T08:36:00Z',   # 19 min FRÜHER als Plan 08:55
+    }})
+    assert r['state'] == STATE_FLYING
+    assert r['text']['subtitle'] == 'BCN → FRA · Ankunft 08:36'
+    assert '(Soll)' not in r['text']['subtitle']
+    # Strukturell: der Client erkennt den Ist-Charakter an est_arr_iso != None.
+    assert r['current_leg']['est_arr_iso'] == '2026-07-09T08:36:00Z'
+
+
+def test_delay_abgeleitetes_est_ist_ebenfalls_unmarkiert():
+    """sched+Board-Delay ist ein ECHTER Anker ⇒ zählt als Ist, kein „(Soll)"."""
+    r = _resolve(_utc(9, 0), obs={'LH1139': {'arr_delay_min': 30}})
+    assert r['text']['subtitle'] == 'BCN → FRA · Ankunft 09:25'
+    assert r['current_leg']['est_arr_iso'] == '2026-07-09T09:25:00Z'
+
+
+def test_ohne_jede_ist_zeit_wird_der_plan_als_soll_gekennzeichnet():
+    """Weder est noch Delay ⇒ Planzeit, aber sichtbar als „(Soll)"."""
+    r = _resolve(_utc(7, 0), obs={'LH1139': {'status': 'airborne'}})
+    assert r['text']['subtitle'].endswith('Ankunft 08:55 (Soll)')
+    assert r['current_leg']['est_arr_iso'] is None
+
+
+def test_synthetische_ankunft_zeigt_gar_keine_zeit():
+    """Ohne echte Soll-Ankunft (arr_synth) fällt die Zeile weg — nichts erfunden."""
+    sectors = [{'flight': 'LH1139', 'from': 'BCN', 'to': 'FRA',
+                'dep_iso': '2026-07-09T06:40:00Z'}]     # kein arr_iso
+    r = _resolve(_utc(7, 0), obs={'LH1139': {'status': 'airborne'}},
+                 sectors=sectors)
+    assert r['state'] == STATE_FLYING
+    assert r['text']['subtitle'] == 'BCN → FRA'
+    assert 'Ankunft' not in r['text']['subtitle']
 
 
 def test_beobachteter_dep_delay_haelt_am_boden():
@@ -1262,13 +1310,15 @@ def test_bugB_flying_ankunft_folgt_absolutem_est_arr_wie_radar():
 
 
 def test_bugB_ohne_est_arr_bleibt_planzeit():
-    """Kein absolutes est, kein Delay → exakt das alte Verhalten (Plan 08:40)."""
+    """Kein absolutes est, kein Delay → die Planzeit (08:40) bleibt die einzige
+    Zahl, wird seit 2026-07-31 aber als „(Soll)" gekennzeichnet statt sie als
+    Ist-Ankunft zu behaupten."""
     now = _utc(8, 30)
     obs = _obs({'LH900': {'status': 'Departed', 'dep_delay_min': 0}})
     r = resolve_crew_live_state(_BUGB_SECTORS, obs, _live({}), now,
                                 homebase='FRA', layover_iata='LHR')
     assert r['state'] == STATE_FLYING
-    assert r['text']['subtitle'] == 'FRA → LHR · Ankunft 08:40'
+    assert r['text']['subtitle'] == 'FRA → LHR · Ankunft 08:40 (Soll)'
     assert r['current_leg']['est_arr_iso'] is None
 
 
