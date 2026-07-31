@@ -5405,6 +5405,76 @@ def _lb_candidates(links, days, today=None):
     return out
 
 
+def _lb_candidates_from_roster(briefings, days, today=None):
+    """Kandidaten-Legs aus dem EIGENEN Roster (`ical_sectors`) — derselbe
+    Shape wie `_lb_candidates`. PURE/testbar.
+
+    WARUM ES DIESEN ZWEITEN WEG BRAUCHT (Befund 2026-07-31, am Live-System
+    nachgesehen): `_lb_candidates` liest ausschließlich `landingreport`-
+    Referenzen aus dem Duty-Events-Link-Cache. In `folinks_<token>.json` des
+    Owners lagen 16 Referenzen — flightInfo, airportWeather, crewList,
+    checkInTimes, crewHotel — und KEINE EINZIGE landingReport. Der Abgleich
+    lieferte deshalb `legs: []` bei `calls: 0`: er hatte nie einen Kandidaten,
+    und der Nachlade-Zweig fand ebenfalls keinen. Für den Nutzer sah das aus
+    wie „LH hat nichts", tatsächlich hat nie jemand gefragt.
+
+    COMMON_LANDING_REPORT braucht — anders als COMMON_CREWLIST — KEINEN
+    accessCode, sondern nur (flightDesignator, flightDate, departureAirport).
+    Diese drei Werte stehen in jedem geflogenen Roster-Sektor. Der Roster ist
+    damit die verlässlichere Kandidatenquelle; die Links bleiben als erster
+    Weg bestehen (sie sind gratis und exakt).
+
+    Deadheads und Nicht-Flug-Sektoren fallen raus (`_pb_is_flight_sector`):
+    für einen Deadhead gibt es keinen eigenen Landing Report."""
+    try:
+        ref = today or _dt.datetime.now(_dt.timezone.utc).date()
+    except Exception:
+        return []
+    out, seen = [], set()
+    for d in sorted((briefings or {}).keys()):
+        if not isinstance(d, str) or len(d) < 10:
+            continue
+        day = briefings.get(d)
+        if not isinstance(day, dict):
+            continue
+        try:
+            dd = _dt.date(int(d[0:4]), int(d[5:7]), int(d[8:10]))
+        except Exception:
+            continue
+        back = (ref - dd).days
+        if back < _LB_MIN_AGE_DAYS or back > days:
+            continue
+        for s in (day.get('ical_sectors') or []):
+            if not (isinstance(s, dict) and _pb_is_flight_sector(s)):
+                continue
+            flight = re.sub(r'\s+', '', str(s.get('flight') or '')).upper()
+            dep = str(s.get('from') or '').upper()
+            if not (flight and len(dep) == 3):
+                continue
+            k = (flight, d[:10], dep)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append({'flight': flight, 'date': d[:10], 'dep': dep,
+                        'arr': str(s.get('to') or '').upper() or None})
+    out.sort(key=lambda c: (c['date'], c['flight']))
+    return out
+
+
+def _lb_merge_candidates(primary, extra):
+    """Link-Kandidaten zuerst (sie tragen die exakten LH-Parameter), fehlende
+    Roster-Kandidaten hinten dran — dedupliziert über (flight, date, dep)."""
+    seen = {(c['flight'], c['date'], c['dep']) for c in (primary or [])}
+    out = list(primary or [])
+    for c in extra or []:
+        k = (c['flight'], c['date'], c['dep'])
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    out.sort(key=lambda c: (c['date'], c['flight']))
+    return out
+
+
 def _lb_leg_row(cand, facts, self_landed, status):
     """Ein Ergebnis-Leg in der vertraglich fixen Shape. Fehlendes bleibt None —
     ein Flugbuch-Vorschlag mit erfundenen Werten wäre schlimmer als keiner."""
@@ -5473,6 +5543,22 @@ def flightops_logbook_verify(token):
                       if not any(l == g for g in fresh)] + fresh
             _links_save(token, merged[-800:])
         cands = _lb_candidates(fresh, days)
+
+    # ZWEITE QUELLE: der eigene Roster (Befund 2026-07-31 — im Link-Cache
+    # steht oft KEINE einzige landingReport-Referenz, s.
+    # `_lb_candidates_from_roster`). Immer ergänzend, nicht nur im Miss-Fall:
+    # der Link-Cache kann einen Teil des Fensters kennen und den Rest nicht,
+    # und ein halb abgeglichenes Flugbuch ist genau die Sorte stiller Lücke,
+    # die niemand meldet.
+    try:
+        import app as _app
+        _briefs = dict(_app._ical_briefings_load(token) or {})
+    except Exception as e:
+        log.warning('[lh_flightops] logbook-verify briefings: %s',
+                    type(e).__name__)
+        _briefs = {}
+    cands = _lb_merge_candidates(cands,
+                                 _lb_candidates_from_roster(_briefs, days))
 
     legs, calls, stopped = [], 0, None   # stopped = Status für den Rest
     for c in cands:

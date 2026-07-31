@@ -323,6 +323,27 @@ _CONTENT_FIELDS = {
     # Tages-Angaben des Writers („Do 30.07"), Fußzeile der aufgeklappten Insel.
     'mainTimeIsToday':     'bool',
     'mainTimeDayLabel':    'str',
+    # ── Nachzug 2026-07-31: BESTÄTIGT gegen GEPLANT ─────────────────────────
+    #
+    # Owner-Entscheid nach seinem eigenen Flug und Tibors Screenshot: „wenn
+    # bestätigte zeiten sind dann kann die aktivität weiterlaufen … aber keine
+    # infos geht nicht. muss schon richtig sein sonst weg."
+    #
+    # Der Client darf NUR dann ohne Netz fortschalten, wenn ein Fakt BELEGT ist
+    # (Board sagt departed/airborne/landed) — eine bloß verstrichene PLANZEIT
+    # belegt nichts, die Maschine kann am Gate stehen. Genau das war der Fehler
+    # „Flug-Animation ohne Pushback".
+    #
+    # ⚠️ DRITTES MAL DIESELBE FALLE: fehlt ein Feld hier, wirft der Normalizer
+    # es als `unknown_key` weg — der Sender darf es schicken, ankommen tut es
+    # nie. So verschwand am 27.07. die Turnaround-Korrektur für drei Tage, und
+    # am 29.07. fünf Felder auf einmal (s. Banner oben). Wer in Swift ein Feld
+    # an `ContentState` hängt, MUSS es hier eintragen.
+    #
+    # Fehlen sie (alter Sender), ist das konservativ richtig: der Client wertet
+    # `nil` als „nicht bestätigt" und schaltet dann gar nicht fort.
+    'depConfirmed':        'bool',
+    'arrConfirmed':        'bool',
 }
 
 # Nicht-optional in Swift ⇒ Key MUSS im JSON stehen (der synthetisierte

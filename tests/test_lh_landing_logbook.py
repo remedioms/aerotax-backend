@@ -148,6 +148,52 @@ def test_candidates_dedupe_and_broken_rows():
     assert len(fo._lb_candidates(links, 14)) == 1
 
 
+def _roster_day(back, sectors):
+    return _day(back), {'ical_sectors': sectors}
+
+
+def test_candidates_aus_roster_wenn_keine_landingreport_links():
+    """DER BEFUND VOM 31.07.: im Link-Cache des Owners lag KEINE einzige
+    landingReport-Referenz (nur flightInfo/crewList/…), der Abgleich lieferte
+    deshalb `legs: []` bei `calls: 0` — er hatte nie einen Kandidaten. Der
+    Roster kennt (Flugnummer, Datum, Abflug) für jedes geflogene Leg, und mehr
+    braucht COMMON_LANDING_REPORT nicht."""
+    briefings = dict([
+        _roster_day(0, [{'flight': 'LH100', 'from': 'FRA', 'to': 'MUC'}]),
+        _roster_day(1, [{'flight': 'LH101', 'from': 'FRA', 'to': 'MUC'}]),
+        _roster_day(3, [{'flight': 'LH 454', 'from': 'FRA', 'to': 'SFO'}]),
+        _roster_day(20, [{'flight': 'LH716', 'from': 'FRA', 'to': 'HND'}]),
+    ])
+    got = fo._lb_candidates_from_roster(briefings, 14)
+    assert [c['flight'] for c in got] == ['LH454']       # 0/1 zu frisch, 20 zu alt
+    assert got[0] == {'flight': 'LH454', 'date': _day(3), 'dep': 'FRA',
+                      'arr': 'SFO'}
+
+
+def test_roster_kandidaten_ohne_deadhead_und_ohne_halbe_zeilen():
+    """Ein Deadhead hat keinen eigenen Landing Report, und ohne Flugnummer
+    oder Abflugstation gibt es nichts zu fragen — beides fällt weg statt einen
+    Leer-Call zu verbrennen."""
+    briefings = dict([
+        _roster_day(3, [{'flight': 'LH500', 'from': 'FRA', 'to': 'MUC', 'dh': True},
+                        {'flight': '', 'from': 'FRA', 'to': 'MUC'},
+                        {'flight': 'LH501', 'from': '', 'to': 'MUC'},
+                        {'flight': 'LH502', 'from': 'FRA', 'to': 'FRA'},
+                        {'flight': 'LH503', 'from': 'MUC', 'to': 'FRA'}]),
+    ])
+    assert [c['flight'] for c in fo._lb_candidates_from_roster(briefings, 14)] \
+        == ['LH503']
+
+
+def test_merge_haelt_link_kandidaten_vorn_und_dedupliziert():
+    link_c = [{'flight': 'LH454', 'date': _day(3), 'dep': 'FRA', 'arr': 'SFO'}]
+    roster_c = [{'flight': 'LH454', 'date': _day(3), 'dep': 'FRA', 'arr': 'SFO'},
+                {'flight': 'LH455', 'date': _day(4), 'dep': 'SFO', 'arr': 'FRA'}]
+    got = fo._lb_merge_candidates(link_c, roster_c)
+    assert [c['flight'] for c in got] == ['LH455', 'LH454']   # sortiert nach Datum
+    assert len(got) == 2
+
+
 # ═══════════════════════════════ Cache-Semantik ═════════════════════════════
 def test_shared_cache_never_stores_or_serves_per_user_flag(monkeypatch, tmp_path):
     monkeypatch.setattr(fo, '_flow_dir', lambda: str(tmp_path))

@@ -113,6 +113,7 @@ for _bp_path, _bp_name in [
     ('blueprints.daily_briefing',            'daily_briefing_bp'),  # Daily Briefing nach Florians Spez (P10, README = fachliche Wahrheit)
     ('blueprints.lh_mqtt',                   'lh_mqtt_bp'),  # LH MQTT-Push-Notifications — Topics/Event-Fanout (Engine A2)
     ('blueprints.live_activity',             'live_activity_bp'),  # Live Activities — ActivityKit-Token-Registry + APNs-Push (P6)
+    ('blueprints.calendar_sweep',            'calendar_sweep_bp'),  # periodischer Nachlauf gespeicherter iCal-Links (NUR Nicht-LH-Hosts)
     ('blueprints.flight_checkins',           'flight_checkins_bp'),  # für einen Flug einchecken → Ereignis-Pushes (abgeflogen/landet in 1h/gelandet)
 ]:
     try:
