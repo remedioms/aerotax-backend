@@ -3101,6 +3101,12 @@ def test_relogin_watch_alerts_on_spike_and_dead_refresher(monkeypatch, tmp_path)
     import app as backend
     monkeypatch.setattr(fo, '_RELOGIN_WATCH_STATE',
                         str(tmp_path / 'watch.json'))
+    # Der Wächter urteilt seit 31.07. aus dem HERZSCHLAG (prozessunabhängig),
+    # nicht aus `_refresher_state['active']`. „Tot" heißt deshalb: es GAB
+    # einen Schlag und er ist alt.
+    monkeypatch.setattr(fo, '_REFRESHER_BEAT_FILE', str(tmp_path / 'beat'))
+    monkeypatch.setattr(fo, '_REFRESHER_PAUSE_FILE', str(tmp_path / 'pause'))
+    monkeypatch.setattr(fo, '_maybe_start_refresher', lambda: None)
     monkeypatch.delenv('ADSB_POLL_SECRET', raising=False)
     monkeypatch.setenv('LH_FLIGHTOPS_REFRESHER', '1')
     mails = []
@@ -3109,10 +3115,11 @@ def test_relogin_watch_alerts_on_spike_and_dead_refresher(monkeypatch, tmp_path)
     counts = [10, 40]
     monkeypatch.setattr(fo, '_relogin_count', lambda: counts.pop(0))
     fo._refresher_state.update(active=False, drain=False, busy=False)
+    fo._refresher_beat_write(now=fo.time.time() - 30 * 60)
     c = backend.app.test_client()
     d1 = c.post('/api/internal/flightops/relogin-watch').get_json()
     # Lauf 1: Baseline (kein prev) — aber toter Refresher alarmiert sofort
-    assert any('NICHT aktiv' in r for r in d1['reasons'])
+    assert any('steht' in r for r in d1['reasons'])
     assert mails
     # Lauf 2: +30 in 1h → Spike-Grund dabei, aber Cooldown drosselt die Mail
     d2 = c.post('/api/internal/flightops/relogin-watch').get_json()
@@ -3154,39 +3161,50 @@ def test_refresh_all_exit_drain_sets_drain_and_joins(monkeypatch):
 
 def test_relogin_watch_boot_grace_no_false_alarm(monkeypatch, tmp_path):
     """BOOT-KARENZ (Fehlalarm 27.07. 21:07): Wächter-Cron traf 38 s nach dem
-    Containerstart — last_tick war noch 0.0 und „now − 0 > 15 min" meldete
-    „Refresher-Loop steht", obwohl der Loop frisch aktiv war. Regel: ohne
-    JEMALS einen Tick gibt es erst nach >10 min aktiver Laufzeit einen Grund;
-    ein echter nie-tickender Loop alarmiert weiterhin."""
+    Containerstart und meldete „Refresher-Loop steht", obwohl der Loop frisch
+    startete. Regel: ohne JEMALS ein Lebenszeichen gibt es erst nach >10 min
+    Prozesslaufzeit einen Grund; ein echt stehender Loop alarmiert weiterhin.
+
+    UMGESTELLT 31.07.: das Urteil hängt nicht mehr an `_refresher_state`
+    (Modul-State, nur im thread-tragenden Prozess wahr — genau die Quelle der
+    Fehlalarme), sondern am HERZSCHLAG, den der Tick-Loop selbst schreibt.
+    Siehe tests/test_refresher_drain_pause.py für die volle Zelle."""
     import time as _time
     import app as backend
     monkeypatch.setattr(fo, '_RELOGIN_WATCH_STATE',
                         str(tmp_path / 'watch.json'))
+    monkeypatch.setattr(fo, '_REFRESHER_BEAT_FILE', str(tmp_path / 'beat'))
+    monkeypatch.setattr(fo, '_REFRESHER_PAUSE_FILE', str(tmp_path / 'pause'))
     monkeypatch.delenv('ADSB_POLL_SECRET', raising=False)
     monkeypatch.setenv('LH_FLIGHTOPS_REFRESHER', '1')
+    monkeypatch.setattr(fo, '_maybe_start_refresher', lambda: None)
     mails = []
     monkeypatch.setattr(fo, '_fo_watch_alert_mail',
                         lambda reasons, cnt, delta: mails.append(reasons) or True)
     monkeypatch.setattr(fo, '_relogin_count', lambda: 253)
     c = backend.app.test_client()
 
-    # Frisch gebootet: aktiv seit 38 s, noch kein Tick ⇒ KEIN Grund, keine Mail.
-    fo._refresher_state.update(active=True, drain=False, busy=False,
-                               last_tick=0.0,
-                               active_since=_time.time() - 38)
+    # Frisch gebootet: Prozess 38 s alt, noch kein Schlag ⇒ KEIN Grund.
+    monkeypatch.setattr(fo, '_REFRESHER_BOOT_TS', _time.time() - 38)
     d1 = c.post('/api/internal/flightops/relogin-watch').get_json()
-    assert d1['reasons'] == []
+    assert d1['reasons'] == [] and d1['refresher']['state'] == 'never'
     assert not mails
 
-    # >10 min aktiv und IMMER NOCH nie getickt ⇒ ehrlicher Alarm.
-    fo._refresher_state.update(active_since=_time.time() - 11 * 60)
+    # >10 min alt und IMMER NOCH kein Schlag ⇒ ehrlicher Alarm.
+    monkeypatch.setattr(fo, '_REFRESHER_BOOT_TS', _time.time() - 11 * 60)
     d2 = c.post('/api/internal/flightops/relogin-watch').get_json()
-    assert any('NIE getickt' in r for r in d2['reasons'])
+    assert any('NIE geschlagen' in r for r in d2['reasons'])
 
-    # Normalfall: echter alter Tick > 15 min ⇒ „steht"-Grund unverändert.
-    fo._refresher_state.update(last_tick=_time.time() - 16 * 60)
+    # Frischer Schlag ⇒ still, auch ohne Thread IN DIESEM Prozess.
+    fo._refresher_beat_write()
     d3 = c.post('/api/internal/flightops/relogin-watch').get_json()
-    assert any('steht' in r for r in d3['reasons'])
+    assert d3['reasons'] == [] and d3['refresher']['state'] == 'alive'
+
+    # Alter Schlag ⇒ „steht"-Grund unverändert.
+    fo._refresher_beat_write(now=_time.time() - 16 * 60)
+    d4 = c.post('/api/internal/flightops/relogin-watch').get_json()
+    assert any('steht' in r for r in d4['reasons'])
+    assert d4['refresher']['state'] == 'stale'
     fo._refresher_state.update(active=False, last_tick=0.0, active_since=0.0)
 
 

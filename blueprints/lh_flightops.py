@@ -6136,18 +6136,27 @@ def _refresh_all_work(tokens):
 def flightops_refresh_drain():
     """Deploy-Vorbereitung: laufenden refresh-all-Lauf UND den Refresher-Loop
     sauber auslaufen lassen (kein neuer LH-Call startet, der aktuelle Grant
-    persistiert fertig). Der Deploy pollt bis running=False. Idempotent —
-    der Container wird danach ohnehin neu erstellt (frischer Prozess hebt
-    das Drain wieder auf)."""
+    persistiert fertig). Der Deploy pollt bis running=False.
+
+    Der Refresher wird PAUSIERT, nicht beendet (Vorfall 31.07. 12:56, s.
+    Banner bei _REFRESHER_PAUSE_S): der Container wird nach einem Drain
+    normalerweise neu erstellt und der frische Prozess startet ohne Pause —
+    bleibt der Recreate aber aus (zweiter, paralleler Deploy), nimmt derselbe
+    Loop nach dem Fenster von selbst wieder auf. Grant-Burn-Schutz unberührt:
+    während der Pause rotiert nichts."""
     if not _internal_secret_ok():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
     with _refresh_all_lock:
         _refresh_all_state['drain'] = True
         running = bool(_refresh_all_state['running'])
-    _refresher_state['drain'] = True
+    until = _refresher_pause()
+    log.info('[fo-refresher] Drain angefordert -> Pause bis %s (%ds)',
+             time.strftime('%H:%M:%SZ', time.gmtime(until)),
+             int(until - time.time()))
     running = running or bool(_refresher_state.get('busy'))
     return jsonify({'ok': True, 'running': running,
-                    'refresher_active': bool(_refresher_state.get('active'))})
+                    'refresher_active': bool(_refresher_state.get('active')),
+                    'refresher_paused_until': until})
 
 
 @lh_flightops_bp.route('/api/internal/flightops/rotate-poke', methods=['POST'])
@@ -6204,10 +6213,222 @@ def flightops_refresh_all():
 _REFRESHER_TICK_S = 60           # Scan-Takt (drain-aware, 1-s-Granularität)
 _REFRESHER_GRANT_GAP_S = 1.0     # Mindestabstand zwischen zwei Rotationen
 _REFRESHER_LOCKFILE = '/tmp/lh_flightops_refresher.lock'
+# ── DRAIN-ÜBERLEBEN (Vorfall 31.07. 12:56) ──────────────────────────────────
+# Ein zweiter, parallel anlaufender Deploy feuerte seinen Drain (Schritt 2b von
+# deploy-hetzner.sh) auf den 32 s zuvor frisch gebooteten poll-Container — und
+# erstellte ihn danach NIE neu. Das Drain-Flag war aber ein EINWEG-Schalter:
+# `[fo-refresher] beendet (drain/exit)`, Thread weg, niemand rotierte mehr,
+# Wächter-Alarm, manueller `docker restart`.
+#
+# Konsequenz: der HTTP-Drain tötet den Loop nicht mehr, er PAUSIERT ihn mit
+# Auto-Resume. Der Grant-Burn-Schutz bleibt dabei vollständig erhalten —
+# während der Pause rotiert definitiv NICHTS (weder ein neuer Tick noch der
+# Rest eines laufenden). Nur der EWIGE Tod fällt weg: kommt innerhalb von
+# _REFRESHER_PAUSE_S kein Container-Recreate (Deploy-Recreate dauert normal
+# < 5 min), nimmt der Loop die Rotation von selbst wieder auf.
+#
+# `drain` bleibt der HARTE Schalter und gehört ab jetzt allein dem
+# Prozess-Ende (atexit/SIGTERM/gunicorn-Recycle, s. _refresher_exit_drain) —
+# dort IST der Thread-Tod richtig, weil der Prozess ohnehin geht.
+_REFRESHER_PAUSE_S = 600
+# Wiederbelebungs-Karenz des Wächters: erst ab diesem Prozess-Alter zieht er
+# einen toten Loop hoch. Ein junger Container steckt evtl. mitten in einem
+# Deploy (Recreate < 5 min) — dort soll der Wächter nicht dagegenlaufen.
+_REFRESHER_REVIVE_MIN_AGE_S = 5 * 60
+_REFRESHER_BOOT_TS = time.time()
 _refresher_state = {'active': False, 'drain': False, 'busy': False,
-                    'last_tick': 0.0, 'last': None, 'active_since': 0.0}
+                    'last_tick': 0.0, 'last': None, 'active_since': 0.0,
+                    # Pause-Fenster des HTTP-Drains: Unix-ts, ab dem wieder
+                    # rotiert werden darf (0 = keine Pause). `paused` ist reine
+                    # Log-Flanken-Erkennung, nie die Entscheidungsquelle.
+                    'pause_until': 0.0, 'paused': False,
+                    # Prozess geht wirklich zu Ende (atexit) — verbietet dem
+                    # Wächter, den Loop im Sterben nochmal hochzuziehen.
+                    'exiting': False, 'revived': 0}
 _refresher_thread = [None]
 _refresher_lock_fh = [None]      # offenes flock-Handle (hält den Lock am Leben)
+
+
+def _refresher_pause_s():
+    """Pause-Fenster des HTTP-Drains in Sekunden (Env-übersteuerbar, damit ein
+    Vorfall ohne Deploy nachjustiert werden kann). Unsinnige Werte fallen auf
+    den Default zurück; 0/negativ ist bewusst NICHT erlaubt — „Pause aus"
+    hieße wieder „ewiger Tod"."""
+    try:
+        v = int((os.environ.get('LH_FLIGHTOPS_DRAIN_PAUSE_S') or '').strip()
+                or _REFRESHER_PAUSE_S)
+    except ValueError:
+        return _REFRESHER_PAUSE_S
+    return v if 30 <= v <= 3600 else _REFRESHER_PAUSE_S
+
+
+def _refresher_paused(now=None):
+    """Darf der Loop JETZT nicht rotieren, weil ein Drain ihn pausiert hat?
+    Seiteneffektfrei bis auf das memoisierte Datei-Lesen (die Log-Flanke macht
+    `_refresher_pause_gate`) — so bleibt die Regel mit Mock-Zeit testbar."""
+    now = now or time.time()
+    return _refresher_pause_until(now) > now
+
+
+# ── HERZSCHLAG statt Thread-Introspektion (Fehlalarm 31.07.) ────────────────
+# Der Wächter fragte bis heute `_refresher_state['active']` ab — MODUL-State,
+# also nur in DEM Prozess wahr, der den Thread trägt. Jede Konstellation, in
+# der die HTTP-Anfrage von einem anderen Prozess beantwortet wird als dem
+# thread-tragenden, meldete „Refresher-Loop NICHT aktiv", obwohl der Loop
+# nachweislich tickte:
+#   · gunicorn-Worker-Recycle (--max-requests 10000): der neue Worker hat den
+#     Thread noch nicht (er wartet ggf. bis zu 15 s auf den flock des alten);
+#   · jede künftige Erhöhung von --workers;
+#   · und — bis zum Drain-Guard oben — der Drain selbst.
+# Ein Wächter, der falsch alarmiert, wird ignoriert und ist beim echten
+# Ausfall wertlos. Deshalb schreibt der Tick-Loop SELBST einen Herzschlag in
+# eine Datei neben dem Lockfile (dieselbe Container-FS, die sich ALLE Prozesse
+# dieses Containers teilen) — und der Wächter liest genau das.
+#
+# Der Herzschlag trägt auch `pause_until`: eine legitime Deploy-Pause ist
+# damit von einem toten Loop unterscheidbar (sonst würde jeder Deploy einen
+# Alarm auslösen, sobald der Wächter in die Pause fällt).
+_REFRESHER_BEAT_FILE = '/tmp/lh_flightops_refresher.beat'
+# Ab wann gilt ein Herzschlag als tot? Der Takt ist 60 s, ABER ein Tick mit
+# vielen fälligen Grants läuft lange (gemessen 31.07.: 16:26:10 → 16:38:46 =
+# 12,6 min für 236 Rotationen). Deshalb schreibt der Tick den Schlag AUCH
+# zwischen den einzelnen Grants — und die Grenze bleibt großzügig bei 15 min.
+_REFRESHER_BEAT_STALE_S = 15 * 60
+
+
+def _refresher_beat_write(now=None):
+    """Herzschlag schreiben. Wirft nie — ein fehlgeschlagener Schreibversuch
+    darf den Rotierer niemals stören."""
+    try:
+        payload = {'ts': now or time.time(), 'pid': os.getpid(),
+                   'pause_until': _refresher_pause_until(),
+                   'active_since': _refresher_state.get('active_since') or 0,
+                   'busy': bool(_refresher_state.get('busy')),
+                   'last': _refresher_state.get('last')}
+        tmp = _REFRESHER_BEAT_FILE + '.tmp%d' % os.getpid()
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, _REFRESHER_BEAT_FILE)
+    except Exception:
+        pass
+
+
+def _refresher_beat_read():
+    """Letzter Herzschlag als dict ({} wenn keiner da/lesbar). Wirft nie."""
+    try:
+        with open(_REFRESHER_BEAT_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _refresher_health(now=None, beat=None):
+    """Zustand des Rotierers aus dem HERZSCHLAG — prozessunabhängig, damit
+    jeder Worker des Refresher-Containers dieselbe Antwort gibt. PURE (bis auf
+    das Datei-Lesen), damit der Wächter testbar bleibt.
+
+        {'state': 'alive'|'paused'|'stale'|'never',
+         'beat_age_s': float|None, 'paused_until': float, 'pid': int|None,
+         'last': dict|None}
+
+    'never'  = es gab in diesem Container noch nie einen Schlag (frischer
+               Boot ODER wirklich nie gestartet — der Aufrufer entscheidet
+               über die Boot-Karenz).
+    'stale'  = es gab einen, aber er ist älter als _REFRESHER_BEAT_STALE_S.
+    'paused' = frisch UND der Drain-Guard hält gerade eine Pause (kein
+               Alarmgrund, das ist der geplante Deploy-Zustand)."""
+    now = now or time.time()
+    b = _refresher_beat_read() if beat is None else (beat or {})
+    ts = float(b.get('ts') or 0)
+    out = {'state': 'never', 'beat_age_s': None,
+           'paused_until': float(b.get('pause_until') or 0),
+           'pid': b.get('pid'), 'last': b.get('last')}
+    if ts <= 0:
+        return out
+    out['beat_age_s'] = round(now - ts, 1)
+    if (now - ts) >= _REFRESHER_BEAT_STALE_S:
+        out['state'] = 'stale'
+    elif out['paused_until'] > now:
+        out['state'] = 'paused'
+    else:
+        out['state'] = 'alive'
+    return out
+
+
+# Die Pause muss CONTAINER-weit gelten, nicht nur im antwortenden Prozess:
+# der Drain kommt als HTTP-Request herein und landet auf irgendeinem
+# gunicorn-Worker — der Rotations-Thread lebt aber genau in EINEM. Stünde die
+# Pause nur im Modul-State des Antwortenden, würde der Refresher munter
+# weiterrotieren (exakt die Fehlerklasse, die den Wächter falsch alarmieren
+# ließ). Deshalb dieselbe Mechanik wie beim Herzschlag: eine Datei auf der
+# geteilten Container-FS, Modul-State nur als schneller Zwilling.
+_REFRESHER_PAUSE_FILE = '/tmp/lh_flightops_refresher.pause'
+_PAUSE_MEMO_S = 2.0                       # Datei-Leseschutz für die Grant-Schleife
+_pause_memo = {'read_at': 0.0, 'until': 0.0}
+
+
+def _refresher_pause_file_until(now=None):
+    """Pause-Ende aus der Datei (memoisiert, wirft nie)."""
+    now = now or time.time()
+    try:
+        if (now - _pause_memo['read_at']) < _PAUSE_MEMO_S:
+            return _pause_memo['until']
+        try:
+            with open(_REFRESHER_PAUSE_FILE) as f:
+                until = float((json.load(f) or {}).get('until') or 0)
+        except Exception:
+            until = 0.0
+        _pause_memo['read_at'], _pause_memo['until'] = now, until
+        return until
+    except Exception:
+        return 0.0
+
+
+def _refresher_pause_until(now=None):
+    """Wirksames Pause-Ende = das SPÄTERE aus Modul-State und Datei."""
+    return max(float(_refresher_state.get('pause_until') or 0.0),
+               _refresher_pause_file_until(now))
+
+
+def _refresher_pause(seconds=None, now=None):
+    """Drain ⇒ Pause setzen (nie verkürzen: zwei Deploys hintereinander sollen
+    das Fenster verlängern, nicht gegeneinander arbeiten). Schreibt in BEIDE
+    Quellen. Gibt das neue Pause-Ende zurück."""
+    now = now or time.time()
+    until = now + float(seconds if seconds is not None else _refresher_pause_s())
+    until = max(until, _refresher_pause_until(now))
+    _refresher_state['pause_until'] = until
+    try:
+        tmp = _REFRESHER_PAUSE_FILE + '.tmp%d' % os.getpid()
+        with open(tmp, 'w') as f:
+            json.dump({'until': until, 'set_at': now, 'pid': os.getpid()}, f)
+        os.replace(tmp, _REFRESHER_PAUSE_FILE)
+        _pause_memo['read_at'], _pause_memo['until'] = now, until
+    except Exception as e:
+        log.warning('[fo-refresher] Pause-Datei: %s', type(e).__name__)
+    return until
+
+
+def _refresher_pause_gate(now=None):
+    """Wie `_refresher_paused`, aber mit den beiden Log-Flanken (Eintritt/
+    Auto-Resume) — der Beleg dafür, dass ein Drain ohne Container-Recreate
+    NICHT mehr das Ende des Rotierers ist. Nur der Loop ruft das."""
+    now = now or time.time()
+    paused = _refresher_paused(now)
+    if paused and not _refresher_state.get('paused'):
+        _refresher_state['paused'] = True
+        # WARNING statt INFO: das ist die eine Zeile, an der der Live-Beweis
+        # hängt („Drain ohne Recreate tötet nicht mehr").
+        log.warning('[fo-refresher] PAUSE durch Drain — keine Rotation für '
+                    '%ds (Auto-Resume, falls kein Container-Recreate folgt)',
+                    int(_refresher_pause_until(now) - now))
+    elif not paused and _refresher_state.get('paused'):
+        _refresher_state['paused'] = False
+        _refresher_state['pause_until'] = 0.0
+        log.warning('[fo-refresher] Pause abgelaufen ohne Container-Recreate '
+                    '— nehme Rotation wieder auf')
+    return paused
 
 
 def _refresher_enabled():
@@ -6452,8 +6673,14 @@ def _refresher_tick():
                + [t for t in due if t not in wanted])
     stats = {}
     for tok in ordered:
-        if _refresher_state['drain']:
+        # GRANT-BURN-SCHUTZ: harter Prozess-Drain UND Deploy-Pause brechen den
+        # Lauf sofort ab — ein pausierter Refresher rotiert definitiv nichts.
+        if _refresher_state['drain'] or _refresher_paused():
             break
+        # Herzschlag AUCH zwischen den Grants: ein Tick mit 236 fälligen
+        # Grants lief gemessen 12,6 min — ohne das sähe er wie ein toter Loop
+        # aus (Fehlalarm-Klasse, s. Banner bei _REFRESHER_BEAT_FILE).
+        _refresher_beat_write()
         _refresher_state['busy'] = True
         try:
             st = _refresher_refresh_grant(tok)
@@ -6518,22 +6745,103 @@ def _refresher_main():
     _REFRESHER_THREAD_ID[0] = threading.get_ident()
     _refresher_state['active'] = True
     _refresher_state['active_since'] = time.time()
-    log.info('[fo-refresher] aktiv pid=%s — einziger RT-Rotierer des Systems',
-             os.getpid())
+    # ERSTER Herzschlag sofort nach dem flock — nicht erst nach dem ersten
+    # Tick. Der Scan über 1.000+ Grants kann dauern, und bis dahin soll der
+    # Wächter „lebt, arbeitet gerade" sehen statt „nie getickt".
+    _refresher_beat_write(_refresher_state['active_since'])
+    log.warning('[fo-refresher] aktiv pid=%s — einziger RT-Rotierer des '
+                'Systems', os.getpid())
     try:
         while not _refresher_state['drain']:
             try:
-                _refresher_tick()
+                # Pause (Deploy-Drain) überspringt NUR die Arbeit — der Loop
+                # selbst lebt weiter und nimmt nach dem Fenster von allein auf.
+                if not _refresher_pause_gate():
+                    _refresher_tick()
             except Exception as e:
                 log.warning('[fo-refresher] tick: %s', type(e).__name__)
+            # Herzschlag auch während der Pause: der Loop IST am Leben, der
+            # Wächter darf ihn nicht als „steht" melden (er sieht die Pause
+            # separat über `paused_until` im Schlag selbst).
             _refresher_state['last_tick'] = time.time()
+            _refresher_beat_write(_refresher_state['last_tick'])
             for _i in range(_REFRESHER_TICK_S):
                 if _refresher_state['drain']:
                     break
                 time.sleep(1)
     finally:
         _refresher_state['active'] = False
+        # flock freigeben — sonst könnte ein In-Process-Wiederbeleben (s.
+        # _refresher_revive) sich am eigenen, noch offenen Handle aussperren:
+        # flock hängt an der OPEN FILE DESCRIPTION, ein zweites open() im
+        # SELBEN Prozess kollidiert genauso wie ein fremder Prozess.
+        try:
+            if _refresher_lock_fh[0] is not None:
+                _refresher_lock_fh[0].close()
+        except Exception:
+            pass
+        _refresher_lock_fh[0] = None
         log.info('[fo-refresher] beendet (drain/exit)')
+
+
+def _refresher_revive(now=None):
+    """ZWEITE LEITPLANKE zum Pause-Umbau: Loop tot, Container aber ALT ⇒
+    in-process neu starten (der Wächter ruft das, s. flightops_relogin_watch).
+
+    Deckt genau den Vorfall 31.07. ab, falls der Thread aus einem anderen
+    Grund als dem HTTP-Drain endet: der Container wird nicht neu erstellt,
+    also muss jemand den Rotierer zurückholen — sonst veralten alle ATs still.
+
+    Bewusst eng: nur wenn die Rolle gesetzt ist, der Thread wirklich tot ist,
+    der Prozess NICHT gerade beendet wird (atexit hat `exiting` gesetzt) und
+    der Prozess alt genug ist (_REFRESHER_REVIVE_MIN_AGE_S) — ein frisch
+    gebooteter Container steckt evtl. mitten in einem Deploy, dort darf der
+    Wächter nicht gegen den Deploy anlaufen. Wirft nie; True = neu gestartet."""
+    try:
+        if not _refresher_enabled() or _refresher_state.get('exiting'):
+            return False
+        th = _refresher_thread[0]
+        if th is not None and getattr(th, 'is_alive', lambda: False)():
+            return False
+        now = now or time.time()
+        if (now - _REFRESHER_BOOT_TS) < _REFRESHER_REVIVE_MIN_AGE_S:
+            return False
+        # HERZSCHLAG-GATE: schlägt es noch, lebt der Loop in einem ANDEREN
+        # Prozess dieses Containers (gunicorn-Worker-Recycle/Overlap). Dann
+        # wäre ein zweiter Loop hier bestenfalls ein flock-Wartezimmer und
+        # schlimmstenfalls ein zweiter Rotierer — beides nicht gewollt.
+        if _refresher_health(now=now).get('state') in ('alive', 'paused'):
+            return False
+        try:
+            if _refresher_lock_fh[0] is not None:
+                _refresher_lock_fh[0].close()
+        except Exception:
+            pass
+        _refresher_lock_fh[0] = None
+        # Der Wiederanlauf hebt genau die beiden Schalter auf, die den Loop
+        # stillgelegt haben — die Rotations-BREMSE (_rot_gate) bleibt stehen,
+        # der Grant-Burn-Schutz wird also nicht mit zurückgesetzt.
+        _refresher_state.update(drain=False, busy=False, paused=False,
+                                pause_until=0.0, last_tick=0.0)
+        # Auch die Container-weite Pause-Datei raeumen — sonst startete der
+        # wiederbelebte Loop direkt wieder in eine (fremde) Pause.
+        try:
+            os.remove(_REFRESHER_PAUSE_FILE)
+        except OSError:
+            pass
+        _pause_memo['read_at'], _pause_memo['until'] = 0.0, 0.0
+        _refresher_thread[0] = None
+        started = _maybe_start_refresher()
+        if started is None:
+            return False
+        _refresher_state['revived'] = int(_refresher_state.get('revived') or 0) + 1
+        log.error('[fo-refresher] WIEDERBELEBT — Loop war tot, Container läuft '
+                  'seit %ds (Drain ohne Container-Recreate?); Neustart #%d',
+                  int(now - _REFRESHER_BOOT_TS), _refresher_state['revived'])
+        return True
+    except Exception as e:
+        log.warning('[fo-refresher] revive: %s', type(e).__name__)
+        return False
 
 
 def _maybe_start_refresher():
@@ -6556,8 +6864,13 @@ def _refresher_exit_drain():
     """atexit-Zwilling von _refresh_all_exit_drain für den Refresher-Loop:
     Worker-Recycle (gunicorn --max-requests) und SIGTERM warten auf das Ende
     der LAUFENDEN Rotation, statt sie zwischen LH-Rotation und Persist zu
-    killen. Wirft nie."""
+    killen. Wirft nie.
+
+    HIER — und nur hier — bleibt `drain` der harte Einweg-Schalter: der
+    Prozess geht ohnehin. `exiting` sperrt zusätzlich die Wiederbelebung
+    (_refresher_revive), damit der Wächter im Sterben nichts hochzieht."""
     try:
+        _refresher_state['exiting'] = True
         th = _refresher_thread[0]
         if not (th and getattr(th, 'is_alive', lambda: False)()):
             return
@@ -6670,26 +6983,47 @@ def flightops_relogin_watch():
     if delta is not None and delta >= alert_n:
         reasons.append(f'needs_relogin +{delta} in ~1h (jetzt {cnt}) — '
                        f'Burn-Muster?')
+    # ── Refresher-Urteil AUS DEM HERZSCHLAG (Umbau 31.07.) ─────────────────
+    # Vorher hing hier alles an `_refresher_state['active']`/`last_tick` —
+    # MODUL-State, nur im thread-tragenden Prozess wahr. Beweis vom 31.07.:
+    # derselbe Wächter meldete auf :8081 `reasons: []` (Thread tickte) und auf
+    # :8080 einen ALARM, obwohl der Web-Container die Rolle korrekt NICHT
+    # trägt. Jetzt entscheidet der Schlag, den der Tick-Loop selbst schreibt.
+    revived = False
+    health = _refresher_health(now=now)
     if _refresher_enabled():
-        if not _refresher_state.get('active'):
-            reasons.append('Refresher-Loop NICHT aktiv (konfiguriert, aber '
-                           'kein Thread/Lock) — niemand rotiert')
-        elif not _refresher_state.get('last_tick'):
-            # BOOT-KARENZ (Fehlalarm 27.07. 21:07: Wächter-Cron traf 38 s nach
-            # dem pushprefs-Containerstart — last_tick war noch 0.0 und
-            # „now − 0 > 15 min" meldete „steht", obwohl der Loop gerade erst
-            # startete; Pass lief danach 7/7 sauber durch). Ohne JEMALS einen
-            # Tick gab es nichts zu vergleichen: erst meckern, wenn der Loop
-            # seit >10 min aktiv ist und immer noch nie getickt hat
-            # (Takt ist 60 s — 10 min sind >Erst-Pass, kein echtes Loch).
-            if now - (_refresher_state.get('active_since') or now) > 10 * 60:
-                reasons.append('Refresher-Loop hat seit Boot NIE getickt '
-                               '(>10min aktiv ohne ersten Pass)')
-        elif now - (_refresher_state.get('last_tick') or 0) > 15 * 60:
-            reasons.append('Refresher-Loop steht (>15min kein Tick)')
+        st = health['state']
+        if st == 'paused':
+            # Kein Alarm: das ist der geplante Deploy-Drain. Auffällig wird es
+            # erst, wenn das Fenster unplausibel weit in der Zukunft liegt.
+            if health['paused_until'] - now > 2 * _refresher_pause_s():
+                reasons.append('Refresher-Pause unplausibel lang — Drain-Sturm?')
+        elif st == 'never':
+            # BOOT-KARENZ (Fehlalarm 27.07. 21:07: der Cron traf 38 s nach dem
+            # Containerstart). Ohne JEMALS einen Schlag gibt es nichts zu
+            # vergleichen — erst melden, wenn der Prozess >10 min alt ist.
+            if (now - _REFRESHER_BOOT_TS) > 10 * 60:
+                revived = _refresher_revive(now=now)
+                reasons.append('Refresher-Loop hat seit Boot NIE geschlagen '
+                               '(>10min Prozesslaufzeit, kein Herzschlag)'
+                               + (' — WIEDERBELEBT' if revived else ''))
+        elif st == 'stale':
+            # ECHTER Ausfall: es GAB einen Schlag, und er ist alt. Das ist der
+            # Vorfall 31.07. 12:56 (Drain ohne Container-Recreate) und jeder
+            # sonstige Thread-Tod. Selbstheilung versuchen, trotzdem melden.
+            revived = _refresher_revive(now=now)
+            reasons.append('Refresher-Loop steht (kein Herzschlag seit %ss) — '
+                           'niemand rotiert' % int(health['beat_age_s'] or 0)
+                           + (' — WIEDERBELEBT' if revived else ''))
     elif flightops_configured():
-        reasons.append('LH_FLIGHTOPS_REFRESHER nicht gesetzt — in dieser '
-                       'Architektur rotiert dann NIEMAND (ATs laufen ab)')
+        # KEIN ALARM MEHR aus einem Container ohne die Rolle (Fehlalarm-Quelle,
+        # live reproduziert 31.07. 17:07 auf :8080): Web- und MQTT-Container
+        # tragen `LH_FLIGHTOPS_REFRESHER` ABSICHTLICH nicht — die Rolle lebt
+        # per Architektur allein im Poll-Container, und der Herzschlag ist
+        # Container-lokal, also von hier aus prinzipiell unsichtbar. Ein
+        # Prozess, der es nicht wissen KANN, darf nichts behaupten; er sagt
+        # nur, dass er nicht zuständig ist (der Wächter-Cron fragt :8081).
+        health['state'] = 'not_my_role'
     alerted = False
     if reasons and now - (prev.get('alerted_at') or 0) > _RELOGIN_ALERT_COOLDOWN_S:
         alerted = _fo_watch_alert_mail(reasons, cnt, delta)
@@ -6704,9 +7038,22 @@ def flightops_relogin_watch():
                     'reasons': reasons, 'alerted': alerted,
                     'refresher': {
                         'expected': _refresher_enabled(),
-                        'active': bool(_refresher_state.get('active')),
-                        'last_tick': _refresher_state.get('last_tick'),
-                        'last': _refresher_state.get('last'),
+                        # DAS Urteil (prozessunabhängig, aus dem Herzschlag):
+                        # 'alive' | 'paused' | 'stale' | 'never' |
+                        # 'not_my_role'. Alles darunter ist Diagnose.
+                        'state': health['state'],
+                        'beat_age_s': health['beat_age_s'],
+                        'beat_pid': health['pid'],
+                        'last': health['last'] or _refresher_state.get('last'),
+                        # Drain-Pause (Deploy) sichtbar machen — sonst sähe
+                        # ein stiller Refresher wie ein kaputter aus.
+                        'paused_until': health['paused_until'],
+                        'revived': int(_refresher_state.get('revived') or 0),
+                        'revived_now': bool(revived),
+                        # In-Prozess-Sicht NUR noch als Diagnose — sie ist
+                        # genau das Signal, das die Fehlalarme erzeugt hat.
+                        'active_in_this_process': bool(
+                            _refresher_state.get('active')),
                         # Verstärkungs-Audit 2026-07-29: Rotationen pro Grant
                         # und Tag (Top-Verbraucher). Ohne das war „6,75 pro
                         # Grant" ein Mittelwert ohne Verteilung.
