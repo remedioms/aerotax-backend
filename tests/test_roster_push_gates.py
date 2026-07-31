@@ -49,6 +49,27 @@ YESTERDAY = '2026-07-19'
 TOMORROW = '2026-07-21'
 
 
+def _hb_today():
+    """DER Tages-Key, auf den die PRODUKTION ankert — Homebase-lokal.
+
+    ZEITZONEN-FEHLERKLASSE (Task #13, rot am 29.07. unter Maschinen-TZ PDT):
+    `take_roster_snapshot` leitet sein „heute" aus
+    `_airport_local_now(_profile_homebase_cached(token) or 'FRA')` ab; die
+    Fixtures unten pinnen die Homebase auf FRA, also Europe/Berlin. Die Tests
+    bauten ihre Tages-Keys dagegen aus `date.today()` — der MASCHINEN-Zeitzone.
+    Zwischen ~22:00 UTC und dem lokalen Mitternachtssprung (in PDT ein ~9-h-
+    Fenster) zeigten beide Uhren auf VERSCHIEDENE Kalendertage: der Test schrieb
+    den 29.07., die Produktion verglich gegen den 30.07. und stufte den Tag
+    korrekt als Vergangenheit ein — `_roster_change_is_past` tat also genau das
+    Richtige, der Test fragte das Falsche ab. Mit dem Datumssprung heilte es von
+    selbst; die Wurzel blieb.
+
+    Deshalb baut diese Datei ihre Tages-Keys ab jetzt aus DERSELBEN Quelle wie
+    die Produktion. Kein Einfrieren der Uhr: die Gates sollen echt gegen die
+    laufende Wanduhr geprüft werden — nur eben gegen DIE RICHTIGE."""
+    return A._airport_local_now('FRA').date()
+
+
 def _sector(flight='LH 440', frm='FRA', to='IAH',
             dep='2026-07-22T08:00:00Z', arr='2026-07-22T18:30:00Z'):
     return {'flight': flight, 'from': frm, 'to': to,
@@ -584,7 +605,7 @@ def test_echter_leg_tausch_bleibt_ein_eintrag_trotz_sortierung():
 
 
 def test_rotation_am_endpoint_erzeugt_weder_pending_noch_push(tmp_path):
-    d = (date.today() + timedelta(days=4)).isoformat()
+    d = (_hb_today() + timedelta(days=4)).isoformat()
 
     def _at(datum, legs, layover):
         day = _rot_day(legs, layover=layover)
@@ -746,7 +767,7 @@ def test_past_modified_landet_im_verlauf_statt_im_pending(tmp_path):
     # im pending — und damit im Badge. Fleet-Messung: 77 von 172 offenen
     # pending-Einträgen hingen an Tagen < heute. Jetzt: Verlauf ja, pending
     # nein, Push nein.
-    d_past = (date.today() - timedelta(days=1)).isoformat()
+    d_past = (_hb_today() - timedelta(days=1)).isoformat()
     r, push, changes_file = _post(
         tmp_path,
         old=[_tag(d_past, routing='FRA-JFK')],
@@ -765,7 +786,7 @@ def test_heutiger_modified_bleibt_pending(tmp_path):
     # Gegenprobe: HEUTE ist nicht Vergangenheit. Der „heute, aber Dienst schon
     # beendet"-Zweig von `_roster_change_is_past` bleibt dem PUSH vorbehalten —
     # die Liste zeigt den heutigen Tag weiter als offen.
-    d_today = date.today().isoformat()
+    d_today = _hb_today().isoformat()
     r, push, changes_file = _post(
         tmp_path,
         old=[_tag(d_today, routing='FRA-JFK')],
@@ -776,13 +797,69 @@ def test_heutiger_modified_bleibt_pending(tmp_path):
     assert data.get('history') in ([], None)
 
 
+@pytest.mark.parametrize('zone', ['America/Los_Angeles', 'Pacific/Auckland',
+                                  'UTC'])
+def test_vergangenheits_gate_ist_unabhaengig_von_der_maschinen_zeitzone(
+        tmp_path, zone):
+    """DER PIN zu Task #13 (Muster: test_lh_mqtt / test_lhfo_quota_diet).
+
+    Die Zell-Familie „gestern → Verlauf / heute → pending / morgen → pending"
+    läuft unter FREMD gestellter Prozess-Zeitzone. `America/Los_Angeles` ist
+    genau die Konstellation, die am 29.07. rot war (lokal 29., UTC 30.);
+    `Pacific/Auckland` prüft die Gegenrichtung (lokal schon der Folgetag).
+
+    Wäre irgendwo im Pfad — Produktion ODER Test — noch eine Maschinen-lokale
+    Tages-Ableitung, kippte mindestens eine der drei Zellen. Der Tages-Key
+    kommt aus `_hb_today()` (Homebase FRA), also aus derselben Quelle wie in
+    `take_roster_snapshot`; die Uhr selbst bleibt echt."""
+    import time as _time
+    alt = os.environ.get('TZ')
+    os.environ['TZ'] = zone
+    try:
+        _time.tzset()
+    except AttributeError:                                   # pragma: no cover
+        pytest.skip('tzset auf dieser Plattform nicht verfügbar')
+    try:
+        heute = _hb_today()
+        faelle = {'gestern': (heute - timedelta(days=1)).isoformat(),
+                  'heute': heute.isoformat(),
+                  'morgen': (heute + timedelta(days=1)).isoformat()}
+        for name, d in faelle.items():
+            box = tmp_path / f'{zone.replace("/", "_")}_{name}'
+            box.mkdir()
+            r, push, changes_file = _post(
+                box,
+                old=[_tag(d, routing='FRA-JFK')],
+                new=[_tag(d, routing='FRA-MIA')])
+            assert r.status_code == 200, (zone, name)
+            data = json.loads(changes_file.read_text())
+            if name == 'gestern':
+                assert data['pending'] == [], (zone, name)
+                assert len(data['history']) == 1, (zone, name)
+                assert data['history'][0]['status'] == 'past_auto'
+                assert push.call_count == 0, (zone, name)
+            else:
+                assert len(data['pending']) == 1, (zone, name)
+                assert data['pending'][0]['status'] == 'pending', (zone, name)
+                assert data.get('history') in ([], None), (zone, name)
+    finally:
+        if alt is None:
+            os.environ.pop('TZ', None)
+        else:
+            os.environ['TZ'] = alt
+        try:
+            _time.tzset()
+        except AttributeError:                               # pragma: no cover
+            pass
+
+
 def test_altbestand_vergangener_pendings_heilt_sich_selbst(tmp_path):
     # SELBSTHEILUNG: das Gate wirkt nur auf NEUE Diffs — die am 29.07.
     # gemessenen 75 offenen Vergangenheits-'modified' auf 40 Token würden sonst
     # ewig im Badge stehen. Jeder Snapshot räumt sie jetzt nach `history`, auch
     # wenn der aktuelle Diff LEER ist.
-    d_past = (date.today() - timedelta(days=3)).isoformat()
-    d_fut = (date.today() + timedelta(days=3)).isoformat()
+    d_past = (_hb_today() - timedelta(days=3)).isoformat()
+    d_fut = (_hb_today() + timedelta(days=3)).isoformat()
     changes_file = tmp_path / 'roster_changes_test.json'
     changes_file.write_text(json.dumps({'pending': [
         {'datum': d_past, 'kind': 'modified', 'status': 'pending'},
@@ -812,7 +889,7 @@ def test_past_added_und_removed_bleiben_pending(tmp_path):
     # Dienst in der Vergangenheit ist für Logbuch/Steuer relevant und bleibt
     # eine offene Kenntnisnahme. ('added' meldet der Diff nur für heute…+10 d,
     # darum hier über 'removed' geprüft.)
-    d_past = (date.today() - timedelta(days=1)).isoformat()
+    d_past = (_hb_today() - timedelta(days=1)).isoformat()
     r, push, changes_file = _post(tmp_path, old=[_tag(d_past)], new=[])
     assert r.status_code == 200
     data = json.loads(changes_file.read_text())
@@ -824,7 +901,7 @@ def test_past_added_und_removed_bleiben_pending(tmp_path):
 def test_pickup_flip_weder_verlauf_noch_push(tmp_path):
     # OWNER-REGEL 2026-07-28: Rauschen darf jetzt auch NICHT MEHR in den
     # Verlauf („Dienstplan → Verlauf zeigt immer wieder Änderungen").
-    d = (date.today() + timedelta(days=1)).isoformat()
+    d = (_hb_today() + timedelta(days=1)).isoformat()
     old = dict(_day_with_pickup(), datum=d)
     new = dict(_day_with_pickup(pickup_marker='', start='14:30'), datum=d)
     r, push, changes_file = _post(tmp_path, old=[old], new=[new])
@@ -835,7 +912,7 @@ def test_pickup_flip_weder_verlauf_noch_push(tmp_path):
 
 
 def test_blocktime_drift_weder_verlauf_noch_push(tmp_path):
-    d = (date.today() + timedelta(days=2)).isoformat()
+    d = (_hb_today() + timedelta(days=2)).isoformat()
     old = dict(_day_with_pickup(), datum=d)
     new = dict(_day_with_pickup(), datum=d)
     new['reader_facts'] = dict(new['reader_facts'], end_time='19:20')
@@ -847,8 +924,8 @@ def test_blocktime_drift_weder_verlauf_noch_push(tmp_path):
 
 
 def test_mixed_past_and_future_pushes_only_future(tmp_path):
-    d_past = (date.today() - timedelta(days=1)).isoformat()
-    d_fut = (date.today() + timedelta(days=2)).isoformat()
+    d_past = (_hb_today() - timedelta(days=1)).isoformat()
+    d_fut = (_hb_today() + timedelta(days=2)).isoformat()
     r, push, _cf = _post(
         tmp_path,
         old=[_tag(d_past, routing='FRA-JFK'), _tag(d_fut, routing='FRA-JFK')],
@@ -883,7 +960,7 @@ def test_gate4_zeitshift_erzeugt_am_endpoint_gar_nichts(tmp_path):
     # Zeit-Shift erzeugt WEDER pending-Eintrag NOCH Push. Bis 28.07. stand hier
     # noch „Verlauf vollständig, nur der Push wird gefiltert" — der Owner hat
     # das nach dem Screenshot von Build 246 explizit gekippt.
-    d = (date.today() + timedelta(days=3)).isoformat()
+    d = (_hb_today() + timedelta(days=3)).isoformat()
     r, push, changes_file = _post(
         tmp_path,
         old=[_fut_flug_tag(d, dep_hhmm='09:00')],
@@ -897,7 +974,7 @@ def test_gate4_zeitshift_erzeugt_am_endpoint_gar_nichts(tmp_path):
 def test_gate4_pingpong_erzeugt_null_verlaufseintraege_und_null_pushes(tmp_path):
     # Der Live-Fall aus dem Owner-Screenshot: 10:55 → 10:25 und 30 s später
     # zurück, beide Richtungen untereinander in der Liste. Jetzt: nichts.
-    d = (date.today() + timedelta(days=3)).isoformat()
+    d = (_hb_today() + timedelta(days=3)).isoformat()
     a, b = _fut_flug_tag(d, dep_hhmm='08:55'), _fut_flug_tag(d, dep_hhmm='08:25')
     for old, new in ((a, b), (b, a)):
         r, push, changes_file = _post(tmp_path, old=[old], new=[new])
@@ -911,7 +988,7 @@ def test_gate4_stille_zeitaenderung_wird_trotzdem_in_die_daten_uebernommen(tmp_p
     # AUTO-ÜBERNAHME: nur der EINTRAG entfällt, die Zeit selbst muss im Roster
     # ankommen. Der Snapshot wird unabhängig vom Diff geschrieben → der neue
     # Stand (09:40) landet 1:1 in `_roster_snapshot_save`.
-    d = (date.today() + timedelta(days=3)).isoformat()
+    d = (_hb_today() + timedelta(days=3)).isoformat()
     neu = _fut_flug_tag(d, dep_hhmm='09:40')
     saved = {}
     p1, p2, p3, p4, p5, p6, p7, push, changes_file = _snapshot_env(
@@ -930,7 +1007,7 @@ def test_gate4_stille_zeitaenderung_wird_trotzdem_in_die_daten_uebernommen(tmp_p
 
 def test_gate4_riesenverspaetung_erzeugt_am_endpoint_einen_eintrag(tmp_path):
     # Die Huge-Delay-Ausnahme bleibt ein ECHTER Eintrag (+ Push).
-    d = (date.today() + timedelta(days=3)).isoformat()
+    d = (_hb_today() + timedelta(days=3)).isoformat()
     r, push, changes_file = _post(
         tmp_path,
         old=[_fut_flug_tag(d, dep_hhmm='09:00')],
@@ -941,7 +1018,7 @@ def test_gate4_riesenverspaetung_erzeugt_am_endpoint_einen_eintrag(tmp_path):
 
 
 def test_gate4_zielwechsel_erzeugt_am_endpoint_einen_eintrag(tmp_path):
-    d = (date.today() + timedelta(days=3)).isoformat()
+    d = (_hb_today() + timedelta(days=3)).isoformat()
     r, push, changes_file = _post(
         tmp_path,
         old=[_fut_flug_tag(d, to='SFO')],
@@ -953,7 +1030,7 @@ def test_gate4_zielwechsel_erzeugt_am_endpoint_einen_eintrag(tmp_path):
 
 
 def test_future_change_push_body_is_concrete(tmp_path):
-    d_fut = (date.today() + timedelta(days=2)).isoformat()
+    d_fut = (_hb_today() + timedelta(days=2)).isoformat()
     r, push, _cf = _post(
         tmp_path,
         old=[_tag(d_fut, routing='FRA-JFK')],

@@ -22015,7 +22015,13 @@ def take_roster_snapshot(token):
     try:
         _today_ymd = _airport_local_now(_hb).strftime('%Y-%m-%d')
     except Exception:
-        _today_ymd = datetime.now().strftime('%Y-%m-%d')
+        # FALLBACK-HÄRTUNG (Task #13, 2026-07-31): hier stand `datetime.now()`
+        # — die MASCHINEN-Zeitzone. In Prod (UTC) fiel das nie auf, wäre aber
+        # dieselbe Fehlerklasse wie der PDT-Testfehler: ein Container in einer
+        # anderen TZ hätte das Vergangenheits-Gate um einen ganzen Tag
+        # verschoben. Der Fallback ankert jetzt auf Europe/Berlin — dasselbe,
+        # was `_airport_local_now` für die Default-Homebase FRA liefert.
+        _today_ymd = _fra_local_now().strftime('%Y-%m-%d')
     # `diff` ist seit 2026-07-29 bereits Gate-4-gefiltert (nur DIENST-Substanz;
     # reine Zeit-Verschiebungen erzeugen keinen Eintrag mehr).
     diff = _compute_roster_diff(old_tage, new_tage, today=_today_ymd) if old_tage else []
@@ -22112,10 +22118,11 @@ def take_roster_snapshot(token):
         if diff:
             _now_hhmm = None
             try:
+                # Fallback Europe/Berlin statt Maschinen-lokal (s.o.).
                 _now_hhmm = (_airport_local_now(_hb).strftime('%H:%M')
-                             if _hb else datetime.now().strftime('%H:%M'))
+                             if _hb else _fra_local_now().strftime('%H:%M'))
             except Exception:
-                _now_hhmm = datetime.now().strftime('%H:%M')
+                _now_hhmm = _fra_local_now().strftime('%H:%M')
             _cand = [c for c in diff
                      if not _roster_change_is_past(c, _today_ymd, _now_hhmm)
                      and _roster_change_is_push_worthy(c)]
