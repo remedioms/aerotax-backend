@@ -3826,3 +3826,112 @@ def test_interactive_landet_nicht_als_query_param_bei_lh():
     sig = inspect.signature(fo.simulator_crewlist)
     assert 'interactive' in sig.parameters
     assert sig.parameters['interactive'].kind is not inspect.Parameter.VAR_KEYWORD
+
+
+# ── Owner-Bug 2026-07-31: „FRA → SBA / MULTI-CITY LAYOVER Santa Barbara" ─────
+# ECHTE Prod-Events (COMMON_DUTY_EVENTS, Owner-Token, Umlauf 88930 FRA-GRU).
+# Der 15.02. trägt einen BEREITSCHAFTS-Abend: eventCategory=STANDBY,
+# eventType=GROUNDEVENT, eventDetails='SBA', FRA→FRA — dreifach als Nicht-Flug
+# gekennzeichnet. Der Konverter ließ den NACKTEN Hauscode 'SBA' als SUMMARY
+# reisen; iOS las das freistehende 3-Letter-Token als IATA (SBA = Santa
+# Barbara Municipal) und erfand ein Leg „FRA → SBA 20:05–00:00". Der
+# offizielle Roster-PDF enthält NIRGENDS ein „SBA" — es ist ein Dienst-Code,
+# kein Ort. Regel: DER TYP ENTSCHEIDET, NICHT DER TEXT.
+DUTY_GRU_STANDBY = {
+    "pkNumber": "123456A",
+    "rosterDays": [
+        {"day": "2026-02-15T00:00:00Z", "events": [
+            {"eventCategory": "briefing", "eventType": "BRIEFING",
+             "eventDetails": "", "wholeDay": False,
+             "startLocation": "FRA", "endLocation": "FRA",
+             "startTime": "2026-02-15T19:05:00Z", "startTimeZoneOffset": 0},
+            {"eventCategory": "hotel", "eventType": "HOTEL",
+             "eventDetails": "Hotel", "wholeDay": False,
+             "startTime": None, "endTime": None,
+             "startLocation": "FRA", "endLocation": None},
+            {"eventCategory": "STANDBY", "eventType": "GROUNDEVENT",
+             "eventDetails": "SBA", "wholeDay": False,
+             "startLocation": "FRA", "endLocation": "FRA",
+             "startTime": "2026-02-15T20:55:00Z", "startTimeZoneOffset": -60,
+             "endTime": "2026-02-15T23:00:00Z", "endTimeZoneOffset": -60}]},
+        {"day": "2026-02-16T00:00:00Z", "events": [
+            {"eventCategory": "flight", "eventType": "FLIGHT",
+             "eventDetails": "LH506", "wholeDay": False,
+             "startTime": "2026-02-16T15:19:00Z", "startLocation": "FRA",
+             "endTime": "2026-02-17T03:32:00Z", "endLocation": "GRU"}]},
+        # 17./19.02.: eventCategory sagt zwar „flight", aber eventDetails='X'
+        # (frei/Ruhetag) und Start/Ziel/Zeiten sind NULL — ohne beide Stationen
+        # und beide Zeiten darf NIE ein Leg entstehen.
+        {"day": "2026-02-17T00:00:00Z", "events": [
+            {"eventCategory": "flight", "eventDetails": "X", "wholeDay": True,
+             "startTime": None, "endTime": None,
+             "startLocation": None, "endLocation": None}]},
+        {"day": "2026-02-18T00:00:00Z", "events": [
+            {"eventCategory": "flight", "eventType": "FLIGHT",
+             "eventDetails": "LH507", "wholeDay": False,
+             "startTime": "2026-02-18T18:45:00Z", "startLocation": "GRU",
+             "endTime": "2026-02-19T06:20:00Z", "endLocation": "FRA"}]},
+        {"day": "2026-02-19T00:00:00Z", "events": [
+            {"eventCategory": "flight", "eventDetails": "X", "wholeDay": True,
+             "startTime": None, "endTime": None,
+             "startLocation": None, "endLocation": None}]},
+    ],
+}
+
+
+def test_standby_groundevent_wird_nie_ein_flug_leg():
+    """Der echte 15.02.-Fall: STANDBY/GROUNDEVENT 'SBA' wird als Dienstart
+    etikettiert ('Standby (SBA)'), nie als nacktes 3-Letter-Token, aus dem
+    Downstream ein Ziel-Flughafen (Santa Barbara) gelesen werden kann."""
+    ics = fo.duty_events_to_ics(DUTY_GRU_STANDBY)
+    assert ics is not None
+    assert 'Standby (SBA)' in ics
+    assert 'SUMMARY:SBA' not in ics          # nackter Code reist nie allein
+    assert 'FRA-SBA' not in ics and 'FRA - SBA' not in ics
+    # Die echten Flüge bleiben unangetastet.
+    assert 'LH 506: FRA-GRU' in ics
+    assert 'LH 507: GRU-FRA' in ics
+
+
+def test_standby_tag_erzeugt_keinen_sektor_in_der_pipeline():
+    """Durch die echte Import-Pipeline: der 15.02. hat KEINEN Flug-Sektor und
+    KEIN Leg — nur Briefing/Layover/Standby-Marker. Der 16.02. behält seinen
+    echten Sektor LH506 FRA-GRU (keine Regression)."""
+    import app as backend
+    ics = fo.duty_events_to_ics(DUTY_GRU_STANDBY)
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    assert '2026-02-15' not in secs or secs['2026-02-15'] == []
+    d16 = secs.get('2026-02-16') or []
+    assert [(s['flight'], s['from'], s['to']) for s in d16] == [('LH506', 'FRA', 'GRU')]
+    briefings, _ = backend._ics_events_to_briefings(events)
+    b15 = briefings.get('2026-02-15') or {}
+    assert not (b15.get('legs') or []), 'Standby-Abend darf kein Leg tragen'
+    assert 'Standby (SBA)' in (b15.get('ical_summary') or '')
+    # X-Tage (17./19.) bleiben freie Tage ohne Legs.
+    for x_day in ('2026-02-17', '2026-02-19'):
+        bx = briefings.get(x_day) or {}
+        assert not (bx.get('legs') or [])
+
+
+def test_typ_schlaegt_text_und_gleiche_stationen_sind_keine_strecke():
+    """Abwehr gegen Schema-Drift: (a) eventCategory='flight' + eventType=
+    GROUNDEVENT wird NIE ein Leg (der Typ entscheidet, nicht der Text);
+    (b) startLocation == endLocation ist NIE eine Strecke."""
+    duty = {"rosterDays": [
+        {"day": "2026-03-01T00:00:00Z", "events": [
+            {"eventCategory": "flight", "eventType": "GROUNDEVENT",
+             "eventDetails": "SBA", "wholeDay": False,
+             "startLocation": "FRA", "endLocation": "MUC",
+             "startTime": "2026-03-01T08:00:00Z",
+             "endTime": "2026-03-01T09:00:00Z"},
+            {"eventCategory": "flight", "eventType": "FLIGHT",
+             "eventDetails": "LH999", "wholeDay": False,
+             "startLocation": "FRA", "endLocation": "FRA",
+             "startTime": "2026-03-01T10:00:00Z",
+             "endTime": "2026-03-01T11:00:00Z"}]},
+    ]}
+    ics = fo.duty_events_to_ics(duty)
+    assert ics is not None
+    assert 'FRA-MUC' not in ics             # GROUNDEVENT wird kein Leg
+    assert ': FRA-FRA' not in ics           # gleiche Stationen sind keine Strecke

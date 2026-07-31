@@ -2505,8 +2505,18 @@ def duty_events_to_ics(resp, pickups=None):
             en = _dt(ev.get('endTime'))
             uid = f'fo-{n}@aerox-flightops'
             n += 1
-            is_flight = (etype == 'flight' or cat in _FLIGHT_CATS)
-            if is_flight and len(frm) == 3 and len(to) == 3 and st and en:
+            # DER TYP ENTSCHEIDET, NICHT DER TEXT (Owner-Bug 2026-07-31,
+            # „FRA→SBA / Santa Barbara"): das echte Prod-Event 15.02.2026 war
+            # eventCategory=STANDBY / eventType=GROUNDEVENT / eventDetails='SBA'
+            # / FRA→FRA — dreifach als Nicht-Flug gekennzeichnet. Ein
+            # GROUNDEVENT ist NIE ein Flug, egal was in eventDetails steht;
+            # und startLocation == endLocation ist NIE eine Strecke. Ohne die
+            # beiden Guards konnte ein künftiges Schema-Drift-Event (cat
+            # 'flight', etype GROUNDEVENT o.ä.) als Leg gemintet werden.
+            is_flight = ((etype == 'flight' or cat in _FLIGHT_CATS)
+                         and etype != 'groundevent')
+            if is_flight and len(frm) == 3 and len(to) == 3 and frm != to \
+                    and st and en:
                 # Flugnummer aus eventDetails (z. B. 'LH400' / 'LH 400 …').
                 import re as _re
                 m = _re.search(r'\b([A-Z]{2}|\d[A-Z])\s?\d{1,4}[A-Z]?\b', det.upper())
@@ -2629,7 +2639,7 @@ def duty_events_to_ics(resp, pickups=None):
                 # fiel durch und iOS klassifizierte den Urlaubstag als Dienst.
                 # myTime-Prosa 'Absence (U1)' → iOS mappt ABSENCE auf Urlaub.
                 summary = f'Absence ({det})' if det else 'Absence'
-            elif cat in ('res', 'frs'):
+            elif cat in ('res', 'frs', 'standby', 'sby'):
                 # RESERVE ist NICHT Standby (LH-Crew-Feedback 2026-07-27:
                 # „Reserve wird als Standby angezeigt inkl. 60-min-Karenzzeit").
                 # MTV Nr. 2a, § 4, 6. Abschnitt: (1) Standby = binnen 60 Min
@@ -2645,7 +2655,15 @@ def duty_events_to_ics(resp, pickups=None):
                 # wie „Absence (U1)"/„Office Day (B4)"), damit iOS/Kalender ihn
                 # weiter 1:1 zeigen können.
                 _du = det.upper().replace('_', '').replace('-', '')
-                _is_sb = _du.startswith('SB') or _du.startswith('STBY')
+                # eventCategory=STANDBY (Prod 15.02.2026, eventDetails='SBA'):
+                # LHs Kategorie IST die Dienstart — vorher fiel STANDBY in den
+                # Roh-Zweig unten und der NACKTE Hauscode 'SBA' reiste als
+                # SUMMARY. iOS las das freistehende 3-Letter-Token als IATA
+                # (SBA = Santa Barbara) und erfand daraus ein Leg FRA→SBA.
+                # Jetzt myTime-Prosa 'Standby (SBA)' — der Code bleibt 1:1
+                # sichtbar, aber als Dienstart etikettiert, nie als Ort.
+                _is_sb = (cat in ('standby', 'sby')
+                          or _du.startswith('SB') or _du.startswith('STBY'))
                 _word = 'Standby' if _is_sb else 'Reserve'
                 summary = f'{_word} ({det})' if det else (
                     f'{_word} {frm}' if len(frm) == 3 else _word)
