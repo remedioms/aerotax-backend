@@ -4544,7 +4544,7 @@ def _connected_tokens(limit=2000):
         _now = time.time()
         while len(out) < limit:
             r = (_app.sb.table('user_profiles')
-                 .select('token,metadata->' + _FO_SYNC_STAMP_KEY)
+                 .select('token,homebase,metadata->' + _FO_SYNC_STAMP_KEY)
                  .filter('metadata->flightops_tokens', 'not.is', 'null')
                  .range(page * size, page * size + size - 1).execute())
             rows = r.data or []
@@ -4554,6 +4554,11 @@ def _connected_tokens(limit=2000):
                     continue
                 out.append(tok)
                 _fo_hydrate_stamp(tok, row.get(_FO_SYNC_STAMP_KEY), _now)
+                # Homebase für die „heute/morgen"-Ankerung der Kadenz-Klassen
+                # (gleiche Query, keine Zusatz-Kosten; s. _fo_local_today).
+                _hb = (row.get('homebase') or '').strip().upper()
+                if _hb:
+                    _fo_homebase[tok] = _hb
             if len(rows) < size:
                 break
             page += 1
@@ -4563,15 +4568,59 @@ def _connected_tokens(limit=2000):
         return []
 
 
-# ── ADAPTIVE SYNC-KADENZ (Quota-Diät 2026-07-28) ────────────────────────────
+# ── ADAPTIVE SYNC-KADENZ (Quota-Diät 2026-07-28 · Klassen-Ausbau 2026-07-31) ─
 # Der Host-Cron ruft refresh-all weiter alle 2 h (unverändert) — aber nicht
-# mehr jeder Lauf synct jeden User. Wer in den nächsten 48 h Dienst hat, wird
-# eng getaktet (≈alle 4 h), alle anderen locker (≈alle 12 h). Ein Roster ohne
-# anstehenden Dienst ändert sich selten und der User schaut auch nicht drauf;
-# ein Roster mit Dienst morgen ist das Kernprodukt.
-_FO_SYNC_NEAR_S = 3.5 * 3600
-_FO_SYNC_FAR_S = 11.5 * 3600
-_FO_DUTY_NEAR_S = 48 * 3600
+# mehr jeder Lauf synct jeden User. Owner-Auftrag 31.07.: „max sparen aber
+# ohne mit Qualität der App zu leiden" — bei 988 Grants (Verdopplung in zwei
+# Tagen) riss die alte Zwei-Klassen-Kadenz (48-h-Horizont: 3,5 h / sonst
+# 11,5 h) den Tagesdeckel trotzdem wieder (gestern 5.203, heute 11:28 UTC
+# schon 3.775 — davon duty_events 2.382).
+#
+# NEU: VIER Klassen, abgeleitet aus dem GESPEICHERTEN Roster (kostet nie
+# einen LH-Call) und bei JEDEM Lauf NEU berechnet (nie gecacht — nur so
+# erkennt der nächste Lauf selbst, dass ein User von langsam auf schnell
+# gewechselt ist, weil im letzten Sync neuer Dienst auftauchte):
+#   fast_sb  Standby/Reserve heute/morgen ohne zugewiesene Legs → 1,9 h
+#            (= jeder Cron-Lauf). Abruf-Risiko: der Roster dieses Users kann
+#            sich JEDE Stunde materiell ändern.
+#   fast     Dienst (Legs/Layover/Office) heute oder morgen → 3,5 h
+#            (effektiv alle 4 h — identisch zur bisherigen near-Klasse,
+#            per Definition KEINE Qualitäts-Regression für Dienst-User).
+#   mid      Dienst in 2–7 Tagen ODER Roster-Abdeckung endet in ≤7 Tagen
+#            (Monats-Veröffentlichung: da wollen alle frische Daten) → 11,5 h
+#            (effektiv alle 12 h — exakt die alte far-Kadenz, also keine
+#            Regression; DB-Messung 31.07.: 395 von 991 Grants sind mid,
+#            bei 7,5 h wären das allein 1.185 Calls/Tag statt 790. Wird der
+#            Dienst „morgen", wechselt der User beim nächsten Lauf von
+#            selbst auf fast — die Klasse wird ja pro Lauf neu gerechnet).
+#   slow     kein Dienst im 7-Tage-Horizont (Urlaub, langer Off-Block,
+#            Roster reicht weit) → 21,5 h (effektiv 1×/Tag). LH pflegt Tage
+#            voraus, und App-Öffnen liefert via Demand-Poke ohnehin sofort
+#            frisch — der User merkt davon nichts.
+# VERBINDUNGS-WAHRHEIT (Owner explizit): Grants hält der Ein-Refresher am
+# Leben (oauth-Host, zählt NICHT aufs Gateway-Kontingent). Roster-Pulls sind
+# reine Daten-Frische — NULL Login-Risiko durch diese Reduktion.
+# FAIL-SAFE: Einstufung nicht bestimmbar (kaputter Roster, leerer Store,
+# Fehler) ⇒ fast. Lieber ein Call zu viel als ein staler Dienstplan.
+# ZEITZONEN (teuerste Fehlerklasse): Kadenz-Alter rechnet in UTC-Epochen;
+# WELCHER Kalendertag „heute"/„morgen" ist, entscheidet die HOMEBASE-Zone
+# des Users (s. _fo_local_today) — nie die Container-Lokalzeit.
+# KOPPLUNG Crewlist-Prefetch / Pickup-Rotation: strukturell über die
+# Horizonte — der Prefetch nimmt nur Legs der nächsten 3 Tage
+# (_CREW_PREFETCH_DAYS), die Pickup-Rotation nur Umläufe in 30/36 h
+# (_ROT_PICKUP_HORIZON_H). Ein slow-User hat dort per Definition nichts,
+# ein seltener synct also automatisch auch seltener Zugaben. Bewusst KEIN
+# zusätzliches Klassen-Gate in flightops_import: taucht im frisch geholten
+# Roster NEUER naher Dienst auf, sollen die Zugaben sofort mitlaufen —
+# ein Gate auf der (dann veralteten) Klasse würde genau das verhindern.
+# `pickup_last_good` bleibt unangetastet (Pickup-Löschbug 29.07.).
+_FO_SYNC_FAST_SB_S = 1.9 * 3600
+_FO_SYNC_FAST_S = 3.5 * 3600
+_FO_SYNC_MID_S = 11.5 * 3600
+_FO_SYNC_SLOW_S = 21.5 * 3600
+_FO_FAST_MAX_D = 1               # Diensttag heute/morgen (Homebase-Kalender)
+_FO_MID_MAX_D = 7                # Dienst in 2–7 Tagen
+_FO_ROSTER_END_GUARD_D = 7       # Abdeckung endet in ≤7 Tagen → mind. mid
 # Letzter Sync je Token. Die Prozess-Map ist der Schnellpfad; DURABEL lebt
 # der Stempel seit 2026-07-30 zusätzlich im Profil (metadata.fo_bg_sync_at,
 # atomarer Merge) und wird in _connected_tokens kostenlos mitgelesen.
@@ -4583,6 +4632,10 @@ _FO_DUTY_NEAR_S = 48 * 3600
 _fo_last_sync = {}
 _FO_LAST_SYNC_CAP = 8000
 _FO_SYNC_STAMP_KEY = 'fo_bg_sync_at'
+# Homebase je Token (IATA) — in _connected_tokens KOSTENLOS mitgelesen
+# (gleiche user_profiles-Query). Nur für die „heute/morgen"-Ankerung der
+# Kadenz-Klassen; Größe ist durch die Grant-Zahl beschränkt (≤ limit).
+_fo_homebase = {}
 # Wellen-Steuerung des Laufs (ersetzt den blinden 120-s-Demand-Vorlauf):
 # harte Lauf-Obergrenze deutlich unter dem 2-h-Cron-Takt, Pause zwischen zwei
 # Wellen etwas über dem Refresher-Tick (60 s), Stall-Limit gegen Grants, deren
@@ -4594,10 +4647,10 @@ _FO_WAVE_STALL_MAX = 3
 # Sanfte Schrittweite zwischen zwei _access_state-Reads auf pending-Grants
 # (reiner Supabase-Read — aber 400+ davon ohne Pause wären eine Lastspitze).
 _FO_PENDING_CHECK_GAP_S = 0.05
-# Tages-Reserve für die lockere Kadenz-Klasse (far_due): User OHNE Dienst in
-# Sicht syncen nur, solange bis zum Hintergrund-Tagesdeckel mindestens diese
-# Zahl Calls frei ist — das Restbudget gehört den Usern mit Dienst in <48 h
-# (deren Roster ist das Kernprodukt, s. Kadenz-Banner oben).
+# Tages-Reserve für die lockerste Kadenz-Klasse (slow): User OHNE Dienst im
+# 7-Tage-Horizont syncen nur, solange bis zum Hintergrund-Tagesdeckel
+# mindestens diese Zahl Calls frei ist — das Restbudget gehört den Usern mit
+# nahem Dienst (deren Roster ist das Kernprodukt, s. Kadenz-Banner oben).
 _FO_FAR_DAY_HEADROOM = 800
 
 
@@ -4618,62 +4671,139 @@ def _fo_day_has_duty(ev):
         d = duty_from_roster_day(ev.get('ical_klass'), ev.get('ical_summary'))
     except Exception:
         d = None
+    # ÜBERNACHT-SPLIT-Zeilen („(Tag 2/2)", SFO-FRA-Ankunftstag u.ä.) tragen
+    # oft KEINE ical_sectors — der Flug steht nur in der Summary. Ein
+    # IATA-Paar (XXX-YYY) dort ist Dienst-Evidenz. Beleg (DB 31.07.): der
+    # Owner-Flugtag 'LH 455: SFO-FRA (Tag 2/2) · X' hatte sectors=leer und
+    # klass=None — ohne diesen Fallback wäre ein FLUGTAG als frei eingestuft
+    # worden. Nur wenn duty_from_roster_day nichts erkannt hat (None): ein
+    # explizites 'free'/'vacation'/'visa' bleibt Nicht-Dienst.
+    if d is None and re.search(r'(?<![A-Z])[A-Z]{3}-[A-Z]{3}(?![A-Z])',
+                               str(ev.get('ical_summary') or '').upper()):
+        return True
     # 'free'/'vacation'/'visa' sind explizit KEIN Dienst; None heißt „nicht
     # erkannt" und gilt hier als kein Nachweis (die Kadenz fällt dann auf die
     # lockere Regel zurück — sie verschiebt nur, sie verliert nichts).
     return d in ('standby', 'reserve')
 
 
-def _fo_duty_within(token, now=None, horizon_s=_FO_DUTY_NEAR_S):
-    """Hat dieser User innerhalb des Horizonts (Default 48 h) Dienst?
-    Kleinstes Briefing-Datum ≥ heute mit Dienst-Evidenz; verglichen wird
-    dessen Tagesbeginn (UTC) — der Dienst kann also frühestens dann
-    beginnen. Kein Treffer / keine Daten ⇒ False („kein Dienst bekannt").
-    Wirft nie."""
+def _fo_day_is_standby(ev):
+    """Standby-/Reserve-Evidenz OHNE zugewiesene Legs. Sind schon Legs am
+    Tag, ist der Abruf passiert — dann gilt die normale fast-Klasse.
+    RB zählt als Reserve (Anita, Forum 22.07.); die SB-Substring-Falle
+    (LISBOA u.ä.) ist in duty_from_roster_day gelöst — dort matchen nur
+    SBY/STANDBY/STBY bzw. RB als ganzes Wort. Wirft nie."""
+    if not isinstance(ev, dict):
+        return False
+    secs = ev.get('ical_sectors')
+    if isinstance(secs, list) and secs:
+        return False
+    if str(ev.get('ical_klass') or '').strip().lower() == 'standby':
+        return True
+    try:
+        from blueprints.crew_live_state import duty_from_roster_day
+        return duty_from_roster_day(
+            ev.get('ical_klass'), ev.get('ical_summary')) in ('standby',
+                                                              'reserve')
+    except Exception:
+        return False
+
+
+def _fo_local_today(token, now):
+    """Kalenderdatum „heute" in der HOMEBASE-Zeitzone des Users (date-Objekt).
+    Das Kadenz-ALTER rechnet in UTC-Epochen; nur die Frage „ist der Dienst
+    heute/morgen?" braucht den Kalender des Users — und der tickt an seiner
+    Homebase (Zeitzonen-Fehlerklasse: 22–24 UTC ist Berlin schon am
+    Folgetag). Fallback Europe/Berlin (LH-Homebases sind DE), dann UTC.
+    NIE die Container-/Geräte-Lokalzeit. Wirft nie."""
+    from datetime import datetime as _d, timezone as _tz
+    tzname = None
+    try:
+        hb = (_fo_homebase.get(token) or '').strip().upper()
+        if hb:
+            from airport_tz import airport_tz as _atz
+            tzname = _atz(hb)
+    except Exception:
+        tzname = None
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tzname or 'Europe/Berlin')
+    except Exception:
+        tz = _tz.utc
+    return _d.fromtimestamp(now, tz).date()
+
+
+def _fo_cadence_class(token, now=None):
+    """→ (klasse, tage_bis_dienst|None) aus dem GESPEICHERTEN Roster.
+    klasse ∈ fast_sb | fast | mid | slow (Bedeutung im Kadenz-Banner).
+    Liest user_ical_briefings (Supabase/Disk — kostet KEINEN LH-Call) und
+    wird pro Lauf neu gerechnet, nie gecacht. FAIL-SAFE: jeder Fehler und
+    ein leerer Store (Neuverbindung!) ⇒ fast — lieber ein Call zu viel als
+    ein staler Dienstplan. Wirft nie."""
     now = now or time.time()
     try:
         import app as _app
-        briefs = _app._ical_briefings_load(token) or {}
+        briefs = _app._ical_briefings_load(token)
     except Exception:
-        return False
-    from datetime import datetime as _d, timezone as _tz
-    today = _d.fromtimestamp(now, _tz.utc).strftime('%Y-%m-%d')
-    best = None
-    for datum, ev in (briefs.items() if isinstance(briefs, dict) else []):
-        ds = str(datum)[:10]
-        if len(ds) != 10 or ds < today:
-            continue
-        if best is not None and ds >= best:
-            continue
-        if _fo_day_has_duty(ev):
-            best = ds
-    if not best:
-        return False
+        return 'fast', None
+    if not isinstance(briefs, dict) or not briefs:
+        return 'fast', None
     try:
-        start = _d.strptime(best, '%Y-%m-%d').replace(
-            tzinfo=_tz.utc).timestamp()
+        from datetime import date as _date
+        today = _fo_local_today(token, now)
+        next_days, sb_near, last_day = None, False, None
+        for datum, ev in briefs.items():
+            try:
+                d = _date.fromisoformat(str(datum)[:10])
+            except Exception:
+                continue
+            if last_day is None or d > last_day:
+                last_day = d
+            delta = (d - today).days
+            if delta < 0:
+                continue
+            if _fo_day_has_duty(ev):
+                if next_days is None or delta < next_days:
+                    next_days = delta
+                if delta <= _FO_FAST_MAX_D and _fo_day_is_standby(ev):
+                    sb_near = True
+        if last_day is None:
+            return 'fast', None          # nur Müll-Keys → fail-safe
+        if next_days is not None and next_days <= _FO_FAST_MAX_D:
+            return ('fast_sb' if sb_near else 'fast'), next_days
+        # ROSTER-ENDE: die Abdeckung reicht nur noch ≤7 Tage (oder ist schon
+        # ganz Vergangenheit) — die Monats-Veröffentlichung steht an, da
+        # wollen alle frische Daten. Mindestens mid, nie slow.
+        if (last_day - today).days <= _FO_ROSTER_END_GUARD_D:
+            return 'mid', next_days
+        if next_days is not None and next_days <= _FO_MID_MAX_D:
+            return 'mid', next_days
+        return 'slow', next_days
     except Exception:
-        return False
-    return (start - now) < horizon_s
+        return 'fast', None
+
+
+_FO_SYNC_THRESH = {'fast_sb': _FO_SYNC_FAST_SB_S, 'fast': _FO_SYNC_FAST_S,
+                   'mid': _FO_SYNC_MID_S, 'slow': _FO_SYNC_SLOW_S}
 
 
 def _fo_should_sync(token, now=None):
     """(bool, grund) — synct DIESER refresh-all-Lauf diesen Token?
-    Erst-Kontakt immer; sonst 3,5 h bei Dienst in Sicht, 11,5 h sonst.
-    Die Briefings werden nur im Graubereich dazwischen gelesen (spart den
-    Supabase-Read für die klaren Fälle)."""
+    Erst-Kontakt immer ('first'); sonst entscheidet die Kadenz-Klasse
+    (Grund = Klassenname bei fällig, 'skip_<klasse>' bei Aufschub).
+    Unter der schnellsten Schwelle (1,9 h) wird der Briefings-Read gespart
+    — schneller synct ohnehin niemand."""
     now = now or time.time()
     last = _fo_last_sync.get(token)
     if last is None:
         return True, 'first'
     age = now - last
-    if age >= _FO_SYNC_FAR_S:
-        return True, 'far_due'
-    if age < _FO_SYNC_NEAR_S:
+    if age < _FO_SYNC_FAST_SB_S:
         return False, 'too_soon'
-    if _fo_duty_within(token, now):
-        return True, 'duty_near'
-    return False, 'no_duty_near'
+    klass, _nd = _fo_cadence_class(token, now)
+    if age >= _FO_SYNC_THRESH.get(klass, _FO_SYNC_FAST_S):
+        return True, klass
+    return False, 'skip_' + klass
 
 
 def _fo_mark_synced(token, now=None):
@@ -4731,7 +4861,7 @@ def _fo_background_budget_open(far=False):
     und der Demand-Vorlauf ließ den Refresher parallel hunderte Grants für
     Imports rotieren, die nie stattfanden.
 
-    `far=True` (Kadenz-Grund far_due) hält zusätzlich _FO_FAR_DAY_HEADROOM
+    `far=True` (Kadenz-Klasse slow) hält zusätzlich _FO_FAR_DAY_HEADROOM
     Calls Abstand zum Tagesdeckel: lockere Roster syncen nur, solange der
     Tag entspannt ist. Im Zweifel (Zählerfehler) offen — das Key-Gate in
     _api_get bleibt die letzte Instanz. Wirft nie."""
@@ -4766,6 +4896,7 @@ def _refresh_all_work(tokens):
     niemand weiß warum")."""
     ok = fail = skipped = deferred = 0
     fail_reasons, skip_reasons, waves = {}, {}, 0
+    due_classes, defer_reasons = {}, {}
     try:
         import app as _app
         _now0 = time.time()
@@ -4783,18 +4914,32 @@ def _refresh_all_work(tokens):
 
         # KADENZ-PLANUNG vor allem anderen: was dieser Lauf ohnehin nicht
         # synct, braucht auch keinen Demand und keine Rotation. Reihenfolge
-        # nach Dringlichkeit: Dienst in Sicht zuerst, dann Erstkontakt, dann
-        # die lockere 11,5-h-Klasse — wird das Budget knapp, trifft es die
-        # User, denen Frische am wenigsten fehlt.
-        _prio = {'duty_near': 0, 'first': 1}
+        # nach Dringlichkeit: Standby/Dienst heute-morgen zuerst, dann
+        # Erstkontakt, dann mid, zuletzt slow — wird das Budget knapp,
+        # trifft es die User, denen Frische am wenigsten fehlt.
+        _prio = {'fast_sb': 0, 'fast': 0, 'first': 1, 'mid': 2, 'slow': 3}
         plan = []
         for _tok in tokens:
             _do, _why = _fo_should_sync(_tok, _now0)
             if _do:
                 plan.append((_prio.get(_why, 2), _tok, _why))
+                due_classes[_why] = due_classes.get(_why, 0) + 1
             else:
                 deferred += 1
+                defer_reasons[_why] = defer_reasons.get(_why, 0) + 1
         plan.sort(key=lambda e: e[0])
+        # TRANSPARENZ (Owner-Tagesreport): aufgeschobene Syncs je Grund in
+        # die ax_api_budget-Zähler (lhfo_skip:<YYYYMMDDHH>[:<grund>]) —
+        # gebatcht, EIN Increment pro Grund und Lauf. Plus eine Log-Zeile
+        # mit der Klassen-Verteilung dieses Laufs.
+        try:
+            from blueprints.lh_open_api import budget_inc
+            for _r, _n in defer_reasons.items():
+                budget_inc('lhfo_skip', _r, units=_n)
+        except Exception:
+            pass
+        log.info('[flightops-refresh-all] kadenz users=%d due=%s deferred=%s',
+                 len(tokens), due_classes or '{}', defer_reasons or '{}')
         remaining = [(t, w) for _p, t, w in plan]
         demanded = set()
         stall = 0
@@ -4818,11 +4963,11 @@ def _refresh_all_work(tokens):
                 else:
                     # BUDGET-STOPP: ist das Hintergrund-Budget zu, würde JEDER
                     # weitere Call im Key-Gate verworfen (16:23-Lauf 30.07.:
-                    # 200+ sinnlose fails). far_due-User halten zusätzlich die
-                    # Tages-Reserve für die Dienst-in-Sicht-Klasse frei — sie
+                    # 200+ sinnlose fails). slow-User halten zusätzlich die
+                    # Tages-Reserve für die Dienst-in-Sicht-Klassen frei — sie
                     # werden einzeln übersprungen, der Lauf läuft weiter.
                     _open, _bwhy = _fo_background_budget_open(
-                        far=(why == 'far_due'))
+                        far=(why == 'slow'))
                     if not _open:
                         if _bwhy == 'budget_day_far_reserve':
                             _note_skip(_bwhy)
@@ -4915,12 +5060,14 @@ def _refresh_all_work(tokens):
                 'ts': time.time(), 'users': len(tokens),
                 'ok': ok, 'fail': fail, 'skipped': skipped,
                 'deferred': deferred, 'waves': waves,
-                'fail_reasons': fail_reasons, 'skip_reasons': skip_reasons}
+                'fail_reasons': fail_reasons, 'skip_reasons': skip_reasons,
+                'due_classes': due_classes, 'defer_reasons': defer_reasons}
         log.info('[flightops-refresh-all] done users=%d ok=%d fail=%d '
                  'skipped=%d deferred=%d waves=%d fail_reasons=%s '
-                 'skip_reasons=%s',
+                 'skip_reasons=%s due=%s defer=%s',
                  len(tokens), ok, fail, skipped, deferred, waves,
-                 fail_reasons or '{}', skip_reasons or '{}')
+                 fail_reasons or '{}', skip_reasons or '{}',
+                 due_classes or '{}', defer_reasons or '{}')
 
 
 @lh_flightops_bp.route('/api/internal/flightops/refresh-drain', methods=['POST'])

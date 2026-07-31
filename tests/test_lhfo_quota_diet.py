@@ -232,50 +232,215 @@ def test_cadence_first_contact_always_syncs(monkeypatch):
     assert do is True and why == 'first'
 
 
-def test_cadence_near_duty_uses_35h_rule(monkeypatch):
-    """Dienst morgen ⇒ 3,5-h-Regel: nach 3 h noch nicht, nach 4 h ja."""
-    now = 1000000.0
-    _patch_briefings(monkeypatch, lambda t: _brief_flight(1, now))
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - 3 * 3600})
-    assert fo._fo_should_sync('AT-N', now=now) == (False, 'too_soon')
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - 4 * 3600})
-    assert fo._fo_should_sync('AT-N', now=now) == (True, 'duty_near')
-
-
-def test_cadence_far_duty_uses_115h_rule(monkeypatch):
-    """Nächster Dienst erst in 10 Tagen ⇒ 11,5-h-Regel."""
-    now = 1000000.0
-    _patch_briefings(monkeypatch, lambda t: _brief_flight(10, now))
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - 4 * 3600})
-    assert fo._fo_should_sync('AT-F', now=now) == (False, 'no_duty_near')
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - 12 * 3600})
-    assert fo._fo_should_sync('AT-F', now=now) == (True, 'far_due')
-
-
-def test_cadence_unknown_duty_uses_115h_rule(monkeypatch):
-    """Keine Briefings / nur freie Tage = „kein Dienst bekannt" ⇒ locker."""
-    now = 1000000.0
-    from datetime import datetime as _d, timezone as _tz
-    today = _d.fromtimestamp(now, _tz.utc).strftime('%Y-%m-%d')
-    _patch_briefings(monkeypatch,
-                     lambda t: {today: {'ical_klass': 'frei',
-                                        'ical_summary': 'OFF DAY'}})
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-U': now - 6 * 3600})
-    assert fo._fo_should_sync('AT-U', now=now) == (False, 'no_duty_near')
-    _patch_briefings(monkeypatch, lambda t: {})
-    assert fo._fo_should_sync('AT-U', now=now) == (False, 'no_duty_near')
-
-
-def test_cadence_standby_counts_as_duty(monkeypatch):
-    """Standby ist Dienst (Anfahrt möglich) — enge Taktung."""
-    now = 1000000.0
+def _day_str(days_ahead, now):
     from datetime import datetime as _d, timedelta as _td, timezone as _tz
-    day = (_d.fromtimestamp(now, _tz.utc) + _td(days=1)).strftime('%Y-%m-%d')
+    return (_d.fromtimestamp(now, _tz.utc) + _td(days=days_ahead)
+            ).strftime('%Y-%m-%d')
+
+
+def _brief_days(now, duty_days=(), free_until=30, extra=None):
+    """Roster-Fixture: freie Tage bis `free_until`, Dienst (Legs) an den
+    `duty_days`-Offsets, optional weitere Tage via `extra`."""
+    out = {}
+    for i in range(0, free_until + 1):
+        out[_day_str(i, now)] = {'ical_klass': 'frei',
+                                 'ical_summary': 'OFF DAY'}
+    for i in duty_days:
+        out.update(_brief_flight(i, now))
+    for k, v in (extra or {}).items():
+        out[k] = v
+    return out
+
+
+def test_cadence_fast_duty_today_or_tomorrow(monkeypatch):
+    """Dienst morgen ⇒ fast (3,5 h): nach 3 h noch nicht, nach 4 h ja."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
     _patch_briefings(monkeypatch,
-                     lambda t: {day: {'ical_klass': 'standby',
-                                      'ical_summary': 'Standby (SB60)'}})
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-S': now - 5 * 3600})
-    assert fo._fo_should_sync('AT-S', now=now) == (True, 'duty_near')
+                     lambda t: _brief_days(now, duty_days=(1,)))
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - 3 * 3600})
+    assert fo._fo_should_sync('AT-N', now=now) == (False, 'skip_fast')
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - 4 * 3600})
+    assert fo._fo_should_sync('AT-N', now=now) == (True, 'fast')
+
+
+def test_cadence_mid_duty_in_2_to_7_days(monkeypatch):
+    """Dienst in 3 Tagen ⇒ mid (11,5 h): nach 8 h nein, nach 12 h ja."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    _patch_briefings(monkeypatch,
+                     lambda t: _brief_days(now, duty_days=(3,)))
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-M': now - 8 * 3600})
+    assert fo._fo_should_sync('AT-M', now=now) == (False, 'skip_mid')
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-M': now - 12 * 3600})
+    assert fo._fo_should_sync('AT-M', now=now) == (True, 'mid')
+
+
+def test_cadence_slow_no_duty_in_horizon(monkeypatch):
+    """Nächster Dienst erst in 10 Tagen ⇒ slow (21,5 h, 1×/Tag)."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    _patch_briefings(monkeypatch,
+                     lambda t: _brief_days(now, duty_days=(10,)))
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - 12 * 3600})
+    assert fo._fo_should_sync('AT-F', now=now) == (False, 'skip_slow')
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - 22 * 3600})
+    assert fo._fo_should_sync('AT-F', now=now) == (True, 'slow')
+
+
+def test_cadence_vacation_only_is_slow(monkeypatch):
+    """Nur Urlaub/Frei im Horizont, Roster reicht weit ⇒ slow."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    _patch_briefings(
+        monkeypatch,
+        lambda t: {_day_str(i, now): {'ical_summary': 'URLAUB'}
+                   for i in range(0, 25)})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-V': now - 12 * 3600})
+    assert fo._fo_should_sync('AT-V', now=now) == (False, 'skip_slow')
+
+
+def test_cadence_empty_store_is_failsafe_fast(monkeypatch):
+    """Neuverbindung/leerer Store und Loader-Fehler ⇒ fast — ein User ohne
+    Briefings darf NIE ausgehungert werden (fail-safe: lieber ein Call zu
+    viel als ein staler Dienstplan)."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    _patch_briefings(monkeypatch, lambda t: {})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-E': now - 4 * 3600})
+    assert fo._fo_should_sync('AT-E', now=now) == (True, 'fast')
+
+    def _boom(t):
+        raise RuntimeError('sb down')
+    _patch_briefings(monkeypatch, _boom)
+    assert fo._fo_should_sync('AT-E', now=now) == (True, 'fast')
+    # Nur Müll-Keys ⇒ ebenfalls fail-safe fast
+    _patch_briefings(monkeypatch, lambda t: {'kaputt': {'x': 1}})
+    assert fo._fo_should_sync('AT-E', now=now) == (True, 'fast')
+
+
+def test_cadence_standby_and_reserve_get_fastest_class(monkeypatch):
+    """Standby/Reserve heute-morgen ohne Legs ⇒ fast_sb (1,9 h = jeder
+    Cron-Lauf). RB zählt als Reserve; LISBOA (SB-Substring-Falle) NICHT."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    # Standby morgen: nach 2 h fällig (fast wäre erst bei 3,5 h)
+    _patch_briefings(
+        monkeypatch,
+        lambda t: _brief_days(now, extra={
+            _day_str(1, now): {'ical_klass': 'standby',
+                               'ical_summary': 'Standby (SB60)'}}))
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-S': now - 2 * 3600})
+    assert fo._fo_should_sync('AT-S', now=now) == (True, 'fast_sb')
+    # RB = Reserve (ganzes Wort) — gleiche Klasse
+    _patch_briefings(
+        monkeypatch,
+        lambda t: _brief_days(now, extra={
+            _day_str(0, now): {'ical_summary': 'RB'}}))
+    assert fo._fo_should_sync('AT-S', now=now) == (True, 'fast_sb')
+    # LISBOA trägt 'SB' als Substring, ist aber KEIN Standby — und ohne
+    # Dienst-Evidenz bleibt der Tag frei ⇒ slow-Klasse, kein Sync nach 2 h
+    _patch_briefings(
+        monkeypatch,
+        lambda t: _brief_days(now, extra={
+            _day_str(0, now): {'ical_summary': 'HOTAC LISBOA'}}))
+    assert fo._fo_should_sync('AT-S', now=now) == (False, 'skip_slow')
+    # Standby MIT schon zugewiesenen Legs = normaler Dienst ⇒ fast, nicht
+    # fast_sb (der Abruf ist passiert, der Tag ist ein Flugtag)
+    d1 = _brief_flight(1, now)
+    for _ev in d1.values():
+        _ev['ical_klass'] = 'standby'
+    _patch_briefings(monkeypatch,
+                     lambda t: _brief_days(now, extra=d1))
+    assert fo._fo_should_sync('AT-S', now=now) == (False, 'skip_fast')
+
+
+def test_cadence_overnight_split_day_counts_as_duty(monkeypatch):
+    """„(Tag 2/2)"-Zeilen (Übernacht-Split) tragen keine ical_sectors — der
+    Flug steht nur in der Summary (DB-Beleg 31.07.: Owner-Flugtag
+    'LH 455: SFO-FRA (Tag 2/2) · X', sectors leer, klass None). Das
+    IATA-Paar in der Summary zählt als Dienst ⇒ fast, nicht slow."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    _patch_briefings(
+        monkeypatch,
+        lambda t: _brief_days(now, extra={
+            _day_str(0, now): {
+                'ical_summary': 'LH 455: SFO-FRA (Tag 2/2) · X'}}))
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-O': now - 4 * 3600})
+    assert fo._fo_should_sync('AT-O', now=now) == (True, 'fast')
+
+
+def test_cadence_roster_end_bumps_to_mid(monkeypatch):
+    """Roster-Abdeckung endet in ≤7 Tagen ⇒ mind. mid, auch ohne Dienst —
+    die Monats-Veröffentlichung will niemand erst nach 22 h sehen."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    _patch_briefings(monkeypatch,
+                     lambda t: _brief_days(now, free_until=5))
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-R': now - 12 * 3600})
+    assert fo._fo_should_sync('AT-R', now=now) == (True, 'mid')
+    # Abdeckung nur Vergangenheit (Roster komplett ausgelaufen) ⇒ ebenfalls mid
+    _patch_briefings(
+        monkeypatch,
+        lambda t: {_day_str(-i, now): {'ical_summary': 'OFF DAY'}
+                   for i in range(3, 10)})
+    assert fo._fo_should_sync('AT-R', now=now) == (True, 'mid')
+
+
+def test_cadence_reclassified_every_run_slow_to_fast(monkeypatch):
+    """Der Wechsel langsam→schnell passiert im NÄCHSTEN Lauf von selbst:
+    die Klasse wird pro Lauf aus dem GESPEICHERTEN Roster neu berechnet,
+    nie gecacht. Gleicher Token, gleiche Uhr — nur der Store ändert sich."""
+    now = 1000000.0
+    monkeypatch.setattr(fo, '_fo_homebase', {})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-W': now - 4 * 3600})
+    _patch_briefings(monkeypatch,
+                     lambda t: _brief_days(now, duty_days=(10,)))
+    assert fo._fo_should_sync('AT-W', now=now) == (False, 'skip_slow')
+    # Neuer Dienst morgen erschien im letzten Sync → Store trägt ihn jetzt
+    _patch_briefings(monkeypatch,
+                     lambda t: _brief_days(now, duty_days=(1, 10)))
+    assert fo._fo_should_sync('AT-W', now=now) == (True, 'fast')
+
+
+def test_cadence_today_anchors_on_homebase_timezone(monkeypatch):
+    """ZEITZONEN-ZELLE (teuerste Fehlerklasse): 23:30 UTC ist in Berlin schon
+    der Folgetag. Dienst am Berlin-„morgen" muss fast sein (UTC-Rechnung
+    ergäbe fälschlich 2 Tage = mid). Und eine JFK-Homebase rechnet mit IHREM
+    Kalender. Läuft bewusst unter fremd gestellter Prozess-Zeitzone."""
+    import os
+    import time as _time
+    from datetime import datetime as _d, timezone as _tz
+    old_tz = os.environ.get('TZ')
+    os.environ['TZ'] = 'Pacific/Auckland'      # fremde Gerätezone
+    _time.tzset()
+    try:
+        now = _d(2026, 8, 5, 23, 30, tzinfo=_tz.utc).timestamp()
+        duty_day = '2026-08-07'                 # Berlin: morgen · UTC: +2 Tage
+        briefs = {duty_day: {'ical_summary': 'LH400 FRA-JFK',
+                             'ical_sectors': [{'fno': 'LH400'}]}}
+        briefs.update({f'2026-08-{d:02d}': {'ical_summary': 'OFF DAY'}
+                       for d in range(8, 31)})
+        _patch_briefings(monkeypatch, lambda t: dict(briefs))
+        monkeypatch.setattr(fo, '_fo_homebase', {'AT-TZ': 'FRA'})
+        monkeypatch.setattr(fo, '_fo_last_sync', {'AT-TZ': now - 4 * 3600})
+        assert fo._fo_should_sync('AT-TZ', now=now) == (True, 'fast')
+        # Ohne Homebase-Eintrag: Fallback Europe/Berlin — gleiches Ergebnis
+        monkeypatch.setattr(fo, '_fo_homebase', {})
+        assert fo._fo_should_sync('AT-TZ', now=now) == (True, 'fast')
+        # JFK-Homebase: dort ist es erst der 5.8. abends → Dienst am 7.8. ist
+        # übermorgen ⇒ mid, kein fast
+        monkeypatch.setattr(fo, '_fo_homebase', {'AT-TZ': 'JFK'})
+        assert fo._fo_should_sync('AT-TZ', now=now) == (False, 'skip_mid')
+        monkeypatch.setattr(fo, '_fo_last_sync', {'AT-TZ': now - 12 * 3600})
+        assert fo._fo_should_sync('AT-TZ', now=now) == (True, 'mid')
+    finally:
+        if old_tz is None:
+            os.environ.pop('TZ', None)
+        else:
+            os.environ['TZ'] = old_tz
+        _time.tzset()
 
 
 def _open_budget(monkeypatch):
@@ -302,6 +467,55 @@ def test_refresh_all_defers_and_counts(monkeypatch):
     assert calls == ['AT-A']
     st = fo._refresh_all_state['last']
     assert st['ok'] == 1 and st['deferred'] == 2 and st['users'] == 3
+
+
+def test_refresh_all_books_skip_counters_and_classes(monkeypatch):
+    """Transparenz für den Owner-Tagesreport: aufgeschobene Syncs landen
+    GEBATCHT (ein Increment pro Grund und Lauf) in lhfo_skip:<grund>, und
+    die done-Zeile trägt due_classes/defer_reasons."""
+    booked = []
+    _open_budget(monkeypatch)
+    import blueprints.lh_open_api as lo
+    monkeypatch.setattr(
+        lo, 'budget_inc',
+        lambda prefix, caller=None, units=1:
+        booked.append((prefix, caller, units)))
+    monkeypatch.setattr(fo, '_fo_should_sync',
+                        lambda tok, now=None:
+                        ((True, 'fast') if tok == 'AT-A'
+                         else (False, 'skip_slow')))
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    monkeypatch.setattr(fo, 'flightops_import', lambda tok: ({}, 200))
+    monkeypatch.setattr(fo, '_fo_mark_synced', lambda tok, now=None: None)
+    monkeypatch.setattr(fo.time, 'sleep', lambda s: None)
+    fo._refresh_all_state['running'] = True
+    fo._refresh_all_state['drain'] = False
+    fo._refresh_all_work(['AT-A', 'AT-B', 'AT-C'])
+    assert booked == [('lhfo_skip', 'skip_slow', 2)]
+    st = fo._refresh_all_state['last']
+    assert st['due_classes'] == {'fast': 1}
+    assert st['defer_reasons'] == {'skip_slow': 2}
+    assert st['ok'] == 1 and st['deferred'] == 2
+
+
+def test_refresh_all_orders_fast_before_slow(monkeypatch):
+    """Priorisierung im Plan: fast_sb/fast → first → mid → slow. Wird das
+    Budget knapp, trifft es zuerst die, denen Frische am wenigsten fehlt."""
+    _open_budget(monkeypatch)
+    reasons = {'AT-SLOW': 'slow', 'AT-SB': 'fast_sb', 'AT-MID': 'mid',
+               'AT-NEW': 'first', 'AT-FAST': 'fast'}
+    monkeypatch.setattr(fo, '_fo_should_sync',
+                        lambda tok, now=None: (True, reasons[tok]))
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    calls = []
+    monkeypatch.setattr(fo, 'flightops_import',
+                        lambda tok: calls.append(tok) or ({}, 200))
+    monkeypatch.setattr(fo, '_fo_mark_synced', lambda tok, now=None: None)
+    monkeypatch.setattr(fo.time, 'sleep', lambda s: None)
+    fo._refresh_all_state['running'] = True
+    fo._refresh_all_state['drain'] = False
+    fo._refresh_all_work(['AT-SLOW', 'AT-SB', 'AT-MID', 'AT-NEW', 'AT-FAST'])
+    assert calls == ['AT-SB', 'AT-FAST', 'AT-NEW', 'AT-MID', 'AT-SLOW']
 
 
 # ── 2b(ii). WELLEN-IMPORT (ersetzt den blinden 120-s-Demand-Vorlauf) ────────
@@ -420,8 +634,8 @@ def test_run_aborts_when_background_budget_closed(monkeypatch):
 
 
 def test_far_due_users_keep_day_reserve(monkeypatch):
-    """far_due-User (kein Dienst in Sicht) syncen NICHT mehr, sobald die
-    Tages-Reserve für die Dienst-Klasse angebrochen wäre — duty_near-User
+    """slow-User (kein Dienst in Sicht) syncen NICHT mehr, sobald die
+    Tages-Reserve für die Dienst-Klassen angebrochen wäre — fast-User
     laufen normal weiter."""
     monkeypatch.setattr(fo, '_rot_hour_used', lambda: 0)
     monkeypatch.setattr(fo, '_lhfo_day_used',
@@ -429,8 +643,8 @@ def test_far_due_users_keep_day_reserve(monkeypatch):
                                  - fo._FO_FAR_DAY_HEADROOM))
     monkeypatch.setattr(
         fo, '_fo_should_sync',
-        lambda tok, now=None: (True, 'far_due' if tok == 'AT-FAR'
-                               else 'duty_near'))
+        lambda tok, now=None: (True, 'slow' if tok == 'AT-FAR'
+                               else 'fast'))
     calls = []
     monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
     monkeypatch.setattr(fo, 'flightops_import',
