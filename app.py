@@ -23895,6 +23895,100 @@ def _group_id_from_channel(channel_id):
     return None
 
 
+# ── ABSENDER-NAMEN FÜR ALTE CHAT-NACHRICHTEN ───────────────────────────────
+# Der Sende-Stempel (`author_name`, siehe send_chat_message) gilt erst ab
+# 2026-08-01. Der GESAMTE bestehende Verlauf trägt ihn nicht — dort stünde
+# weiter der Client-Platzhalter, also genau das, was Till Becke gemeldet hat.
+# Ein Stempel allein hätte den Bug für die Vergangenheit nicht geheilt.
+#
+# Deshalb wird beim LESEN nachaufgelöst: der gespeicherte `author_token` ist
+# `token[:16]+'…'`, die Profile-Tabelle hat den vollen Token als PK. Ein
+# Prefix-LIKE auf dem PK-Index findet die Zeile — dieselbe Mechanik wie
+# /api/user/lookup-by-short (app.py ~11470), nur ohne Rate-Limit-Bedarf, weil
+# hier kein fremder Prefix geraten werden kann: die Tokens stammen aus einem
+# Channel, den der Caller ohnehin lesen darf.
+#
+# EINDEUTIGKEIT IST PFLICHT: nur ein Treffer wird übernommen (limit=2 →
+# genau 1). Bei zwei Profilen mit demselben 16-Zeichen-Prefix würde sonst ein
+# FALSCHER Name an einer Nachricht kleben — schlimmer als gar kein Name.
+# (Messung 2026-08-01 über alle 194 realen Chat-Absender: 175 eindeutig,
+# 19 ohne Profil, 0 Kollisionen.)
+_CHAT_AUTHOR_TTL_S = 300
+_chat_author_cache = {}          # trunc_token → (ts, {'name':…, 'avatar_url':…})
+_chat_author_cache_lock = _req_threading.Lock()
+
+
+def _chat_author_identities(author_tokens):
+    """{gekürzter author_token: {'name', 'avatar_url'}} für Nachrichten ohne
+    Sende-Stempel. Wirft nie: im Fehlerfall fehlt der Eintrag und der Client
+    zeigt seinen ehrlichen Platzhalter statt eines geratenen Namens."""
+    out = {}
+    toks = [t for t in dict.fromkeys(author_tokens or []) if t]
+    if not toks:
+        return out
+    now = time.time()
+    missing = []
+    try:
+        with _chat_author_cache_lock:
+            for t in toks:
+                hit = _chat_author_cache.get(t)
+                if hit is not None and (now - hit[0]) < _CHAT_AUTHOR_TTL_S:
+                    out[t] = hit[1]
+                else:
+                    missing.append(t)
+    except Exception:
+        missing = list(toks)
+    if not missing or not SB_AVAILABLE:
+        return out
+    import re as _re_chat
+    fresh = {}
+    for t in missing:
+        ident = {}
+        # LIKE-Injection-Schutz: '%'/'_' im Prefix würden fremde Zeilen
+        # matchen. Nur das Token-Alphabet zulassen, sonst gar nicht suchen.
+        prefix = (t or '').replace('…', '')
+        if not prefix or not _re_chat.match(r'^[A-Za-z0-9_-]+$', prefix):
+            fresh[t] = (now, ident)
+            out[t] = ident
+            continue
+        try:
+            r = (sb.table('user_profiles')
+                 .select('token,name,avatar_url:metadata->>avatar_url')
+                 .like('token', f'{prefix}%').limit(2).execute())
+            rows = [row for row in (r.data or [])
+                    if (row.get('token') or '').startswith(prefix)]
+            if len(rows) == 1:
+                nm = (rows[0].get('name') or '').strip()
+                if nm:
+                    ident['name'] = nm[:60]
+                av = (rows[0].get('avatar_url') or '').strip()
+                if av:
+                    ident['avatar_url'] = av
+        except Exception as e:
+            app.logger.warning(
+                f'[chat] author_resolve_fail tok={prefix[:8]} '
+                f'err={type(e).__name__}: {str(e)[:120]}')
+            # NICHT cachen — ein einzelner SB-Aussetzer darf nicht 5 min lang
+            # „kein Name" einfrieren.
+            continue
+        fresh[t] = (now, ident)
+        out[t] = ident
+    try:
+        with _chat_author_cache_lock:
+            _chat_author_cache.update(fresh)
+            if len(_chat_author_cache) > 5000:
+                for k, v in list(_chat_author_cache.items()):
+                    if (now - v[0]) >= _CHAT_AUTHOR_TTL_S:
+                        _chat_author_cache.pop(k, None)
+                if len(_chat_author_cache) > 5000:
+                    for k, _v in sorted(_chat_author_cache.items(),
+                                        key=lambda kv: kv[1][0])[:1000]:
+                        _chat_author_cache.pop(k, None)
+    except Exception:
+        pass
+    return out
+
+
 def _channel_access_error(token, channel_id):
     """Membership-Gate für generische Channel-Endpoints. Returns None wenn Zugriff
     erlaubt, sonst ein (jsonify, status)-Tuple für 403/400.
@@ -23980,6 +24074,33 @@ def get_chat_messages(token, channel_id):
         if mm.get('text'):
             mm['text'] = _wall_img_sanitize_urls(mm['text'])
         out.append(mm)
+    # NACHAUFLÖSUNG für den Bestand: alles, was vor dem Sende-Stempel
+    # (2026-08-01) geschrieben wurde, hat kein `author_name`. Ohne diesen
+    # Schritt bliebe Tills Verlauf genau so kryptisch wie gemeldet.
+    # Der Stempel gewinnt, wo er da ist — er ist der Name zum Sendezeitpunkt
+    # und kostet keine Abfrage.
+    try:
+        # metadata-jsonb kann theoretisch alles tragen — nur ein nicht-leerer
+        # String zählt als „Name schon da".
+        def _has_name(m):
+            v = m.get('author_name')
+            return isinstance(v, str) and v.strip() != ''
+
+        need = [m.get('author_token') for m in out if not _has_name(m)]
+        if need:
+            idents = _chat_author_identities(need)
+            for mm in out:
+                if _has_name(mm):
+                    continue
+                ident = idents.get(mm.get('author_token')) or {}
+                if ident.get('name'):
+                    mm['author_name'] = ident['name']
+                if ident.get('avatar_url') and not mm.get('author_avatar'):
+                    mm['author_avatar'] = ident['avatar_url']
+    except Exception as e:
+        # Namen sind Beiwerk — ein Fehler hier darf den Verlauf nie kosten.
+        app.logger.warning(
+            f'[chat] author_backfill_fail err={type(e).__name__}: {str(e)[:120]}')
     return jsonify({'channel': channel_id, 'messages': out})
 
 
@@ -24037,6 +24158,31 @@ def send_chat_message(token, channel_id):
             'ts': time.time(),
             'iso': datetime.now().isoformat(),
         }
+        # ── NAME BEIM SENDEN STEMPELN (Owner/Forum 2026-08-01) ──────────────
+        # Till Becke (Captain, LH) im Forum: „Beim Crewchat stehen Kürzel wie CC
+        # und CA aber nicht die Namen." Die Kürzel sind KEINE Rang-Codes: der
+        # Client kann den GEKÜRZTEN `author_token` nur gegen die eigene
+        # Freundesliste auflösen; ein Nicht-Freund landet beim Platzhalter
+        # „Crew · xxxx", und dessen INITIALEN sind je nach Suffix „CC"/„CA".
+        # In einem Crew-Chat sind die meisten Teilnehmer per Definition keine
+        # Freunde — der Client-Join kann das also gar nicht lösen.
+        #
+        # Deshalb derselbe Weg wie bei Wall-Posts: der Absender-Name wird beim
+        # SENDEN mitgeschrieben (Snapshot), nicht beim Lesen aufgelöst. Der
+        # gekürzte Token bleibt, was er ist — ein Schlüssel, kein Name.
+        # Unbekannte Felder konserviert der Supabase-Adapter im metadata-jsonb.
+        # Alte Nachrichten tragen den Namen nicht; der Client behält dafür
+        # seinen bisherigen Fallback.
+        try:
+            _pr = (_profile_load(token) or {}).get('profile', {}) or {}
+            _nm = (_pr.get('name') or '').strip()
+            if _nm:
+                msg['author_name'] = _nm[:60]
+            _av = (_pr.get('avatar_url') or '').strip()
+            if _av:
+                msg['author_avatar'] = _av
+        except Exception:
+            pass
         if client_message_id:
             # Unbekannte Felder werden vom Supabase-Adapter im metadata-jsonb
             # konserviert und beim Laden wieder re-hydratisiert.
