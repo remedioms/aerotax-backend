@@ -120,6 +120,7 @@ for _bp_path, _bp_name in [
     ('blueprints.live_activity',             'live_activity_bp'),  # Live Activities — ActivityKit-Token-Registry + APNs-Push (P6)
     ('blueprints.calendar_sweep',            'calendar_sweep_bp'),  # periodischer Nachlauf gespeicherter iCal-Links (NUR Nicht-LH-Hosts)
     ('blueprints.flight_checkins',           'flight_checkins_bp'),  # für einen Flug einchecken → Ereignis-Pushes (abgeflogen/landet in 1h/gelandet)
+    ('blueprints.smp_user_cards_blueprint',  'smp_user_cards_bp'),  # User-erstellte SMP-Flashcards + Review-Queue + anonymisiertes Community-Deck
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
