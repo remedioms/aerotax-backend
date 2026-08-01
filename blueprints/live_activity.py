@@ -1221,6 +1221,32 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
         if state['mainTime'] is None:
             # Ohne Ziel-Zeitpunkt gibt es keine ehrliche Karte.
             continue
+        # PUNKT-FORTSCHRITT (Tibor 01.08., „Punkt hinkt der Uhr hinterher"):
+        # nur wenn der Abflug BELEGT ist (shows_arrival trägt genau diese
+        # Gate-Semantik) und beide Instants da sind — dann bekommt jeder
+        # Event-Push den frischen Zeit-Fortschritt mit. Neuere Clients
+        # rechnen ihn ohnehin pro Render (liveProgress); das Feld hier
+        # versorgt ältere Builds. KEINE periodischen Extra-Pushes dafür —
+        # Apples Live-Activity-Throttle (s. Kopfkommentar dieses Fanouts).
+        if shows_arrival and est_dep and est_arr:
+            try:
+                _d0 = datetime.fromisoformat(str(est_dep).replace('Z', '+00:00'))
+                _d1 = datetime.fromisoformat(str(est_arr).replace('Z', '+00:00'))
+                _span = (_d1 - _d0).total_seconds()
+                if _span > 60:
+                    _p = (now_iso - _d0).total_seconds() / _span
+                    # QUANTISIERT auf 5-%-Stufen: ein sekundengenauer Wert
+                    # änderte den Content-Digest bei JEDEM identischen
+                    # MQTT-Event — der Dedupe-Schutz gegen Apples
+                    # Live-Activity-Throttle wäre wirkungslos gewesen
+                    # (test_stale_date_erzeugt_keinen_zusaetzlichen_push
+                    # hat genau das gefangen). 5 % einer Kurzstrecke sind
+                    # ~5 min Punkt-Auflösung — mehr Präzision rendert der
+                    # Client ohnehin selbst (liveProgress pro Render).
+                    state['progress'] = round(
+                        max(0.0, min(1.0, _p)) * 20) / 20
+            except Exception:
+                pass
         try:
             # stale-date bei JEDEM Update nachschieben: solange Events kommen,
             # wandert die Verfallsmarke mit der aktuellen Schätzung mit. Bleiben
