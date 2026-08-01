@@ -215,12 +215,19 @@ for i in $(seq 1 20); do
   # bricht mit einem Syntaxfehler ab — der riss beim ersten Einsatz (01.08.)
   # unter `set -e` das ganze Skript nach dem Container-Neustart weg, also
   # OHNE Rollback und OHNE die SHA-Buchhaltung.
-  if printf %s "$body" | grep -q "blueprints_failed[\"]*:[ ]*\[\]"; then
+  #
+  # NICHT unbedingt abbrechen (zweiter Anlauf 01.08.): ein `break` hinter dem
+  # if/else beendete die Schleife auch dann, wenn dieser EINE Body-Abruf leer
+  # zurueckkam (Worker gerade im Neustart). Ergebnis war ein Rollback mit der
+  # Meldung "Blueprint kaputt", obwohl blueprints_failed nachweislich []
+  # war — ein Fehlalarm, der einen gesunden Deploy zurueckdrehte. Nur ERFOLG
+  # bricht ab; ein echter Blueprint-Fehler faellt nach 20 Versuchen trotzdem
+  # durch, weil R dann FAIL_BLUEPRINTS bleibt.
+  if [ -n "$body" ] && printf %s "$body" | grep -q "blueprints_failed[\"]*:[ ]*\[\]"; then
     R=OK
-  else
-    R=FAIL_BLUEPRINTS
+    break
   fi
-  break
+  R=FAIL_BLUEPRINTS
 done
 echo $R')
 case "$OK" in
