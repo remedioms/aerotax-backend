@@ -13134,7 +13134,7 @@ def _hangout_vibe_labels(keys):
 # („Samstag 14:00–18:00") braucht das echte Fenster. Reine Anzeige-Strings,
 # verbatim durchgereicht — die Zeitzonen-Wahrheit hat der Client, der Server
 # interpretiert hier bewusst nichts.
-_HANGOUT_META_KEYS = ('starts_at', 'ends_at')
+_HANGOUT_META_KEYS = ('starts_at', 'ends_at', 'visible_from')
 
 
 def _hangout_meta_normalize(raw):
@@ -13189,6 +13189,48 @@ def _hangout_is_listable(row):
     """Gehört diese Pin-Zeile in eine LISTE (Karte/Feed)? Abgelaufen oder
     abgesagt → nein. EINE Regel für alle drei Loader."""
     return _pin_not_expired(row) and not _hangout_cancelled_at(row)
+
+
+# ── GEPLANTE HANGOUTS (`meta.visible_from`) ────────────────────────────────
+#
+# Ein Hangout stand bisher ab der Sekunde des Anlegens im Feed: der Loader
+# nimmt alles mit `pin_date >= heute`, ein „frühestens sichtbar ab" gab es
+# nicht. Wer einen Treff vier Wochen vorher anlegt, steht vier Wochen drin —
+# und eine kuratierte Event-Reihe (Stadtfeste, Open-Air-Kino eines Sommers)
+# würde auf einen Schlag den ganzen Feed füllen.
+#
+# `meta.visible_from` (ISO-8601, Offset gehört dazu) verschiebt NUR den
+# Einblend-Zeitpunkt. Der Ablauf bleibt wie gehabt `pin_date`.
+#
+# FAIL-OPEN — und das ist die Umkehrung des `audience`-Filters, mit Absicht:
+# fehlt der Wert, ist er kein String, oder lässt er sich nicht parsen, dann
+# ist der Hangout SICHTBAR. Das hier ist keine Zugriffskontrolle, sondern
+# Terminplanung; ein Parse-Fehler darf niemals einen echten User-Treff
+# verstecken. `visible_from` kann Sichtbarkeit nur VERZÖGERN, nie gewähren —
+# Zielgruppe und Ablauf greifen davor unverändert.
+#
+# Der ERSTELLER sieht seinen Hangout wie überall sonst IMMER, auch vorher.
+def _hangout_visible_from(row):
+    """`meta.visible_from` als aware datetime, sonst None. Wirft nie."""
+    meta = _hangout_meta_of_row(row)
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get('visible_from')
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace('Z', '+00:00'))
+    except Exception:
+        return None  # unlesbar zählt wie „nicht gesetzt" (fail-open)
+    # Ohne Offset ist der Wert nicht eindeutig. Wir lesen ihn als UTC, statt
+    # eine Zone zu raten — geschriebene Werte tragen ihren Offset.
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _hangout_is_scheduled_ahead(row):
+    """Angelegt, aber der Einblend-Zeitpunkt liegt noch in der Zukunft."""
+    vf = _hangout_visible_from(row)
+    return bool(vf and vf > datetime.now(timezone.utc))
 
 
 # ── ZUSAGEN („Bin dabei") ───────────────────────────────────────────────────
@@ -14000,6 +14042,11 @@ def get_crew_at_destination(token):
         aud = _hangout_audience_of_row(p)
         if not mine and not _hangout_row_matches(p, viewer_prof, viewer_ctx):
             continue
+        # Gleiches für den Einblend-Zeitpunkt: die Karte ist derselbe Hangout
+        # auf einem anderen Weg, ein geplanter Treff darf hier nicht früher
+        # auftauchen als im Feed.
+        if not mine and _hangout_is_scheduled_ahead(p):
+            continue
         oprof = {} if mine else (_owner_profs.get(owner) or {})
         pins_out.append({
             'id': pid,
@@ -14092,6 +14139,8 @@ def list_hangouts(token):
         aud = _hangout_audience_of_row(p)
         if not mine and not _hangout_row_matches(p, viewer_prof, viewer_ctx):
             continue  # Zielgruppe verfehlt → gar nicht erst ausliefern
+        if not mine and _hangout_is_scheduled_ahead(p):
+            continue  # noch nicht eingeblendet (meta.visible_from)
         is_friend = owner in friend_set
         oprof = {} if mine else (_owner_profs.get(owner) or {})
         out.append({
@@ -14127,6 +14176,11 @@ def _hangout_visible_row(token, pin_id):
         return None
     if (row.get('user_token') or '') == token:
         return row
+    # Noch nicht eingeblendet → für Fremde nicht von „gibt es nicht" zu
+    # unterscheiden. Sonst wäre der Chat-Kontext (`group__pin_<id>`) die
+    # Hintertür, durch die ein geplanter Hangout vorab lesbar wäre.
+    if _hangout_is_scheduled_ahead(row):
+        return None
     viewer_prof = (_profile_load(token) or {}).get('profile') or {}
     if not _hangout_row_matches(row, viewer_prof,
                                 _hangout_viewer_ctx(token, viewer_prof)):
@@ -14957,7 +15011,13 @@ def create_manual_pin(token):
     # EINGESCHRÄNKTE Hangouts pushen NICHT: der Geo-Fanout kennt die Zielgruppe
     # nicht und würde Titel + Ort an genau die Crew tragen, die den Hangout im
     # Feed bewusst nicht sieht. Lieber kein Push als der falsche.
-    if not _hangout_audience_is_restricted(audience):
+    # GEPLANTE Hangouts pushen beim Anlegen NICHT: der Push träfe Wochen vor
+    # dem Einblenden ein und sein Deep-Link liefe in einen 404, weil der
+    # Hangout für den Empfänger noch gar nicht existiert. Wurde `meta` von
+    # einer fehlenden Migration geschluckt, ist auch `visible_from` weg — dann
+    # ist der Hangout sofort sichtbar und der Push wieder richtig.
+    _scheduled = _hangout_is_scheduled_ahead({'meta': meta})
+    if not _hangout_audience_is_restricted(audience) and not _scheduled:
         try:
             _hangout_notify_nearby(token, lat, lng, iata,
                                    title=(note or iata), pin_id=pin_id)
@@ -29287,6 +29347,92 @@ def _trip_stats_compute(token):
                 legs += 1
         return legs
 
+    # ── Flüge/Distanz/Stunden aus der EINEN Leg-Quelle (Florian 01.08.) ─────
+    # Vorher zählten hier drei Quellen nebeneinander: der routing-STRING der
+    # Steuer-/Roster-Tage (Flüge/Distanz), das DIENST-Fenster aus reader_facts
+    # (als „Flugstunden") und ein eigener, zweiter Import-Merge. Live-Befund
+    # Florian (AT-D8BC…): 143 Flüge, aber „42,2 Flugstunden" — App-Roster-Tage
+    # tragen keine reader_facts-Zeiten, nur die 25 Import-Legs zählten
+    # Blockzeit. Jetzt kommt alles Leg-Basierte aus `_passport_legs`
+    # (= `_logbook_merged_legs`: Roster manual+iCal + Import, Roster gewinnt) —
+    # dieselbe Merge-Wahrheit wie Flugbuch und Crew-Passport, und Flugstunden
+    # sind BLOCKZEIT (arr−dep → Import-Blockzeit → Routen-Median), nicht
+    # Dienstzeit. Der routing-String bleibt Fallback für Tage OHNE Legs
+    # (reine Steuer-Importe: CAS-Tage ohne App-Roster), siehe `leg_dates`.
+    def _leg_iso(s):
+        if not s or not isinstance(s, str):
+            return None
+        try:
+            return datetime.fromisoformat(s.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+
+    passport_legs = _passport_legs(token)
+    leg_dates = set()
+    dur_budget = {'n': 5}   # max teure route-history-Lookups pro Compute
+    for lg in passport_legs:
+        datum = lg.get('date') or ''
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', datum):
+            continue
+        frm = lg.get('from') or ''
+        to = lg.get('to') or ''
+        if not frm or not to:
+            continue
+        try:
+            year = int(datum[:4])
+        except ValueError:
+            continue
+        leg_dates.add(datum)
+        ym = datum[:7]
+        targets = [life]
+        if year == current_year:
+            targets.append(ytd)
+        s = lg.get('sec') or lg.get('imp') or {}
+        if not isinstance(s, dict):
+            s = {}
+        ca = ap_lookup.get(frm)
+        cb = ap_lookup.get(to)
+        fn = str(lg.get('flight') or s.get('flight_no') or '').replace(' ', '').upper()
+        m = re.match(r'^([A-Z]{2,3})\d', fn)
+        airline = m.group(1) if m else ''
+        ac_type = str(lg.get('type') or '').strip().upper()
+        ac_reg = str(lg.get('reg') or s.get('tail') or '').strip().upper()
+        for tg in targets:
+            tg['flights'] += 1
+            if ca and cb and frm != to:
+                tg['distance_km'] += _haversine_km(ca[0], ca[1], cb[0], cb[1])
+            for ent in (ca, cb):
+                if ent and ent[2]:
+                    tg['countries'].add(ent[2])
+            if airline:
+                tg['airlines'][airline] += 1
+            if ac_type:
+                tg['aircraft_types'][ac_type] += 1
+            if 2 < len(ac_reg) <= 10:
+                tg['aircraft_regs'][ac_reg] += 1
+        monthly_flights[ym] = monthly_flights.get(ym, 0) + 1
+        dep = _leg_iso(lg.get('dep_iso'))
+        arr = _leg_iso(lg.get('arr_iso'))
+        mins = None
+        if dep and arr:
+            delta = (arr - dep).total_seconds() / 60.0
+            if delta < 0:
+                delta += 24 * 60   # Mitternachts-Wrap (naive iCal-Zeiten)
+            if 0 < delta < 20 * 60:
+                mins = delta
+        if mins is None:
+            bm = lg.get('block_min')
+            if bm is None:
+                bm = s.get('block_min')
+            if isinstance(bm, (int, float)) and 0 < bm < 20 * 60:
+                mins = float(bm)
+        if mins is None and frm != to:
+            mins = _passport_route_duration_min(frm, to, dur_budget)
+        if mins is not None:
+            for tg in targets:
+                tg['hours_flown_min'] += int(mins)
+            monthly_hours[ym] = monthly_hours.get(ym, 0.0) + mins / 60.0
+
     for t in tage:
         if not isinstance(t, dict): continue
         datum = t.get('datum') or ''
@@ -29323,7 +29469,12 @@ def _trip_stats_compute(token):
                     tg['spesen_eur'] += spesen_amt
                     tg['spesen_days'] += 1
 
-        routing = t.get('routing') or ''
+        # Tage, die die Leg-Quelle schon trägt, zählen hier NICHT mehr —
+        # sonst doppelt (der Leg-Loop oben ist die reichere Wahrheit
+        # desselben Tages). routing-String nur noch als Fallback für
+        # reine Steuer-Import-Tage ohne Sektoren.
+        day_has_legs = datum[:10] in leg_dates
+        routing = '' if day_has_legs else (t.get('routing') or '')
         legs = _accumulate_distance(routing, life)
         if year == current_year:
             _accumulate_distance(routing, ytd)
@@ -29354,10 +29505,12 @@ def _trip_stats_compute(token):
                 if year == current_year:
                     ytd['countries'].add(ent[2])
 
+        # Dienstzeit-Fenster nur als Stunden-FALLBACK für Tage ohne Legs
+        # (Steuer-Import): an Leg-Tagen zählt oben die echte Blockzeit.
         s_raw = rf.get('start_time')
         e_raw = rf.get('end_time')
         try:
-            if s_raw and e_raw:
+            if s_raw and e_raw and not day_has_legs:
                 sh, sm = [int(x) for x in s_raw.split(':')]
                 eh, em = [int(x) for x in e_raw.split(':')]
                 s_m = sh * 60 + sm
@@ -29396,76 +29549,9 @@ def _trip_stats_compute(token):
             for tg in targets:
                 tg['aircraft_regs'][ac_reg] += 1
 
-    # FLUGBUCH-IMPORT einmischen (Kevin 2026-07-26: „Statistik zeigt nur Werte
-    # seit App-Nutzung" — Commit 1e170dd hat nur den Crew-Passport gefixt, die
-    # Trip-Stats-Hälfte blieb offen). Importierte Karriere-Legs zählen in
-    # Flüge/Distanz/Länder/Flugstunden/Airline/Muster mit. Dedupe: das Roster
-    # GEWINNT — ein Import-Leg wird übersprungen, wenn der Roster-Tag dieselbe
-    # Strecke (date + from-to aus dem routing-String) schon trägt. Bewusst
-    # OHNE Mutation der geladenen Strukturen (kein data[d]-in-place wie im
-    # Passport-Merge): alles fließt nur in die lokalen Akkumulatoren — damit
-    # ist der Pfad auch gegen einen künftigen Loader-Prozess-Cache sicher.
-    imported_leg_count = 0
-    try:
-        _imp = _logbook_import_load(token) or {}
-        _imp_legs = _imp.get('legs') or []
-        if _imp_legs:
-            roster_pairs = set()
-            for t in tage:
-                if not isinstance(t, dict):
-                    continue
-                d = (t.get('datum') or '')[:10]
-                parts = [pp.strip().upper() for pp in (t.get('routing') or '').split('-')
-                         if pp and len(pp.strip()) == 3]
-                for a, b in zip(parts[:-1], parts[1:]):
-                    roster_pairs.add(f'{d}|{a}|{b}')
-            for L in _imp_legs:
-                if not isinstance(L, dict):
-                    continue
-                d = (L.get('date') or '')[:10]
-                frm = (L.get('from') or '').strip().upper()
-                to = (L.get('to') or '').strip().upper()
-                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d) \
-                        or len(frm) != 3 or len(to) != 3:
-                    continue
-                if f'{d}|{frm}|{to}' in roster_pairs:
-                    continue          # Roster trägt die Strecke schon → gewinnt
-                try:
-                    year = int(d[:4])
-                except ValueError:
-                    continue
-                imported_leg_count += 1
-                ym = d[:7]
-                targets = [life]
-                if year == current_year:
-                    targets.append(ytd)
-                ca, cb = ap_lookup.get(frm), ap_lookup.get(to)
-                for tg in targets:
-                    tg['flights'] += 1
-                    if ca and cb:
-                        tg['distance_km'] += _haversine_km(ca[0], ca[1], cb[0], cb[1])
-                    for ent in (ca, cb):
-                        if ent and ent[2]:
-                            tg['countries'].add(ent[2])
-                monthly_flights[ym] = monthly_flights.get(ym, 0) + 1
-                bm = L.get('block_min')
-                if isinstance(bm, (int, float)) and 0 < bm < 20 * 60:
-                    for tg in targets:
-                        tg['hours_flown_min'] += int(bm)
-                    monthly_hours[ym] = monthly_hours.get(ym, 0.0) + bm / 60.0
-                fn = (L.get('flight') or '').strip().upper()
-                airline = ''.join(c for c in fn if c.isalpha())[:3] if fn else ''
-                ac_type = (L.get('type') or '').strip().upper()
-                ac_reg = (L.get('reg') or '').strip().upper()
-                for tg in targets:
-                    if airline:
-                        tg['airlines'][airline] += 1
-                    if ac_type:
-                        tg['aircraft_types'][ac_type] += 1
-                    if ac_reg:
-                        tg['aircraft_regs'][ac_reg] += 1
-    except Exception:
-        pass
+    # (Der frühere ZWEITE Import-Merge-Block von 2026-07-26 ist seit 01.08.
+    # ersetzt: die `_passport_legs`-Schleife oben trägt Roster- UND Import-Legs
+    # aus der EINEN Merge-Quelle — er hier hätte alles doppelt gezählt.)
 
     # Tour/Layover-Längen + fastest turn
     cur_tour_len = 0
@@ -29537,7 +29623,7 @@ def _trip_stats_compute(token):
         except (ValueError, TypeError):
             pass
 
-    has_data = bool(tage) or bool(fops) or imported_leg_count > 0
+    has_data = bool(tage) or bool(fops) or bool(passport_legs)
 
     def _serialize(bucket):
         return {

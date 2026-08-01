@@ -473,6 +473,46 @@ def test_inbound_chain_no_sources_no_reg(monkeypatch):
     assert forecast['confidence'] == 'keine'
 
 
+def test_inbound_chain_rotation_fallback_never_overrides_known_reg(monkeypatch):
+    """Tibor 01.08. (LH1137 BCN→FRA, am Gate): Roster-Tail D-AIRM bekannt
+    (Stufe 3), Außenstation ungepollt (kein Board, keine Live-Route) — und der
+    Rotations-Fallback findet eine FREMDE FRA→BCN-Row (D-AIEM; die Row wird
+    OHNE Reg-Abgleich gematcht, FRA-BCN fliegt mehrmals täglich). Vorher
+    überschrieb er chain['reg'] mit der fremden Maschine → „Wo ist mein
+    Flieger" zeigte D-AIEM „Unterwegs", während Tibor in D-AIRM saß. Jetzt:
+    bekannte Reg gewinnt, der Fallback wird komplett übersprungen, der
+    Zubringer bleibt ehrlich unbestimmt (Feed.md: „Reg wird NIE geraten")."""
+    _patch_life_app(monkeypatch, _fake_sb([]))
+    _patch_chain_deps(monkeypatch)
+    monkeypatch.setattr(BP, '_tail_active_guard', lambda reg: bool(reg))
+    monkeypatch.setattr(BP, '_rotation_positioning_row',
+                        lambda *a, **k: {'flight': 'LH1136', 'reg': 'DAIEM',
+                                         'type_code': 'A21N'})
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH1137', '2026-08-01', 'BCN', reg_hint='D-AIRM', arr_iata='FRA')
+    assert chain['reg'] == 'D-AIRM'
+    assert chain['inbound_origin'] is None
+    assert chain['inbound_flight_no'] is None
+    assert chain['aircraft_type'] != 'A21N'
+
+
+def test_inbound_chain_rotation_fallback_confirming_reg_keeps_narrative(monkeypatch):
+    """Nennt die Gegenroute-Row DIESELBE Maschine (Bindestrich-normalisiert:
+    Board „DAIRM" = Roster „D-AIRM"), ist sie eine Bestätigung — das
+    Zubringer-Narrativ bleibt erhalten."""
+    _patch_life_app(monkeypatch, _fake_sb([]))
+    _patch_chain_deps(monkeypatch)
+    monkeypatch.setattr(BP, '_tail_active_guard', lambda reg: bool(reg))
+    monkeypatch.setattr(BP, '_rotation_positioning_row',
+                        lambda *a, **k: {'flight': 'LH1136', 'reg': 'DAIRM',
+                                         'type_code': 'A21N'})
+    chain, forecast, my = BP._build_inbound_chain(
+        'LH1137', '2026-08-01', 'BCN', reg_hint='D-AIRM', arr_iata='FRA')
+    assert chain['reg'] == 'D-AIRM'          # Identität bleibt die Roster-Reg
+    assert chain['inbound_flight_no'] == 'LH1136'
+    assert (chain['inbound_origin'] or {}).get('iata') == 'FRA'
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FR24-gRPC-Korridor — Routen-Gate (Reg-Match + route_to)
 # ══════════════════════════════════════════════════════════════════════════════

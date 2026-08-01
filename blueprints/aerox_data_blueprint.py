@@ -8698,18 +8698,36 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         # Herkunft = Homebase; Zeiten NICHT aus der Row (sched/esti dort sind
         # ABFLUG-Zeiten, keine Ankunft an dep — nichts erfinden, der
         # Dual-Side-Resolver unten liefert die Ankunft, wenn er sie kennt).
-        inbound_fn = (rot_row.get('flight') or '').replace(' ', '').upper() or None
-        inbound_origin = _norm_iata(arr_iata)
-        # Die Gegenroute-Row IST der Zubringer — ihr Tail ist der einlaufende
-        # Flieger (die zuvor aufgelöste Reg gehört zu MEINEM Flug, kann abweichen).
-        # Auf die Zubringer-Reg/-Typ ziehen, damit Snapshot/Korridor (die per Reg
-        # filtern) den RICHTIGEN Flieger finden, nicht meinen.
+        #
+        # ⚠️ REG-GATE (Tibor 01.08., LH1137 BCN→FRA): `_rotation_positioning_row`
+        # matcht OHNE Reg-Abgleich — auf einer mehrfach täglich beflogenen
+        # Strecke (FRA-BCN!) ist die „jüngste Gegenroute-Row" gern eine ANDERE
+        # Maschine. Genau so wurde aus Tibors D-AIRM (Roster-Tail, Stufe 3)
+        # ein D-AIEM samt fremder FRA→BCN-Zeitkette als „Unterwegs" — die Karte
+        # behauptete eine Maschine, in der er nie saß, während die Live
+        # Activity (Rosterwahrheit) richtig lag. Das verletzt die Feed.md-
+        # Invariante „Kennzeichen wird NIE geraten".
+        #
+        # Deshalb: ist BEREITS eine Reg aus einer echten Quelle da (Board-
+        # Merge, SB-Tages-Row oder Roster-Tail, Stufen 1–3), dann trägt der
+        # Fallback nur, wenn seine Row DIESELBE Reg nennt (Bestätigung) oder
+        # gar keine trägt UND wir nur das Narrativ brauchen — eine ABWEICHENDE
+        # Row ist eine fremde Maschine → Fallback komplett überspringen,
+        # Zubringer bleibt ehrlich unbestimmt. Nur ohne jede bekannte Reg
+        # bleibt der dokumentierte 07-07-Fall (Roster ohne Tail) unverändert.
+        _rot_reg = (rot_row.get('reg') or '').strip().upper() or None
         # Museums-Wächter auch HIER (Sweep #11): die Rotations-Row stammt aus
         # demselben Board-Warehouse — sie darf den Scrub oben nicht umgehen.
-        _rot_reg = (rot_row.get('reg') or '').strip().upper() or None
         if _rot_reg and not _tail_active_guard(_rot_reg):
             _rot_reg = None
-        if _rot_reg:
+        # Bindestrich-normalisiert vergleichen: Board-Rows schreiben „DAIEM",
+        # Roster-Tails „D-AIEM" — dasselbe Blech, zwei Schreibweisen.
+        if reg and _rot_reg and \
+                _rot_reg.replace('-', '') != reg.replace('-', ''):
+            return chain, forecast, my   # fremde Maschine — nichts behaupten
+        inbound_fn = (rot_row.get('flight') or '').replace(' ', '').upper() or None
+        inbound_origin = _norm_iata(arr_iata)
+        if _rot_reg and not reg:
             reg = _rot_reg
             chain['reg'] = _rot_reg
             _rot_tc = (rot_row.get('type_code') or '').strip().upper() or None

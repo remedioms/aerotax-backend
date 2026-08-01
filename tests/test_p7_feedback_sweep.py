@@ -413,18 +413,22 @@ def _trip_stats_with(monkeypatch, legs, tage):
 def test_kevin_import_zaehlt_in_lifetime(monkeypatch):
     out = _trip_stats_with(monkeypatch, _IMPORT_LEGS, _ROSTER_TAGE)
     life = out['lifetime']
-    # Roster: 1 Leg (FRA-JFK) + Import: 2 neue Legs (SYD-Rotation); das
-    # Überlapp-Leg vom 2026-07-01 zählt NICHT doppelt, das kaputte gar nicht.
+    # SEIT 01.08. (Florian-Befund „42,2 Flugstunden bei 143 Flügen"): alles
+    # Leg-Basierte kommt aus der EINEN Merge-Quelle `_passport_legs`. Der
+    # Roster-Tag 2026-07-01 hat hier keine ical_sectors — sein LH400 kommt
+    # als Import-Leg aus der Merge-Quelle (500 min Blockzeit), der
+    # routing-String desselben Tages zählt NICHT nochmal (leg_dates-Gate).
     assert life['flights'] == 3
     assert life['distance_km'] > 30000            # 2× FRA-SYD ≈ 33.000 km
     assert 'AU' in life['countries_list']         # SYD bringt Australien
     assert life['top_aircraft'] == 'B747'
     assert out['has_data'] is True
-    # YTD bleibt Roster-only (Import-Legs sind von 2019).
+    # YTD: nur das 2026er-Leg (Import-SYD ist von 2019).
     assert out['ytd']['flights'] == 1
-    # Flugstunden: Roster-Dienst 10h + Import-Blockzeit 2330min (die
-    # 20-h-Sanity-Kappe pro Leg gilt wie im Passport-Merge).
-    assert life['hours_flown'] == pytest.approx(10 + 2330 / 60.0, abs=0.1)
+    # Flugstunden = BLOCKZEIT der Legs (1150+1180+500 min), NICHT mehr das
+    # 10-h-Dienstfenster des Roster-Tags — genau die Florian-Korrektur.
+    assert life['hours_flown'] == pytest.approx((1150 + 1180 + 500) / 60.0,
+                                                abs=0.1)
 
 
 def test_kevin_user_ohne_import_unveraendert(monkeypatch):
