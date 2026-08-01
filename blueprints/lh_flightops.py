@@ -916,6 +916,12 @@ _LHFO_DAY_BACKGROUND_CEILING = 5000
 # Sicherheitsband unter dem echten LH-Tageskontingent von 6.000; Hintergrund
 # bleibt bei 5000 voll gestoppt. Nach Wirkungsnachweis der Quota-Diät
 # (Verbrauch < 5000/Tag) zurück auf 5600 senken.
+#
+# RÜCKBAU-CHECK 01.08. (ax_api_budget, lhfoD:*): 28.07=6684, 29.07=5705,
+# 30.07=5203, 31.07=5167, 01.08 bereits 4500 um 13Z (Projektion >6000).
+# Der Beweis „<5000/Tag" ist NICHT erbracht — Deckel bleibt bewusst auf
+# 5900, sonst sterben abends wieder die interaktiven Imports. Erneut
+# prüfen, wenn drei Folgetage unter 5000 liegen.
 _LHFO_DAY_INTERACTIVE_CEILING = 5900
 
 # Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
