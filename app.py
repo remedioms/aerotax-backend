@@ -19412,6 +19412,9 @@ _LINK_PREVIEW_USER_AGENT = ('AeroXLinkPreviewBot/1.0 '
                             '(+https://aerosteuer.de; Crew-Chat-Link-Vorschau)')
 _LINK_PREVIEW_TIMEOUT = 6.0
 _LINK_PREVIEW_MAX_BYTES = 512 * 1024
+# Oberhalb dessen laden wir gar nicht erst an — das ist kein HTML-Dokument
+# mehr, sondern ein Versehen oder ein Angriffsversuch.
+_LINK_PREVIEW_ABSURD_BYTES = 20 * 1024 * 1024
 _LINK_PREVIEW_MAX_REDIRECTS = 3
 
 
@@ -19490,24 +19493,39 @@ def _link_preview_fetch_html(url):
             ctype = (resp.headers.get('Content-Type') or '').lower()
             if not ctype.startswith('text/html'):
                 return None, 'not_html'
-            # Billiger Vorab-Check: kündigt die Quelle ehrlich einen zu großen
-            # Body an, sparen wir uns den Read-Loop komplett.
+            # Vorab-Check NUR noch gegen absurde Groessen. Frueher stand hier
+            # `clen > _LINK_PREVIEW_MAX_BYTES → too_large`; das wies genau die
+            # Seiten ab, um die es geht (Nachrichtenseiten liegen regelmaessig
+            # ueber 512 KB). Der Lese-Loop unten deckelt ohnehin, wir laden also
+            # nie mehr als das Limit — ein frueher Abbruch bringt nichts ausser
+            # einer leeren Vorschau.
             try:
                 clen = int(resp.headers.get('Content-Length') or 0)
-                if clen and clen > _LINK_PREVIEW_MAX_BYTES:
+                if clen and clen > _LINK_PREVIEW_ABSURD_BYTES:
                     return None, 'too_large'
             except Exception:
                 pass
+            # BEFUND 2026-08-01 (live gemessen): tagesschau.de, Wikipedia UND
+            # airliners.de liefern alle mehr als 512 KB HTML — mit dem alten
+            # `return None, 'too_large'` war die Vorschau fuer praktisch jede
+            # echte Nachrichtenseite leer. Das Limit ist als Schutz richtig,
+            # das WEGWERFEN war falsch: og:-Angaben stehen im <head>, also in
+            # den ersten Kilobytes. Wir lesen deshalb bis zum Limit und
+            # verarbeiten, was wir haben — und hoeren frueher auf, sobald der
+            # </head> durch ist. Das spart Bandbreite UND Zeit.
             chunks = []
             total = 0
             for chunk in resp.iter_content(chunk_size=65536):
                 if not chunk:
                     continue
                 total += len(chunk)
-                if total > _LINK_PREVIEW_MAX_BYTES:
-                    return None, 'too_large'
                 chunks.append(chunk)
-            raw = b''.join(chunks)
+                if total >= _LINK_PREVIEW_MAX_BYTES:
+                    break
+                # Kopf komplett? Dann ist alles Interessante da.
+                if b'</head>' in chunk or b'</HEAD>' in chunk:
+                    break
+            raw = b''.join(chunks)[:_LINK_PREVIEW_MAX_BYTES]
             encoding = resp.encoding or 'utf-8'
             try:
                 return raw.decode(encoding, errors='replace'), None
