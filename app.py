@@ -13134,7 +13134,8 @@ def _hangout_vibe_labels(keys):
 # („Samstag 14:00–18:00") braucht das echte Fenster. Reine Anzeige-Strings,
 # verbatim durchgereicht — die Zeitzonen-Wahrheit hat der Client, der Server
 # interpretiert hier bewusst nichts.
-_HANGOUT_META_KEYS = ('starts_at', 'ends_at', 'visible_from')
+_HANGOUT_META_KEYS = ('starts_at', 'ends_at', 'visible_from', 'all_day',
+                      'curated')
 
 
 def _hangout_meta_normalize(raw):
@@ -13233,6 +13234,24 @@ def _hangout_is_scheduled_ahead(row):
     return bool(vf and vf > datetime.now(timezone.utc))
 
 
+# ── KURATIERTE TERMINE (`meta.curated`, Owner 2026-08-01) ──────────────────
+#
+# Ein Hangout aus dem redaktionellen AeroX-Account ist KEINE persönliche
+# Einladung, sondern ein Stadt-Termin. Zwei Regeln kippen dadurch:
+#
+#   1. Der Ersteller zählt NICHT automatisch als Zusager. Bei einem echten
+#      Treff ist „wer einlädt, ist da" richtig — AeroX geht aber nicht zum
+#      Museumsuferfest. „1 dabei" mit AeroX-Avatar wäre genau der erfundene
+#      Wert, den wir sonst überall vermeiden. Echte Zusagen zählen normal.
+#   2. Kein Geo-Push. Der Fanout an alle im ~100-km-Umkreis ist für einen
+#      persönlichen Treff gedacht; eine kuratierte Terminliste würde daraus
+#      eine Push-Serie machen, die niemand bestellt hat.
+def _hangout_is_curated(row):
+    """Redaktioneller Termin statt persönlicher Einladung."""
+    meta = _hangout_meta_of_row(row)
+    return isinstance(meta, dict) and meta.get('curated') == '1'
+
+
 # ── ZUSAGEN („Bin dabei") ───────────────────────────────────────────────────
 #
 # Bis heute gab es KEINEN Beitritts-Mechanismus: „beitreten" hieß den Chat
@@ -13250,6 +13269,10 @@ def _hangout_attendees_of_row(row):
     auch für Alt-Zeilen aus der Zeit vor der `attendees`-Spalte und für Inserts,
     denen die Migration fehlte: das `user_token` steht immer auf der Zeile, die
     Zusage des Erstellers braucht also gar keinen gespeicherten Zustand.
+
+    AUSNAHME (2026-08-01): bei einem KURATIERTEN Termin zählt der Ersteller
+    nicht mit — die AeroX-Redaktion legt den Termin an, geht aber nicht hin
+    (siehe `_hangout_is_curated`). Echte Zusagen zählen dort ganz normal.
     """
     raw = (row or {}).get('attendees')
     if isinstance(raw, str):
@@ -13259,7 +13282,7 @@ def _hangout_attendees_of_row(row):
             raw = None
     out = []
     owner = (row or {}).get('user_token')
-    if isinstance(owner, str) and owner:
+    if isinstance(owner, str) and owner and not _hangout_is_curated(row):
         out.append(owner)
     if isinstance(raw, (list, tuple)):
         for t in raw:
@@ -14975,8 +14998,10 @@ def create_manual_pin(token):
     if meta:
         row['meta'] = meta
     # Der Ersteller ist automatisch dabei — sonst stünde auf seinem eigenen
-    # Treffpunkt „0 dabei", was schlicht falsch wäre.
-    row['attendees'] = [token]
+    # Treffpunkt „0 dabei", was schlicht falsch wäre. Bei einem KURATIERTEN
+    # Termin gilt das nicht: die Redaktion legt an, geht aber nicht hin.
+    _curated = _hangout_is_curated({'meta': meta})
+    row['attendees'] = [] if _curated else [token]
     degraded = []
     try:
         sb.table('manual_pins').insert(row).execute()
@@ -15016,8 +15041,12 @@ def create_manual_pin(token):
     # Hangout für den Empfänger noch gar nicht existiert. Wurde `meta` von
     # einer fehlenden Migration geschluckt, ist auch `visible_from` weg — dann
     # ist der Hangout sofort sichtbar und der Push wieder richtig.
+    # KURATIERTE Termine pushen NIE (Owner 2026-08-01: „keine push
+    # notifications für aerox events"). Eine redaktionelle Terminliste würde
+    # sonst zur Push-Serie an alle im Umkreis.
     _scheduled = _hangout_is_scheduled_ahead({'meta': meta})
-    if not _hangout_audience_is_restricted(audience) and not _scheduled:
+    if (not _hangout_audience_is_restricted(audience)
+            and not _scheduled and not _curated):
         try:
             _hangout_notify_nearby(token, lat, lng, iata,
                                    title=(note or iata), pin_id=pin_id)
@@ -15035,8 +15064,12 @@ def create_manual_pin(token):
         # Der Ersteller ist immer dabei — das leitet sich aus `user_token` ab
         # und braucht die attendees-Spalte gar nicht (siehe
         # _hangout_attendees_of_row). Deshalb auch im degraded-Fall ehrlich 1.
-        'attendee_count': 1,
-        'attending': True,
+        # Kuratiert: 0, denn die Redaktion geht nicht hin. Gemessen am
+        # WIRKLICH gespeicherten meta — hat die fehlende Migration es
+        # geschluckt, zählt der Feed den Ersteller wieder mit und die Antwort
+        # muss dasselbe sagen statt eine 0 zu versprechen.
+        'attendee_count': 0 if _hangout_is_curated({'meta': meta}) else 1,
+        'attending': not _hangout_is_curated({'meta': meta}),
         'is_owner': True,
         'cancelled': False,
         # Ehrlichkeit: welche Anzeige-Extras die (noch) fehlende Migration
