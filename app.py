@@ -674,6 +674,10 @@ _BUG004_GET_PII_PREFIXES = (
                             #   konnte mit einem fremden Token die privaten Pins
                             #   auslesen (IDOR).
     '/api/lh/flightops/status/',  # /<token> → LH-Verbindungsstatus des Users
+    '/api/user/link-preview/',  # /<token>?url=… → SSRF-gehärteter Server-Fetch
+                            #   im Auftrag des Users; owner-scoped wie jede
+                            #   andere /api/user/-Route (kein Public-Discovery-
+                            #   Zweck wie /profile/<other>).
 )
 
 
@@ -8981,24 +8985,65 @@ def _save_reports(reports):
             pass
 
 
+def _admin_resolve_anon_author_name(token):
+    """Löst ein Token auf den echten Profilnamen auf — AUSSCHLIESSLICH für den
+    Admin-/Moderations-Pfad. `_resolve_reported_content` hat genau ZWEI
+    Aufrufer: die interne Report-Mail an den Betreiber
+    (`_send_report_email_notification`) und das Login-geschützte
+    Moderations-Panel (`admin_moderate_panel`) — beide sind kein Public-API-
+    Response (s. tests/test_moderation_anon_author.py, das genau das prüft).
+
+    Anonyme Beiträge speichern bewusst KEINEN Autoren-Snapshot (s.
+    create_wall_post) — die Anonymität nach AUSSEN bleibt unangetastet. Hier,
+    wo ein konkreter Melde-Fall geprüft wird, braucht der Betreiber trotzdem
+    den echten Namen, um Missbrauch einer Person zuordnen zu können.
+
+    Gibt nie einen leeren/reinen Whitespace-String zurück (None statt '') —
+    der Caller prüft den Wahrheitswert, ein Leerstring dürfte nicht als
+    "aufgelöst" durchgehen."""
+    try:
+        name = ((_profile_load(token) or {}).get('profile') or {}).get('name')
+        name = (name or '').strip()
+        return name or None
+    except Exception:
+        return None
+
+
 def _resolve_reported_content(kind, target_id):
     """Best-effort: holt den tatsächlichen Text eines gemeldeten Items, damit man
     in Mail/Panel SIEHT was gemeldet wurde. Returns {text, author_token,
-    author_name} oder None wenn nicht auflösbar (z.B. chat_msg/layoverrec)."""
+    author_name, is_anonymous} oder None wenn nicht auflösbar (z.B.
+    chat_msg/layoverrec).
+
+    NACHAUFLÖSUNG BEI ANONYMEN BEITRÄGEN (Owner 2026-08-01, Forum-Meldung):
+    ist `author_name` leer UND der Beitrag war `is_anonymous`, wird der echte
+    Name NUR für diesen Admin-Pfad über `_admin_resolve_anon_author_name`
+    nachgeschlagen. Das Moderations-Panel kennzeichnet den Fund explizit als
+    „(anonym gepostet)" — der Bruch der Anonymität ist NUR im Panel/in der
+    Report-Mail sichtbar, niemals in einer Public-API-Antwort."""
+    def _with_anon_fallback(text, author_token, author_name, is_anonymous):
+        author_token = author_token or ''
+        author_name = (author_name or '').strip()
+        if not author_name and is_anonymous and author_token:
+            author_name = _admin_resolve_anon_author_name(author_token) or ''
+        return {'text': text, 'author_token': author_token,
+                'author_name': author_name, 'is_anonymous': bool(is_anonymous)}
+
     try:
         raw = target_id or ''
         tid = raw[5:] if raw.startswith('wall:') else raw
         if kind == 'wall_post' or (kind == 'forum_thread' and raw.startswith('wall:')):
             p = next((x for x in _wall_load_posts() if x.get('id') == tid), None)
             if p:
-                return {'text': p.get('text') or '', 'author_token': p.get('author_token') or '',
-                        'author_name': p.get('author_name') or p.get('author_short') or ''}
+                return _with_anon_fallback(
+                    p.get('text') or '', p.get('author_token'),
+                    p.get('author_name') or p.get('author_short'), p.get('is_anonymous'))
         if kind == 'forum_thread':
             t = next((x for x in _forum_load_threads() if x.get('id') == tid), None)
             if t:
                 txt = ((t.get('title') or '') + '\n' + (t.get('body') or '')).strip()
-                return {'text': txt, 'author_token': t.get('author_token') or '',
-                        'author_name': t.get('author_name') or ''}
+                return _with_anon_fallback(
+                    txt, t.get('author_token'), t.get('author_name'), t.get('is_anonymous'))
         if kind == 'forum_reply':
             import glob
             for fp in glob.glob(os.path.join(_forum_dir(), 'replies_*.json')):
@@ -9009,8 +9054,9 @@ def _resolve_reported_content(kind, target_id):
                     continue
                 r = next((x for x in reps if x.get('id') == tid), None)
                 if r:
-                    return {'text': r.get('body') or '', 'author_token': r.get('author_token') or '',
-                            'author_name': r.get('author_name') or ''}
+                    return _with_anon_fallback(
+                        r.get('body') or '', r.get('author_token'),
+                        r.get('author_name'), r.get('is_anonymous'))
         if kind == 'wall_comment':
             import glob
             for fp in glob.glob(os.path.join(_wall_dir(), 'comments_*.json')):
@@ -9021,9 +9067,9 @@ def _resolve_reported_content(kind, target_id):
                     continue
                 c = next((x for x in cs if x.get('id') == tid), None)
                 if c:
-                    return {'text': c.get('text') or c.get('body') or '',
-                            'author_token': c.get('author_token') or '',
-                            'author_name': c.get('author_name') or c.get('author_short') or ''}
+                    return _with_anon_fallback(
+                        c.get('text') or c.get('body') or '', c.get('author_token'),
+                        c.get('author_name') or c.get('author_short'), c.get('is_anonymous'))
     except Exception:
         pass
     return None
@@ -9305,7 +9351,15 @@ def admin_moderate_panel():
         c = _resolve_reported_content(kind, r.get('target_id', ''))
         if c and (c.get('text') or '').strip():
             content_html = _html.escape(c['text'][:3000])
-            author = _html.escape(c.get('author_name') or c.get('author_token') or '—')
+            author_display = c.get('author_name') or c.get('author_token') or '—'
+            # War der Beitrag ANONYM gepostet, ist author_name hier trotzdem
+            # der echte, nachaufgelöste Profilname (s. _resolve_reported_
+            # content/_admin_resolve_anon_author_name) — das MUSS gekennzeichnet
+            # werden, sonst sieht es aus wie ein normaler Namens-Snapshot. Der
+            # Bruch der Anonymität ist NUR hier im Panel sichtbar.
+            if c.get('is_anonymous') and c.get('author_name'):
+                author_display = f"{c['author_name']} (anonym gepostet)"
+            author = _html.escape(author_display)
         else:
             content_html = "<i style='color:#aaa'>(Inhalt nicht auto-auflösbar)</i>"
             author = _html.escape(r.get('target_token', '') or '—')
@@ -19246,11 +19300,18 @@ def _news_normalize_image_url(u, base_url=None):
 
 
 def _news_extract_metadata(html, base_url=None):
-    """Extrahiert Title, Image-URL und Published-At aus <meta og:*> / <title> / <time>.
-    Bestes-Effort, alle Felder optional. `base_url` (additiv, Owner 2026-07-12)
-    löst relative Bild-URLs auf und schaltet die Bild-Normalisierung scharf."""
+    """Extrahiert Title, Image-URL, Published-At, Site-Name und Description
+    aus <meta og:*> / <title> / <time>. Bestes-Effort, alle Felder optional.
+    `base_url` (additiv, Owner 2026-07-12) löst relative Bild-URLs auf und
+    schaltet die Bild-Normalisierung scharf.
+
+    `site_name`/`description` (additiv, Link-Vorschau 2026-08-01): reiner
+    Zusatz-Output für den neuen `/api/user/link-preview`-Endpoint — der
+    bestehende Aufrufer (`get_news_article`) liest nur `title`/`image_url`
+    per `.get(...)` und ist von den zwei neuen Keys unberührt."""
     import re as _re
-    out = {'title': None, 'image_url': None, 'published_at': None}
+    out = {'title': None, 'image_url': None, 'published_at': None,
+           'site_name': None, 'description': None}
     if not html:
         return out
 
@@ -19324,7 +19385,224 @@ def _news_extract_metadata(html, base_url=None):
                        html, flags=_re.IGNORECASE)
         if m:
             out['published_at'] = m.group(1).strip()
+
+    def _unescape(s):
+        if not s:
+            return s
+        try:
+            import html as _html_lib
+            return _html_lib.unescape(s)
+        except Exception:
+            return s
+
+    out['site_name'] = _unescape(_meta('og:site_name'))
+    out['description'] = _unescape(_meta('og:description')
+                                   or _meta('twitter:description', 'name')
+                                   or _meta('description', 'name'))
     return out
+
+
+# ── Link-Vorschau (Owner 2026-08-01): OG-Karte für Links, die User im
+# Crew-Chat/Forum/Wall teilen. Der Metadaten-Teil ist reine Wiederverwendung
+# von `_news_extract_metadata` (kein zweiter Parser) — der eigentliche Kern
+# dieses Blocks ist die SSRF-Härtung, weil der Server hier eine vom USER
+# eingegebene URL im eigenen Auftrag abruft. Ohne Schutz wäre das ein Orakel
+# auf Cloud-Metadata-Endpunkte (169.254.169.254) oder internes Netz.
+_LINK_PREVIEW_USER_AGENT = ('AeroXLinkPreviewBot/1.0 '
+                            '(+https://aerosteuer.de; Crew-Chat-Link-Vorschau)')
+_LINK_PREVIEW_TIMEOUT = 6.0
+_LINK_PREVIEW_MAX_BYTES = 512 * 1024
+_LINK_PREVIEW_MAX_REDIRECTS = 3
+
+
+def _link_preview_host_blocked(url):
+    """True wenn diese URL NICHT abgerufen werden darf: nur http/https, Host
+    muss auflösbar sein und darf NICHT privat/loopback/link-local/multicast/
+    reserviert sein. Nutzt `_is_private_or_local_ip`, das ALLE von DNS
+    gelieferten IPs prüft (nicht nur die erste) — ein Host mit gemischten
+    A-Records (eine öffentliche, eine 169.254-Metadata-Adresse) rutscht sonst
+    durch. Wird für die Erst-URL UND für JEDEN Redirect-Hop aufgerufen:
+    Redirects sind der klassische SSRF-Bypass (harmlose Erst-Antwort, dann
+    302 auf ein internes Ziel) — deshalb wird hier NICHT blind gefolgt."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url or '')
+        if parsed.scheme not in ('http', 'https'):
+            return True
+        if not parsed.hostname:
+            return True
+        return _is_private_or_local_ip(parsed.hostname)
+    except Exception:
+        return True  # im Zweifel blocken, nicht durchlassen
+
+
+def _link_preview_http_get(url, timeout):
+    """Dünner GET-Wrapper — EINE Stelle zum Monkeypatchen in Tests (Muster wie
+    `_fetch_calendar_feed_text`). `allow_redirects=False`: Redirects werden in
+    `_link_preview_fetch_html` SELBST verfolgt, damit jeder Hop erneut gegen
+    den SSRF-Block geprüft wird, BEVOR ihm gefolgt wird. `stream=True`, damit
+    der Body erst im Aufrufer stückweise gelesen wird (Größenlimit)."""
+    import requests as _requests
+    return _requests.get(url, timeout=timeout, allow_redirects=False, stream=True,
+                          headers={'User-Agent': _LINK_PREVIEW_USER_AGENT,
+                                   'Accept': 'text/html,application/xhtml+xml'})
+
+
+def _link_preview_fetch_html(url):
+    """Holt HTML für eine Link-Vorschau. Returns (html_text, None) bei Erfolg,
+    sonst (None, error_code) mit error_code in {'internal_host_blocked',
+    'not_html', 'too_large', 'too_many_redirects', 'fetch_failed'}.
+
+    Härtung:
+      - Timeout `_LINK_PREVIEW_TIMEOUT` (6s) pro Hop.
+      - Response wird STÜCKWEISE gelesen und abgebrochen sobald
+        `_LINK_PREVIEW_MAX_BYTES` (512 KB) überschritten wird — nie ein
+        blindes `resp.read()`/volles Einlesen.
+      - Nur `Content-Type: text/html*` wird verarbeitet; alles andere liefert
+        eine leere Vorschau statt eines Fehlers.
+      - Maximal `_LINK_PREVIEW_MAX_REDIRECTS` (3) Redirects; JEDES Ziel wird
+        vor dem Folgen erneut gegen `_link_preview_host_blocked` geprüft.
+
+    Bekannte Restlücke (dokumentiert statt verschwiegen): Check-dann-Connect
+    ist kein DNS-Pinning — wer die eigene DNS-Zone kontrolliert, könnte den
+    Namen zwischen Prüfung und TCP-Connect auf eine private IP umbiegen
+    (DNS-Rebinding). Für den Use-Case (User teilt einen Link im Crew-Chat)
+    ist das ein seltenes, aufwändiges Szenario; echtes DNS-Pinning bräuchte
+    einen eigenen Transport-Adapter und ist hier bewusst nicht gebaut."""
+    from urllib.parse import urljoin
+    current = url
+    for _hop in range(_LINK_PREVIEW_MAX_REDIRECTS + 1):
+        if _link_preview_host_blocked(current):
+            return None, 'internal_host_blocked'
+        try:
+            resp = _link_preview_http_get(current, _LINK_PREVIEW_TIMEOUT)
+        except Exception:
+            return None, 'fetch_failed'
+        try:
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get('Location') or ''
+                if not loc:
+                    return None, 'fetch_failed'
+                current = urljoin(current, loc)
+                continue
+            if resp.status_code != 200:
+                return None, 'fetch_failed'
+            ctype = (resp.headers.get('Content-Type') or '').lower()
+            if not ctype.startswith('text/html'):
+                return None, 'not_html'
+            # Billiger Vorab-Check: kündigt die Quelle ehrlich einen zu großen
+            # Body an, sparen wir uns den Read-Loop komplett.
+            try:
+                clen = int(resp.headers.get('Content-Length') or 0)
+                if clen and clen > _LINK_PREVIEW_MAX_BYTES:
+                    return None, 'too_large'
+            except Exception:
+                pass
+            chunks = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > _LINK_PREVIEW_MAX_BYTES:
+                    return None, 'too_large'
+                chunks.append(chunk)
+            raw = b''.join(chunks)
+            encoding = resp.encoding or 'utf-8'
+            try:
+                return raw.decode(encoding, errors='replace'), None
+            except Exception:
+                return raw.decode('utf-8', errors='replace'), None
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    return None, 'too_many_redirects'
+
+
+# In-Memory-TTL-Cache statt Supabase-Tabelle — BEWUSST (Owner-Auftrag
+# 2026-08-01): eine Link-Vorschau ist eine reine DERIVATE eines beliebigen
+# externen Links, jederzeit aus der URL neu herleitbar — nichts geht bei
+# einem Cache-Miss verloren. Anders als z.B. `reports_log` (MUSS Container-
+# Neustarts überleben, sonst verschwinden gemeldete Inhalte aus dem Panel)
+# gibt es hier keinen Durability-Anspruch: ein Miss kostet nur einen erneuten
+# (SSRF-sicheren, 6s-Timeout) Fetch. Eine neue Supabase-Zeile pro geteiltem
+# Link wäre Schema-Aufwand ohne Gegenwert für einen 6h-Wegwerf-Wert. Muster
+# wie `_CURRENT_IATA_MEMO`/`_CURATED_PINS_MEMO`.
+_LINK_PREVIEW_MEMO = {}
+_LINK_PREVIEW_LOCK = _req_threading.Lock()
+_LINK_PREVIEW_TTL = 6 * 3600.0
+_LINK_PREVIEW_MAX_ENTRIES = 500
+
+
+def _link_preview_cache_get(url):
+    now = time.time()
+    with _LINK_PREVIEW_LOCK:
+        hit = _LINK_PREVIEW_MEMO.get(url)
+        if hit is not None and (now - hit[1]) < _LINK_PREVIEW_TTL:
+            return hit[0]
+    return None
+
+
+def _link_preview_cache_put(url, data):
+    now = time.time()
+    with _LINK_PREVIEW_LOCK:
+        _LINK_PREVIEW_MEMO[url] = (data, now)
+        if len(_LINK_PREVIEW_MEMO) > _LINK_PREVIEW_MAX_ENTRIES:  # Speicher-Deckel, praktisch nie
+            _LINK_PREVIEW_MEMO.clear()
+
+
+@app.route('/api/user/link-preview/<token>', methods=['GET'])
+def get_link_preview(token):
+    """Link-Vorschau (OpenGraph) für eine User-eingegebene URL. Query: ?url=.
+
+    Owner-scoped wie andere `/api/user/`-Routen (Bearer-Binding via
+    `_bug004_token_auth_gate`, Prefix in `_BUG004_GET_PII_PREFIXES`).
+
+    Response: {ok, url, title, image_url, site_name, description} — alle
+    Felder außer `ok`/`url` dürfen null sein. Ein nicht auflösbarer/
+    geblockter/zu großer Link ist KEIN Fehler, sondern eine leere Vorschau
+    (der Client zeigt dann nur den rohen Link-Text).
+
+    SSRF ist hier der Kern, nicht Beiwerk — siehe `_link_preview_host_blocked`
+    (Scheme+IP-Block, für Erst-URL UND jeden Redirect-Hop) und
+    `_link_preview_fetch_html` (Timeout/Größenlimit/Content-Type-Gate)."""
+    if not token or not _validate_token_exists(token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 404
+    if _token_rate_limited(token, 'link_preview', limit=60, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    raw_url = (request.args.get('url') or '').strip()
+    if not raw_url or len(raw_url) > 2000:
+        return jsonify({'ok': False, 'error': 'url_required'}), 400
+
+    empty = {'ok': True, 'url': raw_url, 'title': None, 'image_url': None,
+             'site_name': None, 'description': None}
+
+    cached = _link_preview_cache_get(raw_url)
+    if cached is not None:
+        out = dict(cached)
+        out['url'] = raw_url
+        return jsonify(out)
+
+    if _link_preview_host_blocked(raw_url):
+        # Kein Cache-Write für geblockte URLs: der Block selbst ist billig
+        # (ein DNS-Lookup) — es gibt nichts Teures zu sparen, und ein später
+        # unter derselben Domain freigeschalteter Eintrag soll nicht 6h an
+        # einem alten Negativ-Ergebnis kleben.
+        return jsonify(empty)
+
+    html, _err = _link_preview_fetch_html(raw_url)
+    if not html:
+        _link_preview_cache_put(raw_url, empty)
+        return jsonify(empty)
+
+    meta = _news_extract_metadata(html, base_url=raw_url)
+    out = {'ok': True, 'url': raw_url, 'title': meta.get('title'),
+           'image_url': meta.get('image_url'), 'site_name': meta.get('site_name'),
+           'description': meta.get('description')}
+    _link_preview_cache_put(raw_url, out)
+    return jsonify(out)
 
 
 def _extract_article_text(html):
@@ -39227,6 +39505,28 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
         return facts
 
 
+_ARR_STATUS_TERMINAL = ('gelandet', 'landed', 'arrived', 'angekommen',
+                        'at gate', 'on blocks', 'on-blocks',
+                        'gepäck', 'gepaeck', 'baggage',
+                        'diverted', 'umgeleitet')
+
+
+def _arr_status_terminal(status):
+    """Ist dieser Ankunfts-Status ein ABGESCHLOSSENER Zustand (= die Maschine
+    steht), oder nur eine Vorhersage?
+
+    Der Unterschied entscheidet, ob eine Ankunftszeit eine MESSUNG ist. Die
+    Liste der board-plausiblen Ankunfts-Status (obs_selection) mischt beides:
+    „gelandet"/„at gate" sind Tatsachen, „erwartet"/„estimated"/„verspätet"/
+    „Anflug" sind Prognosen. Nur die erste Gruppe darf als Ist gelten —
+    andernfalls hält eine Vorhersage die echte Landung dauerhaft fern
+    (Owner 01.08.2026: „will keine Schätzungen")."""
+    s = str(status or '').strip().lower()
+    if not s:
+        return False
+    return any(t in s for t in _ARR_STATUS_TERMINAL)
+
+
 def _minutes_between(soll, ist):
     """Verspätung in Minuten zwischen zwei ABSOLUTEN Zeitstempeln, sonst None.
 
@@ -39561,7 +39861,15 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # tests/aerox/test_friend_roster_cold_latency.py). „Egal ob es kostet"
         # meint Geld, nicht die Wartezeit der User. Der bezahlte Weg unten ist
         # nicht gedrosselt und deshalb hier der richtige nächste Schritt.
-        if _arr_vorbei and not (_facts or {}).get('est_arr'):
+        # WAS ZAEHLT ALS FREIE WAHRHEIT: nicht „irgendein Wert", sondern eine
+        # MESSUNG. Der Scraper legt auch Prognosen als `est_arr` ab (LH1137
+        # 01.08.: 10:15 mit Status „erwartet", während die Maschine um 10:03
+        # stand). Prüft man nur auf Vorhandensein, fragt die Kaskade nie weiter
+        # und die Prognose bleibt für immer stehen. Terminaler Ankunfts-Status
+        # = Messung; alles andere ist eine Vorhersage und wird eskaliert.
+        _freie_messung = bool((_facts or {}).get('est_arr')) and _arr_status_terminal(
+            (_facts or {}).get('arr_status'))
+        if _arr_vorbei and not _freie_messung:
             # Stufe 3 — FR24 (bezahlt). `flight-summary` trägt die ECHTE
             # Landezeit (`datetime_landed`, hier als `sched_arr`). Der Call ist
             # singleflight-gecacht und budget-gegated; die Route wird gegen das
@@ -39581,6 +39889,11 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                     # widersprüchliche.
                     _sa = (m or {}).get('sched_arr')
                     _facts['arr_delay_min'] = _minutes_between(_sa, _f24.get('sched_arr'))
+                    # FR24 liefert `datetime_landed` nur für beendete Flüge —
+                    # das IST die Messung. Terminal markieren, damit weiter
+                    # unten Phase und Beschriftung darauf aufbauen können.
+                    _facts['arr_status'] = 'landed'
+                    _freie_messung = True
             except Exception:
                 pass
         if m is None:
@@ -39699,6 +40012,16 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 and not (_facts or {}).get('est_arr')):
             s['est_arr_iso'] = None
             s['arr_time_announced_only'] = True
+        # IST ODER ERWARTET? (additiv — alte Builds ignorieren das Feld.)
+        # Nur eine Ankunftszeit mit TERMINALEM Status ist eine Messung. Die App
+        # darf ausschliesslich dafür „Ist" schreiben; steht hier False, ist der
+        # Wert eine Vorhersage und gehört als „Erwartet" beschriftet. Vorher gab
+        # es diese Unterscheidung im Sektor gar nicht — deshalb stand „Ist"
+        # auch über einer hochgerechneten Zeit.
+        s['arr_measured'] = bool(s.get('est_arr_iso')) and bool(
+            _freie_messung
+            or _arr_status_terminal((m or {}).get('status_arr'))
+            or _arr_status_terminal((_facts or {}).get('arr_status')))
         # ── STATUS PLAUSIBILITÄTS-/PHYSIK-GATE (Owner/Fable 2026-07-13, LH454→SFO)
         # Bisher: der ROHE Board-Status floss ungegatet in dieses Feld und weiter
         # in Kalender-Leg-Anzeige, Feed-Bordkarte und flights_live[].status. Manche
@@ -39923,6 +40246,19 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 # alte Builds ignorieren die Extra-Keys).
                 s['phase'] = _fs['phase']
                 s['phase_conf'] = _fs['phase_conf']
+                # LANDUNG SCHLÄGT „FLIEGT NOCH" (Owner 01.08.2026): LH1454 stand
+                # um 20 Uhr Ortszeit auf `phase=AIRBORNE (estimated)`, obwohl der
+                # Flug seit ~7 h unten war — die Engine hatte schlicht nie eine
+                # Landebeobachtung gesehen (der Tafel-Status hing auf „Boarding").
+                # Die App beschriftet die Zeile daraufhin mit „Erwartet". Liegt
+                # eine GEMESSENE Ankunft vor, ist Fliegen physikalisch
+                # ausgeschlossen — dann gilt gelandet. Nur diese Richtung, und
+                # nur mit Messung: eine Prognose darf weiterhin keine Landung
+                # behaupten.
+                if s.get('arr_measured') and str(_fs.get('phase') or '').upper() in (
+                        'AIRBORNE', 'TAXI_OUT', 'BOARDING', 'SCHEDULED'):
+                    s['phase'] = 'LANDED'
+                    s['phase_conf'] = 'observed'
                 # 100%-GLEICHLAUT (Owner/Fable 2026-07-13, Feinschliff 1): der
                 # Kalender-Sektor-`status` zeigt jetzt die VOLLE Engine-Phase —
                 # DIESELBE Wahrheit wie crew_state/flights_live —, nicht mehr nur

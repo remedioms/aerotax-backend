@@ -185,7 +185,8 @@ def test_hochrechnung_bleibt_solange_das_leg_fliegt(monkeypatch):
 # ob es dann kostet."
 
 def _run_kaskade(monkeypatch, *, scraper_arr, lh_arr, fr24_arr,
-                 board_sched_arr='2026-08-01T10:05:00+02:00'):
+                 board_sched_arr='2026-08-01T10:05:00+02:00',
+                 scraper_status='Gelandet', lh_status='Gelandet'):
     base = datetime.now(timezone.utc).replace(microsecond=0)
     arr_iso = base - timedelta(hours=2)
     sec = {
@@ -206,11 +207,16 @@ def _run_kaskade(monkeypatch, *, scraper_arr, lh_arr, fr24_arr,
     aufrufe = {'frei': 0, 'lh': 0, 'fr24': 0}
 
     def facts(*a, **k):
+        # `arr_status` entscheidet, ob die Zeit eine MESSUNG ist. Der Scraper
+        # legt auch Prognosen ab ("Erwartet"/"Verspaetet") — die duerfen die
+        # echte Landung nicht fernhalten.
         if k.get('lh_cached_only'):
             aufrufe['frei'] += 1
-            return {'est_arr': scraper_arr, 'arr_delay_min': None} if scraper_arr else None
+            return ({'est_arr': scraper_arr, 'arr_delay_min': None,
+                     'arr_status': scraper_status} if scraper_arr else None)
         aufrufe['lh'] += 1
-        return {'est_arr': lh_arr, 'arr_delay_min': None} if lh_arr else None
+        return ({'est_arr': lh_arr, 'arr_delay_min': None,
+                 'arr_status': lh_status} if lh_arr else None)
 
     monkeypatch.setattr(ADB, '_flight_facts_from_obs', facts)
     monkeypatch.setattr(ADB, '_fr24_flight_by_number',
@@ -271,3 +277,30 @@ def test_ohne_belastbare_sollzeit_bleibt_die_zahl_leer(monkeypatch):
                           board_sched_arr='10:05')   # nackte Ortszeit
     assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
     assert sec['arr_delay_min'] is None, 'lieber keine Zahl als eine falsche'
+
+
+def test_prognose_im_scraper_haelt_die_messung_nicht_fern(monkeypatch):
+    """Der Fall LH1137: der freie Scraper HAT einen Wert (10:15), aber sein
+    Status ist "Erwartet" — also eine Vorhersage, keine Messung. Genau daran
+    scheiterte der erste Anlauf: die Kaskade sah "Wert vorhanden" und fragte
+    nie weiter, die Prognose blieb fuer immer stehen."""
+    sec, ruf = _run_kaskade(monkeypatch,
+                            scraper_arr='2026-08-01T10:15:00+02:00',
+                            scraper_status='Erwartet',
+                            lh_arr=None,
+                            fr24_arr='2026-08-01T10:03:00+02:00')
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00', (
+        'Eine Prognose darf die gemessene Landung nicht verdraengen.')
+    assert ruf['fr24'] == 1
+    assert sec['arr_measured'] is True
+
+
+def test_ohne_jede_messung_bleibt_die_zeit_als_erwartet_markiert(monkeypatch):
+    """Niemand hat eine Messung → die Prognose darf stehen bleiben, aber sie
+    wird NICHT als Ist ausgewiesen."""
+    sec, _ = _run_kaskade(monkeypatch,
+                          scraper_arr='2026-08-01T10:15:00+02:00',
+                          scraper_status='Erwartet',
+                          lh_arr=None, fr24_arr=None)
+    assert sec['est_arr_iso'] == '2026-08-01T10:15:00+02:00'
+    assert sec['arr_measured'] is False, 'Vorhersage darf nie "Ist" heissen.'
