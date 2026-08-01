@@ -7001,7 +7001,18 @@ def full_health_check():
         'delay_obs_pending_dropped':  _delay_obs_pending_dropped,
         'aircraft': _aircraft_persist,
     }
-    overall = 'ok' if all(v == 'ok' for k, v in health.items() if k not in ('timestamp', 'server', 'heif', 'persistence')) else 'degraded'
+    # „Bewusst nicht geprüft" ist KEIN Fehlzustand. Seit die teuren Checks
+    # (Anthropic, Stripe-Netzcall) nur noch für interne Aufrufer laufen, meldet
+    # ein öffentlicher Aufruf 'skipped_no_internal_auth' bzw. 'configured' —
+    # das als 'degraded' zu werten hätte die Route für JEDEN externen Prober
+    # dauerhaft auf 503 gesetzt und damit einen Daueralarm erzeugt, der nichts
+    # bedeutet. Ein echter Fehler ('fail: …', 'missing_key') zählt weiterhin.
+    _HEALTH_OK_STATES = ('ok', 'skipped_no_internal_auth', 'configured')
+    overall = 'ok' if all(
+        v in _HEALTH_OK_STATES
+        for k, v in health.items()
+        if k not in ('timestamp', 'server', 'heif', 'persistence')
+    ) else 'degraded'
     health['overall'] = overall
     return jsonify(health), 200 if overall == 'ok' else 503
 
