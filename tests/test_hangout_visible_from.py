@@ -18,6 +18,7 @@ Die Regel, die diese Datei festnagelt:
 SICHERHEIT: kein echter SB-/APNs-Call — alle Loader sind gemockt.
 """
 import json
+import time
 import os
 
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
@@ -305,3 +306,80 @@ def test_homebase_neben_aktuellem_standort():
     """Beide zählen: Base UND wo ich heute laut Roster bin."""
     _, iatas = _crew_dest([], {'homebase': 'FRA'}, cur_iata='BOS')
     assert iatas == {'FRA', 'BOS'}
+
+
+# ── Kuratierte Termine sind ortsunabhängig (Owner 2026-08-01) ──────────────
+#
+# „die AeroX events soll jeder sehen können" — der Ortsschnitt von
+# crew-at-destination (und damit das Radar) galt bisher auch für sie.
+
+@pytest.fixture(autouse=True)
+def _leerer_curated_cache():
+    A._CURATED_PINS_MEMO.clear()
+    yield
+    A._CURATED_PINS_MEMO.clear()
+
+
+def _crew_dest_mit_curated(alle_aktiven, profile, cur_iata=None):
+    with patch.object(A, '_manual_pins_load', return_value=[]), \
+         patch.object(A, '_manual_pins_for_friends', return_value=[]), \
+         patch.object(A, '_public_pins_at_iatas', return_value=[]), \
+         patch.object(A, '_hangouts_load_all_active', return_value=alle_aktiven), \
+         patch.object(A, '_friends_load', return_value={'friends': []}), \
+         patch.object(A, '_profiles_load_bulk', return_value={}), \
+         patch.object(A, '_profile_load', return_value={'profile': profile}), \
+         patch.object(A, '_user_current_iata', return_value=cur_iata), \
+         patch.object(A, '_user_future_layovers', return_value=[]), \
+         A.app.test_request_context(f'/api/user/crew-at-destination/{VIEWER}'):
+        return A.get_crew_at_destination(VIEWER).get_json()
+
+
+def test_curated_erreicht_auch_eine_ANDERE_base():
+    """MUC-Baser ohne jeden FRA-Bezug sieht den Frankfurter AeroX-Termin."""
+    fra = _pin('ax', owner=OWNER, iata='FRA', meta={'v': 1, 'curated': '1'})
+    payload = _crew_dest_mit_curated([fra], {'homebase': 'MUC'})
+    assert [p['id'] for p in payload['manual_pins']] == ['ax']
+
+
+def test_normaler_fremder_treff_bleibt_ortsgebunden():
+    """Gegenprobe — ohne `curated` gilt der Ortsschnitt unverändert."""
+    fra = _pin('privat', owner=OWNER, iata='FRA')
+    payload = _crew_dest_mit_curated([fra], {'homebase': 'MUC'})
+    assert payload['manual_pins'] == []
+
+
+def test_curated_umgeht_den_einblend_zeitpunkt_NICHT():
+    """Ortsunabhängig heisst nicht filterlos: visible_from greift weiter."""
+    geplant = _pin('spaet', owner=OWNER, iata='FRA',
+                   meta={'v': 1, 'curated': '1', 'visible_from': _iso(21)})
+    payload = _crew_dest_mit_curated([geplant], {'homebase': 'MUC'})
+    assert payload['manual_pins'] == []
+
+
+def test_curated_umgeht_die_zielgruppe_NICHT():
+    """Ein eingeschränkter kuratierter Termin bleibt eingeschränkt."""
+    nur_lh = _pin('lh', owner=OWNER, iata='FRA',
+                  meta={'v': 1, 'curated': '1'})
+    nur_lh['audience'] = {'v': 1, 'airline': 'LUFTHANSA'}
+    payload = _crew_dest_mit_curated([nur_lh],
+                                     {'homebase': 'ZRH', 'airline': 'SWISS'})
+    assert payload['manual_pins'] == []
+
+
+def test_curated_cache_haelt_und_verfaellt():
+    fra = _pin('ax', owner=OWNER, iata='FRA', meta={'v': 1, 'curated': '1'})
+    with patch.object(A, '_hangouts_load_all_active',
+                      return_value=[fra]) as loader:
+        assert [p['id'] for p in A._curated_pins_all()] == ['ax']
+        A._curated_pins_all()
+        assert loader.call_count == 1, 'zweiter Aufruf muss aus dem Cache kommen'
+        A._CURATED_PINS_MEMO['all'] = (A._CURATED_PINS_MEMO['all'][0],
+                                       time.time() - A._CURATED_PINS_TTL - 1)
+        A._curated_pins_all()
+        assert loader.call_count == 2, 'nach TTL muss neu geladen werden'
+
+
+def test_curated_loader_wirft_nie():
+    with patch.object(A, '_hangouts_load_all_active',
+                      side_effect=RuntimeError('db weg')):
+        assert A._curated_pins_all() == []

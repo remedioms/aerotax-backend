@@ -13252,6 +13252,41 @@ def _hangout_is_curated(row):
     return isinstance(meta, dict) and meta.get('curated') == '1'
 
 
+# Kuratierte Termine sind ORTSUNABHÄNGIG sichtbar (Owner 2026-08-01: „die AeroX
+# events soll jeder sehen können"). Der Hangout-FEED liefert sie ohnehin global;
+# crew-at-destination — und damit das RADAR, das seine Pins von dort holt — war
+# aber auf die eigenen Ziele plus Base beschnitten. Ein MUC-Baser sah die
+# Frankfurter Termine deshalb nie auf dem Radar.
+#
+# Das darf KEIN „alle Pins überall" werden: der Ortsschnitt bleibt für echte
+# User-Treffs unverändert bestehen und wird nur für redaktionelle Termine
+# aufgehoben. Zielgruppe, Einblend-Zeitpunkt und Ablauf greifen davor wie immer.
+#
+# Gecacht, weil crew-at-destination bei jedem Karten-/Radar-Aufruf läuft, die
+# Terminliste sich aber höchstens beim Anlegen ändert.
+_CURATED_PINS_MEMO = {}
+_CURATED_PINS_LOCK = _req_threading.Lock()
+_CURATED_PINS_TTL = 300.0
+
+
+def _curated_pins_all():
+    """Alle aktiven kuratierten Termine — unabhängig vom Ort des Betrachters."""
+    now = time.time()
+    with _CURATED_PINS_LOCK:
+        hit = _CURATED_PINS_MEMO.get('all')
+        if hit is not None and (now - hit[1]) < _CURATED_PINS_TTL:
+            return hit[0]
+    try:
+        val = [p for p in _hangouts_load_all_active() if _hangout_is_curated(p)]
+    except Exception as e:
+        app.logger.warning(
+            f'[hangouts] curated_load_fail err={type(e).__name__}: {str(e)[:120]}')
+        return []
+    with _CURATED_PINS_LOCK:
+        _CURATED_PINS_MEMO['all'] = (val, now)
+    return val
+
+
 # ── ZUSAGEN („Bin dabei") ───────────────────────────────────────────────────
 #
 # Bis heute gab es KEINEN Beitritts-Mechanismus: „beitreten" hieß den Chat
@@ -14055,7 +14090,10 @@ def get_crew_at_destination(token):
     seen = set()
     _all_pins = (_manual_pins_load(token)
                  + _manual_pins_for_friends(token, friend_set)
-                 + _public_pins_at_iatas(public_iatas))
+                 + _public_pins_at_iatas(public_iatas)
+                 # Kuratierte Termine ortsunabhängig dazu — sie sind für alle
+                 # gedacht, nicht nur für Crew, die zufällig hinfliegt.
+                 + _curated_pins_all())
     # N+1-Fix (2026-07-01): Owner-Namen in EINEM Bulk-Query statt pro Pin.
     _owner_profs = _profiles_load_bulk(
         [p.get('user_token') for p in _all_pins
@@ -14067,7 +14105,10 @@ def get_crew_at_destination(token):
         seen.add(pid)
         owner = p.get('user_token') or ''
         mine = owner == token
-        is_public_meetup = (p.get('iata_code') or '').upper() in public_iatas
+        # Kuratierte Termine sind ortsunabhängig für alle da; für echte
+        # User-Treffs bleibt der Ortsschnitt unverändert.
+        is_public_meetup = ((p.get('iata_code') or '').upper() in public_iatas
+                            or _hangout_is_curated(p))
         if not mine and owner not in friend_set and not is_public_meetup:
             continue  # Privacy: nur mutual ODER öffentlicher Pin an meinem Ziel
         # ZIELGRUPPE: zweiter Auslieferungsweg für dieselben Hangouts — hier
@@ -24420,17 +24461,28 @@ def get_chat_messages(token, channel_id):
             v = m.get('author_name')
             return isinstance(v, str) and v.strip() != ''
 
-        need = [m.get('author_token') for m in out if not _has_name(m)]
-        if need:
-            idents = _chat_author_identities(need)
-            for mm in out:
-                if _has_name(mm):
-                    continue
-                ident = idents.get(mm.get('author_token')) or {}
-                if ident.get('name'):
-                    mm['author_name'] = ident['name']
-                if ident.get('avatar_url') and not mm.get('author_avatar'):
-                    mm['author_avatar'] = ident['avatar_url']
+        # NAME: der Sende-Stempel gewinnt, wo er da ist — er ist der Name zum
+        # Sendezeitpunkt.
+        # AVATAR: NICHT. Der wurde beim Senden mitgeschrieben und nie wieder
+        # angefasst, also klebte auf jeder alten Nachricht das Profilfoto von
+        # damals (Owner 2026-08-01: im Hangout-Chat stand noch das Logo von vor
+        # drei Uploads, während die Hangout-Karte daneben das aktuelle zeigte).
+        # Wall und Forum lösen den Avatar längst LIVE auf — der Chat war der
+        # letzte Ort mit dem alten Snapshot. `_chat_author_identities` ist
+        # gecacht, kostet also nicht pro Verlauf eine Abfrage je Autor.
+        idents = _chat_author_identities([m.get('author_token') for m in out])
+        for mm in out:
+            ident = idents.get(mm.get('author_token')) or {}
+            if not _has_name(mm) and ident.get('name'):
+                mm['author_name'] = ident['name']
+            if ident.get('avatar_url'):
+                mm['author_avatar'] = ident['avatar_url']
+            elif ident:
+                # Profil aufgelöst, hat aber KEIN Foto → alten Stempel fallen
+                # lassen. Sonst überlebt ein gelöschtes Profilfoto im Verlauf.
+                mm.pop('author_avatar', None)
+            # ident leer = Autor nicht auflösbar → Stempel bleibt, das ist die
+            # ehrlichere Anzeige als gar kein Avatar.
     except Exception as e:
         # Namen sind Beiwerk — ein Fehler hier darf den Verlauf nie kosten.
         app.logger.warning(

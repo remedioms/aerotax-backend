@@ -149,7 +149,18 @@ def test_get_chat_messages_fuellt_namen_fuer_alte_nachrichten():
 
 
 def test_sende_stempel_gewinnt_ueber_nachaufloesung():
-    """Steht der Name schon auf der Zeile, wird nicht nachgeschlagen."""
+    """Steht der NAME schon auf der Zeile, bleibt er unangetastet.
+
+    GEÄNDERT 2026-08-01: vorher prüfte dieser Test zusätzlich, dass dann GAR
+    NICHT nachgeschlagen wird. Das gilt nicht mehr — der AVATAR wird seit
+    dieser Runde immer live aufgelöst, weil er sonst auf dem Stand des Sendens
+    einfriert (Owner: im Hangout-Chat klebte das Logo von vor drei Uploads,
+    während die Karte darüber das aktuelle zeigte). Der Resolver ist gecacht,
+    die Auflösung kostet also nicht pro Verlauf eine Abfrage je Autor.
+
+    Der Name bleibt gestempelt: er ist der Name zum Sendezeitpunkt.
+    Siehe tests/test_chat_avatar_live.py.
+    """
     _clear_cache()
     neu = {'id': 'm2', 'channel_id': CHANNEL, 'author_token': TRUNC,
            'text': 'Neu', 'ts': 2.0, 'iso': '2026-08-01T10:00:00',
@@ -159,11 +170,16 @@ def test_sende_stempel_gewinnt_ueber_nachaufloesung():
         patch.object(A, '_chat_path', return_value='/tmp/c.json'),
         patch.object(A, '_channel_access_error', return_value=None),
         patch.object(A, '_dm_load_messages', return_value=[neu]),
-        patch.object(A, '_chat_author_identities') as resolve,
+        # return_value MUSS ein Dict sein — die echte Funktion liefert
+        # {token: {'name','avatar_url'}}. Ein nackter MagicMock waere hier
+        # wahrheitswertig und landete als Avatar im JSON.
+        patch.object(A, '_chat_author_identities', return_value={}) as resolve,
     ):
         resp = A.get_chat_messages('AT-LESER-0000000000', CHANNEL)
     assert resp.get_json()['messages'][0]['author_name'] == 'Till Becke'
-    resolve.assert_not_called()
+    # Nachgeschlagen wird jetzt (fuer den Avatar) — der Name darf davon aber
+    # nicht ueberschrieben werden, und genau das sichert die Zeile darueber.
+    resolve.assert_called_once()
 
 
 def test_senden_stempelt_den_namen_mit():
