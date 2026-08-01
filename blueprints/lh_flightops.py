@@ -3150,14 +3150,37 @@ def _links_path(user_token):
     return os.path.join(_flow_dir(), f'folinks_{safe}.json') if safe else None
 
 
+# Serialisiert die Read-Modify-Write-Zyklen auf den Link-Cache. Die Merges
+# (_links_load → filtern → _links_save) liefen ungeschützt in gunicorn-Threads;
+# zwei gleichzeitige Merges für denselben User verwarfen gegenseitig ihre neuen
+# Links. (Full-Review 2026-08-01)
+_links_lock = threading.Lock()
+
+
 def _links_save(user_token, links):
+    """Atomar schreiben: erst in eine Temp-Datei neben dem Ziel, dann
+    `os.replace`. Das alte `open(p, 'w')` kürzte die Datei SOFORT auf 0 Bytes —
+    ein Absturz oder ein Neustart des Containers mitten im Dump hinterließ eine
+    kaputte JSON-Datei, und der accessCode-Cache (die Grundlage für Crewlist/
+    Rotation ohne zusätzliche LH-Calls) war für diesen User verloren."""
+    tmp = None
     try:
         p = _links_path(user_token)
-        if p and isinstance(links, list):
-            with open(p, 'w') as f:
-                json.dump({'ts': time.time(), 'links': links}, f)
+        if not p or not isinstance(links, list):
+            return
+        tmp = f'{p}.tmp{os.getpid()}'
+        with open(tmp, 'w') as f:
+            json.dump({'ts': time.time(), 'links': links}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
     except Exception as e:
         log.warning('[lh_flightops] links_save: %s', type(e).__name__)
+        try:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
 
 
 def _links_load(user_token):
@@ -3216,9 +3239,12 @@ def _resolve_link_params(user_token, service, flight, date, dep=None, arr=None,
         return None
     fresh = extract_duty_links(resp)
     if fresh:
-        merged = [l for l in _links_load(user_token)
-                  if not any(l == g for g in fresh)] + fresh
-        _links_save(user_token, merged[-800:])
+        # Lesen+Schreiben unter EINEM Lock — sonst überschreiben sich zwei
+        # gleichzeitige Merges desselben Users gegenseitig.
+        with _links_lock:
+            merged = [l for l in _links_load(user_token)
+                      if not any(l == g for g in fresh)] + fresh
+            _links_save(user_token, merged[-800:])
     return _links_find(fresh, service, flight, date, dep, arr)
 
 
@@ -3260,9 +3286,12 @@ def _resolve_sim_link_params(user_token, date, interactive=False):
         return None
     fresh = extract_duty_links(resp)
     if fresh:
-        merged = [l for l in _links_load(user_token)
-                  if not any(l == g for g in fresh)] + fresh
-        _links_save(user_token, merged[-800:])
+        # Lesen+Schreiben unter EINEM Lock — sonst überschreiben sich zwei
+        # gleichzeitige Merges desselben Users gegenseitig.
+        with _links_lock:
+            merged = [l for l in _links_load(user_token)
+                      if not any(l == g for g in fresh)] + fresh
+            _links_save(user_token, merged[-800:])
     return _links_find_sim(fresh, date)
 
 
@@ -5545,9 +5574,10 @@ def flightops_logbook_verify(token):
                            today.isoformat(), interactive=True)
         fresh = extract_duty_links(resp) if isinstance(resp, dict) else []
         if fresh:
-            merged = [l for l in _links_load(token)
-                      if not any(l == g for g in fresh)] + fresh
-            _links_save(token, merged[-800:])
+            with _links_lock:
+                merged = [l for l in _links_load(token)
+                          if not any(l == g for g in fresh)] + fresh
+                _links_save(token, merged[-800:])
         cands = _lb_candidates(fresh, days)
 
     # ZWEITE QUELLE: der eigene Roster (Befund 2026-07-31 — im Link-Cache
@@ -6686,16 +6716,30 @@ def flightops_refresh_all():
                             'last': _refresh_all_state['last']})
         _refresh_all_state['running'] = True
         _refresh_all_state['drain'] = False
-    tokens = _connected_tokens()
-    if not tokens:
+    # Ab hier steht `running=True`. JEDER Weg aus dieser Funktion, der den
+    # Worker-Thread nicht wirklich startet, MUSS das Flag zurücksetzen —
+    # sonst hält ein einzelner Fehlschlag (Supabase-Aussetzer in
+    # _connected_tokens, RuntimeError beim Thread-Start unter Speicherdruck)
+    # den Cron für immer mit `already_running` ab und die Roster-Aktualisierung
+    # aller User stirbt still bis zum nächsten Prozess-Neustart.
+    # (Full-Review 2026-08-01)
+    try:
+        tokens = _connected_tokens()
+        if not tokens:
+            with _refresh_all_lock:
+                _refresh_all_state['running'] = False
+            return jsonify({'ok': True, 'users': 0,
+                            'last': _refresh_all_state['last']})
+        th = threading.Thread(target=_refresh_all_work, args=(tokens,),
+                              daemon=True)
+        _refresh_all_thread[0] = th
+        th.start()
+    except Exception as e:
         with _refresh_all_lock:
             _refresh_all_state['running'] = False
-        return jsonify({'ok': True, 'users': 0,
-                        'last': _refresh_all_state['last']})
-    th = threading.Thread(target=_refresh_all_work, args=(tokens,),
-                          daemon=True)
-    _refresh_all_thread[0] = th
-    th.start()
+        log.exception('[lh_flightops] refresh-all konnte nicht starten: %s', e)
+        return jsonify({'ok': False, 'error': 'start_failed',
+                        'detail': type(e).__name__}), 500
     return jsonify({'ok': True, 'started': True, 'users': len(tokens),
                     'last': _refresh_all_state['last']})
 

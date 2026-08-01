@@ -1022,7 +1022,14 @@ def test_status_reports_needs_relogin(monkeypatch):
     monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'refresh': 'R', 'needs_relogin': True, 'scope': 's'})
     import app as backend
-    d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
+    # `/api/lh/flightops/status/` steht seit dem Full-Review 2026-08-01 im
+    # GET-Auth-Gate (vorher konnte JEDER den LH-Verbindungszustand eines
+    # fremden Tokens auslesen) — daher Gate passieren + Bearer mitschicken,
+    # genau wie iOS/Android es tun.
+    _pass_auth_gate(monkeypatch)
+    d = backend.app.test_client().get(
+        '/api/lh/flightops/status/AT-U',
+        headers={'Authorization': 'Bearer AT-U'}).get_json()
     assert d['connected'] is False and d['needs_relogin'] is True
 
 
@@ -1440,7 +1447,14 @@ def test_import_endpoint_reports_pending_as_transient(monkeypatch):
     assert 'AT-U' in fo._refresh_wanted        # Vormerkung für den Refresher
     fo._refresh_wanted.clear()
     # Status bleibt währenddessen connected (keine Relogin-Karte)
-    d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
+    # `/api/lh/flightops/status/` steht seit dem Full-Review 2026-08-01 im
+    # GET-Auth-Gate (vorher konnte JEDER den LH-Verbindungszustand eines
+    # fremden Tokens auslesen) — daher Gate passieren + Bearer mitschicken,
+    # genau wie iOS/Android es tun.
+    _pass_auth_gate(monkeypatch)
+    d = backend.app.test_client().get(
+        '/api/lh/flightops/status/AT-U',
+        headers={'Authorization': 'Bearer AT-U'}).get_json()
     assert d['connected'] is True and d['needs_relogin'] is False
 
 
@@ -3594,7 +3608,14 @@ def test_status_meldet_verbindungsalter(monkeypatch):
         'connected_at': _t.time() - 3 * 86400,
         'first_connected_at': _t.time() - 10 * 86400, 'reconnects': 2})
     import app as backend
-    d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
+    # `/api/lh/flightops/status/` steht seit dem Full-Review 2026-08-01 im
+    # GET-Auth-Gate (vorher konnte JEDER den LH-Verbindungszustand eines
+    # fremden Tokens auslesen) — daher Gate passieren + Bearer mitschicken,
+    # genau wie iOS/Android es tun.
+    _pass_auth_gate(monkeypatch)
+    d = backend.app.test_client().get(
+        '/api/lh/flightops/status/AT-U',
+        headers={'Authorization': 'Bearer AT-U'}).get_json()
     assert d['connected'] is True
     assert 2.9 <= d['connected_days'] <= 3.1
     assert d['reconnects'] == 2
@@ -3607,7 +3628,14 @@ def test_status_erfindet_kein_alter_fuer_altgrants(monkeypatch):
     monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
         'access': 'A', 'refresh': 'R', 'scope': 's'})
     import app as backend
-    d = backend.app.test_client().get('/api/lh/flightops/status/AT-U').get_json()
+    # `/api/lh/flightops/status/` steht seit dem Full-Review 2026-08-01 im
+    # GET-Auth-Gate (vorher konnte JEDER den LH-Verbindungszustand eines
+    # fremden Tokens auslesen) — daher Gate passieren + Bearer mitschicken,
+    # genau wie iOS/Android es tun.
+    _pass_auth_gate(monkeypatch)
+    d = backend.app.test_client().get(
+        '/api/lh/flightops/status/AT-U',
+        headers={'Authorization': 'Bearer AT-U'}).get_json()
     assert d['connected'] is True
     assert 'connected_days' not in d and 'connected_at' not in d
 

@@ -26,10 +26,20 @@ import json
 import time
 import re
 import hmac
+import hashlib as _hashlib
 import tempfile
 from flask import Blueprint, request, jsonify
 
 layover_group_bp = Blueprint('layover_group', __name__)
+
+# Schlüssel für die Voter-Pseudonyme (siehe _voter_pseudonym). Ein gesetztes
+# Server-Secret hält die Pseudonyme über Neustarts und über alle Worker hinweg
+# stabil; ohne Secret bleibt ein Prozess-Salt, der pro Prozess konsistent ist.
+_VOTER_PSEUDONYM_KEY = (
+    os.environ.get('AEROX_PSEUDONYM_KEY')
+    or os.environ.get('SUPABASE_SERVICE_KEY')
+    or os.urandom(32).hex()
+).encode('utf-8')
 
 _SB_TABLE = 'layover_group_meta'
 # Cloud Run: nur /tmp ist zuverlässig beschreibbar → Disk-Fallback dorthin, sonst
@@ -201,6 +211,66 @@ def _merge_poll_votes(incoming_polls, stored_polls):
     return out
 
 
+def _mask_voter_tokens(meta, caller_token):
+    """Ersetzt fremde `voter_tokens` durch stabile Pseudonyme.
+
+    SECURITY (Full-Review 2026-08-01): Der Vote-Endpoint legt das ROHE Token des
+    Abstimmenden in der Option ab, und die Antworten gaben das Blob wörtlich
+    heraus. Ein Token IST in diesem Backend das Bearer-Credential — damit
+    verriet jede Umfrage die Zugangsdaten aller Mitglieder, die abgestimmt
+    haben. Der Aufrufer bekommt jetzt nur noch SEIN eigenes Token im Klartext
+    zurück; alle anderen werden zu `v:<hmac>`.
+
+    KOMPATIBEL zu ausgelieferten Builds: iOS liest aus der Liste ausschließlich
+    `votes = voterTokens.count` und `myVote = options.first { $0.voterTokens
+    .contains(eigenesToken) }` (CrewGroupsView) — Länge und der eigene Eintrag
+    bleiben unverändert. Die maskierten Werte können auch nicht zurück in den
+    Speicher sickern: `_merge_poll_votes` übernimmt für bestehende Optionen
+    IMMER die Server-Liste und verwirft die vom Client geschickte."""
+    if not isinstance(meta, dict):
+        return meta
+    polls = meta.get('polls')
+    if not isinstance(polls, list):
+        return meta
+    out_polls = []
+    for p in polls:
+        if not isinstance(p, dict):
+            out_polls.append(p)
+            continue
+        p = dict(p)
+        opts = []
+        for o in (p.get('options') or []):
+            if not isinstance(o, dict):
+                opts.append(o)
+                continue
+            o = dict(o)
+            o['voter_tokens'] = [
+                t if t == caller_token else _voter_pseudonym(t)
+                for t in (o.get('voter_tokens') or [])
+            ]
+            opts.append(o)
+        p['options'] = opts
+        out_polls.append(p)
+    masked = dict(meta)
+    masked['polls'] = out_polls
+    return masked
+
+
+def _voter_pseudonym(token):
+    """Stabiles, nicht umkehrbares Pseudonym für einen fremden Abstimmenden.
+
+    HMAC statt nacktem SHA256: ein Token ist nur 64 Bit (`uuid4().hex[:16]`),
+    ein reiner Hash wäre damit durchprobierbar. Ohne Server-Secret ist der
+    Prozess-Salt der Rückfall — Pseudonyme sind dann nur innerhalb einer
+    Prozess-Generation stabil, was für Zählen/Vergleichen im Client reicht."""
+    try:
+        return 'v:' + hmac.new(_VOTER_PSEUDONYM_KEY,
+                               (token or '').encode('utf-8'),
+                               _hashlib.sha256).hexdigest()[:16]
+    except Exception:
+        return 'v:anon'
+
+
 @layover_group_bp.route('/api/layover-group/<token>/meta/<group_id>', methods=['GET'])
 def get_layover_group_meta(token, group_id):
     if not _auth_ok(token):
@@ -209,7 +279,7 @@ def get_layover_group_meta(token, group_id):
     if not gid:
         return jsonify({'ok': False, 'error': 'bad_group'}), 400
     meta = _load(gid)
-    return jsonify({'ok': True, 'meta': meta})
+    return jsonify({'ok': True, 'meta': _mask_voter_tokens(meta, token)})
 
 
 @layover_group_bp.route('/api/layover-group/<token>/meta/<group_id>', methods=['PUT'])
@@ -238,7 +308,7 @@ def put_layover_group_meta(token, group_id):
     blob = {'plan': plan, 'polls': polls, 'pinned_note': pinned,
             'updated_at': time.time()}
     _save(gid, blob)
-    return jsonify({'ok': True, 'meta': blob})
+    return jsonify({'ok': True, 'meta': _mask_voter_tokens(blob, token)})
 
 
 @layover_group_bp.route('/api/layover-group/<token>/meta/<group_id>/vote', methods=['POST'])
@@ -273,4 +343,4 @@ def vote_layover_group_poll(token, group_id):
         stored['polls'] = polls
         stored['updated_at'] = time.time()
         _save(gid, stored)
-    return jsonify({'ok': True, 'meta': stored})
+    return jsonify({'ok': True, 'meta': _mask_voter_tokens(stored, token)})

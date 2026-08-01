@@ -203,8 +203,8 @@ def test_budget_inc_buffers_and_flushes_hour_and_caller_key(monkeypatch):
     import time as _t
     from blueprints import aerox_data_blueprint as adb
     seen = []
-    monkeypatch.setattr(adb, '_budget_key_inc',
-                        lambda key, units=1: seen.append((key, units)))
+    monkeypatch.setattr(adb, '_budget_key_inc_ex',
+                        lambda key, units=1: (seen.append((key, units)), (None, True))[1])
     lh._budget_buf.clear()
     lh.budget_inc('lhopen', 'mqtt_event')
     lh.budget_inc('lhopen', 'mqtt_event')
@@ -225,7 +225,7 @@ def test_budget_flush_puts_units_back_when_write_fails(monkeypatch):
 
     def _boom(key, units=1):
         raise RuntimeError('sb down')
-    monkeypatch.setattr(adb, '_budget_key_inc', _boom)
+    monkeypatch.setattr(adb, '_budget_key_inc_ex', _boom)
     lh._budget_buf.clear()
     lh.budget_inc('lhfo', None)          # darf NICHT werfen
     assert lh.budget_flush() == 0        # auch der Flush nicht
@@ -235,11 +235,42 @@ def test_budget_flush_puts_units_back_when_write_fails(monkeypatch):
     lh._budget_buf.clear()
 
 
+def test_budget_flush_puts_units_back_when_write_fails_silently(monkeypatch):
+    """Der Fall, der PRODUKTIV eintritt — und der bis 2026-08-01 Einheiten frass.
+
+    `_budget_key_inc` wirft NIE: faellt der atomare RPC UND der Upsert-Fallback
+    aus (Supabase-Aussetzer), kam es mit `None` zurueck — genau wie im
+    Erfolgsfall des Upsert-Pfads. `budget_flush` konnte „geschrieben" und
+    „stillschweigend verloren" also nicht unterscheiden und verbuchte JEDE
+    Einheit als erledigt; der Rueckgabe-in-den-Puffer-Pfad war nur ueber eine
+    Exception erreichbar, die es nicht gibt. Die LH-Quota-Zaehler liefen nach
+    jedem Aussetzer zu niedrig — bei einem Kontingent, das taeglich gerissen
+    wird, ist das die gefaehrliche Richtung.
+    """
+    from blueprints import aerox_data_blueprint as adb
+    monkeypatch.setattr(adb, '_budget_key_inc_ex',
+                        lambda key, units=1: (None, False))
+    lh._budget_buf.clear()
+    lh.budget_inc('lhfo', None)
+    assert lh.budget_flush() == 0
+    assert lh._budget_buf, 'still verlorene Einheiten muessen zurueck in den Puffer'
+    lh._budget_buf.clear()
+
+
+def test_budget_key_inc_ex_reports_success_and_failure():
+    """Die Statusrueckgabe selbst: nur ein echter Schreibfehler meldet False."""
+    from blueprints import aerox_data_blueprint as adb
+    # Ohne konfigurierten Store gibt es nichts zu wiederholen — sonst wuechse
+    # der Puffer unbegrenzt. Der In-Memory-Zaehler traegt den Wert.
+    total, ok = adb._budget_key_inc_ex('test:key:noop', 1)
+    assert ok is True and total is None
+
+
 def test_budget_caller_label_is_sanitised(monkeypatch):
     from blueprints import aerox_data_blueprint as adb
     seen = []
-    monkeypatch.setattr(adb, '_budget_key_inc',
-                        lambda key, units=1: seen.append(key))
+    monkeypatch.setattr(adb, '_budget_key_inc_ex',
+                        lambda key, units=1: (seen.append(key), (None, True))[1])
     lh._budget_buf.clear()
     lh.budget_inc('lhfo', 'COMMON_DUTY:EVENTS/../x')
     lh.budget_flush()
@@ -383,8 +414,9 @@ def test_flush_feeds_global_gate_from_rpc_total(monkeypatch):
     import time as _t
     from blueprints import aerox_data_blueprint as adb
     _reset_global_gate()
-    monkeypatch.setattr(adb, '_budget_key_inc',
-                        lambda key, units=1: 777 if key.count(':') == 1 else None)
+    monkeypatch.setattr(adb, '_budget_key_inc_ex',
+                        lambda key, units=1: (777, True) if key.count(':') == 1
+                        else (None, True))
     lh._budget_buf.clear()
     lh.budget_inc('lhopen', 'mqtt_leg_reg')
     lh.budget_flush()

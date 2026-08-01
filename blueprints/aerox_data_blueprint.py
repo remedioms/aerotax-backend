@@ -1335,22 +1335,42 @@ def _budget_key_inc(key, units=1):
     `lh_open_api._budget_ok` gated darauf (die LH-Quota gilt pro KEY, die
     lokalen Zähler aber pro Prozess). Bestandsaufrufer ignorieren den Rückgabe-
     wert; die Signatur bleibt kompatibel."""
+    total, _ok = _budget_key_inc_ex(key, units)
+    return total
+
+
+def _budget_key_inc_ex(key, units=1):
+    """Wie _budget_key_inc, sagt aber zusätzlich, ob der Schreibvorgang HIELT.
+
+    Returns `(total_oder_None, ok)`. `ok=False` heißt: weder der atomare RPC
+    noch der Upsert-Fallback kamen durch, die Einheiten stehen also NICHT im
+    prozess-übergreifenden Zähler. Der Aufrufer (lh_open_api.budget_flush) legt
+    sie dann zurück in den Puffer.
+
+    WARUM (Full-Review 2026-08-01): `_budget_key_inc` wirft nie und liefert
+    auch im Erfolgsfall des Upsert-Fallbacks `None` — aus dem Rückgabewert war
+    „geschrieben" von „stillschweigend verloren" nicht zu unterscheiden.
+    budget_flush hat deshalb JEDE Einheit als erledigt verbucht, auch wenn
+    Supabase gerade weg war: der Rückgabe-in-den-Puffer-Pfad war toter Code und
+    die LH-Quota-Zähler liefen nach jedem Supabase-Aussetzer zu niedrig."""
     used = _MEM_BUDGET.get(key, 0) + max(1, int(units))
     _MEM_BUDGET[key] = used          # In-Memory IMMER zählen (Safety-Net)
     sb = _sb()
     if sb is None:
-        return None
+        # Kein Store konfiguriert — nichts zu wiederholen, sonst wüchse der
+        # Puffer unbegrenzt. Der In-Memory-Zähler oben trägt den Wert.
+        return None, True
     n = _budget_rpc_add(key, units)
     if n is not None:
         _MEM_BUDGET[key] = max(used, n)
-        return n
+        return n, True
     try:
         sb.table('ax_api_budget').upsert(
             {'month': key, 'n': max(used, _budget_key_used(key)),
              'updated_at': _iso_now()}).execute()
     except Exception:
-        pass
-    return None
+        return None, False
+    return None, True
 
 
 def lh_quota_snapshot(hours=6):

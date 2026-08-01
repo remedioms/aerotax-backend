@@ -161,7 +161,20 @@ rsh "date +%s > /var/lib/aerox-deploy-flag"
 # Vorherigen SHA fuer den Rollback-Pfad sichern (Ancestor-Wahrheit bleibt
 # auch nach einem automatischen Rollback korrekt).
 PREV_SHA="$DEPLOYED"
-rsh "cd /opt/aerox && cp compose.yaml compose.yaml.prev && sed -i 's#image: .*#image: $IMG#' compose.yaml && echo OK"
+# Nur Zeilen umschreiben, die schon auf ein aerotax-backend-Image zeigen.
+# Der Poll-Split ist Absicht: `aerotax-backend` (:8080) und `aerotax-poll`
+# (:8081) laufen aus DEMSELBEN Image, beide Zeilen MUESSEN mitwandern. Das
+# alte `s#image: .*#…#` traf aber jede image-Zeile — ein spaeter ergaenzter
+# Dienst (Redis, Postgres, Exporter) waere beim naechsten Deploy stillschweigend
+# auf das Backend-Image umgebogen worden und haette als "gesund" gestartet.
+# Danach wird geprueft, dass ueberhaupt etwas ersetzt wurde.
+REWROTE=$(rsh "cd /opt/aerox && cp compose.yaml compose.yaml.prev && sed -i -E 's#^([[:space:]]*image:[[:space:]]*).*aerotax-backend.*\$#\\1$IMG#' compose.yaml && grep -c '$IMG' compose.yaml")
+if [ "${REWROTE:-0}" -lt 1 ]; then
+  echo "❌ Compose-Umschreibung traf KEINE aerotax-backend-image-Zeile — Abbruch vor dem Neustart."
+  rsh "cd /opt/aerox && cp compose.yaml.prev compose.yaml"
+  exit 1
+fi
+echo "     $REWROTE image-Zeile(n) auf $IMG gesetzt."
 echo "[2b/5] FlightOps-Refresh drainen (Grant-Burn-Schutz)…"
 # Praeziser Schutz zusaetzlich zum Cron-Fenster-Guard oben: laufende
 # refresh-all-Laeufe sauber auslaufen lassen (drain-Flag + poll bis
@@ -180,7 +193,35 @@ echo drained'
 echo "[3/5] Container neu erstellen…"
 rsh "cd /opt/aerox && docker compose up -d >/dev/null 2>&1 && echo OK"
 echo "[4/5] Health-Check (bis 60s)…"
-OK=$(rsh 'R=FAIL; for i in $(seq 1 20); do sleep 3; c=$(curl -s -o /dev/null -w "%{http_code}" -m5 http://127.0.0.1:8080/api/health); if [ "$c" = 200 ]; then R=OK; break; fi; done; echo $R')
+# Geprueft werden BEIDE Container und der Blueprint-Zustand:
+#  · :8080 = Public-Backend (AeroX-API)
+#  · :8081 = Poll-/Refresher-Container aus DEMSELBEN Image. Er trug bisher
+#    keinerlei Gate — ein Image, das nur dort kaputtgeht (Poll, FlightOps-
+#    Refresher, Cron-Ziele), wurde als "gesund" durchgewunken, waehrend der
+#    Refresher still tot war.
+#  · blueprints_failed: app.py faengt Blueprint-Importfehler ab, damit ein
+#    einzelner Fehler nicht das Backend killt. Ohne diese Pruefung deployt ein
+#    Backend mit toten Feature-Familien (Flugbuch, Trip-Trade, Crew-Graph) mit
+#    gruenem Haken.
+OK=$(rsh 'R=FAIL
+for i in $(seq 1 20); do
+  sleep 3
+  c=$(curl -s -o /dev/null -w "%{http_code}" -m5 http://127.0.0.1:8080/api/health)
+  [ "$c" = 200 ] || continue
+  c2=$(curl -s -o /dev/null -w "%{http_code}" -m5 http://127.0.0.1:8081/api/health)
+  [ "$c2" = 200 ] || { R=FAIL_POLL; continue; }
+  body=$(curl -s -m5 http://127.0.0.1:8080/api/health)
+  case "$body" in
+    *'"blueprints_failed": []'*|*'"blueprints_failed":[]'*) R=OK; break ;;
+    *) R=FAIL_BLUEPRINTS; break ;;
+  esac
+done
+echo $R')
+case "$OK" in
+  FAIL_POLL)       echo "     ⚠️  :8080 gesund, aber der Poll-/Refresher-Container (:8081) antwortet nicht." ;;
+  FAIL_BLUEPRINTS) echo "     ⚠️  Backend laeuft, aber mindestens ein Blueprint hat den Import NICHT ueberlebt:"
+                   rsh "curl -s -m5 http://127.0.0.1:8080/api/health | tr ',' '\n' | grep -A2 blueprints_failed" || true ;;
+esac
 if [ "$OK" = "OK" ]; then
   echo "[5/5] ✅ Deploy erfolgreich & gesund."
   # Deployten Commit auf dem Host vermerken (Quelle des Ancestor-Gates).

@@ -44,6 +44,27 @@ from flask import Blueprint, request, jsonify, current_app
 # importiert app nur lazy in Funktionen.
 from blueprints.aerox_data_blueprint import _route_label_cities, _iata_city_name
 
+# ── Roster-Tagesgrenze ──────────────────────────────────────────────────────
+# Die Dienstplan-Tage (`user_ical_briefings.datum`, die Schlüssel der
+# Briefing-Dicts) sind KALENDERTAGE in der Heimatzone, nicht UTC-Tage. Der
+# Server läuft in UTC — `datetime.now().date()` lag damit zwischen 00:00 und
+# 02:00 Berliner Zeit (Sommerzeit) einen Tag ZURÜCK und die Family sah in
+# genau diesem Fenster den gestrigen Dienst als „heute". Wie in
+# daily_briefing wird der Tag deshalb explizit in Europe/Berlin gebildet.
+# (Full-Review 2026-08-01)
+try:
+    from zoneinfo import ZoneInfo as _FW_ZI
+    _FW_ROSTER_TZ = _FW_ZI('Europe/Berlin')
+except Exception:                                  # pragma: no cover
+    _FW_ROSTER_TZ = None
+
+
+def _fw_today():
+    """Heutiges Datum in der Roster-Zone (Europe/Berlin)."""
+    if _FW_ROSTER_TZ is not None:
+        return _dt.datetime.now(_FW_ROSTER_TZ).date()
+    return _dt.datetime.now().date()
+
 family_watch_bp = Blueprint('family_watch', __name__)
 
 # Late-binding helper: greift bei jedem call frisch auf app-module-Attribute zu.
@@ -469,7 +490,7 @@ def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
         events = loader(crew_token) or {}
     except Exception:
         return False
-    today = _dt.datetime.now().date().isoformat()
+    today = _fw_today().isoformat()
     for datum in sorted(k for k in events if isinstance(k, str) and k[:10] >= today):
         ev = events.get(datum) or {}
         if not isinstance(ev, dict):
@@ -1081,7 +1102,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     # wenn die Crew die Felder freigegeben hatte.
     if 'next_flight' in allowed_fields and sb_avail and sb is not None:
         try:
-            today = _dt.datetime.now().date().isoformat()
+            today = _fw_today().isoformat()
             # FIX „FRA-HND obwohl die Crew auf SFO-Tour ist" (2026-07-03):
             # vorher limit(1) → wenn der NÄCHSTGELEGENE Roster-Tag KEIN Leg-Paar
             # im Summary hat (Layover-Ruhetag „LAYOVER SFO", OFF) blieb
@@ -1247,7 +1268,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         # FRA) ist man NICHT im Layover, sondern zuhause → nicht als Layover werten.
         try:
             now = _dt.datetime.now(_dt.timezone.utc)
-            today_d = _dt.datetime.now().date()
+            today_d = _fw_today()
             days = [today_d.isoformat(),
                     (today_d - _dt.timedelta(days=1)).isoformat()]
             # raw_event trägt die Pro-Leg-Sektoren (ical_sectors, echt-UTC-

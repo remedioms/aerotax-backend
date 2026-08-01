@@ -116,6 +116,21 @@ _CACHE_TTL_S = 600.0
 _cache = {}
 _cache_lock = threading.Lock()
 
+# Sperrfrist nach einem fehlgeschlagenen Briefing pro (Token, Tag) — verhindert,
+# dass Client-Retries die LH-Kette erneut bezahlen (siehe ax_daily_briefing).
+_FAIL_COOLDOWN_S = 120.0
+_fail_memo = {}
+
+
+def _note_briefing_failure(cache_key):
+    """Merkt einen Fehlschlag für die Sperrfrist (unter _cache_lock)."""
+    with _cache_lock:
+        _fail_memo[cache_key] = time.time()
+        if len(_fail_memo) > 5000:
+            _cutoff = time.time() - _FAIL_COOLDOWN_S
+            for _k in [k for k, v in _fail_memo.items() if v < _cutoff]:
+                _fail_memo.pop(_k, None)
+
 _ISO_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}')
 _MONTHS = ('JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
            'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC')
@@ -1574,14 +1589,44 @@ def ax_daily_briefing(token):
     if hit and (now - hit[0]) < _CACHE_TTL_S:
         return jsonify(hit[1])
 
-    # Stunden-Notbremse (wie Pickup): das Briefing ist On-Demand-Komfort und
-    # darf den Roster-Kernpfad nie aushungern. Stale Cache ist dann erlaubt.
+    # FEHLSCHLAG-SPERRE (Full-Review 2026-08-01): Fehlerantworten landeten nie im
+    # Cache und der Endpoint hatte keine Drossel — jeder Client-Retry (und ein
+    # Pull-to-Refresh in Folge) fuhr die komplette LH-Kette erneut. Genau die
+    # Situationen, in denen es fehlschlägt (Quota knapp, Gateway zickig), sind
+    # die, in denen zusätzliche Calls am teuersten sind. Nach einem Fehlschlag
+    # ist derselbe (Token, Tag) für _FAIL_COOLDOWN_S gesperrt: erst der Stale-
+    # Cache, sonst eine ehrliche 503 — beides ohne einen einzigen LH-Call.
+    with _cache_lock:
+        _failed_at = _fail_memo.get(ck)
+    if _failed_at and (now - _failed_at) < _FAIL_COOLDOWN_S:
+        if hit:
+            return jsonify({**hit[1], 'stale': True})
+        return jsonify({'ok': False, 'error': 'briefing_cooldown',
+                        'phase': 'cooldown',
+                        'retry_after_s': int(_FAIL_COOLDOWN_S - (now - _failed_at))}), 503
+
+    # Notbremse (wie Pickup): das Briefing ist On-Demand-Komfort und darf den
+    # Roster-Kernpfad nie aushungern. Stale Cache ist dann erlaubt.
+    #
+    # FIX (Full-Review 2026-08-01): Die Bremse stand auf _LHFO_HOUR_CEILING=800
+    # und prüfte den Tagesstand GAR NICHT — aber jeder LH-Call, den dieser
+    # Endpoint danach macht (duty_events, crew_rotation, crew_list), läuft als
+    # HINTERGRUND-Call und wird in _api_get schon bei 650/h bzw. 5000/Tag
+    # abgewiesen. Zwischen 650 und 800 und an jedem Abend mit gerissenem
+    # Tagesdeckel (ax_api_budget 28.07.–01.08.: 5167–6684/Tag) lief das Briefing
+    # also in ein `None` und antwortete 502 duty_events_failed — während der
+    # vorhandene Stale-Cache und die ehrliche 503 unerreichbar blieben. Die
+    # Bremse misst jetzt gegen dieselben Deckel, gegen die die Calls laufen.
     used = fo._rot_hour_used()
-    if used >= _LHFO_HOUR_CEILING:
+    day_used = fo._lhfo_day_used()
+    hour_closed = used >= min(_LHFO_HOUR_CEILING, fo._LHFO_HOUR_BACKGROUND_CEILING)
+    day_closed = day_used >= fo._LHFO_DAY_BACKGROUND_CEILING
+    if hour_closed or day_closed:
         if hit:
             return jsonify({**hit[1], 'stale': True})
         return jsonify({'ok': False, 'error': 'lh_quota_deferred',
-                        'phase': 'quota', 'lhfo_hour_used': used}), 503
+                        'phase': 'quota', 'lhfo_hour_used': used,
+                        'lhfo_day_used': day_used}), 503
 
     calls = _lh_calls_counter()
 
@@ -1592,6 +1637,11 @@ def ax_daily_briefing(token):
     calls['duty_events'] += 1
     de = fo.duty_events(token, day_before, day_after)
     if not isinstance(de, dict):
+        _note_briefing_failure(ck)
+        # Ein vorhandener (abgelaufener) Cache ist immer noch besser als ein
+        # blanker Fehler — der Roster-Tag ändert sich selten binnen Minuten.
+        if hit:
+            return jsonify({**hit[1], 'stale': True})
         return jsonify({'ok': False, 'error': 'duty_events_failed',
                         'phase': 'duty_events'}), 502
     # accessCodes/Links dieser Response gleich mitnehmen (kostenlos).

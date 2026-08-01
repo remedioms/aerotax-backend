@@ -90,6 +90,11 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 #   P5 news              — Multi-Source Aviation-News-Aggregator (feedparser+AvHerald)
 #   P6a crew_graph       — Crew-Network-Graph (wer-mit-wem)
 #   P6b trip_trade       — Open-Time Trip-Trade Board
+#
+# Soft-fail heißt NICHT still: jeder Fehlschlag landet hier und wird von
+# /api/health mit ausgeliefert, damit das Deploy-Gate ein halbtotes Backend
+# nicht als „gesund" durchwinkt (Full-Review 2026-08-01).
+_BOOT_BLUEPRINT_FAILURES = []
 for _bp_path, _bp_name in [
     ('blueprints.adsb_blueprint',            'adsb_bp'),
     ('blueprints.aircraft_info_blueprint',   'aircraft_info_bp'),
@@ -120,7 +125,18 @@ for _bp_path, _bp_name in [
         _mod = __import__(_bp_path, fromlist=[_bp_name])
         app.register_blueprint(getattr(_mod, _bp_name))
     except Exception as _e:
-        app.logger.warning(f'[boot] blueprint-register-skip {_bp_path}: {type(_e).__name__}: {str(_e)[:120]}')
+        # SICHTBAR MACHEN (Full-Review 2026-08-01): Ein Blueprint, der nicht
+        # lädt, nimmt eine ganze Feature-Familie mit (Flugbuch, Trip-Trade,
+        # Crew-Graph …) — bisher stand darüber nur eine WARNING in einem Log,
+        # das niemand liest, und /api/health meldete munter 200. Ein Deploy mit
+        # halbtotem Backend galt damit als „gesund". Der Fehler wird jetzt als
+        # ERROR geloggt UND in /api/health mitgeführt, damit das Deploy-Gate ihn
+        # sehen kann.
+        _BOOT_BLUEPRINT_FAILURES.append({
+            'module': _bp_path,
+            'error': f'{type(_e).__name__}: {str(_e)[:200]}',
+        })
+        app.logger.error(f'[boot] blueprint-register-FAIL {_bp_path}: {type(_e).__name__}: {str(_e)[:200]}')
 
 # Sentry: optional, soft-fail. CLOUD_RUN_REVISION wird automatisch injiziert.
 try:
@@ -291,6 +307,19 @@ _SB_TIMEOUT_EXECUTOR = _sb_cf.ThreadPoolExecutor(
     thread_name_prefix='sb-timeout',
 )
 
+# GEGENDRUCK (Full-Review 2026-08-01): Die Warteschlange des Executors ist
+# unbegrenzt. Wenn Supabase klemmt, gibt der Aufrufer nach `timeout_s` auf —
+# die eingereichte Aufgabe läuft aber WEITER und belegt bis zum
+# postgrest-Timeout (120 s) einen der 16 Threads. Unter Last reiht sich damit
+# Arbeit auf, die niemand mehr abholt: die Queue wächst, der Speicher der
+# kleinen Hetzner-Kiste mit ihr, und nach dem Ende der Störung arbeitet der
+# Pool minutenlang längst vergessene Anfragen ab. Über dem Deckel wird deshalb
+# sofort „fehlgeschlagen" gemeldet — der Aufrufer behandelt das ohnehin schon
+# wie einen Timeout und fällt auf seinen Disk-/Cache-Pfad zurück.
+_SB_TIMEOUT_MAX_INFLIGHT = 64
+_sb_inflight = [0]
+_sb_inflight_lock = _req_threading.Lock()
+
 def _supabase_execute_with_timeout(label, fn, timeout_s=5):
     """Run fn (typically a wrapped supabase .execute()) with a hard timeout.
 
@@ -301,13 +330,34 @@ def _supabase_execute_with_timeout(label, fn, timeout_s=5):
         def _do(): return sb.table('jobs').select('data').eq('job_id', x).execute()
         res, timed_out = _supabase_execute_with_timeout('load_job', _do, timeout_s=5)
     """
+    with _sb_inflight_lock:
+        if _sb_inflight[0] >= _SB_TIMEOUT_MAX_INFLIGHT:
+            print(f'[supabase-timeout] {label} abgewiesen — '
+                  f'{_sb_inflight[0]} Aufgaben bereits in Arbeit (Deckel '
+                  f'{_SB_TIMEOUT_MAX_INFLIGHT}); Supabase klemmt vermutlich')
+            return None, True
+        _sb_inflight[0] += 1
+
+    def _release(_f):
+        with _sb_inflight_lock:
+            if _sb_inflight[0] > 0:
+                _sb_inflight[0] -= 1
+
     try:
         fut = _SB_TIMEOUT_EXECUTOR.submit(fn)
-        try:
-            return fut.result(timeout=timeout_s), False
-        except _sb_cf.TimeoutError:
-            print(f'[supabase-timeout] {label} exceeded {timeout_s}s — returning None')
-            return None, True
+    except Exception as e:
+        _release(None)
+        print(f'[supabase-timeout] {label} submit-error: {type(e).__name__}: {e}')
+        return None, True
+    # Erst zählen, wenn die AUFGABE fertig ist — nicht wenn der Aufrufer
+    # aufgibt. Sonst wäre der Deckel wirkungslos, denn genau die aufgegebenen
+    # Aufgaben sind die, die weiterlaufen.
+    fut.add_done_callback(_release)
+    try:
+        return fut.result(timeout=timeout_s), False
+    except _sb_cf.TimeoutError:
+        print(f'[supabase-timeout] {label} exceeded {timeout_s}s — returning None')
+        return None, True
     except Exception as e:
         print(f'[supabase-timeout] {label} error: {type(e).__name__}: {e}')
         return None, True
@@ -454,9 +504,36 @@ def _close_current_thread_supabase_client():
 
 _REQ_LOG_PREFIX = '[req]'
 # Pfade die NICHT instrumentiert werden (zu noisy oder uninteressant):
-#   /api/progress (SSE-Endpoint, langer Open)
 #   statische Assets (gibts hier nicht aber als Safety)
-_REQ_LOG_SKIP = ('/api/progress',)
+#
+# `/api/progress` stand hier — genau der Endpoint, der pro Verbindung minuten-
+# lang einen Worker-Thread hält, war damit im Request-Log unsichtbar. Bei einer
+# Thread-Erschöpfung hätte man die Ursache im Log NICHT gesehen (die
+# Startsturm-Falle: „Fehler beim Client, nichts im Server-Log"). Er ist jetzt
+# instrumentiert; der Deckel in progress_stream hält das Volumen klein.
+_REQ_LOG_SKIP = ()
+
+# ── /api/progress: Deckel für gleichzeitige SSE-Ströme ──
+# 6 von 24 Request-Threads sind das Maximum, das die Fortschritts-Kosmetik
+# belegen darf — der Rest bleibt für die AeroX-API und /api/health.
+_PROGRESS_MAX_CONCURRENT = 6
+_progress_slots = [0]
+import threading as _progress_threading   # bare `threading` ist hier oben noch nicht gebunden
+_progress_slots_lock = _progress_threading.Lock()
+
+
+def _progress_slot_acquire():
+    with _progress_slots_lock:
+        if _progress_slots[0] >= _PROGRESS_MAX_CONCURRENT:
+            return False
+        _progress_slots[0] += 1
+        return True
+
+
+def _progress_slot_release():
+    with _progress_slots_lock:
+        if _progress_slots[0] > 0:
+            _progress_slots[0] -= 1
 
 
 # ── Wave-1 BUG-004 (2026-06-02): Token-Auth-Gate via before_request ──
@@ -585,6 +662,18 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/ax/flight-recap/',          # /<token> → Post-Flight-Wahrheit
     '/api/ax/my-flight-status/',      # /<token> → eigener Tail + Pünktlich-Verdikt
     '/api/ax/daily-briefing/',        # /<token> → Crew-Namen/PKs + Hotel/Pickup (P10)
+    # ── Full-Review 2026-08-01 ──
+    '/api/layover-group/',  # /<token>/meta/<gid> → geteilter Plan + Umfragen.
+                            #   Das blueprint-eigene _auth_ok vergleicht nur
+                            #   Bearer==Pfad-Token und prüft NICHT, ob das Token
+                            #   überhaupt existiert — ein frei erfundenes
+                            #   „AT-IRGENDWAS" kam damit durch. Das globale Gate
+                            #   ergänzt die Existenz-Prüfung.
+    '/api/user/manual-pins/',  # /<token> → eigene Karten-Pins (Koordinaten +
+                            #   Notizen). Der Handler prüfte GAR NICHTS: jeder
+                            #   konnte mit einem fremden Token die privaten Pins
+                            #   auslesen (IDOR).
+    '/api/lh/flightops/status/',  # /<token> → LH-Verbindungsstatus des Users
 )
 
 
@@ -646,11 +735,24 @@ _BUG004_REQUIRE_TOKEN_BINDING = _token_binding_enforced_from_env()
 # owner-scoped PUT; `/friends/<other>` exemptete `/add`, `/remove` und
 # `/overlap`.  Neue Routen sind jetzt deny-by-default owner-scoped und müssen
 # hier ausdrücklich als exakter Public-Discovery-Read eingetragen werden.
+#
+# `/api/user/friends/<token>` stand hier bis 2026-08-01 als Public-Read und war
+# damit der schwerste Leak des Backends: die Antwort enthält pro Freund das ROHE
+# `token` (get_user_friends), und ein Token IST das Bearer-Credential (das Gate
+# unten prüft nur `bearer == pfad-token`). Ohne Bearer konnte also jeder mit
+# EINEM bekannten Token die Freundesliste ziehen, aus deren Tokens die nächsten
+# Listen ziehen und so den ganzen Social-Graph als Credential-Sammlung
+# durchlaufen. Die Route ist jetzt owner-scoped — RÜCKWÄRTSKOMPATIBEL, weil
+# weder iOS (18 Aufrufstellen, alle `appState.token`/`TokenStore.get()`) noch
+# Android (AeroXChatRepository/AeroXCrewCommunityRepository: `"friends",
+# token.value`) sie je mit einem FREMDEN Token aufrufen und beide Clients auf
+# jedem Request `Authorization: Bearer <eigener Token>` senden.
+# Das `token`-Feld selbst bleibt in der Antwort (iOS `Friend.token` und Android
+# `ChatFriend` sind nicht-optional und brauchen es für DM-Kanal, friend-roster
+# und friend-requests) — es geht jetzt nur noch an den Owner der Liste.
 _BUG004_CROSS_USER_ROUTE_RULES = (
     (frozenset(('GET', 'HEAD')),
      _bug004_re.compile(r'^/api/user/profile/AT-[A-Za-z0-9_-]+/?$')),
-    (frozenset(('GET', 'HEAD')),
-     _bug004_re.compile(r'^/api/user/friends/AT-[A-Za-z0-9_-]+/?$')),
 )
 
 # Unauthenticated-Routen: laufen BEVOR ein Token existiert (Signup/Login/
@@ -6780,28 +6882,59 @@ def recover_failed_job():
 def quick_health():
     """v8.40: Schneller Health-Check ohne externe Calls. Frontend nutzt das bei
     Verbindungsfehlern um zu unterscheiden: Server down vs. Endpoint-spezifisch."""
+    # `ok` bleibt True (der Prozess LEBT — das Frontend unterscheidet damit
+    # weiterhin „Server down" von „Endpoint kaputt", und ein bestehender
+    # Monitor schlägt nicht plötzlich Alarm). Die Blueprint-Fehler kommen
+    # ADDITIV dazu: das Deploy-Gate liest `blueprints_failed` und bricht ab,
+    # statt ein Backend mit toten Feature-Familien als gesund auszurollen.
     return jsonify({
         'ok': True,
         'service': 'aerotax-backend',
         'version': 'v8.40',
         'token_binding_enforced': _BUG004_REQUIRE_TOKEN_BINDING,
         'push_outbox': dict(globals().get('_PUSH_OUTBOX_METRICS') or {}),
+        'blueprints_failed': list(_BOOT_BLUEPRINT_FAILURES),
     })
+
+
+def _health_full_internal_ok():
+    """Darf dieser Aufrufer die TEUREN Health-Checks auslösen?
+
+    Gleiches Muster wie lh_flightops._internal_secret_ok: mit gesetztem Secret
+    zählt der Header, ohne Secret nur ein Aufruf von localhost (Ops per SSH auf
+    dem Host). Alles andere bekommt die billigen lokalen Checks."""
+    try:
+        secret = os.environ.get('ADSB_POLL_SECRET', '').strip()
+        if secret:
+            provided = (request.headers.get('X-Poll-Secret') or '').strip()
+            return bool(provided) and hmac.compare_digest(provided, secret)
+        return (request.remote_addr or '') in ('127.0.0.1', '::1')
+    except Exception:
+        return False
 
 
 @app.route('/api/health/full', methods=['GET'])
 def full_health_check():
     """End-to-End Health Check: Server, Anthropic API, File-System."""
     health = {'server': 'ok', 'timestamp': datetime.utcnow().isoformat() + 'Z'}
-    # Anthropic
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=180.0)
-        r = client.messages.create(
-            model='claude-haiku-4-5-20251001', max_tokens=10,
-            messages=[{'role':'user','content':'pong'}])
-        health['anthropic'] = 'ok' if r.content else 'no_content'
-    except Exception as e:
-        health['anthropic'] = f'fail: {str(e)[:120]}'
+    # Anthropic — NUR für interne Aufrufer (Full-Review 2026-08-01).
+    # Diese Route war unauthentifiziert und machte pro Aufruf einen ECHTEN,
+    # kostenpflichtigen Anthropic-Call mit 180 s Timeout plus einen
+    # Stripe-Call. Jeder im Internet konnte damit Geld ausgeben und, weil
+    # jeder Aufruf bis zu 180 s einen der 24 Worker-Threads hält, das Backend
+    # in die Knie zwingen. Ohne Secret bleiben die billigen, lokalen Checks —
+    # ein vorhandener Prober bekommt weiterhin 200 mit server/filesystem/pil.
+    if _health_full_internal_ok():
+        try:
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=20.0)
+            r = client.messages.create(
+                model='claude-haiku-4-5-20251001', max_tokens=10,
+                messages=[{'role':'user','content':'pong'}])
+            health['anthropic'] = 'ok' if r.content else 'no_content'
+        except Exception as e:
+            health['anthropic'] = f'fail: {str(e)[:120]}'
+    else:
+        health['anthropic'] = 'skipped_no_internal_auth'
     # File system
     try:
         test_path = os.path.join(_JOBS_DIR, '.health-check')
@@ -6813,13 +6946,17 @@ def full_health_check():
     # PIL/HEIF
     health['pil'] = 'ok' if PIL_AVAILABLE else 'missing'
     health['heif'] = 'ok' if HEIF_AVAILABLE else 'missing'
-    # Stripe — verifiziert dass STRIPE_SECRET_KEY konfiguriert + valide ist
+    # Stripe — verifiziert dass STRIPE_SECRET_KEY konfiguriert + valide ist.
+    # Der Netz-Call nur intern (siehe Anthropic oben); öffentlich bleibt die
+    # reine Konfigurations-Aussage, die nichts kostet und nichts blockiert.
     try:
         if not stripe.api_key:
             health['stripe'] = 'missing_key'
-        else:
+        elif _health_full_internal_ok():
             stripe.Account.retrieve()
             health['stripe'] = 'ok'
+        else:
+            health['stripe'] = 'configured'
     except Exception as e:
         health['stripe'] = f'fail: {str(e)[:120]}'
     # Supabase — DB read + uploaded_files / pdfs Tabellen erreichbar
@@ -10473,6 +10610,31 @@ def _public_profile_projection(token):
 _PAYWALL_WALL_DATE = '2026-12-26'          # Hard Wall ab hier (6 Monate Beta ab 2026-06-25)
 
 
+# ── Kalendertag in der Heimatzone ───────────────────────────────────────────
+# Der Server läuft in UTC. Überall dort, wo ein KALENDERTAG gemeint ist (der
+# Roster-Tag, die Bezahlschranken-Grenze, ein Default-Flugdatum), ist der
+# UTC-Tag zwischen 00:00 und 02:00 Berliner Zeit noch der gestrige — das ist
+# die teuerste wiederkehrende Fehlerklasse dieses Projekts. Zeiten AM
+# EREIGNISORT gehören weiterhin in die Zone des jeweiligen Flughafens; dieser
+# Helfer ist nur für Tagesgrenzen des Heimatkalenders.
+_BERLIN_TZ = None
+try:
+    from zoneinfo import ZoneInfo as _AxZoneInfo
+    _BERLIN_TZ = _AxZoneInfo('Europe/Berlin')
+except Exception:                                  # pragma: no cover
+    _BERLIN_TZ = None
+
+
+def _berlin_today_iso():
+    """Heutiges Datum (YYYY-MM-DD) in Europe/Berlin."""
+    try:
+        if _BERLIN_TZ is not None:
+            return datetime.now(_BERLIN_TZ).strftime('%Y-%m-%d')
+    except Exception:
+        pass
+    return datetime.now().strftime('%Y-%m-%d')
+
+
 def _auth_created_at_for_token(token):
     """Echtes Signup-Datum (E-Mail-Auth) für einen Token, falls vorhanden."""
     try:
@@ -10518,7 +10680,13 @@ def user_entitlement(token):
     # rechnet ohnehin seen=jetzt < Wall = Gründungs-Crew; das reicht.
     seen = prof.get('pro_first_seen') or _auth_created_at_for_token(token) \
         or datetime.now().isoformat()
-    today = datetime.now().date().isoformat()
+    # Tagesgrenze in der Heimatzone statt in der Serverzeit (UTC). Sonst
+    # verschiebt sich die Bezahlschranke für jeden User um bis zu zwei Stunden:
+    # zwischen 00:00 und 02:00 Berliner Zeit am Wall-Datum gälte noch der
+    # Vortag, und wer in genau diesem Fenster die App öffnet, würde
+    # unterschiedlich behandelt als jemand zwei Stunden später — bei einer
+    # kostenpflichtigen Entscheidung. (Full-Review 2026-08-01)
+    today = _berlin_today_iso()
     seen_date = str(seen)[:10]
     if is_family:
         return jsonify({'ok': True, 'pro_required': False,
@@ -10914,6 +11082,30 @@ def post_user_location():
     return jsonify({'ok': False, 'error': 'persist_failed'}), 500
 
 
+# PostgREST-Grammatik-Zeichen, die aus einem Suchbegriff ausbrechen können.
+# Der q-Wert wird in user_search roh in einen `or_()`-Ausdruck interpoliert
+# (`name.ilike.<q>%,name.ilike.% <q>%,airline.ilike.<q>%`). Ein Komma hängt dort
+# eine EIGENE Bedingung an, Klammern öffnen/schließen Gruppen — mit
+# `q=x,name.not.is.null` hätte ein Aufrufer die ganze User-Tabelle (inklusive
+# aller Auth-Tokens) ziehen können. `*` ist in PostgREST der ilike-Platzhalter
+# und `%` wirkt in SQL LIKE genauso, beide machen aus jeder Suche ein
+# Full-Listing. Diese Zeichen kommen in echten Namen/Airlines nicht vor.
+_SEARCH_FILTER_FORBIDDEN = str.maketrans({c: None for c in ',()"\\*%'})
+
+
+def _search_filter_sanitize(value):
+    """Entschärft einen User-Suchbegriff für die PostgREST-Filter-Grammatik.
+
+    Entfernt NUR die Ausbruch-Zeichen — Umlaute, Bindestriche, Apostrophe und
+    Leerzeichen bleiben erhalten, damit „Müller-Lüdenscheidt" und „O'Brien"
+    weiter gefunden werden."""
+    if not value:
+        return value
+    cleaned = value.translate(_SEARCH_FILTER_FORBIDDEN)
+    # Steuerzeichen (inkl. Newline) raus — sie gehören in keinen Filterwert.
+    return ''.join(ch for ch in cleaned if ch.isprintable()).strip()
+
+
 @app.route('/api/user/search', methods=['GET'])
 def user_search():
     """Crew-Discovery (J11). Query: ?q=&airline=&homebase=&limit=20&token=<own>.
@@ -10921,11 +11113,41 @@ def user_search():
     Searcher selbst nicht zurückzugeben. Privacy: liefert nur public profile-
     Felder, NIEMALS email/apple_sub/internal.
     Rate-Limit: max 20 Ergebnisse pro Call, Query muss ≥2 Zeichen haben.
+
+    AUTH-PFLICHT (2026-08-01): Die Antwort enthält pro Treffer das ROHE `token`
+    des gefundenen Users — und ein Token IST das Bearer-Credential (das Gate in
+    _bug004_token_auth_gate prüft nur `bearer == pfad-token`). Diese Route lief
+    bis heute völlig UNAUTHENTIFIZIERT (ihr Pfad enthält kein AT-Segment, also
+    greift das Gate nicht), d.h. jeder im Internet konnte mit `?q=an` echte
+    Credentials fremder User abholen. Sie verlangt jetzt einen gültigen Bearer.
+    RÜCKWÄRTSKOMPATIBEL: iOS (APIClient.request) und Android (execute) setzen
+    `Authorization: Bearer <eigener Token>` auf JEDEM Request.
+    Das `token`-Feld bleibt in der Antwort — iOS `SearchUser.token` und der
+    Follow-Flow (friend-requests/send mit `friend_token`) sind nicht-optional
+    darauf angewiesen. Der eigentliche Fix (opake Discovery-ID statt Token) muss
+    beidseitig mit einem App-Build kommen.
     """
-    q = (request.args.get('q') or '').strip().lower()
-    airline = (request.args.get('airline') or '').strip().lower()
-    homebase = (request.args.get('homebase') or '').strip().upper()
-    limit = min(int(request.args.get('limit') or 20), 50)
+    _bearer = _request_bearer_token()
+    if not _bearer:
+        return jsonify({'count': 0, 'users': [], 'error': 'auth_required'}), 401
+    _bv = _validate_token(_bearer)
+    if _bv.state is _TokenValidationState.UNAVAILABLE:
+        return _auth_store_unavailable_response()
+    if _bv.state is not _TokenValidationState.VALID:
+        return jsonify({'count': 0, 'users': [], 'error': 'unauthorized'}), 401
+    # Harvest-Bremse: die Suche gibt Credentials heraus, also darf ein einzelnes
+    # Konto sie nicht im Sekundentakt durchfahren. 300/h ist für Tippen in der
+    # Suchleiste (debounced) reichlich und deckelt das Absammeln hart.
+    if _ip_rate_limited(_bearer, endpoint='user_search', limit=300, window_sec=3600):
+        return jsonify({'count': 0, 'users': [], 'error': 'rate_limited'}), 429
+    q = _search_filter_sanitize((request.args.get('q') or '').strip().lower())
+    airline = _search_filter_sanitize((request.args.get('airline') or '').strip().lower())
+    homebase = _search_filter_sanitize((request.args.get('homebase') or '').strip().upper())
+    try:
+        limit = min(max(int(request.args.get('limit') or 20), 1), 50)
+    except (TypeError, ValueError):
+        # `?limit=abc` warf vorher ValueError → 500 statt einer Antwort.
+        limit = 20
     searcher_token = (request.args.get('token') or '').strip()
     # exclude_family=1 → Family-Accounts ausblenden (eine Family sucht ihre CREW,
     # nicht andere Familien). „Crew" = account_type None/'crew', nie 'family'.
@@ -14736,7 +14958,10 @@ def get_destination_leaderboard(iata, token):
     Privacy: nur opt-in-Crew (share_roster); Namen aus user_profiles, kein Token.
     """
     iata = (iata or '').upper().strip()[:3]
-    if not SB_AVAILABLE or len(iata) != 3:
+    # `isalpha()` zusätzlich zur Länge: `iata` wird unten in einen PostgREST-
+    # `or_()`-Ausdruck interpoliert, und ein Wert wie „A,B" ist auch 3 Zeichen
+    # lang — er hätte dort eine eigene Bedingung angehängt.
+    if not SB_AVAILABLE or len(iata) != 3 or not iata.isalpha():
         return jsonify({'ok': False, 'iata': iata, 'ranking': [],
                         'my_rank': None, 'my_count': 0, 'total_crew': 0})
     from collections import defaultdict
@@ -14756,12 +14981,26 @@ def get_destination_leaderboard(iata, token):
         # NUR die Hinflug-Ankunft (letztes Leg eines Routings == iata), nie
         # Return-Legs oder Layover-Fortsetzungstage (ical_klass == 'hotel_layover').
         pat = f'%{iata}%'
-        r = (sb.table('user_ical_briefings')
-             .select('token,datum,ical_summary,ical_location,ical_klass')
-             .or_(f'ical_location.ilike.{pat},ical_summary.ilike.{pat}')
-             .limit(20000).execute())
+        # PAGINIERT (Full-Review 2026-08-01): `.limit(20000)` war wirkungslos —
+        # PostgREST kappt still bei seiner max-rows-Grenze (1000). Das Ranking
+        # lief damit über eine willkürliche, ungeordnete Teilmenge: an einem
+        # gut besuchten Flughafen entschied nicht, wer am häufigsten dort war,
+        # sondern welche 1000 Zeilen die DB zufällig zuerst lieferte. Gleiches
+        # range()-Muster wie _contacts_match_auth_rows.
+        rows = []
+        offset, page = 0, 1000
+        while offset < 20000:
+            rp = (sb.table('user_ical_briefings')
+                  .select('token,datum,ical_summary,ical_location,ical_klass')
+                  .or_(f'ical_location.ilike.{pat},ical_summary.ilike.{pat}')
+                  .range(offset, offset + page - 1).execute())
+            chunk = rp.data or []
+            rows.extend(chunk)
+            if len(chunk) < page:
+                break
+            offset += page
         seen = set()
-        for row in (r.data or []):
+        for row in rows:
             tk = row.get('token'); dt = row.get('datum')
             if not tk or not dt:
                 continue
@@ -25607,6 +25846,28 @@ def _wall_img_legacy_dir(key):
     return _WALL_IMG_KEY_DIRS.get(key)
 
 
+def _own_image_url_only(u):
+    """Lässt nur backend-eigene Bild-Pfade als `image_url` durch.
+
+    SECURITY (Full-Review 2026-08-01): `image_url` wurde als beliebiger String
+    übernommen und in JEDEM Client gerendert. Damit konnte ein Poster eine
+    fremde URL einschleusen und bekam von jedem Betrachter still einen Treffer
+    (IP, Zeitpunkt, grober Standort) — ein Tracking-Beacon in der Crew-Wand.
+
+    Legitime Werte sind IMMER relativ: `upload_wall_image` antwortet mit
+    `/api/wall/image/<key>/<datei>`, und iOS/Android schicken exakt diesen
+    Rückgabewert weiter. Alles mit Schema oder Host (`http://`, `//host/…`)
+    wird verworfen — der Post bleibt bestehen, nur ohne Fremdbild."""
+    if not u:
+        return None
+    s = str(u).strip()
+    if not s.startswith('/') or s.startswith('//'):
+        return None
+    if '://' in s or '\n' in s or '\r' in s:
+        return None
+    return s
+
+
 def _wall_img_sanitize_urls(text):
     """Ersetzt Legacy-Token-Segmente in Wall-Image-URLs durch den opaken Key.
     Arbeitet auf beliebigen Strings (image_url-Felder UND Chat-Texte mit
@@ -26009,7 +26270,7 @@ def create_wall_post(token):
                         'message': 'Zu viele Posts in kurzer Zeit. Bitte später erneut.'}), 429
     body = request.get_json(silent=True) or {}
     raw_text = (body.get('text') or '').strip()
-    image_url = (body.get('image_url') or '').strip() or None
+    image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     layover = (body.get('layover_iata') or '').strip().upper() or None
     if not raw_text and not image_url:
         return jsonify({'ok': False, 'error': 'empty_post'}), 400
@@ -26330,7 +26591,7 @@ def toggle_dislike(token, post_id):
 def add_comment(token, post_id):
     body = request.get_json(silent=True) or {}
     text = (body.get('text') or '').strip()
-    image_url = (body.get('image_url') or '').strip() or None
+    image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     parent_comment_id = (body.get('parent_comment_id') or '').strip() or None
     if not text and not image_url:
         return jsonify({'ok': False, 'error': 'empty_comment'}), 400
@@ -27377,7 +27638,7 @@ def forum_create_thread(token):
     category = (body.get('category_id') or '').strip().lower()
     raw_title = (body.get('title') or '').strip()
     raw_text = (body.get('body') or '').strip()
-    image_url = (body.get('image_url') or '').strip() or None
+    image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     gif_url = (body.get('gif_url') or '').strip() or None
     explicit_tags = body.get('hashtags') or []
     # Sichtbarkeits-Scope (User-Feature): 'all' = alle Airlines sehen den Thread,
@@ -27634,7 +27895,7 @@ def forum_create_reply(token, thread_id):
         return jsonify({'ok': False, 'error': 'rate_limited'}), 429
     body = request.get_json(silent=True) or {}
     raw_text = (body.get('body') or '').strip()
-    image_url = (body.get('image_url') or '').strip() or None
+    image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     gif_url = (body.get('gif_url') or '').strip() or None
     parent_reply_id = (body.get('parent_reply_id') or '').strip() or None
     mentioned_token = (body.get('mentioned_token') or '').strip() or None
@@ -28841,7 +29102,7 @@ def add_layover_rec(token):
     # Optionales Ort-Foto (Vertrag mit iOS 2026-07-10): NUR eigene Serve-Pfade
     # aus upload_layover_image akzeptieren — keine fremden/absoluten URLs
     # (gleiche Schutz-Idee wie _wall_img_sanitize_urls). Ungültig → still None.
-    image_url = (body.get('image_url') or '').strip() or None
+    image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     if image_url and not re.match(
             r'^/api/layover-recs/image/[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_.-]{1,80}$',
             image_url):
@@ -29275,7 +29536,7 @@ def layover_rec_add_comment(token, rec_id):
     """Body: {body, image_url?, parent_comment_id?}"""
     body = request.get_json(silent=True) or {}
     text = (body.get('body') or '').strip()
-    image_url = (body.get('image_url') or '').strip() or None
+    image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     parent_comment_id = (body.get('parent_comment_id') or '').strip() or None
     if not text and not image_url:
         return jsonify({'ok': False, 'error': 'empty'}), 400
@@ -30526,7 +30787,12 @@ def flight_times(flightno):
     from blueprints.aerox_data_blueprint import _paid_budget_ok, _paid_budget_inc
     key = os.environ.get('AERODATABOX_KEY', '')
     fn = (flightno or '').strip().upper().replace(' ', '')
-    date = request.args.get('date') or datetime.utcnow().strftime('%Y-%m-%d')
+    # Default-Datum in der Heimatzone, nicht UTC (Full-Review 2026-08-01):
+    # Zwischen 00:00 und 02:00 Berliner Zeit ist der UTC-Tag noch der gestrige.
+    # Ein Client, der ohne `date` nach seinem gerade laufenden Nachtflug fragt,
+    # bekam dann die Zeiten der VORTAGS-Instanz derselben Flugnummer — also
+    # plausible, aber falsche Ab-/Ankunftszeiten.
+    date = request.args.get('date') or _berlin_today_iso()
     require_board = (request.args.get('require_board') or '').lower() in (
         '1', 'true', 'yes')
     ckey = f"{fn}|{date}|board:{int(require_board)}"
@@ -32886,7 +33152,10 @@ def _auth_upsert_user(email, rec):
 # In-process TTL-Cache (60s) damit _validate_token_exists nicht jeden
 # Auth-Check zu einem voll-SB-Read macht. _auth_load selbst liest 1000er-
 # Batches aus Supabase — bei 100 RPS würden wir SB unnötig belasten.
-_TOKEN_VALIDATE_CACHE = {'tokens': None, 'expires': 0.0}
+_TOKEN_VALIDATE_CACHE = {'tokens': None, 'expires': 0.0, 'last_force': 0.0}
+# Mindestabstand zwischen zwei ERFOLGREICHEN Force-Refreshes der Token-Map
+# (jeder lädt auth_users komplett). Siehe _validate_token.
+_TOKEN_FORCE_REFRESH_MIN_S = 5.0
 _TOKEN_VALIDATE_CACHE_TTL = 60.0
 
 
@@ -32954,11 +33223,28 @@ def _validate_token(token):
     if hit is None and not cache_stale:
         # Token nicht im Cache, aber Cache ist nicht stale. Möglich: neuer
         # Signup seit letztem Refresh. Einmal force-refresh, dann erneut checken.
+        #
+        # DROSSEL (Full-Review 2026-08-01): Dieser Force-Refresh lädt über
+        # _auth_load() die KOMPLETTE auth_users-Tabelle — und er lief pro
+        # Request mit unbekanntem Token. Ein Angreifer (oder ein Client mit
+        # abgelaufenem Token in einer Retry-Schleife) konnte damit von außen
+        # beliebig viele Volltabellen-Ladungen auslösen, unauthentifiziert und
+        # ungedrosselt. Der Refresh ist nur der Sicherheitsnetz-Pfad für einen
+        # frischen Signup in einem ANDEREN Worker; der Normalfall läuft über
+        # _invalidate_token_cache(). Ein Nachladen alle paar Sekunden reicht
+        # dafür völlig — der Client wiederholt ohnehin.
+        _last_force = _TOKEN_VALIDATE_CACHE.get('last_force') or 0.0
+        if (now - _last_force) < _TOKEN_FORCE_REFRESH_MIN_S:
+            return _TokenValidationResult(_TokenValidationState.INVALID)
         fresh = _refresh_token_cache(now, force=True)
         if fresh is None:
             # Das Token könnte ein frischer Signup sein: 503 statt 401 verhindert
             # Client-Logout, ohne einen Angreifer als authentifiziert zu behandeln.
+            # Bewusst OHNE last_force-Stempel: ein fehlgeschlagener Refresh darf
+            # den nächsten Versuch nicht blockieren, sonst würden während einer
+            # Supabase-Störung echte User als INVALID abgewiesen (= Logout).
             return _TokenValidationResult(_TokenValidationState.UNAVAILABLE)
+        _TOKEN_VALIDATE_CACHE['last_force'] = now
         hit = fresh.get(token)
     if hit is not None:
         return _TokenValidationResult(_TokenValidationState.VALID, hit)
@@ -50767,22 +51053,39 @@ def progress_stream():
         ]
         import time, json as _j
 
-        # Phase 1: Hauptsteps (12s Abstand → ~2:24 Min)
-        for pct, text in steps:
-            yield f"data: {_j.dumps({'pct': pct, 'text': text})}\n\n"
-            time.sleep(12)
+        # PLATZ-DECKEL (Full-Review 2026-08-01): Dieser Stream ist reine
+        # Fortschritts-Kosmetik (feste sleeps, kein echter Job-Zustand), hält
+        # aber pro Verbindung ~7,5 Minuten einen gunicorn-Thread — bei 3 Workern
+        # à 8 Threads sind das 24 insgesamt, die sich :8080 mit der ganzen
+        # AeroX-API und /api/health teilen. Unauthentifiziert: 24 offene
+        # curl-Verbindungen legten damit das komplette Backend lahm (und wegen
+        # _REQ_LOG_SKIP ohne eine Zeile im Log — genau die Startsturm-Falle).
+        # Über dem Deckel bekommt der Client sofort einen einzelnen
+        # Fortschritts-Tick und der Thread ist wieder frei; die eigentliche
+        # Berechnung läuft in einem ANDEREN Request und bleibt unberührt.
+        if not _progress_slot_acquire():
+            yield f"data: {_j.dumps({'pct': 5, 'text': 'Auswertung läuft…'})}\n\n"
+            return
+        try:
+            # Phase 1: Hauptsteps (12s Abstand → ~2:24 Min)
+            for pct, text in steps:
+                yield f"data: {_j.dumps({'pct': pct, 'text': text})}\n\n"
+                time.sleep(12)
 
-        # Phase 2: Heartbeat (alle 10s, langsam steigend bis 95%)
-        # Maximum 30 Heartbeats → 5 Min zusätzlich → Gesamt ~7:30 Min
-        pct = 72
-        for i in range(30):
-            msg = wait_msgs[i % len(wait_msgs)]
-            yield f"data: {_j.dumps({'pct': pct, 'text': msg})}\n\n"
-            time.sleep(10)
-            if pct < 95:
-                pct += 1
+            # Phase 2: Heartbeat (alle 10s, langsam steigend bis 95%)
+            # Maximum 30 Heartbeats → 5 Min zusätzlich → Gesamt ~7:30 Min
+            pct = 72
+            for i in range(30):
+                msg = wait_msgs[i % len(wait_msgs)]
+                yield f"data: {_j.dumps({'pct': pct, 'text': msg})}\n\n"
+                time.sleep(10)
+                if pct < 95:
+                    pct += 1
 
-        yield f"data: {_j.dumps({'pct': 100, 'text': 'Fertig!'})}\n\n"
+            yield f"data: {_j.dumps({'pct': 100, 'text': 'Fertig!'})}\n\n"
+        finally:
+            # Auch bei Client-Abbruch (GeneratorExit) den Platz freigeben.
+            _progress_slot_release()
     return app.response_class(generate(), mimetype='text/event-stream',
         headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
 

@@ -361,9 +361,13 @@ def budget_flush():
         _budget_buf.clear()
     done = 0
     try:
-        from blueprints.aerox_data_blueprint import _budget_key_inc
+        from blueprints.aerox_data_blueprint import _budget_key_inc_ex
         for k, u in list(pending.items()):
-            total = _budget_key_inc(k, u)
+            total, _written = _budget_key_inc_ex(k, u)
+            if not _written:
+                # Schreibfehler: Einheiten NICHT als erledigt verbuchen — sie
+                # bleiben in `pending` und wandern unten zurück in den Puffer.
+                continue
             # Der bare Stunden-Key (ohne :<caller>) ist die gemeinsame Wahrheit
             # für den prozess-übergreifenden Gate — der RPC liefert hier den
             # Stand ALLER Prozesse zurück, sonst weiß niemand voneinander.

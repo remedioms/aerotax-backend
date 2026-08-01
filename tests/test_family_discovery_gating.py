@@ -61,21 +61,64 @@ def _write_disk_profiles(tmpdir, profiles):
             json.dump(p, f)
 
 
+_VALID = A._TokenValidationResult(A._TokenValidationState.VALID, 'searcher@aerox.test')
+_AUTH = {'Authorization': 'Bearer AT-SEARCHER'}
+
+
 def _search(tmpdir, query, extra_qs=''):
     with patch.object(A, 'SB_AVAILABLE', False), \
          patch.object(A, '_USER_HISTORY_DIR', tmpdir), \
+         patch.object(A, '_validate_token', return_value=_VALID), \
          patch.object(A, '_blocked_by', return_value=set()):
         client = A.app.test_client()
-        return client.get(f'/api/user/search?q={query}&token=AT-SEARCHER{extra_qs}')
+        return client.get(f'/api/user/search?q={query}&token=AT-SEARCHER{extra_qs}',
+                          headers=_AUTH)
 
 
 def _search_raw(tmpdir, qs):
     """Suche mit beliebigem Query-String (kein q= vorausgesetzt)."""
     with patch.object(A, 'SB_AVAILABLE', False), \
          patch.object(A, '_USER_HISTORY_DIR', tmpdir), \
+         patch.object(A, '_validate_token', return_value=_VALID), \
          patch.object(A, '_blocked_by', return_value=set()):
         client = A.app.test_client()
-        return client.get(f'/api/user/search?token=AT-SEARCHER&{qs}')
+        return client.get(f'/api/user/search?token=AT-SEARCHER&{qs}',
+                          headers=_AUTH)
+
+
+# ── Crew-Suche verlangt Authentifizierung (Full-Review 2026-08-01) ───────────
+
+def test_search_without_bearer_is_rejected():
+    """Die Suche gibt pro Treffer das rohe `token` heraus — und ein Token IST
+    in diesem Backend das Bearer-Credential. Unauthentifiziert war sie damit
+    ein Selbstbedienungsladen für fremde Zugangsdaten."""
+    r = A.app.test_client().get('/api/user/search?q=an')
+    assert r.status_code == 401
+    assert r.get_json()['error'] == 'auth_required'
+    assert r.get_json()['users'] == []
+
+
+def test_search_with_unknown_bearer_is_rejected():
+    invalid = A._TokenValidationResult(A._TokenValidationState.INVALID)
+    with patch.object(A, '_validate_token', return_value=invalid):
+        r = A.app.test_client().get('/api/user/search?q=an',
+                                    headers={'Authorization': 'Bearer AT-NOPE'})
+    assert r.status_code == 401
+    assert r.get_json()['error'] == 'unauthorized'
+
+
+def test_search_filter_sanitize_blocks_postgrest_breakout():
+    """`q` wird roh in einen PostgREST-`or_()`-Ausdruck interpoliert. Ein Komma
+    hängt dort eine EIGENE Bedingung an — `q=x,name.not.is.null` hätte die
+    ganze User-Tabelle samt aller Auth-Tokens geliefert. Ebenso muss `%`/`*`
+    raus, sonst wird jede Suche zum Full-Listing."""
+    assert A._search_filter_sanitize('x,name.not.is.null') == 'xname.not.is.null'
+    assert A._search_filter_sanitize('a)b(c') == 'abc'
+    assert A._search_filter_sanitize('%') == ''
+    assert A._search_filter_sanitize('a*b') == 'ab'
+    # Echte Namen bleiben unangetastet.
+    assert A._search_filter_sanitize('müller-lüdenscheidt') == 'müller-lüdenscheidt'
+    assert A._search_filter_sanitize("o'brien") == "o'brien"
 
 
 def test_search_family_gets_role_marker(tmp_path):

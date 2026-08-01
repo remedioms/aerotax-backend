@@ -54,6 +54,12 @@ _MEMO_GLOBALS = {
     '_FREE_TIMES_MEMO': None,
     '_FREE_CREW_LIVE_MEMO': None,
     '_OBS_FACTS_MEMO': None,
+    # Sperrfrist nach fehlgeschlagenem Daily-Briefing (blueprints/daily_briefing).
+    # In Produktion gewollt: ein Fehlschlag drosselt Retries für 120 s, damit
+    # Client-Wiederholungen nicht die volle LH-Call-Kette erneut bezahlen. Im
+    # Test würde derselbe (Token, Tag) aus einem vorigen Test die folgenden
+    # Tests in die Sperrfrist laufen lassen.
+    '_fail_memo': None,
 }
 
 

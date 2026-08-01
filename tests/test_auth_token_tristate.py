@@ -67,12 +67,24 @@ def test_cross_user_exemptions_are_exact_method_and_route_rules():
     profile = f'/api/user/profile/{TOKEN}'
     friends = f'/api/user/friends/{TOKEN}'
     assert A._bug004_is_cross_user_route('GET', profile) is True
-    assert A._bug004_is_cross_user_route('HEAD', friends) is True
     assert A._bug004_is_cross_user_route('PUT', profile) is False
     assert A._bug004_is_cross_user_route('POST', friends + '/add') is False
     assert A._bug004_is_cross_user_route('POST', friends + '/remove') is False
     assert A._bug004_is_cross_user_route('GET', friends + '/overlap') is False
     assert A._bug004_is_cross_user_route('GET', '/api/layover-recs/' + TOKEN) is False
+
+
+def test_friends_list_is_owner_scoped_not_public():
+    """Die Freundesliste darf KEINE Cross-User-Ausnahme mehr sein.
+
+    Sie liefert pro Freund das rohe `token`, und ein Token ist in diesem
+    Backend das Bearer-Credential. Als Public-Read war sie der Einstieg in
+    einen Durchlauf des gesamten Social-Graphen: eine bekannte Token-Liste
+    führt zur nächsten. Owner-scoped heißt: nur mit passendem Bearer.
+    (Full-Review 2026-08-01)"""
+    friends = f'/api/user/friends/{TOKEN}'
+    assert A._bug004_is_cross_user_route('GET', friends) is False
+    assert A._bug004_is_cross_user_route('HEAD', friends) is False
 
 
 def test_token_binding_is_deny_by_default_with_explicit_emergency_opt_out():
