@@ -211,10 +211,16 @@ for i in $(seq 1 20); do
   c2=$(curl -s -o /dev/null -w "%{http_code}" -m5 http://127.0.0.1:8081/api/health)
   [ "$c2" = 200 ] || { R=FAIL_POLL; continue; }
   body=$(curl -s -m5 http://127.0.0.1:8080/api/health)
-  case "$body" in
-    *'"blueprints_failed": []'*|*'"blueprints_failed":[]'*) R=OK; break ;;
-    *) R=FAIL_BLUEPRINTS; break ;;
-  esac
+  # KEIN case-Muster hier: `[]` im Muster liest bash als Zeichenklasse und
+  # bricht mit einem Syntaxfehler ab — der riss beim ersten Einsatz (01.08.)
+  # unter `set -e` das ganze Skript nach dem Container-Neustart weg, also
+  # OHNE Rollback und OHNE die SHA-Buchhaltung.
+  if printf %s "$body" | grep -q "blueprints_failed[\"]*:[ ]*\[\]"; then
+    R=OK
+  else
+    R=FAIL_BLUEPRINTS
+  fi
+  break
 done
 echo $R')
 case "$OK" in
