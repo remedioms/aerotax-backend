@@ -38864,6 +38864,10 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                 rec['dep_delay_min'] = _ann_dep
                 if not rec.get('esti_dep'):
                     rec['esti_dep'] = _mat_dep
+                    # HOCHGERECHNET, NICHT GEMESSEN: diese Uhrzeit entsteht aus
+                    # `Plan + angesagte Minuten` (Tafel-TEXT), nicht aus einer
+                    # Beobachtung. Sie darf nie als Ist-Zeit auftreten.
+                    rec['esti_dep_announced'] = True
                 rec['delay_known'] = True
                 # best-delay/-side neu wählen: eine echte arr-Zahl behält Vorrang
                 # (arr-OTP ist die ehrlichere Metrik), sonst trägt jetzt die dep-Seite.
@@ -38879,6 +38883,7 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                 rec['arr_delay_min'] = _ann_arr
                 if not rec.get('esti_arr'):
                     rec['esti_arr'] = _mat_arr
+                    rec['esti_arr_announced'] = True   # s. dep-Seite
                 rec['delay_known'] = True
                 # arr gewinnt als beste Ein-Zahl (D15-OTP).
                 rec['delay_min'] = _ann_arr
@@ -39440,7 +39445,29 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 _is_past = _dt_date2.fromisoformat(leg_date) < _dt_date2.today()
         except Exception:
             _is_past = False
-        if _is_past and (m is None or not m.get('esti_arr')):
+        # SOLL-ANKUNFT VORBEI → die Messung MUSS geholt werden (Owner 01.08.2026
+        # „warum stimmen die Uhrzeiten weiterhin nicht"). Die Bedingung lautete
+        # `m is None or not m.get('esti_arr')`: trug die Tafel IRGENDEINE
+        # Ankunfts-Schätzung, wurde das persistierte Ist gar nicht erst
+        # ABGEFRAGT. Eine Tafel-Prognose wird nach der Landung aber nie
+        # korrigiert — sie blieb also für immer stehen.
+        # BELEG (LH1137 BCN-FRA, 01.08.): Tafel 10:15 (= 10:05 Plan + 10 min
+        # angesagt), tatsächlich gelandet 10:03. Angezeigt wurde 10:15, als
+        # „Ist" — eine Uhrzeit, die es nie gab.
+        # Kosten: ein zusätzlicher Lesezugriff auf dieselbe GRATIS-SB-Tabelle
+        # (lh_cached_only, memoisiert) je bereits gelandetem Leg; die
+        # `deadline`-Schranke dieser Funktion begrenzt das weiterhin.
+        _arr_vorbei = False
+        try:
+            _ai0 = s.get('arr_iso')
+            if _ai0:
+                _adt0 = datetime.fromisoformat(str(_ai0).replace('Z', '+00:00'))
+                if _adt0.tzinfo is None:
+                    _adt0 = _adt0.replace(tzinfo=timezone.utc)
+                _arr_vorbei = _adt0 <= now
+        except Exception:
+            _arr_vorbei = False
+        if _is_past and (m is None or not m.get('esti_arr') or _arr_vorbei):
             try:
                 from blueprints.aerox_data_blueprint import (
                     _flight_facts_from_obs as _facts_from_obs)
@@ -39548,16 +39575,34 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # nie einen vorhandenen m-Wert überschreiben. delay_known wird ehrlich
         # nachgezogen, wenn erst die Facts eine Delay-Zahl liefern.
         if _facts:
+            # GEMESSENE LANDUNG SCHLÄGT TAFEL-SCHÄTZUNG (Owner 01.08.2026:
+            # „warum stimmen die Uhrzeiten weiterhin nicht"). Für ein Leg, dessen
+            # Soll-Ankunft VORBEI ist, sind die persistenten Facts eine
+            # Messung — der Merge-Wert dagegen oft nur eine Tafel-Prognose, die
+            # nach der Landung nie korrigiert wird. Reines Lückenfüllen liess
+            # deshalb die Prognose gewinnen.
+            # BELEG (LH1137 BCN-FRA, 01.08.): dieselbe Antwort trug
+            # `info.esti_arr 10:15 / arr_delay +10` (Tafel) UND
+            # `resolve.est_arr 10:03 / arr_delay -2` (gemessen: 2 min ZU FRÜH).
+            # Angezeigt wurde 10:15 — als „Ist". Diese Uhrzeit hat es nie
+            # gegeben: 10:05 Plan + 10 min angesagte Verspätung. Genau ein
+            # synthetisierter Wert, der als Messung auftrat.
             if s.get('est_dep_iso') is None and _facts.get('est_dep'):
                 s['est_dep_iso'] = _facts.get('est_dep')
-            if s.get('est_arr_iso') is None and _facts.get('est_arr'):
+            if _facts.get('est_arr') and (s.get('est_arr_iso') is None or _arr_vorbei):
                 s['est_arr_iso'] = _facts.get('est_arr')
             if s.get('dep_delay_min') is None \
                     and _facts.get('dep_delay_min') is not None:
                 s['dep_delay_min'] = _facts.get('dep_delay_min')
-            if s.get('arr_delay_min') is None \
-                    and _facts.get('arr_delay_min') is not None:
+            if _facts.get('arr_delay_min') is not None \
+                    and (s.get('arr_delay_min') is None or _arr_vorbei):
                 s['arr_delay_min'] = _facts.get('arr_delay_min')
+                if _arr_vorbei:
+                    # Die Ein-Zahl-Verspätung folgt der Messung mit, sonst stünde
+                    # neben der korrigierten Zeit weiter die alte Prognose-Zahl.
+                    s['delay_known'] = True
+                    s['delay_min'] = _facts.get('arr_delay_min')
+                    s['delay_side'] = 'arr'
             if not known and s.get('delay_min') is None:
                 _fd = (s.get('arr_delay_min') if s.get('arr_delay_min') is not None
                        else s.get('dep_delay_min'))
@@ -39570,6 +39615,19 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                                            else 'dep')
             if _facts.get('cancelled') and not s.get('cancelled'):
                 s['cancelled'] = True
+        # KEINE HOCHRECHNUNG AUF EINEM GELANDETEN LEG (Owner 01.08.2026: „will
+        # keine Schätzungen. wir haben genug Informationsquellen").
+        # `esti_arr_announced` markiert eine Uhrzeit, die aus `Plan + angesagte
+        # Minuten` eines Tafel-TEXTES entstanden ist — eine Hochrechnung, keine
+        # Beobachtung. Ist die Soll-Ankunft vorbei und lieferte auch die
+        # persistente Messung nichts, bleibt lieber GAR KEINE Zeit stehen, als
+        # eine erfundene als „Ist" auszuweisen (Owner-Regel „lieber keine Zeile
+        # als ein synthetisierter Wert"). Die Verspätungs-ZAHL aus der Ansage
+        # bleibt erhalten — sie ist eine echte Meldung, nur eben keine Uhrzeit.
+        if (_arr_vorbei and m.get('esti_arr_announced')
+                and not (_facts or {}).get('est_arr')):
+            s['est_arr_iso'] = None
+            s['arr_time_announced_only'] = True
         # ── STATUS PLAUSIBILITÄTS-/PHYSIK-GATE (Owner/Fable 2026-07-13, LH454→SFO)
         # Bisher: der ROHE Board-Status floss ungegatet in dieses Feld und weiter
         # in Kalender-Leg-Anzeige, Feed-Bordkarte und flights_live[].status. Manche
