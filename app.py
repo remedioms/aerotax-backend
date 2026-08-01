@@ -20417,6 +20417,236 @@ def get_logbook(token):
     })
 
 
+def _lb_pdf_hhmm(minutes):
+    """Minuten → „hh:mm" fürs PDF. None/0-oder-negativ → leere Zelle
+    (FCL.050-Regel dieses Moduls: nichts erfinden, leere Zelle statt 0:00)."""
+    if not isinstance(minutes, (int, float)) or minutes <= 0:
+        return ''
+    m = int(minutes)
+    return f'{m // 60}:{m % 60:02d}'
+
+
+def _lb_pdf_utc_hhmm(iso):
+    """ISO-Zeit → „HH:MM" in UTC. FCL.050 verlangt UTC — eine NAIVE Zeit
+    (kein Offset, Rome-TZID-Klasse) ist nicht sicher konvertierbar und wird
+    ehrlich weggelassen statt als Wandzeit ausgegeben."""
+    if not iso or not isinstance(iso, str):
+        return ''
+    try:
+        dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+    except ValueError:
+        return ''
+    if dt.tzinfo is None:
+        return ''
+    from datetime import timezone as _tz
+    return dt.astimezone(_tz.utc).strftime('%H:%M')
+
+
+@app.route('/api/user/logbook/<token>/pdf', methods=['GET'])
+def get_logbook_pdf(token):
+    """**EASA-FCL.050-Flugbuch als PDF** (Owner-Freigabe 01.08., PLAN-Doc
+    „Flugbuch-Ausbau"). Quelle ist EXAKT `get_logbook` per internem
+    View-Reuse — keine zweite Merge-/Summen-Implementierung (Passport-Lehre
+    2026-07-28: die Zweit-Kopie verlor still den kompletten Import).
+
+    Query: `range=all|YYYY|YYYY-MM` (Default all), `fmt=easa` (einziges
+    Format; FAA folgt als eigene Spaltenvorlage auf derselben Datenbasis).
+
+    Ehrlichkeits-Regeln: fehlende Reg/Typ/Zeiten = LEERE Zelle; naive
+    Zeiten ohne Offset werden nicht als UTC ausgegeben; Sim-Sektion strikt
+    getrennt (zählt NIE in die Flug-Summen); Seitensummen Diese Seite /
+    Übertrag / Gesamt, Übertrag Seite 1 = `meta.carryover_min`
+    (Vor-Logbuch, Kevin-Muster) NUR in der Block-Spalte und als Fußnote
+    ausgewiesen."""
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
+    fmt = (request.args.get('fmt') or 'easa').strip().lower()
+    if fmt != 'easa':
+        return jsonify({'ok': False, 'error': 'fmt_unsupported',
+                        'hint': 'Aktuell nur fmt=easa (FCL.050).'}), 400
+    rng = (request.args.get('range') or 'all').strip()
+
+    with app.test_request_context():
+        resp = get_logbook(token)
+    payload = resp.get_json(silent=True) if hasattr(resp, 'get_json') else None
+    if not isinstance(payload, dict) or not payload.get('ok'):
+        return jsonify({'ok': False, 'error': 'logbook_unavailable'}), 502
+
+    def _in_range(datum):
+        if rng == 'all':
+            return True
+        return isinstance(datum, str) and datum.startswith(rng)
+
+    entries = [e for e in (payload.get('entries') or []) if _in_range(e.get('date'))]
+    entries.sort(key=lambda e: (e.get('date') or '', e.get('dep_iso') or ''))
+    sims = [s for s in (payload.get('sim_sessions') or []) if _in_range(s.get('date'))]
+    sims.sort(key=lambda s: s.get('date') or '')
+    # Der Vor-Logbuch-Übertrag gehört zur GESAMT-Historie; ein Teil-Range
+    # (einzelnes Jahr) trägt ihn nicht — sonst stünde 2019 mit 130:00 da.
+    carry = payload.get('carryover_min') or 0 if rng == 'all' else 0
+
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.pdfgen import canvas as _canvas
+
+    prof = {}
+    try:
+        prof = (_profile_load(token) or {}).get('profile') or {}
+    except Exception:
+        prof = {}
+    who = ' · '.join(x for x in (prof.get('name'), prof.get('airline'),
+                                 prof.get('homebase')) if x)
+
+    W, H = landscape(A4)
+    buf = BytesIO()
+    c = _canvas.Canvas(buf, pagesize=(W, H))
+    margin = 1.4 * cm
+    rows_per_page = 24
+
+    cols = [
+        ('DATUM', 62), ('VON', 46), ('AB (UTC)', 48), ('NACH', 46),
+        ('AN (UTC)', 48), ('MUSTER', 52), ('KENNZ.', 62), ('FLUG', 56),
+        ('BLOCK', 42), ('LDG T', 34), ('LDG N', 34), ('NACHT', 42),
+        ('FKT', 34), ('PIC', 110), ('BEMERKUNGEN', 0),
+    ]
+    total_w = W - 2 * margin
+    fixed = sum(w for _, w in cols if w)
+    cols = [(t, w if w else max(60, total_w - fixed)) for t, w in cols]
+
+    def _row_values(e):
+        ldg_t = e.get('ldg_day')
+        ldg_n = e.get('ldg_night')
+        rem = (e.get('remarks') or '').strip()
+        if e.get('pf'):
+            rem = ('PF' + (' · ' if rem else '') + rem)
+        return [
+            e.get('date') or '', e.get('from') or '',
+            _lb_pdf_utc_hhmm(e.get('dep_iso')), e.get('to') or '',
+            _lb_pdf_utc_hhmm(e.get('arr_iso')),
+            (e.get('type') or ''), (e.get('reg') or ''),
+            (e.get('flight') or ''), _lb_pdf_hhmm(e.get('block_min')),
+            str(ldg_t) if isinstance(ldg_t, int) and ldg_t > 0 else '',
+            str(ldg_n) if isinstance(ldg_n, int) and ldg_n > 0 else '',
+            _lb_pdf_hhmm(e.get('night_min')),
+            (e.get('role') or ''), (e.get('pic_name') or ''), rem,
+        ]
+
+    pages = [entries[i:i + rows_per_page]
+             for i in range(0, len(entries), rows_per_page)] or [[]]
+    n_pages = len(pages)
+
+    def _sums(chunk):
+        return (sum(e.get('block_min') or 0 for e in chunk),
+                sum(e.get('ldg_day') or 0 for e in chunk),
+                sum(e.get('ldg_night') or 0 for e in chunk),
+                sum(e.get('night_min') or 0 for e in chunk))
+
+    def _draw_header(page_no):
+        c.setFont('Helvetica-Bold', 11)
+        c.drawString(margin, H - margin, 'Flugbuch (EASA FCL.050)')
+        c.setFont('Helvetica', 8)
+        if who:
+            c.drawString(margin + 150, H - margin, who)
+        label = 'Gesamt' if rng == 'all' else rng
+        c.drawRightString(W - margin, H - margin,
+                          f'Zeitraum: {label} · erstellt '
+                          f'{datetime.utcnow().strftime("%Y-%m-%d")} (UTC) · '
+                          f'Seite {page_no}/{n_pages}')
+        y = H - margin - 18
+        c.setFont('Helvetica-Bold', 7)
+        x = margin
+        for title, w in cols:
+            c.drawString(x + 1, y, title)
+            x += w
+        c.setLineWidth(0.5)
+        c.line(margin, y - 3, W - margin, y - 3)
+        return y - 14
+
+    def _draw_sum_line(y, label, s, bold=False):
+        c.setFont('Helvetica-Bold' if bold else 'Helvetica', 7.5)
+        x = margin
+        vals = {'BLOCK': _lb_pdf_hhmm(s[0]) or '0:00',
+                'LDG T': str(s[1]), 'LDG N': str(s[2]),
+                'NACHT': _lb_pdf_hhmm(s[3]) or ''}
+        c.drawString(x + 1, y, label)
+        for title, w in cols:
+            if title in vals:
+                c.drawString(x + 1, y, vals[title])
+            x += w
+        return y - 11
+
+    running = (carry, 0, 0, 0)
+    for pi, chunk in enumerate(pages):
+        y = _draw_header(pi + 1)
+        c.setFont('Helvetica', 7)
+        if not chunk:
+            c.drawString(margin, y, 'Keine Flüge im gewählten Zeitraum.')
+            y -= 12
+        for e in chunk:
+            x = margin
+            for (title, w), val in zip(cols, _row_values(e)):
+                v = str(val)
+                # grob auf Spaltenbreite kappen (Helvetica ~4.2pt/Zeichen @7pt)
+                max_chars = max(3, int(w / 4.2))
+                if len(v) > max_chars:
+                    v = v[:max_chars - 1] + '…'
+                c.drawString(x + 1, y, v)
+                x += w
+            y -= 10.5
+        page_s = _sums(chunk)
+        c.line(margin, y + 6, W - margin, y + 6)
+        y -= 2
+        y = _draw_sum_line(y, 'Diese Seite', page_s)
+        y = _draw_sum_line(y, 'Übertrag', running)
+        running = tuple(a + b for a, b in zip(running, page_s))
+        y = _draw_sum_line(y, 'Gesamt', running, bold=True)
+        if pi == 0 and carry:
+            c.setFont('Helvetica-Oblique', 6.5)
+            c.drawString(margin, y - 2,
+                         f'Übertrag enthält {_lb_pdf_hhmm(carry)} Blockzeit '
+                         f'aus dem Vor-Logbuch (Total from previous pages); '
+                         f'Landungen des Vor-Logbuchs sind nicht erfasst.')
+        if pi < n_pages - 1 or sims:
+            c.showPage()
+
+    # ── FSTD-Sektion (strikt getrennt, FCL.050) ─────────────────────────────
+    if sims:
+        y = H - margin
+        c.setFont('Helvetica-Bold', 11)
+        c.drawString(margin, y, 'FSTD-Sessions (Simulator) — getrennt von der Flugzeit')
+        y -= 18
+        c.setFont('Helvetica-Bold', 7)
+        for title, xoff in (('DATUM', 0), ('GERÄT/CODE', 70), ('ORT', 200),
+                            ('ROLLE', 250), ('INSTRUCTOR', 300), ('DAUER', 430)):
+            c.drawString(margin + xoff, y, title)
+        y -= 12
+        c.setFont('Helvetica', 7)
+        sim_total = 0
+        for s_ in sims:
+            if y < margin + 30:
+                c.showPage()
+                y = H - margin
+                c.setFont('Helvetica', 7)
+            c.drawString(margin, y, s_.get('date') or '')
+            c.drawString(margin + 70, y, (s_.get('code') or '')[:28])
+            c.drawString(margin + 200, y, (s_.get('place') or '')[:10])
+            c.drawString(margin + 250, y, (s_.get('role') or '')[:10])
+            c.drawString(margin + 300, y, (s_.get('instructor') or '')[:28])
+            c.drawString(margin + 430, y, _lb_pdf_hhmm(s_.get('duration_min')))
+            sim_total += s_.get('duration_min') or 0
+            y -= 10.5
+        c.setFont('Helvetica-Bold', 7.5)
+        c.drawString(margin, y - 2, f'FSTD gesamt: {_lb_pdf_hhmm(sim_total) or "0:00"}')
+
+    c.save()
+    pdf = buf.getvalue()
+    fname = 'flugbuch-easa' + ('' if rng == 'all' else f'-{rng}') + '.pdf'
+    resp = make_response(pdf)
+    resp.mimetype = 'application/pdf'
+    resp.headers['Content-Disposition'] = f'attachment; filename="{fname}"'
+    return resp
+
+
 @app.route('/api/user/logbook/<token>/leg', methods=['POST'])
 def save_logbook_leg(token):
     """Manuelles Overlay EINES Legs speichern (Landungen Tag/Nacht, Starts,
