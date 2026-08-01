@@ -39505,6 +39505,14 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
         return facts
 
 
+# Wie viele Minuten VOR der behaupteten Ankunft darf eine Beobachtung
+# geschrieben worden sein und trotzdem als Messung gelten? Uhren zwischen
+# Scraper-Host und Flughafen-Tafel laufen nicht sekundengleich, und manche
+# Boards stempeln die Zeile beim On-Block statt beim Touchdown. 3 Minuten
+# Toleranz decken das; die Prognose-Fälle liegen deutlich darüber (LH1137:
+# 12 min).
+_ARR_OBS_SETTLE_MIN = 3
+
 _ARR_STATUS_TERMINAL = ('gelandet', 'landed', 'arrived', 'angekommen',
                         'at gate', 'on blocks', 'on-blocks',
                         'gepäck', 'gepaeck', 'baggage',
@@ -39867,8 +39875,30 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # stand). Prüft man nur auf Vorhandensein, fragt die Kaskade nie weiter
         # und die Prognose bleibt für immer stehen. Terminaler Ankunfts-Status
         # = Messung; alles andere ist eine Vorhersage und wird eskaliert.
-        _freie_messung = bool((_facts or {}).get('est_arr')) and _arr_status_terminal(
-            (_facts or {}).get('arr_status'))
+        # ZWEITE HUERDE — der Status allein reicht nicht. Für LH1137 meldete der
+        # Scraper „gelandet" UND die alte Prognose 10:15, während die Maschine
+        # um 10:03 stand: er behauptet eine Messung und liefert eine Rechnung.
+        #
+        # Die Heuristik „Ist == Plan + Verspätung ⇒ gerechnet" trägt NICHT —
+        # Boards leiten ihre Verspätung AUS der Ist-Zeit ab, die Gleichung gilt
+        # also auch bei jeder echten Messung (geprüft an LH1454).
+        #
+        # Was trägt, ist Physik: EINE LANDUNG KANN NICHT VOR DER LANDUNG
+        # AUFGEZEICHNET WORDEN SEIN. Wurde die Ankunfts-Beobachtung zuletzt
+        # geschrieben, BEVOR die behauptete Ankunftszeit erreicht war, ist der
+        # Wert eine Vorhersage — dann (und nur dann) wird eskaliert. Ein echt
+        # gemessenes Leg kostet weiterhin nichts.
+        # `arr_obs_at` fehlt bei Altbeständen → dann wie bisher dem Status
+        # glauben (fail-open, keine Kostenlawine für historische Zeilen).
+        _mess_zeitstempel_ok = True
+        _obs_at = (_facts or {}).get('arr_obs_at')
+        if _obs_at and (_facts or {}).get('est_arr'):
+            _delta = _minutes_between((_facts or {}).get('est_arr'), _obs_at)
+            if _delta is not None:
+                _mess_zeitstempel_ok = _delta >= -_ARR_OBS_SETTLE_MIN
+        _freie_messung = (bool((_facts or {}).get('est_arr'))
+                          and _arr_status_terminal((_facts or {}).get('arr_status'))
+                          and _mess_zeitstempel_ok)
         if _arr_vorbei and not _freie_messung:
             # Stufe 3 — FR24 (bezahlt). `flight-summary` trägt die ECHTE
             # Landezeit (`datetime_landed`, hier als `sched_arr`). Der Call ist

@@ -304,3 +304,77 @@ def test_ohne_jede_messung_bleibt_die_zeit_als_erwartet_markiert(monkeypatch):
                           lh_arr=None, fr24_arr=None)
     assert sec['est_arr_iso'] == '2026-08-01T10:15:00+02:00'
     assert sec['arr_measured'] is False, 'Vorhersage darf nie "Ist" heissen.'
+
+
+# ── Physik-Huerde: eine Landung kann nicht VOR der Landung notiert werden ────
+# Owner-Entscheidung 01.08.2026 ("ja den Mittelweg"): nur bezahlen, wenn der
+# freie Wert VERDAECHTIG ist. Die naheliegende Regel "Ist == Plan + Verspaetung
+# ⇒ gerechnet" traegt NICHT — Boards leiten ihre Verspaetung AUS der Ist-Zeit
+# ab, die Gleichung gilt also auch bei echten Messungen (LH1454: 13:20 + 0 ==
+# 13:20). Sie haette bei fast jedem gelandeten Leg gefeuert. Der Zeitstempel
+# der Beobachtung traegt.
+
+def _run_zeitstempel(monkeypatch, *, est_arr, obs_at, fr24_arr):
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+    arr_iso = base - timedelta(hours=3)
+    sec = {'flight': 'LH1137', 'from': 'BCN', 'to': 'FRA',
+           'dep_iso': _iso(arr_iso - timedelta(hours=2)), 'arr_iso': _iso(arr_iso)}
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: {
+        'delay_known': True, 'delay_min': 10, 'delay_side': 'arr',
+        'dep_delay_min': 0, 'arr_delay_min': 10, 'status': 'Gelandet',
+        'cancelled': False, 'esti_dep': None, 'esti_arr': None,
+        'reg': 'DAIRM', 'sides': {'dep': 'obs', 'arr': 'obs'},
+        'sched_dep': None, 'sched_arr': '2026-08-01T10:05:00+02:00'})
+    monkeypatch.setattr(A, '_board_local_to_utc_iso', lambda v, station=None: v)
+    monkeypatch.setattr(A, '_gate_facts_arr_against_leg', lambda f, _a: f)
+    ruf = {'fr24': 0}
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {
+        'est_arr': est_arr, 'arr_status': 'Gelandet',
+        'arr_delay_min': 10, 'arr_obs_at': obs_at})
+
+    def _f24(fn, d=None):
+        ruf['fr24'] += 1
+        return {'sched_arr': fr24_arr, 'dep_iata': 'BCN', 'arr_iata': 'FRA'}
+    monkeypatch.setattr(ADB, '_fr24_flight_by_number', _f24)
+    A._enrich_leg_delays([sec], arr_iso.strftime('%Y-%m-%d'), free_only=False)
+    return sec, ruf
+
+
+def test_beobachtung_vor_der_behaupteten_ankunft_ist_verdaechtig(monkeypatch):
+    """Der Fall LH1137: Status "Gelandet", Zeit 10:15 — aber die Zeile wurde
+    schon um 10:05 geschrieben. Um 10:05 kann niemand eine Landung um 10:15
+    gesehen haben. Also Prognose → eskalieren."""
+    sec, ruf = _run_zeitstempel(monkeypatch,
+                                est_arr='2026-08-01T10:15:00+02:00',
+                                obs_at='2026-08-01T10:05:00+02:00',
+                                fr24_arr='2026-08-01T10:03:00+02:00')
+    assert ruf['fr24'] == 1, 'verdaechtiger Wert MUSS die bezahlte Stufe ausloesen'
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
+
+
+def test_beobachtung_nach_der_landung_kostet_nichts(monkeypatch):
+    """Echte Messung: die Zeile entstand NACH der Ankunft → nichts bezahlen."""
+    sec, ruf = _run_zeitstempel(monkeypatch,
+                                est_arr='2026-08-01T10:03:00+02:00',
+                                obs_at='2026-08-01T10:06:00+02:00',
+                                fr24_arr='2026-08-01T09:00:00+02:00')
+    assert ruf['fr24'] == 0, 'gemessenes Leg darf keinen Cent kosten'
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
+
+
+def test_kleine_uhrdifferenz_gilt_noch_als_messung(monkeypatch):
+    """Zwei Minuten Vorlauf sind Uhren-Ungenauigkeit, keine Prognose."""
+    _, ruf = _run_zeitstempel(monkeypatch,
+                              est_arr='2026-08-01T10:03:00+02:00',
+                              obs_at='2026-08-01T10:01:00+02:00',
+                              fr24_arr='2026-08-01T09:00:00+02:00')
+    assert ruf['fr24'] == 0
+
+
+def test_ohne_zeitstempel_wird_dem_status_geglaubt(monkeypatch):
+    """Altbestand ohne `arr_obs_at` → fail-open, keine Kostenlawine."""
+    _, ruf = _run_zeitstempel(monkeypatch,
+                              est_arr='2026-08-01T10:15:00+02:00',
+                              obs_at=None,
+                              fr24_arr='2026-08-01T10:03:00+02:00')
+    assert ruf['fr24'] == 0

@@ -3813,6 +3813,11 @@ def _obs_rows_to_facts(dep_row, arr_row):
                 facts[out_k] = v
         if arr_row.get('max_delay_min') is not None:
             facts['arr_delay_min'] = arr_row.get('max_delay_min')
+        # WANN wurde diese Ankunfts-Beobachtung zuletzt geschrieben? Der Wert
+        # entscheidet, ob `est_arr` eine Messung sein KANN (siehe Select oben).
+        _ua = _s(arr_row.get('updated_at'))
+        if _ua is not None:
+            facts['arr_obs_at'] = _ua
         if arr_row.get('cancelled'):
             facts['cancelled'] = True
         # Route auch aus der ARR-Row ableitbar (falls keine DEP-Row): airport=Ziel+#ARR,
@@ -4558,7 +4563,16 @@ def _flight_facts_from_obs_uncached(flight_no, date, dep_iata=None, arr_iata=Non
             try:
                 q = (sb.table('airport_delay_obs')
                      .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
-                             'status,max_delay_min,cancelled,reg,type_code,date')
+                             'status,max_delay_min,cancelled,reg,type_code,date,'
+                             # `updated_at` wurde bisher nur SORTIERT, nie
+                             # gelesen. Es ist aber der einzige Beleg dafuer,
+                             # WANN eine Beobachtung entstand — und damit die
+                             # einzige Moeglichkeit, eine echte Landung von
+                             # einer stehengebliebenen Prognose zu trennen
+                             # (eine Landung kann nicht vor der Landung
+                             # aufgezeichnet worden sein). Kostet keine
+                             # zusaetzliche Abfrage, nur eine Spalte.
+                             'updated_at')
                      .in_('date', dates).eq('flight', fn)
                      .order('updated_at', desc=True).limit(20).execute())
             except Exception:
