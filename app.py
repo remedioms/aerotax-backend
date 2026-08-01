@@ -39227,6 +39227,25 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
         return facts
 
 
+def _minutes_between(soll, ist):
+    """Verspätung in Minuten zwischen zwei ABSOLUTEN Zeitstempeln, sonst None.
+
+    Bewusst streng: beide Werte müssen eine Zeitzone tragen. Eine nackte
+    „HH:MM"-Soll-Zeit (Stations-Ortszeit) gegen einen UTC-Ist-Wert zu rechnen
+    ergäbe eine um den Stations-Offset verschobene Zahl — lieber KEINE Zahl als
+    eine falsche (Owner-Regel „keine Schätzungen/Fake-Werte")."""
+    try:
+        if not soll or not ist:
+            return None
+        a = datetime.fromisoformat(str(soll).replace('Z', '+00:00'))
+        b = datetime.fromisoformat(str(ist).replace('Z', '+00:00'))
+        if a.tzinfo is None or b.tzinfo is None:
+            return None
+        return int(round((b - a).total_seconds() / 60.0))
+    except Exception:
+        return None
+
+
 def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                        past_horizon_h=30, deadline=None):
     """Reichert die Pro-Leg-Sektoren EINES Roster-Tages (ical_sectors[]) IN PLACE
@@ -39523,6 +39542,47 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                                     _facts[_ak] = _fc2.get(_ak)
             except Exception:
                 _facts = None
+        # ── QUELLEN-KASKADE FÜR EIN GELANDETES LEG (Owner 01.08.2026) ────────
+        # „es gibt LH Api, f24 und den airport scrapper (der ist free und zu
+        #  bevorzugen) aber sonst LH und wenn da keine verfügbarkeit dann f24,
+        #  immer aber richtige werte. egal ob dann kostet."
+        # Stufe 1 (Scraper + LH-aus-Cache) ist oben schon gelaufen. Fehlt danach
+        # eine GEMESSENE Ankunft, obwohl die Maschine längst unten ist, wird
+        # eskaliert — sonst bleibt die Tafel-Prognose stehen und die App zeigt
+        # eine Zeit, die es nie gab (LH1137 01.08.: 10:15 statt 10:03).
+        # Nur für bereits gelandete Legs ohne freie Wahrheit → der teure Pfad
+        # bleibt die Ausnahme, nicht der Normalfall.
+        # Stufe 2 (LH) läuft in Stufe 1 MIT — `_flight_facts_from_obs` legt die
+        # LH-Open-API-Fakten über die Scraper-Fakten. Bewusst NUR aus dem
+        # LH-Cache (`lh_cached_only=True`, ein Miss stößt das Hintergrund-
+        # Warmup an): der blockierende LH-Call ist global auf 5/s gedrosselt und
+        # SERIALISIERT damit alle Worker-Threads — auf einem Fan-out über 25–30
+        # Legs gemessene 5–12 s Wartezeit (Vorfall 22.07., festgehalten in
+        # tests/aerox/test_friend_roster_cold_latency.py). „Egal ob es kostet"
+        # meint Geld, nicht die Wartezeit der User. Der bezahlte Weg unten ist
+        # nicht gedrosselt und deshalb hier der richtige nächste Schritt.
+        if _arr_vorbei and not (_facts or {}).get('est_arr'):
+            # Stufe 3 — FR24 (bezahlt). `flight-summary` trägt die ECHTE
+            # Landezeit (`datetime_landed`, hier als `sched_arr`). Der Call ist
+            # singleflight-gecacht und budget-gegated; die Route wird gegen das
+            # Leg geprüft, damit nie eine fremde Rotation angehängt wird.
+            try:
+                from blueprints.aerox_data_blueprint import _fr24_flight_by_number
+                _f24 = _fr24_flight_by_number(op_fn, leg_date)
+                if (isinstance(_f24, dict) and _f24.get('sched_arr')
+                        and (not _f24.get('arr_iata') or _f24.get('arr_iata') == to)
+                        and (not _f24.get('dep_iata') or _f24.get('dep_iata') == frm)):
+                    _facts = dict(_facts or {})
+                    _facts['est_arr'] = _f24.get('sched_arr')
+                    # Die Verspätungs-ZAHL muss zur neuen Zeit passen, sonst
+                    # stünde neben 10:03 weiter „+10". FR24 liefert keine
+                    # Soll-Zeit → gegen die Fahrplan-Ankunft des Boards rechnen.
+                    # Ohne belastbare Soll-Zeit lieber KEINE Zahl als eine
+                    # widersprüchliche.
+                    _sa = (m or {}).get('sched_arr')
+                    _facts['arr_delay_min'] = _minutes_between(_sa, _f24.get('sched_arr'))
+            except Exception:
+                pass
         if m is None:
             # Kein Merge-Signal: nur weitermachen, wenn die persistente Quelle für
             # dieses Vergangenheits-Leg wirklich Ist-Fakten liefert. Sonst wie
@@ -39603,6 +39663,17 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                     s['delay_known'] = True
                     s['delay_min'] = _facts.get('arr_delay_min')
                     s['delay_side'] = 'arr'
+            elif _arr_vorbei and _facts.get('est_arr') \
+                    and _facts.get('arr_delay_min') is None:
+                # Gemessene Ankunft übernommen, aber keine belastbare Zahl dazu
+                # (FR24 kennt keine Soll-Zeit, Board-Soll war nicht absolut).
+                # Dann muss die ALTE Zahl weg — „10:03" neben „+10 min" wäre ein
+                # Widerspruch, und geraten wird hier nichts.
+                s['arr_delay_min'] = None
+                if s.get('delay_side') == 'arr':
+                    s['delay_min'] = None
+                    s['delay_known'] = False
+                    s['delay_side'] = None
             if not known and s.get('delay_min') is None:
                 _fd = (s.get('arr_delay_min') if s.get('arr_delay_min') is not None
                        else s.get('dep_delay_min'))

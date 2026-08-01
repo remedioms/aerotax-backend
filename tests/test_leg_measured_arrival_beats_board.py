@@ -177,3 +177,97 @@ def test_hochrechnung_bleibt_solange_das_leg_fliegt(monkeypatch):
                board_arr='2026-08-01T10:15:00+0200', board_delay=10,
                measured_arr=None, measured_delay=None)
     assert sec['est_arr_iso'] == '2026-08-01T10:15:00+0200'
+
+
+# ── Quellen-Kaskade: Scraper (frei) → LH → FR24 (bezahlt) ───────────────────
+# Owner 01.08.2026: "der airport scrapper ist free und zu bevorzugen, aber sonst
+# LH und wenn da keine Verfuegbarkeit dann f24, immer aber richtige Werte, egal
+# ob es dann kostet."
+
+def _run_kaskade(monkeypatch, *, scraper_arr, lh_arr, fr24_arr,
+                 board_sched_arr='2026-08-01T10:05:00+02:00'):
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+    arr_iso = base - timedelta(hours=2)
+    sec = {
+        'flight': 'LH1137', 'from': 'BCN', 'to': 'FRA',
+        'dep_iso': _iso(arr_iso - timedelta(hours=2)), 'arr_iso': _iso(arr_iso),
+    }
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: {
+        'delay_known': True, 'delay_min': 10, 'delay_side': 'arr',
+        'dep_delay_min': 0, 'arr_delay_min': 10,
+        'status': 'Boarding', 'cancelled': False,
+        'esti_dep': None, 'esti_arr': '2026-08-01T10:15:00+0200',
+        'reg': 'DAIRM', 'sides': {'dep': 'obs', 'arr': 'obs'},
+        'sched_dep': None, 'sched_arr': board_sched_arr,
+    })
+    monkeypatch.setattr(A, '_board_local_to_utc_iso', lambda v, station=None: v)
+    monkeypatch.setattr(A, '_gate_facts_arr_against_leg', lambda f, _a: f)
+
+    aufrufe = {'frei': 0, 'lh': 0, 'fr24': 0}
+
+    def facts(*a, **k):
+        if k.get('lh_cached_only'):
+            aufrufe['frei'] += 1
+            return {'est_arr': scraper_arr, 'arr_delay_min': None} if scraper_arr else None
+        aufrufe['lh'] += 1
+        return {'est_arr': lh_arr, 'arr_delay_min': None} if lh_arr else None
+
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', facts)
+    monkeypatch.setattr(ADB, '_fr24_flight_by_number',
+                        lambda fn, d=None: (aufrufe.__setitem__('fr24', aufrufe['fr24'] + 1)
+                                            or ({'sched_arr': fr24_arr, 'dep_iata': 'BCN',
+                                                 'arr_iata': 'FRA'} if fr24_arr else None)))
+
+    A._enrich_leg_delays([sec], arr_iso.strftime('%Y-%m-%d'), free_only=False)
+    return sec, aufrufe
+
+
+def test_scraper_gewinnt_und_kostet_nichts(monkeypatch):
+    """Hat der freie Scraper die Messung, wird NICHTS bezahlt."""
+    sec, ruf = _run_kaskade(monkeypatch,
+                            scraper_arr='2026-08-01T10:03:00+02:00',
+                            lh_arr='2026-08-01T09:59:00+02:00',
+                            fr24_arr='2026-08-01T09:55:00+02:00')
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
+    assert ruf['lh'] == 0 and ruf['fr24'] == 0, 'freie Quelle reicht → kein LH, kein FR24'
+
+
+def test_lh_laeuft_in_stufe_1_mit_und_blockiert_nie(monkeypatch):
+    """LH ist Stufe 2, wird aber INNERHALB von `_flight_facts_from_obs` mit
+    `lh_cached_only=True` abgefragt (die Funktion legt LH ueber den Scraper).
+
+    Ein blockierender LH-Call ist hier verboten: er ist global auf 5/s
+    gedrosselt und serialisiert damit ALLE Worker — auf 25-30 Legs sind das
+    5-12 s Wartezeit (Vorfall 22.07.). Geld darf kosten, Wartezeit nicht.
+    Festgehalten auch in tests/aerox/test_friend_roster_cold_latency.py."""
+    sec, ruf = _run_kaskade(monkeypatch,
+                            scraper_arr='2026-08-01T10:03:00+02:00',
+                            lh_arr=None,
+                            fr24_arr='2026-08-01T09:55:00+02:00')
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
+    assert ruf['lh'] == 0, 'NIE ein blockierender LH-Call auf dem Fan-out'
+    assert ruf['fr24'] == 0, 'freie Wahrheit vorhanden → nichts bezahlen'
+
+
+def test_erst_wenn_frei_und_lh_leer_sind_kostet_fr24(monkeypatch):
+    """Der gemeldete Fall: nur FR24 kennt die echte Landung (10:03)."""
+    sec, ruf = _run_kaskade(monkeypatch,
+                            scraper_arr=None, lh_arr=None,
+                            fr24_arr='2026-08-01T10:03:00+02:00')
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00', (
+        'Ohne freie Wahrheit MUSS der bezahlte Weg die richtige Zeit liefern.')
+    assert ruf['fr24'] == 1
+    # Soll 10:05 gegen Ist 10:03 → 2 Minuten zu frueh. Die Zahl muss zur Zeit
+    # passen, sonst stuende neben 10:03 weiter die alte "+10".
+    assert sec['arr_delay_min'] == -2
+    assert sec['delay_min'] == -2
+
+
+def test_ohne_belastbare_sollzeit_bleibt_die_zahl_leer(monkeypatch):
+    """Kein absolutes Board-Soll → keine Verspaetungszahl erfinden."""
+    sec, _ = _run_kaskade(monkeypatch,
+                          scraper_arr=None, lh_arr=None,
+                          fr24_arr='2026-08-01T10:03:00+02:00',
+                          board_sched_arr='10:05')   # nackte Ortszeit
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
+    assert sec['arr_delay_min'] is None, 'lieber keine Zahl als eine falsche'
