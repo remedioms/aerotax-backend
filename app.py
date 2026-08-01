@@ -14040,6 +14040,17 @@ def get_crew_at_destination(token):
     cur_iata = _user_current_iata(token)
     if cur_iata:
         public_iatas.add(cur_iata)
+    # HOMEBASE zählt IMMER mit (Owner 2026-08-01: „meine homebase ist frankfurt…
+    # sollte auch ohne dienstplan eintrag zu sehen sein"). Vorher bestand die
+    # Menge nur aus künftigen LAYOVERN (also Outstations) und dem heutigen
+    # Roster-Tag — `_user_current_iata` liest ausschliesslich den Roster, kein
+    # Profil und kein GPS. Ein FRA-Baser zu Hause in Frankfurt hatte damit an
+    # einem freien Tag GAR KEIN FRA in der Menge und sah lokale Hangouts an
+    # seiner eigenen Base nie. Die Base ist ein Arbeitsort aus dem Profil, kein
+    # Aufenthaltsort — es wird nichts Neues über den User erhoben.
+    _hb = ((viewer_prof or {}).get('homebase') or '').upper().strip()
+    if len(_hb) == 3 and _hb.isalpha():
+        public_iatas.add(_hb)
     pins_out = []
     seen = set()
     _all_pins = (_manual_pins_load(token)

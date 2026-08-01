@@ -252,3 +252,56 @@ def test_kein_geo_push_fuer_einen_geplanten_hangout():
     # Degradiert (Migration fehlt, `meta` geschluckt) → sofort sichtbar,
     # also ist der Push dann richtig.
     assert A._hangout_is_scheduled_ahead({'meta': None}) is False
+
+
+# ── Homebase zählt als „hier" (Owner 2026-08-01) ───────────────────────────
+
+def _crew_dest(pins_at_iatas, profile, cur_iata=None):
+    """crew-at-destination mit LEEREM Roster — genau der Fall, um den es geht:
+    freier Tag, keine Layover, kein heutiger Roster-Eintrag."""
+    seen = {}
+
+    def _capture(iatas):
+        seen['iatas'] = set(iatas or [])
+        return [p for p in pins_at_iatas
+                if (p.get('iata_code') or '').upper() in seen['iatas']]
+
+    with patch.object(A, '_manual_pins_load', return_value=[]), \
+         patch.object(A, '_manual_pins_for_friends', return_value=[]), \
+         patch.object(A, '_public_pins_at_iatas', side_effect=_capture), \
+         patch.object(A, '_friends_load', return_value={'friends': []}), \
+         patch.object(A, '_profiles_load_bulk', return_value={}), \
+         patch.object(A, '_profile_load', return_value={'profile': profile}), \
+         patch.object(A, '_user_current_iata', return_value=cur_iata), \
+         patch.object(A, '_user_future_layovers', return_value=[]), \
+         A.app.test_request_context(f'/api/user/crew-at-destination/{VIEWER}'):
+        payload = A.get_crew_at_destination(VIEWER).get_json()
+    return payload, seen.get('iatas', set())
+
+
+def test_homebase_zaehlt_auch_ohne_dienstplan_eintrag():
+    """FRA-Baser zu Hause, freier Tag, kein Roster → sieht seine lokalen
+    Hangouts trotzdem. Vorher war die IATA-Menge in genau diesem Fall LEER."""
+    pin = _pin(owner=OWNER, iata='FRA')
+    payload, iatas = _crew_dest([pin], {'homebase': 'FRA'})
+    assert 'FRA' in iatas
+    assert [p['id'] for p in payload['manual_pins']] == ['h1']
+
+
+def test_ohne_homebase_im_profil_keine_erfundene_iata():
+    """Kein Profil-Feld → nichts dazuerfinden."""
+    for prof in ({}, {'homebase': ''}, {'homebase': 'Frankfurt'}, {'homebase': 'F1A'}):
+        _, iatas = _crew_dest([], prof)
+        assert iatas == set(), f'{prof} → {iatas}'
+
+
+def test_homebase_erweitert_nicht_auf_alles():
+    """Nur die Base kommt dazu — ein Hangout anderswo bleibt unsichtbar."""
+    payload, iatas = _crew_dest([_pin(owner=OWNER, iata='JFK')], {'homebase': 'FRA'})
+    assert iatas == {'FRA'} and payload['manual_pins'] == []
+
+
+def test_homebase_neben_aktuellem_standort():
+    """Beide zählen: Base UND wo ich heute laut Roster bin."""
+    _, iatas = _crew_dest([], {'homebase': 'FRA'}, cur_iata='BOS')
+    assert iatas == {'FRA', 'BOS'}
