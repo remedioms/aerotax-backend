@@ -1,6 +1,15 @@
 #!/bin/bash
 # AeroX Hetzner Deploy: neues Backend-Image ausrollen mit Health-Check + Auto-Rollback.
 #
+# GCLOUD-PYTHON-FIX (2026-08-01): gcloud griff sich Xcodes Python 3.9.6 und
+# crashte beim Laden von gcloud.builds („'_MessageClass' | '_MessageClass'")
+# — damit schlug JEDER --from-git-Build fehl. Homebrew-python3.11 ist die
+# von gcloud unterstützte Version auf dieser Maschine; nur setzen, wenn der
+# Aufrufer nichts anderes vorgibt und der Interpreter existiert.
+if [ -z "${CLOUDSDK_PYTHON:-}" ] && [ -x /opt/homebrew/bin/python3.11 ]; then
+    export CLOUDSDK_PYTHON=/opt/homebrew/bin/python3.11
+fi
+#
 # EMPFOHLEN (Deploy-Gates 2026-07-27 — „Fixes bleiben gefixt"):
 #   ./deploy-hetzner.sh --from-git [<git-ref>]
 #     baut aus einem SAUBEREN Worktree des Commits das Image main-<shortsha>
