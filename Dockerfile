@@ -56,7 +56,23 @@ COPY . .
 #   Cloud-Run-Service muss `containerConcurrency=8` matchen (Tests:
 #   tests/test_concurrency_invariants.py).
 # timeout=1800s (30 Min) reicht für lange Worker-Jobs (process-job via Cloud Tasks).
-# max-requests=200/jitter=20 für graceful restart vor Memory-Leak-Akkumulation.
+#
+# WER DIESES CMD WIRKLICH BENUTZT (Full-Review 2026-08-01): Auf Hetzner
+# überschreibt compose.yaml das CMD komplett (workers 3, max-requests 5000) —
+# aber das NAS (`/volume1/docker/aerotax-backend/compose.yaml`, öffentlich als
+# nas-api.aerosteuer.de und Lese-Primary des CDN-Workers) hat KEIN `command:`
+# und startet damit GENAU diese Zeile. Das ist keine tote Reserve-Einstellung.
+#
+# max-requests: war 200/jitter 20 — bei ~40 Anfragen/Minute recycelt der
+# EINZIGE Worker damit alle paar Minuten, und app.py leistet beim Import echte
+# Arbeit (Blueprints, Hintergrund-Threads). Genau das Muster des
+# „Request stirbt im Startsturm"-Vorfalls: der Client bekommt einen Fehler, im
+# Server-Log steht dazu nichts. 2000/200 behält den Speicherleck-Schutz (der
+# NAS-Container hat nur 1 GB), streckt den Neustart aber auf ~Stunden.
+#
+# workers bleibt 1: der NAS-Container ist auf 1 GB begrenzt, ein zweiter
+# Worker verdoppelt den Grundverbrauch. Nebenläufigkeit liefert gthread mit
+# threads=8 (Tests: tests/test_concurrency_invariants.py).
 CMD exec gunicorn app:app \
     --bind 0.0.0.0:${PORT:-8080} \
     --workers 1 \
@@ -64,7 +80,7 @@ CMD exec gunicorn app:app \
     --threads 8 \
     --timeout 1800 \
     --graceful-timeout 60 \
-    --max-requests 200 \
-    --max-requests-jitter 20 \
+    --max-requests 2000 \
+    --max-requests-jitter 200 \
     --access-logfile - \
     --error-logfile -

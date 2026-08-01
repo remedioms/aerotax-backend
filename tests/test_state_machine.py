@@ -1073,7 +1073,14 @@ def test_dockerfile_timeout_sufficient_for_long_jobs():
 
 
 def test_dockerfile_workers_count_one():
-    """Cloud Run mit concurrency=1: workers=1 pro Container (Spec)."""
+    """workers=1 pro Container — Nebenläufigkeit kommt von gthread/threads=8.
+
+    Die alte Begründung („Cloud Run mit concurrency=1") ist überholt: Cloud Run
+    ist seit 2026-07-09 abgebaut. Der Wert bleibt trotzdem richtig, nur aus
+    einem anderen Grund — dieses CMD läuft heute auf dem NAS-Container, und der
+    ist auf 1 GB begrenzt; ein zweiter Worker verdoppelte den Grundverbrauch.
+    Hetzner überschreibt das CMD ohnehin per compose (workers 3).
+    (Begründung korrigiert im Full-Review 2026-08-01)"""
     src = open(_DOCKERFILE).read()
     assert '--workers 1' in src or '--workers=1' in src
 

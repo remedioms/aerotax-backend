@@ -55,16 +55,26 @@ def test_dockerfile_timeout_1800():
     assert re.search(r'--timeout[ =]+1800\b', src)
 
 
-def test_dockerfile_max_requests_200():
-    """Memory-Leak-Guard: graceful restart alle 200 requests."""
+def test_dockerfile_max_requests_2000():
+    """Memory-Leak-Guard bleibt, aber ohne Neustart-Sturm.
+
+    War 200. Dieses CMD ist NICHT die tote Reserve, für die es lange gehalten
+    wurde: Hetzner überschreibt es per compose, das NAS
+    (`/volume1/docker/aerotax-backend/compose.yaml`, öffentlich als
+    nas-api.aerosteuer.de) aber NICHT — dort startet genau diese Zeile. Mit 200
+    recycelte der einzige Worker bei ~40 Anfragen/Minute alle paar Minuten, und
+    app.py leistet beim Import echte Arbeit. Das ist die
+    „Request stirbt im Startsturm"-Fehlerklasse: Fehler beim Client, nichts im
+    Server-Log. 2000 hält den Leck-Schutz (NAS-Container: 1 GB) und streckt den
+    Neustart auf Stunden. (Full-Review 2026-08-01)"""
     src = _read(DOCKERFILE)
-    assert re.search(r'--max-requests[ =]+200\b', src)
+    assert re.search(r'--max-requests[ =]+2000\b', src)
 
 
-def test_dockerfile_max_requests_jitter_20():
-    """jitter=20 (User-Spec)."""
+def test_dockerfile_max_requests_jitter_200():
+    """Jitter bleibt bei 10 % von max-requests (war 20 bei 200)."""
     src = _read(DOCKERFILE)
-    assert re.search(r'--max-requests-jitter[ =]+20\b', src)
+    assert re.search(r'--max-requests-jitter[ =]+200\b', src)
 
 
 # ─── Procfile-Konsistenz ─────────────────────────────────────────────────────
