@@ -260,7 +260,10 @@ if [ "$OK" = "OK" ]; then
     NAS_TOK=$(gcloud auth print-access-token 2>/dev/null || true)
     if [ -n "$NAS_TOK" ]; then
       echo "$NAS_TOK" | ssh "$NAS_HOST" "cat > /tmp/artok && sudo sh -c 'cat /tmp/artok | /usr/local/bin/docker login -u oauth2accesstoken --password-stdin https://europe-west3-docker.pkg.dev' >/dev/null 2>&1; rm -f /tmp/artok" || true
-      NAS_REWROTE=$(ssh "$NAS_HOST" "sudo /usr/local/bin/docker pull '$IMG' >/dev/null 2>&1 && sudo sh -c 'cd /volume1/docker/aerotax-backend && cp compose.yaml compose.yaml.prev && sed -i -E \"s#^([[:space:]]*image:[[:space:]]*).*aerotax-backend.*\$#\\\\1$IMG#\" compose.yaml && grep -c \"$IMG\" compose.yaml'" 2>/dev/null || echo 0)
+      # KEIN $-Anker im sed (Erstlauf 02.08.: `\$#` wurde von der Remote-Shell
+      # als Parameter-Anzahl expandiert → „unterminated s command"; `.*` reicht
+      # ohnehin bis zum Zeilenende).
+      NAS_REWROTE=$(ssh "$NAS_HOST" "sudo /usr/local/bin/docker pull '$IMG' >/dev/null 2>&1 && sudo sh -c 'cd /volume1/docker/aerotax-backend && cp compose.yaml compose.yaml.prev && sed -i -E \"s#^([[:space:]]*image:[[:space:]]*).*aerotax-backend.*#\\\\1$IMG#\" compose.yaml && grep -c \"$IMG\" compose.yaml'" 2>/dev/null || echo 0)
       if [ "${NAS_REWROTE:-0}" -ge 1 ]; then
         ssh "$NAS_HOST" "sudo sh -c 'cd /volume1/docker/aerotax-backend && /usr/local/bin/docker-compose -p aerotax-backend up -d' >/dev/null 2>&1" || true
         NAS_IMG=$(ssh "$NAS_HOST" "sudo /usr/local/bin/docker inspect aerotax-backend --format '{{.Config.Image}}' 2>/dev/null" || true)
