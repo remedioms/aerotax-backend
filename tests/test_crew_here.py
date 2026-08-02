@@ -227,35 +227,51 @@ def test_crew_here_zaehlt_ehrlich():
 
 
 def test_crew_here_unbekanntes_free_zaehlt_nicht_als_frei():
-    data = _crew_here([_member('AT-A', free=None)])
+    data = _crew_here([_member('AT-A', free=None)], friends=['AT-A'])
     assert data['counts']['free_tomorrow'] == 0
     assert data['crew'][0]['free_tomorrow'] is None
 
 
 def test_crew_here_ohne_eigenes_hotel_kein_same_hotel():
     """Kennt das Verzeichnis MEIN Hotel nicht, behaupten wir keine Treffer."""
-    data = _crew_here([_member('AT-A', hotel='Novotel BKK')], my_hotel=None)
+    data = _crew_here([_member('AT-A', hotel='Novotel BKK')], my_hotel=None,
+                      friends=['AT-A'])
     assert data['counts']['same_hotel'] == 0
     assert data['crew'][0]['same_hotel'] is False
     assert data['my_hotel'] is None
 
 
+def test_crew_here_nicht_freunde_bleiben_anonym():
+    """DATENSCHUTZ-KONTRAKT (Owner 2026-08-02 „Tibor, Jennifer und 94 andere
+    — aber ohne zu sagen, ob die frei haben und wer sie sind"): Nicht-Freunde
+    erscheinen NIE als Person (kein Name, kein Avatar, keine Flags) — sie
+    zählen nur in den anonymen Aggregaten."""
+    data = _crew_here([_member('AT-A', name='Fremde Person'),
+                       _member('AT-FRIEND', name='Frida')],
+                      friends=['AT-FRIEND'])
+    assert data['counts']['total'] == 2
+    assert data['friends_here'] == 1
+    assert [c['name'] for c in data['crew']] == ['Frida']
+    blob = str(data)
+    assert 'Fremde Person' not in blob
+    assert 'AT-A' not in blob
+
+
 def test_crew_here_liefert_keine_fremden_tokens():
-    """Das Token IST das Bearer-Credential — nur gegenseitige Friends."""
+    """Das Token IST das Bearer-Credential — Fremde stehen seit der
+    Datenschutz-Runde 2026-08-02 gar nicht mehr in der Liste."""
     data = _crew_here([_member('AT-A'), _member('AT-FRIEND')],
                       friends=['AT-FRIEND'])
-    by_id = {c['name']: c for c in data['crew']}
     tokens = {c['token'] for c in data['crew']}
     assert 'AT-A' not in tokens
     assert 'AT-FRIEND' in tokens
     assert all(c['match_id'] for c in data['crew'])
-    assert by_id  # Namen/Avatare kommen mit
 
 
 def test_crew_here_liefert_keinen_fremden_hotelnamen():
     """Crew-Hotels sind airline-vertraulich (vgl. _filter_crew_hotels) — nach
-    aussen geht nur der abgeleitete Boolean."""
-    data = _crew_here([_member('AT-A', hotel='Novotel BKK')])
+    aussen geht nur der abgeleitete Boolean (auch bei Freunden)."""
+    data = _crew_here([_member('AT-A', hotel='Novotel BKK')], friends=['AT-A'])
     assert 'hotel' not in data['crew'][0]
     assert data['crew'][0]['same_hotel'] is True
     assert data['my_hotel'] == 'Novotel BKK'   # das eigene darf man sehen
@@ -270,19 +286,39 @@ def test_crew_here_ohne_bekannten_ort_sagt_das_ehrlich():
 
 def test_crew_here_vorschau_ist_gedeckelt():
     members = [_member(f'AT-{i}') for i in range(30)]
-    data = _crew_here(members)
+    data = _crew_here(members, friends=[f'AT-{i}' for i in range(30)])
     assert data['counts']['total'] == 30
     assert len(data['crew']) == A._CREW_HERE_PREVIEW_MAX
     assert data['crew_truncated'] is True
 
 
-def test_crew_here_sortiert_friends_und_selbes_hotel_nach_vorn():
+def test_crew_here_sortiert_selbes_hotel_nach_vorn():
+    """Sortierung innerhalb der (reinen Freundes-)Liste: selbes Hotel zuerst,
+    dann längster Aufenthalt. Nicht-Freunde (Xaver) fehlen komplett."""
     data = _crew_here([
         _member('AT-X', hotel=None, nights=1, name='Xaver'),
         _member('AT-HOTEL', hotel='Novotel BKK', nights=1, name='Hanna'),
-        _member('AT-FRIEND', hotel=None, nights=1, name='Frida'),
-    ], friends=['AT-FRIEND'])
-    assert [c['name'] for c in data['crew']] == ['Frida', 'Hanna', 'Xaver']
+        _member('AT-FRIEND', hotel=None, nights=3, name='Frida'),
+    ], friends=['AT-FRIEND', 'AT-HOTEL'])
+    assert [c['name'] for c in data['crew']] == ['Hanna', 'Frida']
+
+
+def test_crew_here_datum_wird_auf_heute_geklemmt():
+    """Beliebige Zukunftstage waren eine Fern-Vorschau auf fremde
+    Aufenthaltsorte — der Endpoint beantwortet nur noch heute ±1."""
+    my_days = _days(('2026-07-28', 'FRA'), ('2026-07-29', 'BKK'),
+                    ('2026-07-30', 'BKK'))
+    with patch.object(A, '_crew_ops_today', return_value=TODAY), \
+         patch.object(A, '_crew_roster_days', return_value=my_days), \
+         patch.object(A, '_profile_load', return_value={'profile': LH_PROFILE}), \
+         patch.object(A, '_friends_load', return_value={'friends': []}), \
+         patch.object(A, '_crew_hotel_at', return_value=None), \
+         patch.object(A, '_crew_here_members', return_value=[]) as mock_members, \
+         A.app.test_request_context(
+             f'/api/user/crew-here/{VIEWER}?iata=BKK&date=2026-09-15'):
+        data = A.get_crew_here(VIEWER).get_json()
+    assert data['date'] == TODAY
+    assert mock_members.call_args[0][1] == TODAY
 
 
 # ── Sichtbarkeits-Gates der Scan-Stufe ──────────────────────────────────────

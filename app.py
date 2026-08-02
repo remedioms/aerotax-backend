@@ -9081,6 +9081,20 @@ def _admin_delete_content(kind, target_id):
     try:
         raw = target_id or ''
         tid = raw[5:] if raw.startswith('wall:') else raw
+        if kind in ('smp_flashcard', 'smp_exam_question'):
+            # Community-Flashcards liegen serverseitig in ax_smp_user_cards.
+            # Gebündelte IHK-Fragen sind unveränderliche App-Inhalte: deren
+            # Meldung wird im Panel erledigt und im nächsten Content-Release
+            # korrigiert; nur Community-Karten können sofort entfernt werden.
+            if kind == 'smp_exam_question':
+                return False, 'bundled_content_requires_release'
+            if not SB_AVAILABLE:
+                return False, 'storage_unavailable'
+            r = (sb.table('ax_smp_user_cards')
+                 .update({'deleted': True, 'updated_at': datetime.now(timezone.utc).isoformat()})
+                 .eq('id', tid)
+                 .execute())
+            return (bool(r.data), 'deleted' if r.data else 'not_found')
         if kind == 'wall_post' or (kind == 'forum_thread' and raw.startswith('wall:')):
             posts = _wall_load_posts()
             tp = next((p for p in posts if p.get('id') == tid), None)
@@ -9154,7 +9168,42 @@ def _admin_delete_content(kind, target_id):
     return False, 'unsupported_kind'
 
 
-def _send_report_email_notification(entry):
+def _auto_hide_reported_smp_community_card(target_id):
+    """Blendet eine freigegebene Community-Karte nach zwei unabhängigen
+    Meldungen aus. `status=rejected` statt `deleted=true` hält den Vorgang
+    reversibel und verhindert zugleich, dass die Karte weiter über den
+    Community-Endpoint ausgeliefert wird. Gebündelte App-Karten haben keinen
+    Datensatz in dieser Tabelle und werden deshalb niemals automatisch
+    verändert.
+
+    Returns True nur, wenn die Karte bei diesem Aufruf tatsächlich von
+    `approved` auf `rejected` gesetzt wurde. Best-effort: Ein Storage-Problem
+    darf das Speichern der Meldung nicht verhindern.
+    """
+    if not SB_AVAILABLE or not target_id:
+        return False
+    try:
+        current = (sb.table('ax_smp_user_cards')
+                   .select('id,status,deleted')
+                   .eq('id', target_id)
+                   .limit(1)
+                   .execute())
+        rows = current.data or []
+        if not rows or rows[0].get('status') != 'approved' or rows[0].get('deleted'):
+            return False
+        changed = (sb.table('ax_smp_user_cards')
+                   .update({'status': 'rejected',
+                            'updated_at': datetime.now(timezone.utc).isoformat()})
+                   .eq('id', target_id)
+                   .eq('status', 'approved')
+                   .execute())
+        return bool(changed.data)
+    except Exception as e:
+        print(f"[smp-moderation] auto-hide fail: {type(e).__name__}: {str(e)[:160]}")
+        return False
+
+
+def _send_report_email_notification(entry, report_count=None, auto_hidden=False):
     """Schickt eine Notification-Mail bei neuer Inhalts-Meldung (Forum/Wall/Chat)
     via Resend. Best-effort — der Report gilt auch ohne Mail als gespeichert.
     Empfänger: SUPPORT_NOTIFY_EMAIL (Default aerox@aerosteuer.de → Cloudflare-
@@ -9183,6 +9232,13 @@ def _send_report_email_notification(entry):
         if content and (content.get('text') or '').strip():
             e_content = _html.escape(content['text'][:1500])
             e_author = _html.escape(content.get('author_name') or content.get('author_token') or '—')
+        elif (entry.get('content_title') or entry.get('content_body')):
+            snapshot = '\n\n'.join(x for x in (
+                (entry.get('content_title') or '').strip(),
+                (entry.get('content_body') or '').strip(),
+            ) if x)
+            e_content = _html.escape(snapshot[:4000])
+            e_author = e_ttoken
         else:
             e_content = "(Inhalt nicht automatisch auflösbar — im Panel prüfen)"
             e_author = e_ttoken
@@ -9193,12 +9249,23 @@ def _send_report_email_notification(entry):
             f"<a href='{_html.escape(panel_url)}' style='background:#2563eb;color:#fff;"
             f"text-decoration:none;padding:11px 20px;border-radius:8px;font-family:sans-serif;"
             f"font-weight:600'>→ Im Moderations-Panel öffnen</a></p>")
-        subject = f"[AeroX Meldung] {_hdr_safe(entry.get('reason'))} · {_hdr_safe(entry.get('kind'))}"
+        count_text = str(report_count) if isinstance(report_count, int) else '—'
+        e_count = _html.escape(count_text)
+        hidden_notice = (
+            "<div style='background:#fff0d6;border:1px solid #e6a23c;border-radius:8px;"
+            "padding:14px;font-family:sans-serif;color:#633c00;margin-bottom:16px'>"
+            "<b>Automatisch ausgeblendet:</b> Diese Community-Karte hat zwei "
+            "unabhängige Meldungen erreicht und wird nicht mehr ausgeliefert.</div>"
+        ) if auto_hidden else ''
+        subject_prefix = '[AeroX · Karte ausgeblendet]' if auto_hidden else '[AeroX Meldung]'
+        subject = f"{subject_prefix} {_hdr_safe(entry.get('reason'))} · {_hdr_safe(entry.get('kind'))}"
         html_body = (
             f"<h2 style='font-family:sans-serif'>Neue Inhalts-Meldung</h2>"
+            f"{hidden_notice}"
             f"<p style='font-family:sans-serif;color:#444'>"
             f"<b>Grund:</b> {e_reason}<br>"
             f"<b>Typ:</b> {e_kind}<br>"
+            f"<b>Unabhängige offene Meldungen:</b> {e_count}<br>"
             f"<b>Autor des Inhalts:</b> {e_author}<br>"
             f"<b>Gemeldeter Nutzer-Token:</b> {e_ttoken}<br>"
             f"<b>Melder:</b> {e_reporter}<br>"
@@ -9361,6 +9428,13 @@ def admin_moderate_panel():
             if c.get('is_anonymous') and c.get('author_name'):
                 author_display = f"{c['author_name']} (anonym gepostet)"
             author = _html.escape(author_display)
+        elif r.get('content_title') or r.get('content_body'):
+            snapshot = '\n\n'.join(x for x in (
+                (r.get('content_title') or '').strip(),
+                (r.get('content_body') or '').strip(),
+            ) if x)
+            content_html = _html.escape(snapshot[:5000])
+            author = _html.escape(r.get('target_token', '') or '—')
         else:
             content_html = "<i style='color:#aaa'>(Inhalt nicht auto-auflösbar)</i>"
             author = _html.escape(r.get('target_token', '') or '—')
@@ -14205,6 +14279,17 @@ def get_crew_here(token):
     """
     st = (request.args.get('iata') or '').strip().upper()[:3]
     ref = (request.args.get('date') or '').strip()[:10] or _crew_ops_today()
+    # DATUMS-KLEMME (Datenschutz-Runde 2026-08-02): der Endpoint beantwortet
+    # „wer ist JETZT hier" — heute ±1 Tag (Zeitzonen-Kulanz). Beliebige
+    # Zukunftstage waren eine Vorschau auf fremde Aufenthaltsorte; kein
+    # legitimer Consumer fragt sie (iOS sendet gar kein `date`).
+    try:
+        _today = datetime.strptime(_crew_ops_today(), '%Y-%m-%d')
+        _refd = datetime.strptime(ref, '%Y-%m-%d')
+        if abs((_refd - _today).days) > 1:
+            ref = _crew_ops_today()
+    except Exception:
+        ref = _crew_ops_today()
     my_days = _crew_roster_days(token)
     my_prof = (_profile_load(token) or {}).get('profile') or {}
     if len(st) != 3 or not st.isalpha():
@@ -14242,29 +14327,45 @@ def get_crew_here(token):
             counts['arriving_today'] += 1
         if ops.get('departing_tomorrow') is True:
             counts['departing_tomorrow'] += 1
-        prof = m.get('profile') or {}
+        # DATENSCHUTZ (Owner 2026-08-02 „Tibor, Jennifer (Freunde) und 94
+        # andere sind in Frankfurt — aber ohne zu sagen, ob die frei haben
+        # und wer sie sind"): NICHT-Freunde erscheinen NIE als Person in der
+        # Antwort — kein Name, kein Avatar, keine Initialen, keine Frei-/
+        # Nächte-Flags. Sie zählen nur in den anonymen Aggregaten (`counts`).
+        # Vorher listete `crew` JEDEN Teilenden mit Name + Avatar; zusammen
+        # mit dem freien `?iata=`/`?date=`-Parameter war das eine
+        # Fern-Enumeration („wer ist nächste Woche in BKK") — genau das
+        # Stalking-Muster, das die Hangout-Karte nie gebraucht hat.
         is_friend = m['token'] in friend_set
+        if not is_friend:
+            continue
+        prof = m.get('profile') or {}
         crew.append({
             'match_id': _hashlib.sha256(m['token'].encode()).hexdigest()[:16],
             'name': (prof.get('name') or 'Crew'),
             'avatar_url': prof.get('avatar_url') or None,
-            # Rohes Token NUR für gegenseitige Friends (DM-Flow).
-            'token': m['token'] if is_friend else None,
-            'is_friend': is_friend,
+            # Rohes Token für gegenseitige Friends (DM-Flow) — andere stehen
+            # gar nicht mehr in der Liste.
+            'token': m['token'],
+            'is_friend': True,
             'same_hotel': same_hotel,
             'free_tomorrow': ops.get('free_tomorrow'),
             'nights': int(ops.get('nights') or 0),
             'arriving_today': ops.get('arriving_today'),
             'departing_tomorrow': ops.get('departing_tomorrow'),
         })
-    # Vorschau-Liste: Friends zuerst, dann selbes Hotel, dann längster Aufenthalt.
-    crew.sort(key=lambda c: (not c['is_friend'], not c['same_hotel'],
-                             -c['nights'], c['name'].lower()))
+    # Vorschau-Liste (nur Freunde): selbes Hotel zuerst, dann längster
+    # Aufenthalt — und hart gekappt, damit die Liste nie endlos wird.
+    crew.sort(key=lambda c: (not c['same_hotel'], -c['nights'],
+                             c['name'].lower()))
     return jsonify({
         'ok': True, 'iata': st, 'date': ref, 'here': bool(mine.get('here')),
         'my_hotel': mine.get('hotel'), 'my_nights': int(mine.get('nights') or 0),
         'my_free_tomorrow': mine.get('free_tomorrow'),
         'counts': counts,
+        # `friends_here` explizit: die App baut daraus „Tibor, Jennifer und
+        # N andere" (N = total − friends_here), ohne selbst zählen zu müssen.
+        'friends_here': len(crew),
         'crew': crew[:_CREW_HERE_PREVIEW_MAX],
         'crew_truncated': len(crew) > _CREW_HERE_PREVIEW_MAX,
     })
@@ -46883,11 +46984,16 @@ def moderation_report(token):
     target_token = (body.get('target_token') or '').strip()
     reason = (body.get('reason') or '').strip()[:64]
     note = (body.get('note') or '').strip()[:2000]
+    content_title = (body.get('content_title') or '').strip()[:1000]
+    content_body = (body.get('content_body') or '').strip()[:5000]
     if not kind or not reason:
         return jsonify({'ok': False, 'error': 'kind_and_reason_required'}), 400
     if kind not in ('wall_post', 'wall_comment', 'forum_thread', 'forum_reply',
-                    'layoverrec', 'layoverrec_comment', 'chat_msg', 'user'):
+                    'layoverrec', 'layoverrec_comment', 'chat_msg', 'user',
+                    'smp_flashcard', 'smp_exam_question'):
         return jsonify({'ok': False, 'error': 'invalid_kind'}), 400
+    if kind in ('smp_flashcard', 'smp_exam_question') and len(note) < 5:
+        return jsonify({'ok': False, 'error': 'description_required'}), 400
 
     # Durabel laden (Supabase-first, Disk-Fallback) — NICHT mehr direkt von der
     # ephemeren Disk, sonst gehen Meldungen bei jedem Deploy/Restart verloren.
@@ -46901,6 +47007,8 @@ def moderation_report(token):
         'target_token': target_token,
         'reason': reason,
         'note': note,
+        'content_title': content_title,
+        'content_body': content_body,
         'status': 'pending',
     }
     reports.append(entry)
@@ -46908,13 +47016,25 @@ def moderation_report(token):
     if len(reports) > 50000:
         reports = reports[-50000:]
     _save_reports(reports)
-    # KEIN Auto-Hide/Auto-Delete mehr (User-Entscheid 2026-06-25): Meldungen
-    # werden NICHT automatisch bei N Reportern versteckt. Der Betreiber bekommt
-    # jede Meldung per Mail + Panel und entscheidet manuell (löschen/erledigt).
     auto_hidden = False
+    report_count = None
+    if kind == 'smp_flashcard' and target_id:
+        # Nur unterschiedliche Accounts zählen. Mehrfaches Melden durch
+        # dieselbe Person kann die Zwei-Meldungen-Schwelle nicht auslösen.
+        reporters = {
+            r.get('reporter_token') for r in reports
+            if r.get('kind') == kind
+            and r.get('target_id') == target_id
+            and r.get('status') != 'resolved'
+            and r.get('reporter_token')
+        }
+        report_count = len(reporters)
+        if report_count >= 2:
+            auto_hidden = _auto_hide_reported_smp_community_card(target_id)
     # ── Email-Notification an Betreiber via Resend (best-effort, blockt nicht) ──
     try:
-        _send_report_email_notification(entry)
+        _send_report_email_notification(
+            entry, report_count=report_count, auto_hidden=auto_hidden)
     except Exception:
         pass
     return jsonify({'ok': True, 'report_id': entry['id'], 'hidden': auto_hidden})
