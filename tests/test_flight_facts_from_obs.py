@@ -478,16 +478,16 @@ def test_operational_detail_can_fill_estimates_when_schedule_is_complete(monkeyp
 _NOW = 1783584000
 
 
-def test_status_category_taxi_offblock_not_enroute():
-    """Ghost-Fix: ein dep-seitiges „Abgeflogen" = OFF-BLOCK, nicht airborne. Die
-    Engine macht daraus TAXI_OUT → status_category bleibt LEER (kein Legacy-Wert).
-    Die alte Substring-Heuristik hätte fälschlich 'enroute' gesetzt (Geister-
-    Airborne eines noch rollenden Fliegers)."""
+def test_status_category_overdue_offblock_is_clock_landed_not_enroute():
+    """Clock-Landing-Vertrag aus FlightState: ein dep-seitiges „Abgeflogen"
+    beginnt als OFF-BLOCK, wird nach längst verstrichener Soll-Ankunft plus
+    Grace aber konservativ zu LANDED. Der Legacy-Mapper muss deshalb
+    ``arrived`` liefern — weiterhin niemals das frühere falsche ``enroute``."""
     facts = {'dep_iata': 'FRA', 'arr_iata': 'GVA', 'dep_status': 'Abgeflogen',
              'sched_dep': '2026-07-09T05:50:00+02:00',
              'sched_arr': '2026-07-09T06:55:00+02:00'}
     flight = {'flight': 'LH2557', 'dep_iata': 'FRA', 'arr_iata': 'GVA'}
-    assert axd._status_category_from_facts(flight, facts, now=_NOW) is None
+    assert axd._status_category_from_facts(flight, facts, now=_NOW) == 'arrived'
 
 
 def test_status_category_bogus_early_landing_rejected():
