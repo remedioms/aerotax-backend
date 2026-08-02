@@ -11109,6 +11109,39 @@ def put_user_profile(token):
             profile.pop('home_transport_mode', None)
     if 'home_geocoded' in body:
         profile['home_geocoded'] = bool(body.get('home_geocoded'))
+    # Persönlicher Monatswert (Teilzeit/individuelle Stundenschwelle). Bewusst
+    # KEINE MTV-Zuordnung: Airline + Position bleiben die einzigen Gates dafür.
+    # Das Feld lebt privat in metadata-jsonb und wird nur im Owner-GET geliefert;
+    # _PUBLIC_PROFILE_FIELDS enthält es ausdrücklich nicht.
+    if 'monthly_target_hours' in body:
+        try:
+            import math as _math_mth
+            _mth = float(body.get('monthly_target_hours'))
+            if not _math_mth.isfinite(_mth) or not 1 <= _mth <= 100:
+                raise ValueError
+            profile['monthly_target_hours'] = _mth
+        except (TypeError, ValueError):
+            return jsonify({'ok': False,
+                            'error': 'invalid_monthly_target_hours'}), 400
+    # Private MTV-/Stunden-Konfiguration. Diese Felder dienen ausschließlich
+    # dazu, die eigene Auswahl auf einem zweiten Gerät wiederherzustellen. Sie
+    # stehen absichtlich NICHT in _PUBLIC_PROFILE_FIELDS und verleihen allein
+    # keine MTV-Zuordnung (dafür bleiben Airline + Kabinenposition maßgeblich).
+    _tariff_enums = {
+        'tariff_role': {'flugbegleiter', 'purserI', 'unbekannt'},
+        'tariff_scope': {'konteinsatz', 'gemischt', 'interkont', 'unbekannt'},
+        'tariff_limit_model': {
+            'standard', 'erhoehtAufAntrag', 'kontOnlyErmaessigt',
+            'ab20Dienstjahren', 'sommerPlusTeam',
+        },
+    }
+    for _tariff_key, _allowed_values in _tariff_enums.items():
+        if _tariff_key in body:
+            _tariff_value = body.get(_tariff_key)
+            if _tariff_value not in _allowed_values:
+                return jsonify({'ok': False,
+                                'error': f'invalid_{_tariff_key}'}), 400
+            profile[_tariff_key] = _tariff_value
     # PRE-FLIGHT-TIMELINE (ADDITIV 2026-07-12): selbst angegebene Fahrzeit
     # Wohnung→Flughafen in Minuten (ÖPNV/Auto) — speist serverseitig die
     # „Fahrt zum Flughafen"-Phase der Crew-Bordkarten (crew_state.pre_phase).

@@ -168,6 +168,65 @@ def test_bug003_invalid_account_type_rejected(client, user):
     assert body.get("error") == "invalid_account_type"
 
 
+def test_profile_monthly_target_hours_roundtrips_owner_only(client, user):
+    """Persönliche Stunden syncen geräteübergreifend, bleiben aber privat.
+
+    Der Wert ist keine MTV-Zuordnung und darf deshalb weder Airline/Position
+    verändern noch im öffentlichen Friend-Discovery-Profil erscheinen.
+    """
+    token = user["token"]
+    r = client.put(f"/api/user/profile/{token}",
+                   json={"name": "Teilzeit Crew", "airline": "Condor",
+                         "position": "Crew", "monthly_target_hours": 64,
+                         "tariff_role": "flugbegleiter",
+                         "tariff_scope": "gemischt",
+                         "tariff_limit_model": "standard"},
+                   headers=_bearer(token))
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    owner = client.get(f"/api/user/profile/{token}", headers=_bearer(token))
+    owner_profile = json.loads(owner.get_data(as_text=True)).get("profile") or {}
+    assert owner_profile.get("monthly_target_hours") == 64
+    assert owner_profile.get("airline") == "Condor"
+    assert owner_profile.get("position") == "Crew"
+    assert owner_profile.get("tariff_role") == "flugbegleiter"
+    assert owner_profile.get("tariff_scope") == "gemischt"
+    assert owner_profile.get("tariff_limit_model") == "standard"
+
+    public = client.get(f"/api/user/profile/{token}")
+    public_profile = json.loads(public.get_data(as_text=True)).get("profile") or {}
+    assert "monthly_target_hours" not in public_profile
+    assert "tariff_role" not in public_profile
+    assert "tariff_scope" not in public_profile
+    assert "tariff_limit_model" not in public_profile
+
+
+def test_profile_monthly_target_hours_rejects_invalid_values(client, user):
+    token = user["token"]
+    for value in (0, 101, "not-a-number"):
+        r = client.put(f"/api/user/profile/{token}",
+                       json={"monthly_target_hours": value},
+                       headers=_bearer(token))
+        assert r.status_code == 400
+        assert json.loads(r.get_data(as_text=True)).get("error") == \
+            "invalid_monthly_target_hours"
+
+
+def test_profile_tariff_settings_reject_invalid_values(client, user):
+    token = user["token"]
+    invalid = {
+        "tariff_role": "cockpit",
+        "tariff_scope": "monthly_guess",
+        "tariff_limit_model": "unlimited",
+    }
+    for key, value in invalid.items():
+        r = client.put(f"/api/user/profile/{token}", json={key: value},
+                       headers=_bearer(token))
+        assert r.status_code == 400
+        assert json.loads(r.get_data(as_text=True)).get("error") == \
+            f"invalid_{key}"
+
+
 # ─────────────────────────────────────────────────────────────────
 # BUG-004: Token-Auth gate
 # ─────────────────────────────────────────────────────────────────
