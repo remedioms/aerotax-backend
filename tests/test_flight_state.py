@@ -469,13 +469,31 @@ def test_taxi_fresh_offblock_stays_taxi_out():
     assert fs["in_flight"] is False
 
 
-def test_taxi_long_offblock_but_past_arrival_stays_taxi_out():
-    """Off-block long ago BUT now is past the expected arrival -> do NOT elevate
-    (bounded by arrival; a real landing/monotonicity handles the terminal end)."""
+def test_taxi_long_offblock_past_arrival_grace_is_clock_landed():
+    """CLOCK-LANDING (owner 2026-08-02, LH754 FRA->BLR): off-block long ago AND
+    now is past expected arrival + arrival grace -> LANDED (estimated). The old
+    contract ("stays TAXI_OUT, a real landing handles the terminal end") proved
+    wrong at stations without board/ADS-B coverage: no landing signal EVER
+    arrives and crew_state showed "Startet gerade" six hours after touchdown."""
     fs = _fs_offblock(NOW, sched_dep_ts=NOW - 6 * 3600,
                       sched_dep="2026-07-08T22:00:00Z",
                       sched_arr="2026-07-09T02:00:00Z")   # arr 2h in the past
-    assert fs["phase"] == TAXI_OUT
+    assert fs["phase"] == LANDED
+    assert fs["phase_conf"] == ESTIMATED
+    assert fs["phase_source"] == "offblock_time"
+    assert fs["live"] is None                     # keine erfundene Position
+    assert fs["in_flight"] is False
+
+
+def test_taxi_long_offblock_inside_arrival_grace_stays_airborne():
+    """Between expected arrival and arrival+grace the phase stays AIRBORNE —
+    the old code dipped back to TAXI_OUT in this window (elevation was bounded
+    strictly by exp_arr), which read as a landing-then-unlanding regression."""
+    fs = _fs_offblock(NOW, sched_dep_ts=NOW - 6 * 3600,
+                      sched_dep="2026-07-08T22:00:00Z",
+                      sched_arr=E._ts_to_iso(NOW - 20 * 60))  # arr 20 min ago
+    assert fs["phase"] == AIRBORNE
+    assert fs["phase_conf"] == ESTIMATED
 
 
 def test_taxi_arrival_via_delay_shifts_the_bound():

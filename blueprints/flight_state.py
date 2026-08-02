@@ -654,7 +654,27 @@ def _phase_machine(observations, keys, raw_pos, near_origin, prior, now):
             offb = _offblock_ts(observations, keys, board_dep)
             exp_arr = _expected_arr_ts(observations, keys)
             long_offblock = offb is not None and (now - offb) > TAXI_OUT_MAX_S
-            before_arr = exp_arr is None or now < exp_arr
+            # CLOCK-LANDING (owner 2026-08-02, LH754 FRA->BLR: crew_state stand
+            # 6 h nach der Landung noch auf TAXI_OUT/"Startet gerade"): the old
+            # elevation stopped at expected arrival — past exp_arr NOTHING fired
+            # any more and the stale board TAXI_OUT pinned the phase forever
+            # (BLR has no board/ADS-B coverage, so no landing signal ever comes).
+            # Time evidence works in both directions: a plane that pushed back
+            # hours ago cannot still be taxiing once its expected arrival plus
+            # the shared arrival grace has passed — it flew and by now it is
+            # down. LANDED with conf=ESTIMATED, no invented touchdown position
+            # (live stays None). Same grace as the stale-approach rule
+            # (APPROACH_ARRIVAL_GRACE_S) — one truth for "arrival is overdue".
+            # A genuine return-to-gate emits fresh hard board signals which win
+            # in the tiers above before this clock branch is ever reached.
+            if long_offblock and exp_arr is not None \
+                    and now >= exp_arr + APPROACH_ARRIVAL_GRACE_S:
+                return R(LANDED, ESTIMATED, "offblock_time", exp_arr)
+            # Airborne elevation now carries THROUGH the arrival-grace window
+            # (before: strictly before exp_arr) so the phase goes
+            # AIRBORNE -> LANDED without a TAXI_OUT dip in between.
+            before_arr = exp_arr is None \
+                or now < exp_arr + APPROACH_ARRIVAL_GRACE_S
             if long_offblock and before_arr:
                 return R(AIRBORNE, ESTIMATED, "offblock_time",
                          (board_dep.obs_ts if board_dep else offb))
