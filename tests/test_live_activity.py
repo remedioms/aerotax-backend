@@ -100,6 +100,7 @@ class _FakeSB:
     def __init__(self):
         self.rows = []
         self.briefings = []          # user_ical_briefings (nur der Sweep)
+        self.obs = []                # airport_delay_obs (R3: Landungs-Beleg)
         self.rpc_calls = []
         self._seq = 0
         self.fail_rpc = set()
@@ -108,6 +109,8 @@ class _FakeSB:
     def table(self, name):
         if name == 'user_ical_briefings':
             return _Table(self, 'briefings')
+        if name == 'airport_delay_obs':
+            return _Table(self, 'obs')
         assert name == 'live_activities', name
         return _Table(self)
 
@@ -1219,7 +1222,7 @@ def test_sweep_laesst_langstrecke_mitten_im_flug_in_ruhe(client, sb, auth, apns,
     sb.briefings.append(_brief([_sector(-6, 3, FROZEN_UTC)]))
     counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
     assert counts == {'checked': 1, 'ended': 0, 'kept': 1, 'no_roster': 0,
-                      'hard_age': 0}
+                      'hard_age': 0, 'landed': 0}
     assert not apns['client'].sent
     assert sb.row()['active'] is True
 
@@ -1368,6 +1371,261 @@ def test_sweep_endpoint_secret_gate(client, sb, auth, monkeypatch):
     r = client.post('/api/internal/live-activity/sweep',
                     headers={'X-Poll-Secret': 'geheim'})
     assert r.status_code == 200 and r.get_json()['ok'] is True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# R3 (Tibor 2026-08-02) — die BESTAETIGTE LANDUNG beendet die Karte
+# ════════════════════════════════════════════════════════════════════════════
+# Befund: die Karte klebte 12+ min nach dem Aufsetzen auf „im Flug / noch
+# 0:00" (LH1457). Die Landung stand um 07:04Z als „Gelandet" in
+# `airport_delay_obs` — nur reichte sie niemand an die Activity weiter: der
+# MQTT-Fanout sah kein `arrived`-Event, und der Stale-Sweep rechnete
+# ausschliesslich gegen PLANZEITEN.
+#
+# Owner-Staffelung: bestaetigter Fakt darf weiterlaufen; nur-Plan nie in den
+# Flug-Zustand; traegt der letzte bestaetigte Fakt nicht mehr (bestaetigte
+# Ankunft + 60 min), endet die Aktivitaet.
+
+def _leg(dep_h, arr_h, base=None, flight='LH1457', frm='MUC', to='FRA'):
+    base = base or FROZEN_UTC
+    return {'flight': flight, 'from': frm, 'to': to,
+            'dep_iso': (base + timedelta(hours=dep_h)).isoformat(),
+            'arr_iso': (base + timedelta(hours=arr_h)).isoformat()}
+
+
+def _obs(landed_min_ago=12, status='Gelandet', flight='LH1457', to='FRA',
+         stamp_min_ago=None, cancelled=False, esti=True):
+    """Eine ARR-Board-Zeile, wie der Poller sie schreibt (Board-Zeiten sind
+    STATIONS-LOKAL — hier FRA, also Europe/Berlin)."""
+    from zoneinfo import ZoneInfo
+    arr = FROZEN_UTC - timedelta(minutes=landed_min_ago)
+    local = arr.astimezone(ZoneInfo('Europe/Berlin'))
+    stamp = FROZEN_UTC - timedelta(
+        minutes=stamp_min_ago if stamp_min_ago is not None
+        else max(0, landed_min_ago - 2))
+    return {'airport': f'{to}#ARR', 'flight': flight,
+            'date': local.date().isoformat(),
+            'sched': local.strftime('%H:%M'),
+            'esti': local.strftime('%H:%M') if esti else None,
+            'status': status, 'cancelled': cancelled,
+            'updated_at': stamp.isoformat(),
+            'esti_changed_at': stamp.isoformat()}
+
+
+def test_bestaetigte_landung_beendet_die_karte(client, sb, auth, apns, frozen):
+    """DER Tibor-Fall. Ohne diesen Zweig stuende die Karte noch ~2,5 h."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))
+    sb.obs.append(_obs(landed_min_ago=12))
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts['ended'] == 1 and counts['landed'] == 1
+    aps = apns['client'].sent[-1]['payload']['aps']
+    assert aps['event'] == 'end'
+    state = aps['content-state']
+    assert state['kicker'] == 'GELANDET'
+    assert state['arrConfirmed'] is True and state['depConfirmed'] is True
+    assert sb.row()['end_reason'] == 'arrived_confirmed'
+
+
+def test_abschluss_traegt_die_ECHTE_landezeit(client, sb, auth, apns, frozen):
+    """Owner-Regel „lieber keine Zeile als ein synthetisierter Wert": im
+    Abschluss steht die gemessene Landung, nicht „jetzt" und nicht die
+    Plan-Ankunft."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))       # Plan-Ankunft: -12 min
+    sb.obs.append(_obs(landed_min_ago=25))                # gemessen: -25 min
+    LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    state = apns['client'].sent[-1]['payload']['aps']['content-state']
+    ist = FROZEN_UTC - timedelta(minutes=25)
+    assert abs(state['mainTime'] - (ist.timestamp() - APPLE_EPOCH)) < 60
+    assert abs(state['estArr'] - (ist.timestamp() - APPLE_EPOCH)) < 60
+
+
+def test_karte_verschwindet_erst_zur_60_min_frist(client, sb, auth, apns,
+                                                  frozen):
+    """Die Staffelung sagt „bestaetigte Ankunft + 60 min" — nicht „sofort
+    weg". Die dismissal-date liegt genau auf dieser Frist."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))
+    sb.obs.append(_obs(landed_min_ago=12))
+    LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    aps = apns['client'].sent[-1]['payload']['aps']
+    # `dismissal-date` sind Unix-Sekunden ab `aps.timestamp` (die Uhr des
+    # Sende-Moments) — die Karte steht noch die RESTLICHE Frist: 60 min minus
+    # der 12 min, die seit der Landung vergangen sind.
+    rest = LA._LA_LANDED_HOLD_S - 12 * 60
+    assert abs(aps['dismissal-date'] - (aps['timestamp'] + rest)) <= 90
+    assert aps['dismissal-date'] > aps['timestamp']       # nicht sofort weg
+
+
+def test_eingefrorene_prognose_ist_keine_landung(client, sb, auth, apns,
+                                                 frozen):
+    """Die Messhuerde (`esti_changed_at`, Migration 20260802): ein Board, das
+    „Gelandet" schaltet, aber die Plan-`esti` von vor drei Stunden stehen
+    laesst, beendet hier gar nichts. Terminaler Status beweist die LANDUNG,
+    nicht die ZEIT."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))
+    sb.obs.append(_obs(landed_min_ago=12, stamp_min_ago=180))
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts['landed'] == 0 and counts['kept'] == 1
+    assert not apns['client'].sent
+
+
+def test_prognose_status_beendet_nichts(client, sb, auth, apns, frozen):
+    """„Erwartet"/„Anflug" ist eine Vorhersage — keine Landung."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))
+    for status in ('Erwartet', 'Anflug', 'Estimated', 'Verspätet', None):
+        sb.obs[:] = [_obs(landed_min_ago=12, status=status)]
+        assert LA.sweep_stale_live_activities(
+            now_utc=FROZEN_UTC)['landed'] == 0
+    assert not apns['client'].sent
+
+
+def test_landung_in_der_zukunft_ist_keine_landung(client, sb, auth, apns,
+                                                  frozen):
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, 0.5)]))
+    sb.obs.append(_obs(landed_min_ago=-20))               # „gelandet" in 20 min
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['landed'] == 0
+    assert not apns['client'].sent
+
+
+def test_turnaround_verliert_seine_karte_nicht(client, sb, auth, apns, frozen):
+    """Ein Umlauf hat mehrere Legs. Landet Leg 1, laeuft die Karte weiter —
+    beendet wird erst, wenn kein Abflug mehr aussteht."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2, flight='LH1457'),
+                                _leg(1.0, 2.5, flight='LH1458',
+                                     frm='FRA', to='MUC')]))
+    sb.obs.append(_obs(landed_min_ago=12))
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts['landed'] == 0 and counts['kept'] == 1
+    assert not apns['client'].sent
+
+
+def test_landung_eines_fremden_legs_beendet_nichts(client, sb, auth, apns,
+                                                   frozen):
+    """Der Board-Read ist gebuendelt — die Landung einer ANDEREN Flugnummer
+    darf die Karte nicht schliessen."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2, flight='LH1457')]))
+    sb.obs.append(_obs(landed_min_ago=12, flight='LH999'))
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['landed'] == 0
+
+
+def test_sektor_ohne_flugnummer_beendet_nichts(client, sb, auth, apns, frozen):
+    """Ohne Flugnummer gibt es keinen Beleg — und ohne Beleg kein Ende
+    (dieselbe Regel wie beim Roster-Read)."""
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_sector(-2, -0.2, FROZEN_UTC)]))
+    sb.obs.append(_obs(landed_min_ago=12, to='ORD'))
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['landed'] == 0
+
+
+def test_landungs_zweig_macht_keinen_lh_call(client, sb, auth, apns, frozen,
+                                             monkeypatch):
+    """Der Beleg kommt aus GESPEICHERTEN Board-Zeilen. Ein LH- oder FR24-Call
+    pro Karte waere genau die Kosten-Falle, aus der dieses Modul kommt."""
+    from blueprints import lh_mqtt as _mqtt
+    monkeypatch.setattr(_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: pytest.fail('Sweep ruft LH'))
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))
+    sb.obs.append(_obs(landed_min_ago=12))
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['landed'] == 1
+
+
+def test_fehlende_stempel_spalte_bricht_den_sweep_nicht(client, sb, auth, apns,
+                                                        frozen, monkeypatch):
+    """fcm_token-Lehre: laeuft die Migration irgendwo noch nicht, darf der
+    Sweep nicht ausfallen — dann traegt der Altbestands-Stempel
+    (`updated_at`)."""
+    real_table = sb.table
+
+    def _table(name):
+        t = real_table(name)
+        if name != 'airport_delay_obs':
+            return t
+        orig_select = t.select
+
+        def _select(cols):
+            if 'esti_changed_at' in str(cols):
+                raise RuntimeError('column esti_changed_at does not exist')
+            return orig_select(cols)
+
+        t.select = _select
+        return t
+
+    monkeypatch.setattr(sb, 'table', _table)
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))
+    row = _obs(landed_min_ago=12)
+    row.pop('esti_changed_at')
+    sb.obs.append(row)
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['landed'] == 1
+
+
+def test_beendete_karte_wird_nicht_zweimal_beendet(client, sb, auth, apns,
+                                                   frozen):
+    _register(client)
+    _age_row(sb, 0)
+    sb.briefings.append(_brief([_leg(-1.5, -0.2)]))
+    sb.obs.append(_obs(landed_min_ago=12))
+    LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    n = len(apns['client'].sent)
+    assert LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)['checked'] == 0
+    assert len(apns['client'].sent) == n
+
+
+def test_fanout_loescht_die_bestaetigung_nicht_mehr(client, sb, auth, apns):
+    """Ein Push ERSETZT das ContentState vollstaendig. Bis heute schickte der
+    Fanout `depConfirmed`/`arrConfirmed` nie mit — jedes Event drehte die
+    Karte damit auf „nicht bestaetigt" zurueck und nahm ihr das Recht,
+    offline fortzuschalten."""
+    _register(client)
+    LA.push_for_affected([(TOKEN, _sector(-3, 3))], 'departed', 'LH1457',
+                         '2026-08-02')
+    state = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert state['depConfirmed'] is True
+    assert 'arrConfirmed' not in state          # noch nicht gelandet
+    LA.push_for_affected([(TOKEN, _sector(-3, -0.1))], 'arrived', 'LH1457',
+                         '2026-08-02')
+    state = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert state['arrConfirmed'] is True and state['depConfirmed'] is True
+
+
+def test_ohne_abflug_beleg_bleibt_die_bestaetigung_weg(client, sb, auth, apns):
+    """Eine ETA-Korrektur am Gate belegt keinen Abflug — dann darf auch kein
+    `depConfirmed` mitfahren (sonst waere es genau der Fake-Abflug)."""
+    _register(client)
+    LA.push_for_affected([(TOKEN, _sector(-1, 3))], 'est_arr', 'LH1457',
+                         '2026-08-02', facts={'dep_status': 'Boarding'})
+    state = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert 'depConfirmed' not in state and 'arrConfirmed' not in state
+
+
+def test_mqtt_arrived_beendet_die_karte_NICHT(client, sb, auth, apns):
+    """Das Ende bleibt beim Sweep, der den ganzen Roster sieht. Der Fanout
+    kennt pro Ereignis nur EIN Leg und wuerde einen Umlauf mitten im
+    Turnaround abschneiden."""
+    _register(client)
+    LA.push_for_affected([(TOKEN, _sector(-3, -0.1))], 'arrived', 'LH1457',
+                         '2026-08-02')
+    aps = apns['client'].sent[-1]['payload']['aps']
+    assert aps['event'] == 'update' and 'dismissal-date' not in aps
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -34,8 +34,27 @@ Kategorie `roster_change` („Dienstplan-Änderungen"), unter der schon
 `flight_update`/`inbound_departure`/`inbound_arrival` laufen.
 
 DATENSCHUTZ: ein Check-in ist ein privates Abo. Es gibt keinen Endpoint, der
-fremde Check-ins ausliefert, und keine Spalte, die den beobachteten Menschen
-benennt. Niemand erfährt, dass jemand seinen Flug verfolgt.
+fremde Check-ins ausliefert. Niemand erfährt, dass jemand seinen Flug verfolgt.
+
+WESSEN FLUG IST DAS? (Tibor 2026-08-02)
+───────────────────────────────────────
+Tibor checkte sich über die Crew-Bordkarte bei JULIENS Umlauf ein und bekam
+später „Landet bald · LH455" — ohne jeden Hinweis, warum ihn dieser Flug
+etwas angeht. Der Push braucht also den Kontext, aus dem der Check-in
+entstanden ist.
+
+Dafür gibt es `via_name`: der Rufname des Crew-Mitglieds, über dessen
+Bordkarte eingecheckt wurde. Er wird vom Client mitgeschickt (er zeigt die
+Karte ja gerade an) und NICHT vom Server erraten — es gibt keine Ableitung
+„wer sonst könnte auf diesem Flug sein", weil ein geratener Name schlimmer
+wäre als gar keiner. Fehlt er (alte App-Builds, Selbst-Check-in), lautet der
+Titel „Dein Check-in · LH455".
+
+Das ist KEIN Widerspruch zum Datenschutz-Absatz oben: `via_name` benennt
+niemanden gegenüber Dritten. Der Wert wandert ausschließlich in die Pushes
+GENAU DES NUTZERS, der den Namen ohnehin auf der Bordkarte vor sich hatte,
+und in dessen eigene Abo-Liste. Es gibt weiterhin keinen Endpoint, der fremde
+Check-ins ausliefert, und der Beobachtete erfährt weiterhin nichts.
 """
 import logging
 import threading
@@ -195,30 +214,82 @@ def landed_confirmed_by_board(status_bucket, now_utc, departed_at_iso):
     return (now_utc - dep_at) >= timedelta(minutes=LANDED_MIN_BLOCK_MIN)
 
 
-def build_message(kind, flight_no, dep_iata, arr_iata):
+def clean_via_name(raw):
+    """Rufname des Crew-Mitglieds, über dessen Bordkarte eingecheckt wurde —
+    oder None. Streng, weil der Wert später in einen Push-Titel wandert.
+
+    Genommen wird NUR das erste Wort (aus „Julien K." wird „Julien"): ein
+    Nachname gehört nicht in einen Push, und „Julien K.s Flug" wäre kein
+    deutscher Satz. Alles mit Ziffern, Steuerzeichen oder dem Trenner „·"
+    fliegt raus — ein Token oder eine E-Mail hat hier nichts verloren.
+    """
+    s = ' '.join(str(raw or '').split())
+    if not s:
+        return None
+    first = s.split(' ')[0].strip('.,;:!?')
+    if not (2 <= len(first) <= 24):
+        return None
+    if any(c.isdigit() for c in first):
+        return None
+    if any(c in first for c in '·@/\\<>{}[]|"\''):
+        return None
+    if not any(c.isalpha() for c in first):
+        return None
+    return first
+
+
+def possessive(name):
+    """Deutscher Genitiv eines Rufnamens: „Julien" → „Juliens", aber
+    „Lukas"/„Max"/„Fritz" → „Lukas'" (Zischlaut bekommt nur den Apostroph)."""
+    if not name:
+        return None
+    return name + ("'" if name[-1].lower() in ('s', 'ß', 'x', 'z') else 's')
+
+
+def context_title(flight_no, via_name=None):
+    """Der Titel sagt zuerst, WESSEN Flug das ist (Tibor 2026-08-02).
+
+    Mit bekanntem Rufnamen „Juliens Flug · LH455", sonst „Dein Check-in ·
+    LH455" — nie ein geratener Name. Was passiert ist, steht vollständig im
+    Body; die Zuordnung ist die Information, die im Titel gefehlt hat.
+    """
+    who = possessive(clean_via_name(via_name))
+    lead = f'{who} Flug' if who else 'Dein Check-in'
+    return f'{lead} · {flight_no}'
+
+
+def build_message(kind, flight_no, dep_iata, arr_iata, via_name=None):
     """(title, body) einer Meldung — oder None für unbekannte Arten.
 
     KEINE Uhrzeit im Text. Grund: eine Uhrzeit ohne ihren Zonen-Bezug ist die
     teuerste Fehlerklasse dieses Projekts (Zeitzonenregel), und ein Push-Text
     trägt keinen Platz für „Ortszeit <Stadt>". Die drei Aussagen sind
     zonen-invariant formuliert; die genaue Zeit steht in der App.
+
+    KEIN UNSICHERHEITS-ANHANG (Owner 2026-08-02, wörtlich: „keine bestätigte
+    landung kann weg was für ein blöder hinweis"). Der Satz „Geschätzt — keine
+    bestätigte Landung." ist ersatzlos gestrichen. Er war doppelt überflüssig:
+    „landet voraussichtlich in etwa einer Stunde" IST bereits die Schätzung,
+    und die Meldung feuert ohnehin nur gegen eine ECHTE geschätzte Ankunft
+    (`eta_one_hour_due`) — eine reine Planzeit erzeugt hier gar keinen Push.
+    Ein Disclaimer, der das nochmal dementiert, macht die eigene Aussage nur
+    unglaubwürdig.
     """
     frm = (dep_iata or '').strip().upper()
     to = (arr_iata or '').strip().upper()
     route = f'{frm}–{to}' if len(frm) == 3 and len(to) == 3 else None
     tail = f' · {route}' if route else ''
+    title = context_title(flight_no, via_name)
     if kind == 'departed':
-        return (f'Abgeflogen · {flight_no}',
-                f'{flight_no} ist gestartet{tail}.')
+        return (title, f'{flight_no} ist gestartet{tail}.')
     if kind == 'eta_1h':
         where = f' in {to}' if len(to) == 3 else ''
-        return (f'Landet bald · {flight_no}',
+        return (title,
                 f'{flight_no} landet voraussichtlich in etwa einer Stunde'
-                f'{where}. Geschätzt — keine bestätigte Landung.')
+                f'{where}.')
     if kind == 'arrived':
         where = f' in {to}' if len(to) == 3 else ''
-        return (f'Gelandet · {flight_no}',
-                f'{flight_no} ist{where} gelandet.')
+        return (title, f'{flight_no} ist{where} gelandet.')
     return None
 
 
@@ -229,8 +300,35 @@ _PUSH_TYPE = {'departed': 'flight_departed',
 
 # ── Supabase-Zugriff ────────────────────────────────────────────────────────
 
-_SELECT = ('id,user_token,flight_no,flight_date,dep_iata,arr_iata,dep_iso,'
-           'sent')
+_SELECT_BASE = ('id,user_token,flight_no,flight_date,dep_iata,arr_iata,'
+                'dep_iso,sent')
+_SELECT = _SELECT_BASE + ',via_name'
+
+# SCHEMA-SAFE (Lehre fcm_token, 01.08.2026): läuft die Migration irgendwo noch
+# nicht oder hat PostgREST sein Schema-Cache noch nicht neu geladen, scheitert
+# JEDER Read mit „column ... does not exist" — und die Meldungen wären still
+# komplett tot. Beim ersten Fehlschlag fällt das Modul deshalb prozessweit auf
+# die alte Projektion zurück (Verhalten = Stand vor dieser Änderung: Titel ohne
+# Namen). Der Flag-Flip ist bewusst einseitig; ein Neustart nach der Migration
+# holt die Spalte zurück.
+_via_name_available = True
+
+
+def _select_cols():
+    return _SELECT if _via_name_available else _SELECT_BASE
+
+
+def _note_missing_via_name(exc):
+    """True, wenn dieser Fehler nach der fehlenden Spalte aussieht."""
+    global _via_name_available
+    txt = str(exc).lower()
+    if 'via_name' in txt or 'pgrst204' in txt or '42703' in txt:
+        if _via_name_available:
+            log.warning('[fcheck] Spalte via_name fehlt — Titel ohne Namen '
+                        '(Migration 20260802_flight_checkins_via_name.sql?)')
+        _via_name_available = False
+        return True
+    return False
 
 
 def _rows_for_flight(flight_no, dates):
@@ -238,13 +336,21 @@ def _rows_for_flight(flight_no, dates):
     client = _sb()
     if client is None or not flight_no:
         return []
+
+    def _read():
+        return (client.table('flight_checkins').select(_select_cols())
+                .eq('flight_no', flight_no)
+                .in_('flight_date', list(dates))
+                .limit(500).execute()).data or []
+
     try:
-        r = (client.table('flight_checkins').select(_SELECT)
-             .eq('flight_no', flight_no)
-             .in_('flight_date', list(dates))
-             .limit(500).execute())
-        return r.data or []
+        return _read()
     except Exception as e:
+        if _note_missing_via_name(e):
+            try:
+                return _read()
+            except Exception as e2:
+                e = e2
         log.warning('[fcheck] rows_for_flight fail %s: %s', flight_no,
                     type(e).__name__)
         return []
@@ -277,7 +383,7 @@ def _push_for_row(row, kind, now_utc):
     if sent.get(kind):
         return False
     built = build_message(kind, row.get('flight_no'), row.get('dep_iata'),
-                          row.get('arr_iata'))
+                          row.get('arr_iata'), via_name=row.get('via_name'))
     if not built:
         return False
     title, body = built
@@ -441,14 +547,24 @@ def sweep(now_utc=None):
         return stats
     dates = [(now_utc.date() + timedelta(days=o)).isoformat()
              for o in (-1, 0, 1)]
+    def _read():
+        return (client.table('flight_checkins').select(_select_cols())
+                .in_('flight_date', dates)
+                .limit(SWEEP_ROW_CAP).execute()).data or []
+
     try:
-        r = (client.table('flight_checkins').select(_SELECT)
-             .in_('flight_date', dates)
-             .limit(SWEEP_ROW_CAP).execute())
-        rows = r.data or []
+        rows = _read()
     except Exception as e:
-        log.warning('[fcheck] sweep read fail: %s', type(e).__name__)
         rows = []
+        retried = False
+        if _note_missing_via_name(e):
+            try:
+                rows = _read()
+                retried = True
+            except Exception as e2:
+                e = e2
+        if not retried:
+            log.warning('[fcheck] sweep read fail: %s', type(e).__name__)
     stats['rows'] = len(rows)
     for row in rows:
         sent = row.get('sent') or {}
@@ -563,15 +679,37 @@ def flight_checkin(token):
            'dep_iata': dep, 'arr_iata': arr,
            'dep_iso': dep_instant.isoformat() if dep_instant else None,
            'updated_at': now_iso}
-    try:
+    # ÜBER WESSEN BORDKARTE? Der Client kennt den Namen (er zeigt die Karte
+    # gerade an) — der Server rät ihn NIE. Fehlt/verunglückt er, bleibt es beim
+    # neutralen „Dein Check-in"-Titel; ein Check-in scheitert daran nie.
+    via = clean_via_name(body.get('via_name') or body.get('via'))
+
+    def _store(with_via):
+        payload = dict(row)
+        if with_via:
+            payload['via_name'] = via
         (client.table('flight_checkins')
-         .upsert(row, on_conflict='user_token,flight_no,flight_date')
+         .upsert(payload, on_conflict='user_token,flight_no,flight_date')
          .execute())
+
+    try:
+        _store(bool(via) and _via_name_available)
     except Exception as e:
-        log.warning('[fcheck] checkin fail tok=%s: %s', token[:8],
-                    type(e).__name__)
-        return jsonify({'ok': False, 'error': 'store_failed'}), 503
-    return jsonify({'ok': True, 'flight': flight_no, 'date': date})
+        ok = False
+        if via and _note_missing_via_name(e):
+            # Migration noch nicht überall durch: lieber ein Abo ohne Namen als
+            # gar keins (Lehre fcm_token, 01.08.2026).
+            try:
+                _store(False)
+                ok = True
+            except Exception as e2:
+                e = e2
+        if not ok:
+            log.warning('[fcheck] checkin fail tok=%s: %s', token[:8],
+                        type(e).__name__)
+            return jsonify({'ok': False, 'error': 'store_failed'}), 503
+    return jsonify({'ok': True, 'flight': flight_no, 'date': date,
+                    'via_name': via})
 
 
 @flight_checkins_bp.route('/api/flight/checkout/<token>', methods=['POST'])
@@ -615,20 +753,35 @@ def flight_checkins_list(token):
     now_utc = datetime.now(timezone.utc)
     dates = [(now_utc.date() + timedelta(days=o)).isoformat()
              for o in (-1, 0, 1, 2)]
+    def _read():
+        cols = 'flight_no,flight_date,dep_iata,arr_iata'
+        if _via_name_available:
+            cols += ',via_name'
+        return (client.table('flight_checkins').select(cols)
+                .eq('user_token', token).in_('flight_date', dates)
+                .limit(200).execute()).data or []
+
     try:
-        r = (client.table('flight_checkins')
-             .select('flight_no,flight_date,dep_iata,arr_iata')
-             .eq('user_token', token).in_('flight_date', dates)
-             .limit(200).execute())
-        rows = r.data or []
+        rows = _read()
     except Exception as e:
-        log.warning('[fcheck] list fail tok=%s: %s', token[:8],
-                    type(e).__name__)
         rows = []
+        retried = False
+        if _note_missing_via_name(e):
+            try:
+                rows = _read()
+                retried = True
+            except Exception as e2:
+                e = e2
+        if not retried:
+            log.warning('[fcheck] list fail tok=%s: %s', token[:8],
+                        type(e).__name__)
+    # `via_name` ist additiv — alte Builds ignorieren das Feld. Ausgeliefert
+    # wird es NUR an den Eigentümer des Abos (Bearer == Pfad-Token).
     return jsonify({'ok': True, 'checkins': [
         {'flight': r.get('flight_no'),
          'date': str(r.get('flight_date'))[:10],
-         'dep': r.get('dep_iata'), 'arr': r.get('arr_iata')}
+         'dep': r.get('dep_iata'), 'arr': r.get('arr_iata'),
+         'via_name': r.get('via_name')}
         for r in rows]})
 
 

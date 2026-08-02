@@ -92,7 +92,7 @@ def test_landung_direkt_nach_abflug_ist_unglaubwuerdig():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Texte — keine erfundenen Werte, Schätzung ist als solche beschriftet
+# Texte — keine erfundenen Werte, kein Disclaimer-Anhang
 # ══════════════════════════════════════════════════════════════════════════
 
 def test_texte_tragen_route_nur_wenn_bekannt():
@@ -102,10 +102,24 @@ def test_texte_tragen_route_nur_wenn_bekannt():
     assert '–' not in b2 and 'None' not in b2
 
 
-def test_eta_text_sagt_dass_es_eine_schaetzung_ist():
+def test_eta_text_bleibt_eine_aussage():
+    """„landet voraussichtlich in etwa einer Stunde" IST die Schätzung."""
     _, b = FC.build_message('eta_1h', 'LH455', 'SFO', 'FRA')
-    assert 'voraussichtlich' in b
-    assert 'Geschätzt' in b
+    assert b == 'LH455 landet voraussichtlich in etwa einer Stunde in FRA.'
+
+
+def test_kein_push_traegt_einen_unsicherheits_disclaimer():
+    """Owner 02.08.2026, wörtlich: „keine bestätigte landung kann weg was für
+    ein blöder hinweis.. auch bei den anderen pushes". Der Zusatz war doppelt
+    überflüssig — die Meldung feuert ohnehin nur gegen eine ECHTE geschätzte
+    Ankunft, und „voraussichtlich" sagt dasselbe schon."""
+    verboten = ('Geschätzt', 'bestätigte Landung', 'keine bestätigte',
+                'ohne Gewähr', 'unverbindlich')
+    for kind in ('departed', 'eta_1h', 'arrived'):
+        for via in (None, 'Julien'):
+            t, b = FC.build_message(kind, 'LH455', 'SFO', 'FRA', via_name=via)
+            for wort in verboten:
+                assert wort not in b and wort not in t, (kind, wort)
 
 
 def test_texte_ohne_uhrzeit():
@@ -114,6 +128,63 @@ def test_texte_ohne_uhrzeit():
     for kind in ('departed', 'eta_1h', 'arrived'):
         _, b = FC.build_message(kind, 'LH455', 'SFO', 'FRA')
         assert ':' not in b
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WESSEN Flug? (Tibor 02.08.2026 — „Landet bald · LH455" ohne Kontext)
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_titel_nennt_den_menschen_ueber_dessen_bordkarte_eingecheckt_wurde():
+    t, b = FC.build_message('eta_1h', 'LH455', 'SFO', 'FRA',
+                            via_name='Julien')
+    assert t == 'Juliens Flug · LH455'
+    assert b.startswith('LH455 landet voraussichtlich')
+
+
+def test_titel_ohne_namen_sagt_wenigstens_warum():
+    """Alte App-Builds schicken keinen Namen — dann NICHT raten, sondern den
+    Anlass nennen."""
+    for kind in ('departed', 'eta_1h', 'arrived'):
+        t, _ = FC.build_message(kind, 'LH455', 'SFO', 'FRA')
+        assert t == 'Dein Check-in · LH455'
+
+
+def test_alle_drei_meldungen_tragen_denselben_kontext():
+    for kind in ('departed', 'eta_1h', 'arrived'):
+        t, _ = FC.build_message(kind, 'LH455', 'SFO', 'FRA', via_name='Julien')
+        assert t == 'Juliens Flug · LH455'
+
+
+def test_genitiv_mit_zischlaut_bekommt_nur_den_apostroph():
+    assert FC.possessive('Julien') == 'Juliens'
+    assert FC.possessive('Lukas') == "Lukas'"
+    assert FC.possessive('Max') == "Max'"
+    assert FC.possessive(None) is None
+
+
+def test_nur_der_rufname_landet_im_push():
+    """Ein Nachname gehört nicht in einen Push — und „Julien K.s Flug" wäre
+    kein deutscher Satz."""
+    assert FC.clean_via_name('Julien K.') == 'Julien'
+    assert FC.clean_via_name('  Julien   Meier ') == 'Julien'
+
+
+def test_muell_wird_nie_zu_einem_namen():
+    """Ein Token, eine Mail oder eine Nummer darf nie im Titel stehen."""
+    for schrott in (None, '', '  ', 'A', 'AT-abc123', 'a@b.de', '12345',
+                    '·', '...', 'x' * 40):
+        assert FC.clean_via_name(schrott) is None
+    assert FC.context_title('LH455', 'AT-abc123') == 'Dein Check-in · LH455'
+
+
+def test_name_aus_der_abo_zeile_landet_im_titel(monkeypatch, rec):
+    """Ende-zu-Ende über den Event-Fanout: der Name hängt am ABO, nicht am
+    Ereignis."""
+    monkeypatch.setattr(FC, '_rows_for_flight',
+                        lambda f, d: [_row(via_name='Julien')])
+    assert FC.notify_flight_event('departed', 'LH455', '2026-07-30',
+                                  now_utc=NOW) == 1
+    assert rec.pushes[0]['title'] == 'Juliens Flug · LH455'
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -321,6 +392,65 @@ def test_checkin_ohne_flugnummer_ist_400(monkeypatch):
     monkeypatch.setattr(FC, '_bearer_ok', lambda t: True)
     r = _client().post('/api/flight/checkin/tok-abc', json={'flight': ''})
     assert r.status_code == 400
+
+
+class _ColumnMissingTable(_FakeTable):
+    """PostgREST vor dem Schema-Reload: JEDER Select mit `via_name` scheitert."""
+
+    def __init__(self, rows, sink):
+        super().__init__(rows, sink)
+        self._cols = ''
+
+    def select(self, *a, **k):
+        self._cols = a[0] if a else ''
+        return self
+
+    def execute(self):
+        if 'via_name' in self._cols:
+            raise RuntimeError(
+                'column flight_checkins.via_name does not exist')
+        return super().execute()
+
+
+def test_fehlende_spalte_killt_die_meldungen_nicht(monkeypatch, rec):
+    """Die fcm_token-Lehre vom 01.08.: Code, der eine neue Spalte liest, darf
+    ohne die Migration nicht den ganzen Pfad still abschalten. Ohne Spalte
+    laufen die Meldungen weiter — nur eben ohne Namen im Titel."""
+    monkeypatch.setattr(FC, '_via_name_available', True)
+    sb = _FakeSB([_row(sent={'departed': True,
+                             'departed_at': (NOW - timedelta(hours=5)).isoformat()})])
+    monkeypatch.setattr(sb, 'table',
+                        lambda _n: _ColumnMissingTable(sb.rows, sb.sink))
+    monkeypatch.setattr(FC, '_sb', lambda: sb)
+    monkeypatch.setattr(FC, '_facts_for', lambda row: {
+        'est_arr': (NOW + timedelta(minutes=45)).isoformat(),
+        'bucket': 'airborne'})
+    assert FC.sweep(now_utc=NOW)['eta'] == 1
+    assert rec.pushes[0]['title'] == 'Dein Check-in · LH455'
+    assert FC._via_name_available is False
+
+
+def test_checkin_speichert_den_rufnamen(monkeypatch):
+    """Der Client kennt den Namen (er zeigt die Bordkarte an) — der Server
+    übernimmt ihn, rät ihn aber nie."""
+    monkeypatch.setattr(FC, '_bearer_ok', lambda t: True)
+    monkeypatch.setattr(FC, '_via_name_available', True)
+    stored = {}
+
+    class _T(_FakeTable):
+        def upsert(self, row, **k):
+            stored.update(row)
+            return self
+
+    sb = _FakeSB([])
+    monkeypatch.setattr(sb, 'table', lambda _n: _T(sb.rows, sb.sink))
+    monkeypatch.setattr(FC, '_sb', lambda: sb)
+    r = _client().post('/api/flight/checkin/tok-abc',
+                       json={'flight': 'LH455', 'date': '2026-07-30',
+                             'via_name': 'Julien K.'})
+    assert r.status_code == 200, r.get_json()
+    assert stored['via_name'] == 'Julien'
+    assert r.get_json()['via_name'] == 'Julien'
 
 
 def test_push_typen_haengen_am_bestehenden_dienstplan_schalter():

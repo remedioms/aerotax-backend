@@ -1217,6 +1217,15 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             'estArr': est_arr,
             'cancelled': True if kind == 'cancelled' else None,
             'footLeading': flight_disp or None,
+            # BESTÄTIGT GEGEN GEPLANT (Nachzug 2026-08-02). Die Felder gab es
+            # im Swift-Vertrag seit dem 31.07., dieser Fanout hat sie nie
+            # mitgeschickt — und weil ein Push das ContentState VOLLSTÄNDIG
+            # ersetzt, LÖSCHTE jedes Event die Bestätigung, die der Client
+            # selbst gesetzt hatte. Die Karte fiel damit auf „nicht bestätigt"
+            # zurück und durfte offline nicht mehr fortschalten. `None` (kein
+            # Beleg) fällt im Normalizer weg = konservativ wie bisher.
+            'depConfirmed': True if _departure_is_proven(kind, facts) else None,
+            'arrConfirmed': True if kind == 'arrived' else None,
         }
         if state['mainTime'] is None:
             # Ohne Ziel-Zeitpunkt gibt es keine ehrliche Karte.
@@ -1305,7 +1314,13 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
 _LA_SWEEP_LEAD_S = 4 * 3600         # so früh startet der Client die Activity
 _LA_SWEEP_GRACE_S = 90 * 60         # Kulanz NACH dem Abo-Fenster des Legs
 _LA_SWEEP_HARD_MAX_AGE_H = 14       # Reißleine ohne Roster-Beleg
-_LA_SWEEP_MIN_GAP_S = 600           # höchstens alle 10 min (pro Prozess)
+# 300 s statt der ursprünglichen 600 s (Tibor 02.08.: „klebt 12+ min auf
+# gelandet"). Seit R3 beendet der Sweep die Karte bei BESTÄTIGTER Landung —
+# sein Takt ist damit die Reaktionszeit auf die Landung, nicht mehr nur eine
+# Aufräum-Frequenz. 300 s ist genau der Topic-Poll-Takt, der ihn anstößt; ein
+# größerer Wert hieße, jeden zweiten Anstoß zu verwerfen. Der Lauf kostet zwei
+# gebündelte Supabase-Reads und pusht nur bei echter Änderung.
+_LA_SWEEP_MIN_GAP_S = 300           # höchstens alle 5 min (pro Prozess)
 _LA_SWEEP_MAX_ROWS = 500
 _LA_SWEEP_TOKEN_CHUNK = 60
 
@@ -1370,18 +1385,20 @@ def _roster_sectors_by_token(tokens, now_utc):
     return out
 
 
-def _duty_still_plausible(sectors, now_utc):
-    """True, wenn IRGENDEIN Sektor des Users gerade noch laufen kann.
+def _plausible_sectors(sectors, now_utc):
+    """Die Sektoren des Users, die JETZT im Fenster einer Live Activity liegen
+    (Briefing −4 h bis Abo-Ende +90 min). Liste, kann leer sein.
 
     Das Ende kommt aus `lh_mqtt.sector_sub_end` — bewusst dieselbe Definition
     wie beim MQTT-Abo-Fenster (Ankunft +1 h, ohne bekannte Ankunft konservative
     Blockannahme), damit es nicht zwei Auffassungen davon gibt, wie lange ein
-    Leg laufen kann. Plus `_LA_SWEEP_GRACE_S` Kulanz.
+    Leg laufen kann.
     """
     try:
         from blueprints.lh_mqtt import _parse_iso_utc, sector_sub_end
     except Exception:                                   # pragma: no cover
-        return True                                     # fail-safe
+        return None                                     # fail-safe: „weiß nicht"
+    out = []
     for s in sectors or []:
         if not isinstance(s, dict):
             continue
@@ -1391,8 +1408,16 @@ def _duty_still_plausible(sectors, now_utc):
         start = dep - timedelta(seconds=_LA_SWEEP_LEAD_S)
         end = sector_sub_end(s, dep) + timedelta(seconds=_LA_SWEEP_GRACE_S)
         if start <= now_utc <= end:
-            return True
-    return False
+            out.append(s)
+    return out
+
+
+def _duty_still_plausible(sectors, now_utc):
+    """True, wenn IRGENDEIN Sektor des Users gerade noch laufen kann."""
+    plausible = _plausible_sectors(sectors, now_utc)
+    if plausible is None:                               # pragma: no cover
+        return True                                     # fail-safe
+    return bool(plausible)
 
 
 def _last_known_arrival(sectors):
@@ -1426,31 +1451,275 @@ def _row_age_h(row, now_utc):
         return None
 
 
-def _end_row(row, mark_time, reason):
-    """EINE Zeile beenden: `event='end'` mit sofortiger dismissal-date, danach
-    die Registry-Zeile stilllegen. Die Zeile wird AUCH dann stillgelegt, wenn
-    der APNs-Push scheitert — sonst pusht der Fanout weiter gegen eine Karte,
-    die nachweislich nichts Richtiges mehr zeigt."""
+# ── R3: die BESTÄTIGTE LANDUNG beendet die Karte (Tibor 2026-08-02) ─────────
+#
+# BEFUND: Tibors Live Activity klebte 12+ min nach dem Aufsetzen auf „im Flug /
+# noch 0:00" (LH1457). Die Landung stand um 07:04Z als „Gelandet" in
+# `airport_delay_obs` — nur hat sie NIEMAND an die Karte weitergereicht:
+#   · `push_for_affected` hängt ausschließlich am LH-MQTT-Ereignis. Kommt
+#     `arrived` nicht an (QoS 0, kein Replay, ~10 Deploy-Blindfenster/Tag), sieht
+#     die Karte die Landung nie — und dieses Modul kannte KEINE zweite Quelle.
+#   · Der Stale-Sweep (R2b) rechnete nur gegen PLANZEITEN: Abo-Fenster
+#     (Ankunft +1 h) plus 90 min Kulanz. Er hätte die Karte erst ~2,5 h nach der
+#     PLAN-Ankunft geräumt — und bis dahin behauptet sie weiter „im Flug".
+#
+# DIE OWNER-STAFFELUNG (verbindlich, Widgets-LiveActivity.md „bestätigt gegen
+# geplant"), hier serverseitig vollzogen:
+#   1. Bestätigter Fakt darf weiterlaufen  → eine laufende Karte mit belegtem
+#      Abflug wird NIE wegen Zeitablauf abgeräumt (unverändert, R2a/R2b).
+#   2. Nur-Plan nie in den Flug-Zustand    → unverändert (`_departure_is_proven`).
+#   3. Trägt der letzte bestätigte Fakt nicht mehr — bestätigte Ankunft
+#      + 60 min — endet die Aktivität. GENAU DAS baut dieser Abschnitt.
+#
+# Der Client kennt dieselbe Frist als `ContentState.landedGrace` (60 min); er
+# KANN eine Activity aber nicht selbst beenden (`Activity.end` nur im
+# App-Prozess oder per Push). Der Push von hier ist also die einzige Stelle, an
+# der die Karte wirklich verschwindet.
+#
+# EIN PUSH, NICHT ZWEI: das Ende geht als `event='end'` MIT ZUKÜNFTIGER
+# `dismissal-date` (= bestätigte Ankunft + 60 min) raus. Der Inhalt dieses
+# Pushes IST der finale Zustand — Phase „gelandet", echte Ankunftszeit —, und
+# die Karte bleibt bis zur Frist sichtbar, statt in der Sekunde der Landung zu
+# verschwinden. Zwei Pushes (erst Update, dann Ende) wären derselbe Inhalt
+# doppelt und damit Apple-Throttle-Budget für nichts.
+#
+# WOHER DIE LANDUNG KOMMT — und was NICHT als Landung zählt:
+# ausschließlich `airport_delay_obs` (gespeicherte Board-Beobachtung, EIN
+# gebündelter Supabase-Read pro Sweep). KEIN LH-Call, kein FR24, kein bezahlter
+# Fallback — dieser Sweep bleibt kostenlos.
+#   · Der Ankunfts-Status muss TERMINAL sein („Gelandet"/„landed"/…, dieselbe
+#     Liste wie `app._arr_status_terminal`). „Erwartet"/„Anflug" ist eine
+#     Prognose.
+#   · Es muss eine echte `esti`-Uhrzeit dastehen.
+#   · MESSHÜRDE (`esti_changed_at`, Migration 20260802): eine Landung kann nicht
+#     VOR der Landung aufgezeichnet worden sein. Boards frieren `esti` gern auf
+#     dem Planwert ein und schalten nur den Status um — ein terminaler Status
+#     ALLEIN beendet hier deshalb nichts. Altbestandszeilen ohne Stempel fallen
+#     wie im Kalender-Lesepfad auf `updated_at` zurück.
+#   · Eine Ankunft in der ZUKUNFT ist keine Landung.
+#
+# UND DER TURNAROUND? Ein Umlauf hat mehrere Legs; die Karte läuft über den
+# Turnaround weiter. Beendet wird deshalb NUR, wenn im Activity-Fenster kein
+# Leg mehr AUSSTEHT (kein Abflug in der Zukunft) und ausgerechnet das LETZTE
+# Leg bestätigt gelandet ist. Genau darum bleibt das Ende hier im Sweep, der
+# den ganzen Roster sieht — und nicht im MQTT-Fanout, der pro Ereignis nur ein
+# einzelnes Leg kennt (dort ist `arrived` weiterhin völlig richtig „turnaround").
+_LA_LANDED_HOLD_S = 60 * 60         # Owner-Staffelung: Ankunft + 60 min
+_LA_LANDED_LOOKBACK_H = 20          # so weit zurück gilt eine Board-Landung
+_LA_LANDED_OBS_CAP = 400            # Deckel für den Board-Read pro Sweep
+
+# Fallback-Liste, falls app.py nicht erreichbar ist (isolierter Unit-Test).
+# Die Wahrheit steht in `app._ARR_STATUS_TERMINAL` — hier NICHT erweitern.
+_ARR_TERMINAL_FALLBACK = ('gelandet', 'landed', 'arrived', 'angekommen',
+                          'at gate', 'on blocks', 'on-blocks', 'gepäck',
+                          'gepaeck', 'baggage', 'diverted', 'umgeleitet')
+
+# Toleranz zwischen behaupteter Ankunft und ihrem Schreib-Stempel (identisch zu
+# `app._ARR_OBS_SETTLE_MIN`): Uhren laufen auseinander, ein paar Minuten sind
+# kein Beleg für eine Fälschung.
+_LA_OBS_SETTLE_MIN = 3
+
+
+def _status_terminal(status):
+    fn = _app_attr('_arr_status_terminal')
+    if callable(fn):
+        try:
+            return bool(fn(status))
+        except Exception:                               # pragma: no cover
+            pass
+    s = str(status or '').strip().lower()
+    return bool(s) and any(t in s for t in _ARR_TERMINAL_FALLBACK)
+
+
+def _flight_keys(sector):
+    """Schreibweisen der Flugnummer, unter denen die Board-Zeile stehen kann
+    ('LH 1457' → {'LH1457'}). Leere Menge, wenn der Sektor keine trägt."""
+    raw = str((sector or {}).get('flight') or '').replace(' ', '').upper()
+    keys = {raw} if raw else set()
+    try:
+        from blueprints.lh_mqtt import _norm_flight
+        nf = _norm_flight(raw)
+        if nf:
+            keys.add(nf[0] + nf[1])
+    except Exception:                                   # pragma: no cover
+        pass
+    return {k for k in keys if k}
+
+
+def _closing_sector(sectors, now_utc):
+    """Das Leg, dessen Landung die Karte beenden DÜRFTE — oder None.
+
+    None heißt „die Karte darf auf keinen Fall wegen einer Landung enden":
+    entweder liegt gar kein Leg im Activity-Fenster, oder es steht noch ein
+    Abflug aus (Turnaround/Mehr-Leg-Umlauf).
+    """
+    plausible = _plausible_sectors(sectors, now_utc)
+    if not plausible:
+        return None
+    try:
+        from blueprints.lh_mqtt import _parse_iso_utc
+    except Exception:                                   # pragma: no cover
+        return None
+    best, best_dep = None, None
+    for s in plausible:
+        dep = _parse_iso_utc(s.get('dep_iso'))
+        if dep is None:                                 # pragma: no cover
+            continue
+        if dep > now_utc:
+            return None                                 # ein Leg steht noch aus
+        if best_dep is None or dep > best_dep:
+            best, best_dep = s, dep
+    return best
+
+
+def _arrival_obs_rows(sectors, now_utc):
+    """EIN gebündelter Board-Read für alle Kandidaten-Legs. Wirft nie; []
+    heißt „keine Landung belegt" und damit: nichts beenden."""
+    want_ap, want_fn = set(), set()
+    for s in sectors or []:
+        to = str((s or {}).get('to') or '').strip().upper()
+        keys = _flight_keys(s)
+        if len(to) == 3 and keys:
+            want_ap.add(f'{to}#ARR')
+            want_fn |= keys
+    if not want_ap or not want_fn:
+        return []
+    client = _sb()
+    if client is None:
+        return []
+    dates = [(now_utc.date() + timedelta(days=off)).isoformat()
+             for off in (-1, 0, 1)]
+    base = 'airport,flight,date,sched,esti,status,cancelled,updated_at'
+
+    def _read(cols):
+        return (client.table('airport_delay_obs').select(cols)
+                .in_('airport', sorted(want_ap))
+                .in_('flight', sorted(want_fn))
+                .in_('date', dates)
+                .limit(_LA_LANDED_OBS_CAP).execute()).data or []
+
+    try:
+        # SCHEMA-SAFE (Lehre fcm_token 01.08.): ohne die Spalte lieber ohne
+        # Messhürde-Stempel lesen als gar nicht — der Altbestands-Zweig unten
+        # (updated_at) trägt dann.
+        return _read(base + ',esti_changed_at')
+    except Exception:
+        try:
+            return _read(base)
+        except Exception as exc:
+            log.warning('[live-activity] sweep board read failed: %s',
+                        type(exc).__name__)
+            return []
+
+
+def confirmed_arrival(obs_rows, sector, now_utc):
+    """Bestätigte Landezeit dieses Legs (aware UTC) oder None. Pure.
+
+    Die vier Hürden stehen im Kopfkommentar dieses Abschnitts. Im Zweifel
+    None — eine Karte fälschlich zu beenden ist teurer, als sie 10 min zu lang
+    stehen zu lassen.
+    """
+    to = str((sector or {}).get('to') or '').strip().upper()
+    keys = _flight_keys(sector)
+    if len(to) != 3 or not keys:
+        return None
+    try:
+        from blueprints.lh_mqtt import _board_dt, _parse_iso_utc, _station_tz
+    except Exception:                                   # pragma: no cover
+        return None
+    tz = _station_tz(to)
+    if tz is None:
+        # Ohne Ortszone wäre jede Board-Uhrzeit eine Rechnung ins Blaue
+        # (Zeitzonen-Fehlerklasse). Dann lieber kein Ende.
+        return None
+    dep = _parse_iso_utc((sector or {}).get('dep_iso'))
+    best = None
+    for row in obs_rows or []:
+        if not isinstance(row, dict):                   # pragma: no cover
+            continue
+        if str(row.get('airport') or '').upper() != f'{to}#ARR':
+            continue
+        if str(row.get('flight') or '').replace(' ', '').upper() not in keys:
+            continue
+        if row.get('cancelled'):
+            continue
+        if not _status_terminal(row.get('status')):
+            continue                                    # Prognose, keine Messung
+        arr = _board_dt(row.get('date'), row.get('esti'), tz)
+        if arr is None:
+            continue                                    # Status ohne Uhrzeit
+        arr = arr.astimezone(timezone.utc)
+        if arr > now_utc:
+            continue                                    # „gelandet" in der Zukunft
+        if (now_utc - arr) > timedelta(hours=_LA_LANDED_LOOKBACK_H):
+            continue                                    # Vortags-Rotation
+        if dep is not None and arr < dep:
+            continue                                    # vor dem eigenen Abflug
+        # MESSHÜRDE: der Stempel muss NACH der behaupteten Ankunft liegen.
+        stamp = _parse_iso_utc(row.get('esti_changed_at')) \
+            or _parse_iso_utc(row.get('updated_at'))
+        if stamp is None:
+            continue
+        if stamp < arr - timedelta(minutes=_LA_OBS_SETTLE_MIN):
+            continue                                    # eingefrorene Prognose
+        if best is None or arr > best:
+            best = arr
+    return best
+
+
+def _end_row(row, mark_time, reason, dismiss_after_s=0, kicker='BEENDET',
+             sector=None, arrived=False):
+    """EINE Zeile beenden: `event='end'` mit `dismissal-date`, danach die
+    Registry-Zeile stilllegen. Die Zeile wird AUCH dann stillgelegt, wenn der
+    APNs-Push scheitert — sonst pusht der Fanout weiter gegen eine Karte, die
+    nachweislich nichts Richtiges mehr zeigt.
+
+    `dismiss_after_s=0` (Default) = sofort weg: der Fall „nichts trägt mehr".
+    `arrived=True` = der Abschluss NACH einer bestätigten Landung; dann trägt
+    die Karte den echten Landezeitpunkt und verschwindet erst zur Frist.
+    """
     state = {
         'stateVersion': 2,
         # BEWUSST ein bereits im Vertrag benutzter Phasen-Wert. Ein neuer String
         # („ended") wäre riskant: ist `phase` in Swift ein enum mit String-
         # rawValue, verwirft der Decoder ein unbekanntes ContentState KOMPLETT
-        # und STILL — das Ende käme dann nie an. Sichtbar wird der Wert nicht,
-        # die Karte wird im selben Push sofort ausgeblendet.
+        # und STILL — das Ende käme dann nie an. `turnaround` ist zugleich die
+        # Phase, die der MQTT-Fanout für `arrived` setzt: gelandet, steht.
         'phase': 'turnaround',
-        'kicker': 'BEENDET',
+        'kicker': kicker,
         # Echter, bekannter Zeitpunkt — keine erfundene Landezeit.
         'mainTime': mark_time,
         'generatedAt': datetime.now(timezone.utc),
     }
+    if arrived:
+        frm = str((sector or {}).get('from') or '').strip().upper() or None
+        to = str((sector or {}).get('to') or '').strip().upper() or None
+        fno = (sorted(_flight_keys(sector))[:1] or [None])[0]
+        state.update({
+            'fromIATA': frm, 'toIATA': to,
+            'route': f'{frm}–{to}' if frm and to else None,
+            'fromTZIdentifier': _airport_tz(frm),
+            'toTZIdentifier': _airport_tz(to),
+            'flightNo': fno, 'footLeading': fno,
+            # Die gemessene Landung IST die Ankunftszeit dieser Karte.
+            'estArr': mark_time,
+            # Eine Landung belegt beide Enden. `arrConfirmed` ist genau das
+            # Feld, an dem der Client seine 60-min-Frist (`landedGrace`)
+            # festmacht — hier stimmen Server und Client überein.
+            'depConfirmed': True, 'arrConfirmed': True,
+            # 1.0 ist ein KONSTANTER Wert, kein Uhr-Ableitung — er darf den
+            # Digest-Schutz nicht zeitabhängig machen (5-%-Quantisierung im
+            # Fanout aus demselben Grund).
+            'progress': 1.0,
+        })
     normalized, problems = _normalize_content_state(state)
     if _fatal_problems(problems):                       # pragma: no cover
         log.warning('[live-activity] sweep end state invalid: %s', problems)
         return False
     ok = False
     try:
-        res = _push_row(row, normalized, event='end', dismiss_after_s=0)
+        res = _push_row(row, normalized, event='end',
+                        dismiss_after_s=max(0, int(dismiss_after_s or 0)))
         ok = res.get('status') == 'sent'
     except Exception as exc:
         log.warning('[live-activity] sweep end push failed user_ref=%s: %s',
@@ -1470,10 +1739,11 @@ def _end_row(row, mark_time, reason):
 def sweep_stale_live_activities(now_utc=None):
     """Beendet Live Activities ohne Grundlage. Returns Zähler-Dict. Wirft nie.
 
-    KEIN LH-Call — ausschließlich gespeicherte Roster-Zeiten.
+    KEIN LH-Call, kein FR24 — ausschließlich gespeicherte Roster-Zeiten und
+    gespeicherte Board-Beobachtungen (`airport_delay_obs`).
     """
     counts = {'checked': 0, 'ended': 0, 'kept': 0, 'no_roster': 0,
-              'hard_age': 0}
+              'hard_age': 0, 'landed': 0}
     if not _sweep_enabled():
         counts['disabled'] = True
         return counts
@@ -1484,10 +1754,34 @@ def sweep_stale_live_activities(now_utc=None):
         return counts
     by_token = _roster_sectors_by_token({r.get('user_token') for r in rows},
                                         now_utc)
+    # ERST alle Abschluss-Kandidaten sammeln, DANN EINEN Board-Read (statt
+    # einem pro Karte — dieselbe Bündelungs-Regel wie beim Roster-Read).
+    closing = {}
+    for row in rows:
+        try:
+            sec = _closing_sector(by_token.get(row.get('user_token')), now_utc)
+        except Exception:                               # pragma: no cover
+            sec = None
+        if sec is not None:
+            closing[row.get('id')] = sec
+    obs_rows = _arrival_obs_rows(closing.values(), now_utc) if closing else []
     for row in rows:
         try:
             sectors = by_token.get(row.get('user_token'))
             if sectors:
+                # (1) BESTÄTIGTE LANDUNG schlägt jede Planzeit-Rechnung: finaler
+                # Zustand mit echter Ankunftszeit, Karte verschwindet zur Frist.
+                sec = closing.get(row.get('id'))
+                arr_dt = (confirmed_arrival(obs_rows, sec, now_utc)
+                          if sec is not None else None)
+                if arr_dt is not None:
+                    hold = _LA_LANDED_HOLD_S - (now_utc - arr_dt).total_seconds()
+                    if _end_row(row, arr_dt, 'arrived_confirmed',
+                                dismiss_after_s=hold, kicker='GELANDET',
+                                sector=sec, arrived=True):
+                        counts['ended'] += 1
+                        counts['landed'] += 1
+                    continue
                 if _duty_still_plausible(sectors, now_utc):
                     counts['kept'] += 1
                     continue
@@ -1510,9 +1804,11 @@ def sweep_stale_live_activities(now_utc=None):
             log.warning('[live-activity] sweep row failed: %s',
                         type(exc).__name__)
     if counts['ended']:
-        log.info('[live-activity] sweep: %d von %d beendet (kein laufendes '
-                 'Leg: %d, Reißleine: %d)', counts['ended'], counts['checked'],
-                 counts['ended'] - counts['hard_age'], counts['hard_age'])
+        log.info('[live-activity] sweep: %d von %d beendet (gelandet: %d, kein '
+                 'laufendes Leg: %d, Reißleine: %d)', counts['ended'],
+                 counts['checked'], counts['landed'],
+                 counts['ended'] - counts['hard_age'] - counts['landed'],
+                 counts['hard_age'])
     return counts
 
 
