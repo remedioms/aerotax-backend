@@ -50692,6 +50692,48 @@ def _attach_sectors(briefings, events, existing=None):
         app.logger.warning(f'[ical-briefings] sectors-attach-fail: {str(e)[:160]}')
 
 
+def _preserve_past_flown_days(briefings, existing):
+    """SCHUTZPLANKE (Tibor-Vorfall 2026-08-02, „Tirana fehlt"): Ein Import darf
+    einen VERGANGENEN Tag, der gespeicherte Flug-Sektoren trägt, nicht durch
+    einen sektorlosen Neuaufbau entkernen.
+
+    Der echte Hergang: Ein Historien-Import mit Fenster-Ende 31.07. konnte die
+    BCN-Hotel-Spanne nicht ableiten (der Weiterflug lag außerhalb des Fensters)
+    → Datums-Fallback-VEVENT 31.07.–01.08., das EINEN TAG über das Fenster
+    hinausragt. `_ics_events_to_briefings` baut jeden angefassten Tag frisch
+    (REPLACE-NOT-ACCUMULATE) → der 01.08. verlor seine geflogenen Legs
+    (BCN-FRA, FRA-TIA) an einen bloßen „Layover [BCN] (Tag 2/2)"-Marker; das
+    Reconcile rettete nichts, weil der Tag ja in feed_dates stand.
+
+    Regel: Datum < heute UND alter Tag hat ical_sectors UND der Neuaufbau hat
+    KEINE → der alte Tagessatz bleibt KOMPLETT stehen. Geflogene Historie kann
+    nicht rückwirkend storniert werden; ein Voll-Import MIT Flug-Events für den
+    Tag baut ihn weiterhin normal neu (der Guard greift nur bei sektorlosem
+    Neuaufbau). Zukunftstage bleiben bewusst REPLACE-Semantik (Streichungen
+    müssen verschwinden — Owner-Regel „golden truth"). Läuft NACH
+    `_attach_sectors`, VOR dem Save; in-place, gibt die Zahl der bewahrten
+    Tage zurück, wirft nie."""
+    kept = 0
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        for d, old in (existing or {}).items():
+            if not isinstance(old, dict) or d >= today:
+                continue
+            if not (old.get('ical_sectors') or []):
+                continue
+            new = briefings.get(d)
+            if isinstance(new, dict) and not (new.get('ical_sectors') or []):
+                briefings[d] = dict(old)
+                kept += 1
+                app.logger.info(
+                    f'[ical-briefings] past-day-guard: {d} behalten '
+                    f'({len(old.get("ical_sectors") or [])} Sektoren, neuer '
+                    f'Aufbau war sektorlos: {str(new.get("ical_summary"))[:60]!r})')
+    except Exception as e:
+        app.logger.warning(f'[ical-briefings] past-day-guard-fail: {str(e)[:120]}')
+    return kept
+
+
 def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
     """RECONCILE: säubert veraltete/stornierte iCal-Tage aus `briefings` (in-place)
     UND aus der manuellen Briefing-Map + Supabase, sodass ein RE-IMPORT den Monat
@@ -51295,6 +51337,11 @@ def import_calendar_feed(token):
         # `existing` = gespeicherter Stand VOR diesem Import → Plan-Blockzeiten
         # überleben den Replace (s. _preserve_plan_times).
         _attach_sectors(briefings, _ev_sel, existing=existing)
+        # Geflogene Vergangenheit gegen sektorlose Neuaufbauten verteidigen
+        # (Tibor 2026-08-02: Historien-Import-Fallback-Marker entkernte den
+        # Vortag) — nach _attach_sectors, damit „hat der Neuaufbau Sektoren?"
+        # eine beantwortbare Frage ist.
+        _preserve_past_flown_days(briefings, existing)
         if not _ical_briefings_save(token, briefings):
             _persist_err = 'briefings_persist_failed'
     except Exception as e:
@@ -52055,6 +52102,10 @@ def upload_calendar_events(token):
         # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad) —
         # inkl. Plan-Blockzeiten aus dem gespeicherten Stand.
         _attach_sectors(briefings, adapted, existing=existing_briefings)
+        # Gleiche Schutzplanke wie im ICS-URL-Pfad: ein hinterherhängender
+        # Gerätekalender darf geflogene Vergangenheit nicht entkernen
+        # (identischer Zünder wie der Historien-Import, s. Helper-Doku).
+        _preserve_past_flown_days(briefings, existing_briefings)
         _persist_err = (None if _ical_briefings_save(token, briefings)
                         else 'briefings_persist_failed')
     except Exception as e:

@@ -3212,6 +3212,16 @@ def duty_events_to_ics(resp, pickups=None, rot_legs=None, enrich=True):
                     # Datums-Verhalten für den GANZEN Lauf — erster Tag bis
                     # letzter Tag+2 (DTEND exklusiv), damit der Layover-Morgen
                     # seinen Marker behält.
+                    # ⚠️ ACHTUNG (Tibor 2026-08-02): dieses Event ragt damit
+                    # EINEN TAG über den letzten Hotel-Tag hinaus — bei einem
+                    # Fenster-Import (Historie endet am Monatsletzten) fasst es
+                    # den ersten Tag NACH dem Fenster an und der REPLACE-Aufbau
+                    # entkernte dort die geflogenen Legs. Die Schutzplanke
+                    # `_preserve_past_flown_days` (app.py) fängt das ab; das
+                    # Log hier macht sichtbar, WANN dieser Zweig überhaupt zieht.
+                    log.info('[lh_flightops] hotel-span %s %s..%s nicht '
+                             'ableitbar → Datums-Fallback bis %s',
+                             (to or frm), _first, _last, _shift(_last, 2))
                     lines += ['BEGIN:VEVENT', f'UID:{uid}',
                               f'DTSTART;VALUE=DATE:{_first}',
                               f'DTEND;VALUE=DATE:{_shift(_last, 2)}',
@@ -4226,6 +4236,17 @@ def flightops_import(token):
     # damit die Re-Login-Heilung nie an Hintergrund-Syncs verhungert.
     resp = duty_events(token, fd, td,
                        interactive=not bool(body.get('background')))
+    # FORENSIK (Tibor 2026-08-02: Fenster/History des zerstörenden Laufs war
+    # aus den Logs nicht rekonstruierbar — alter Container weg, keine Zeile):
+    # EIN INFO-Log pro Import mit Fenster, History-Flag und Antwort-Umfang.
+    try:
+        _n_days = len(_as_list((resp or {}).get('rosterDays')
+                               or (resp or {}).get('days') or []))
+        log.info('[lh_flightops] import tok=%s fenster=%s..%s history=%s '
+                 'bg=%s tage=%s', token[:8], fd, td, _history,
+                 bool(body.get('background')), _n_days)
+    except Exception:
+        pass
     if resp is None:
         return jsonify({'ok': False, 'error': 'duty_events_failed'}), 502
     # Service-Referenzen (accessCode für Crew-Liste/Check-in!) mitnehmen —
