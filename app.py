@@ -51260,6 +51260,18 @@ def import_calendar_feed(token):
     # Layover-Synthese für Feeds ohne LAYOVER-Events (Condor/offblock/
     # Edelweiss, no-op für LH/SWISS/ITA — siehe Gates im Helper).
     events = _generic_layover_synthesis(events, token=token)
+    # RECONCILE-WAHRHEIT VOR JEDER PERFORMANCE-KAPPUNG sichern.
+    #
+    # Die Briefing-Pipeline verarbeitet aus Speicher-/CPU-Gründen höchstens
+    # 200 Events, der Profil-Snapshot höchstens 300. Diese Grenzen dürfen aber
+    # NICHT den vom Feed tatsächlich abgedeckten Zeitraum definieren: liegen
+    # mehr als 200 aktuelle Events vor, behält `_select_relevant_feed_events`
+    # bewusst die chronologisch ersten. `fmax` des Reconcile schrumpfte dadurch
+    # künstlich und der Zukunfts-Geist-Prune löschte echte, nur hinter dem Cap
+    # liegende Dienste. Die vollständige normalisierte Liste wird ausschließlich
+    # für den billigen Datums-Abgleich verwendet; Aufbau/Persistenz bleiben
+    # unverändert gekappt.
+    _reconcile_events = list(events)
     # Relevanz-Auswahl VOR den Caps: Jahre-lange iCloud-Feeds (ITA: 1385 Events
     # seit 2023, unsortiert) würden sonst per Prefix-Slice die AKTUELLEN
     # Dienste verlieren. ≤300 Events (LH/SWISS-Fenster) = unverändert.
@@ -51387,7 +51399,7 @@ def import_calendar_feed(token):
                               'feed_dates': 0, 'cleared': 0, 'window': None}
         else:
             _reconcile_dbg = _reconcile_month_briefings(
-                token, briefings, _ev_sel, full_clean=_full_clean)
+                token, briefings, _reconcile_events, full_clean=_full_clean)
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
         # `existing` = gespeicherter Stand VOR diesem Import → Plan-Blockzeiten
         # überleben den Replace (s. _preserve_plan_times).
@@ -52130,6 +52142,11 @@ def upload_calendar_events(token):
         adapted = _itaify_roster_events(adapted, token=token)
         adapted = _edelweissify_roster_events(adapted, token=token)
         adapted = _generic_layover_synthesis(adapted, token=token)
+        # Wie im URL-/Direkt-ICS-Pfad: das 200er-Limit begrenzt nur den teuren
+        # Neuaufbau, niemals die autoritative Feed-Abdeckung fürs Reconcile.
+        # Sonst kann ein großer EventKit-Kalender echte Dienste hinter dem Cap
+        # per Zukunfts-Geist-Prune löschen.
+        _reconcile_events = list(adapted)
         adapted = _select_relevant_feed_events(adapted, 200)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
@@ -52153,7 +52170,7 @@ def upload_calendar_events(token):
                               'skipped': 'url_feed_fresher'}
         else:
             _reconcile_dbg = _reconcile_month_briefings(
-                token, briefings, adapted, full_clean=_full_clean)
+                token, briefings, _reconcile_events, full_clean=_full_clean)
         # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad) —
         # inkl. Plan-Blockzeiten aus dem gespeicherten Stand.
         _attach_sectors(briefings, adapted, existing=existing_briefings)
