@@ -261,6 +261,18 @@ def _satisfied_manifest(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
+@legal_consent_bp.get("/api/legal-consent/manifest")
+def legal_consent_manifest():
+    """AUTH-FREI: das aktuell servierte Rechts-Manifest (Version/Hash/Dokumente).
+
+    Fuer das Ship-Gate `ios/AeroTax/scripts/check-legal-manifest.sh`
+    (Vorfall 2026-08-02: iOS-Manifest-Bump ohne Server-Haelfte = 409-Wand;
+    der Vertrag lebt in zwei Repos ohne Kopplung). Das Manifest ist ohnehin
+    oeffentlich — es steckt wortgleich in jedem App-Binary; hier steht nur,
+    welchen Stand der SERVER kennt."""
+    return jsonify({"ok": True, "manifest": _public_manifest()})
+
+
 @legal_consent_bp.get("/api/legal-consent/status")
 def legal_consent_status():
     token, _email, auth_error = _auth_result()
