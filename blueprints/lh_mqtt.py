@@ -1371,14 +1371,21 @@ def _build_push(kind, flight_disp, topic_date, facts, sector):
     return None
 
 
-def _push_inbound(kind, event_flight, topic_date, facts=None):
+def _push_inbound(kind, event_flight, topic_date, facts=None,
+                  excluded_tokens=None):
     """Departed/Arrived/Est-Dep eines (subscribten) Flugs: die Crews finden,
     deren NÄCHSTES Leg am Ankunfts-Airport mit GENAU dieser Maschine geplant
     ist, und ihnen den Zubringer-Status pushen — im Layover weiß man so, ob
     der eigene Abflug pünktlich wird (est_dep = Frühwarnung noch VOR dem
     Zubringer-Start, ab 15 min). Guard gegen die Früh-Rotation derselben
     Maschine: der Event-Flug muss der BESTE (letzte) Board-Inbound vor dem
-    Leg sein; ohne Board-Daten (Outstation) zählt der Maschinen-Match."""
+    Leg sein; ohne Board-Daten (Outstation) zählt der Maschinen-Match.
+
+    `excluded_tokens` enthält die Crew des Event-Flugs selbst. Bei einem
+    Durchlauf bleibt dieselbe Besatzung auf der Maschine und hat anschließend
+    ebenfalls ein Leg ab dem Ankunftsort. Ohne diesen Ausschluss wurde sie als
+    wartende Crew fehlklassifiziert und bekam nach ihrer eigenen Landung
+    „Dein Flieger ist gelandet" (Tibor + Kollegin, BGO, 02.08.2026)."""
     facts = facts or lh_flight_facts(event_flight, topic_date, force=True,
                                      caller='mqtt_inbound') or {}
     if kind == 'est_dep':
@@ -1401,7 +1408,7 @@ def _push_inbound(kind, event_flight, topic_date, facts=None):
                  if isinstance(delay, int) and abs(delay) >= 5 else '')
     obs = None
     pushed = 0
-    seen = set()
+    seen = set(excluded_tokens or ())
     for tok, s in _iter_sectors(rows):
         if not tok or tok in seen:
             continue
@@ -1597,8 +1604,9 @@ def lh_mqtt_event():
         # zusätzlich zur Direkt-Crew — der Zubringer eines ANDEREN Legs kann
         # sich schon VOR seinem Abflug verspäten (Layover-Frühwarnung).
         try:
-            pushed += _push_inbound(kind, flight_disp, topic_date,
-                                    facts=facts or None)
+            pushed += _push_inbound(
+                kind, flight_disp, topic_date, facts=facts or None,
+                excluded_tokens={tok for tok, _sector in affected})
         except Exception as e:
             log.warning('[lh_mqtt] inbound push fail %s: %s', flight_disp,
                         type(e).__name__)

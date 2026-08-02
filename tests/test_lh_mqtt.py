@@ -286,6 +286,45 @@ def test_inbound_arrived_mentions_own_departure(client, monkeypatch):
     assert data['type'] == 'inbound_arrival'
 
 
+def test_inbound_arrived_excludes_crew_of_arriving_flight(client, monkeypatch):
+    """Durchgehende Crew ist kein wartender Empfänger ihres eigenen Zubringers.
+
+    Beide User haben dasselbe nächste Leg auf derselben Maschine. user0 saß
+    aber bereits auf dem gerade gelandeten Event-Flug; nur die tatsächlich am
+    Boden wartende user1 darf den Inbound-Push erhalten (BGO-Fall 02.08.).
+    """
+    from blueprints import flight_checkins as FC
+    from blueprints import live_activity as LA
+    from datetime import datetime as dt, timezone as tz
+
+    now = dt.now(tz.utc)
+    current_leg = {
+        'flight': 'LH123', 'from': 'MUC', 'to': 'FRA',
+        'dep_iso': '2026-07-22T10:00:00Z',
+        'arr_iso': '2026-07-22T11:00:00Z',
+    }
+    next_leg = _layover_leg(now, tail='D-AIKP')
+    pushes = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight',
+                        lambda dates, c, n: _rows([current_leg]))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([next_leg], [next_leg]))
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, *a, **k: pushes.append(tok))
+    monkeypatch.setattr(FC, 'notify_flight_event', lambda *a, **k: 0)
+    monkeypatch.setattr(LA, 'push_for_affected', lambda *a, **k: 0)
+
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Arrived', flight='LH123')).get_json()
+
+    assert d['users'] == 1
+    assert d['pushed'] == 1
+    assert pushes == ['user1']
+
+
 def test_inbound_early_rotation_is_filtered(client, monkeypatch):
     # Board kennt einen SPÄTEREN Zubringer (LH999) → das Event der früheren
     # Rotation (LH123) pusht nicht.
@@ -371,7 +410,7 @@ def test_inbound_delay_small_is_silent(client, monkeypatch):
 
 
 def test_est_dep_serves_direct_crew_and_inbound_watchers(client, monkeypatch):
-    # LH123 ist ROSTER-Flug von user0 UND Zubringer von user0s Kollegin (LH400
+    # LH123 ist ROSTER-Flug von user0 UND Zubringer von user1 (LH400
     # ab FRA) → beide Pushes aus EINEM Event. Topic-Datum = LOKALES Abflugdatum
     # des Sektors (Broker-Keying) — dynamisch aus `now`, sonst wird der Test
     # nach Mitternacht datumsabhängig rot (so geschehen am 2026-07-23).
@@ -389,7 +428,8 @@ def test_est_dep_serves_direct_crew_and_inbound_watchers(client, monkeypatch):
                         lambda dates, c, n: _rows([direct_leg]))
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: dict(facts))
     monkeypatch.setattr(lh_mqtt, '_rows_from_station',
-                        lambda dates, st: _rows([_layover_leg(now, tail='D-AIKP')]))
+                        lambda dates, st: _rows(
+                            [], [_layover_leg(now, tail='D-AIKP')]))
     monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
     monkeypatch.setattr(lh_mqtt, '_do_push',
                         lambda tok, title, body, data=None, idempotency_key=None:
@@ -531,7 +571,8 @@ def test_inbound_path_never_calls_live_activity(client, monkeypatch):
     monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
     monkeypatch.setattr(lh_mqtt, 'lh_flight_facts', lambda *a, **k: {})
     monkeypatch.setattr(lh_mqtt, '_push_inbound',
-                        lambda kind, disp, date, facts=None: 1)
+                        lambda kind, disp, date, facts=None,
+                        excluded_tokens=None: 1)
     monkeypatch.setattr(LA, 'push_for_affected',
                         lambda *a, **k: pytest.fail(
                             'Live-Activity ohne betroffene Crew verboten'))
@@ -554,7 +595,8 @@ def test_departed_event_refreshes_facts_for_live_activity(client, monkeypatch):
                         lambda *a, **k: (seen.__setitem__('force', k.get('force')),
                                          {'est_arr': '2026-07-22T23:58:00+02:00'})[1])
     monkeypatch.setattr(lh_mqtt, '_push_inbound',
-                        lambda kind, disp, date, facts=None: 0)
+                        lambda kind, disp, date, facts=None,
+                        excluded_tokens=None: 0)
     monkeypatch.setattr(LA, 'push_for_affected',
                         lambda affected, kind, flight_disp, topic_date,
                         facts=None: (seen.__setitem__('facts', facts), 1)[1])
