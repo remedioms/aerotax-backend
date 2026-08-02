@@ -19,8 +19,11 @@ create table if not exists public.ax_smp_user_cards (
     topic       text,
     front       text not null,
     back        text not null,
-    status      text not null default 'pending'
-                check (status in ('pending', 'approved', 'rejected')),
+    source_community_card_id uuid references public.ax_smp_user_cards(id),
+    status      text not null default 'private'
+                check (status in ('private', 'pending', 'approved', 'rejected')),
+    submitted_at timestamptz,
+    consent_version text,
     deleted     boolean not null default false,
     created_at  timestamptz not null default now(),
     updated_at  timestamptz not null default now()

@@ -80,6 +80,23 @@ def test_historical_eight_character_token_prefix_is_redacted():
     assert redact_text(TOKEN[:8]) == REDACTED_TOKEN
 
 
+def test_layover_web_invite_and_legacy_code_are_redacted():
+    secret = 'lw_' + ('x' * 43)
+    legacy = 'eyJpIjoiZ3JvdXAxMjMifQ'
+    safe = redact_url(f'/layover/{secret}?c={legacy}')
+    assert secret not in safe
+    assert legacy not in safe
+    assert f'/layover/{REDACTED_TOKEN}' in safe
+    assert 'c=[redacted]' in safe
+
+
+def test_layover_web_api_path_secret_is_redacted():
+    secret = 'lw_' + ('y' * 43)
+    safe = redact_text(f'POST /api/layover-web/invites/{secret}/messages')
+    assert secret not in safe
+    assert REDACTED_TOKEN in safe
+
+
 def test_logging_filter_failure_emits_neutral_record(monkeypatch):
     import observability.redaction as redaction
 

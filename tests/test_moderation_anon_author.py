@@ -195,3 +195,74 @@ def test_report_email_notification_ruft_resolver_nur_intern_ohne_response_leak()
         # Netzzugriff; hier zählt nur: kein Exception, kein Rückgabewert mit PII.
         result = A._send_report_email_notification(entry)
     assert result is None
+
+
+def test_smp_meldung_speichert_frage_antwort_und_sendet_resend_notification():
+    saved = []
+    with A.app.test_request_context(method='POST', json={
+        'kind': 'smp_flashcard', 'target_id': 'card-1', 'reason': 'wrong',
+        'note': 'Die Definition ist fachlich nicht richtig.',
+        'content_title': 'Was ist SMART?',
+        'content_body': 'Schnell, modern, attraktiv.',
+    }), patch.object(A, '_token_rate_limited', return_value=False), \
+         patch.object(A, '_load_reports', return_value=[]), \
+         patch.object(A, '_save_reports', side_effect=lambda rows: saved.extend(rows)), \
+         patch.object(A, '_send_report_email_notification') as mail:
+        resp = A.moderation_report(TOKEN)
+    assert resp.status_code == 200
+    assert saved[0]['content_title'] == 'Was ist SMART?'
+    assert saved[0]['content_body'] == 'Schnell, modern, attraktiv.'
+    mail.assert_called_once()
+
+
+def test_zwei_unterschiedliche_smp_melder_blenden_community_karte_aus():
+    existing = [{
+        'id': 'r1', 'reporter_token': 'AT-FIRST0000000001',
+        'kind': 'smp_flashcard', 'target_id': 'card-1',
+        'reason': 'wrong', 'status': 'pending',
+    }]
+    with A.app.test_request_context(method='POST', json={
+        'kind': 'smp_flashcard', 'target_id': 'card-1', 'reason': 'wrong',
+        'note': 'Auch diese Antwort ist fachlich falsch.',
+        'content_title': 'Frage', 'content_body': 'Antwort',
+    }), patch.object(A, '_token_rate_limited', return_value=False), \
+         patch.object(A, '_load_reports', return_value=existing), \
+         patch.object(A, '_save_reports'), \
+         patch.object(A, '_auto_hide_reported_smp_community_card',
+                      return_value=True) as hide, \
+         patch.object(A, '_send_report_email_notification') as mail:
+        resp = A.moderation_report(TOKEN)
+    assert resp.get_json()['hidden'] is True
+    hide.assert_called_once_with('card-1')
+    assert mail.call_args.kwargs == {'report_count': 2, 'auto_hidden': True}
+
+
+def test_doppelte_smp_meldung_desselben_accounts_zaehlt_nur_einmal():
+    existing = [{
+        'id': 'r1', 'reporter_token': TOKEN,
+        'kind': 'smp_flashcard', 'target_id': 'card-1',
+        'reason': 'wrong', 'status': 'pending',
+    }]
+    with A.app.test_request_context(method='POST', json={
+        'kind': 'smp_flashcard', 'target_id': 'card-1', 'reason': 'wrong',
+        'note': 'Ich melde dieselbe Karte erneut.',
+        'content_title': 'Frage', 'content_body': 'Antwort',
+    }), patch.object(A, '_token_rate_limited', return_value=False), \
+         patch.object(A, '_load_reports', return_value=existing), \
+         patch.object(A, '_save_reports'), \
+         patch.object(A, '_auto_hide_reported_smp_community_card') as hide, \
+         patch.object(A, '_send_report_email_notification') as mail:
+        resp = A.moderation_report(TOKEN)
+    assert resp.get_json()['hidden'] is False
+    hide.assert_not_called()
+    assert mail.call_args.kwargs == {'report_count': 1, 'auto_hidden': False}
+
+
+def test_smp_meldung_braucht_beschreibung():
+    with A.app.test_request_context(method='POST', json={
+        'kind': 'smp_exam_question', 'target_id': 'q-1', 'reason': 'wrong',
+        'note': 'x', 'content_title': 'Frage', 'content_body': 'Antwort',
+    }), patch.object(A, '_token_rate_limited', return_value=False):
+        resp, status = A.moderation_report(TOKEN)
+    assert status == 400
+    assert resp.get_json()['error'] == 'description_required'

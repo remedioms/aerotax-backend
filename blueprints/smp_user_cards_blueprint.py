@@ -189,7 +189,9 @@ def _own_card_view(row):
         'topic': row.get('topic'),
         'front': row.get('front'),
         'back': row.get('back'),
+        'source_community_card_id': row.get('source_community_card_id'),
         'status': row.get('status'),
+        'submitted_at': row.get('submitted_at'),
         'deleted': bool(row.get('deleted')),
         'created_at': row.get('created_at'),
         'updated_at': row.get('updated_at'),
@@ -256,13 +258,28 @@ def smp_upsert_user_card():
     topic_raw = body.get('topic')
     topic = _strip_html(topic_raw)[:TOPIC_MAX] if topic_raw else None
 
+    source_raw = body.get('source_community_card_id')
+    source_community_card_id = _valid_uuid(str(source_raw)) if source_raw else None
+    if source_raw and not source_community_card_id:
+        return jsonify({'ok': False, 'error': 'invalid_source_community_card_id'}), 400
+
+    submit_for_review = body.get('submit_for_review') is True
+    rights_confirmed = body.get('rights_confirmed') is True
+    terms_version = _strip_html(body.get('terms_version') or '')[:40]
+    if submit_for_review and (not rights_confirmed or not terms_version):
+        return jsonify({'ok': False, 'error': 'rights_confirmation_required'}), 400
+    if submit_for_review and source_community_card_id:
+        # Eine gespeicherte Community-Karte ist keine eigene Schöpfung und darf
+        # nicht als neue Einreichung dupliziert werden.
+        return jsonify({'ok': False, 'error': 'community_copy_cannot_be_submitted'}), 400
+
     deleted_provided = 'deleted' in body
     deleted = bool(body.get('deleted')) if deleted_provided else None
 
     now = _now_iso()
     try:
         existing = (sb.table('ax_smp_user_cards')
-                    .select('id,owner_token,status,front,back,deleted')
+                    .select('id,owner_token,status,front,back,deleted,source_community_card_id')
                     .eq('id', card_id)
                     .limit(1)
                     .execute())
@@ -278,6 +295,7 @@ def smp_upsert_user_card():
                 'topic': topic,
                 'front': front,
                 'back': back,
+                'source_community_card_id': source_community_card_id,
                 'updated_at': now,
             }
             if deleted_provided:
@@ -286,9 +304,18 @@ def smp_upsert_user_card():
             # in die Review-Queue — sonst könnte ein User nach Freigabe den
             # Text unbemerkt gegen etwas anderes tauschen, das nie geprüft
             # wurde ("approved" bliebe stehen, obwohl der Inhalt neu ist).
-            if (row.get('status') == 'approved'
-                    and (front != row.get('front') or back != row.get('back'))):
+            content_changed = front != row.get('front') or back != row.get('back')
+            if submit_for_review:
                 update_fields['status'] = 'pending'
+                update_fields['submitted_at'] = now
+                update_fields['consent_version'] = terms_version
+            elif row.get('status') == 'approved' and content_changed:
+                # Eine bereits freiwillig eingereichte Karte bleibt nach einer
+                # Änderung im Review-Prozess, wird aber nie ungeprüft live.
+                update_fields['status'] = 'pending'
+            elif row.get('status') == 'rejected' and content_changed:
+                # Nach Ablehnung ist ein neuer bewusster Submit erforderlich.
+                update_fields['status'] = 'private'
             (sb.table('ax_smp_user_cards')
              .update(update_fields)
              .eq('id', card_id)
@@ -302,7 +329,10 @@ def smp_upsert_user_card():
                 'topic': topic,
                 'front': front,
                 'back': back,
-                'status': 'pending',
+                'source_community_card_id': source_community_card_id,
+                'status': 'pending' if submit_for_review else 'private',
+                'submitted_at': now if submit_for_review else None,
+                'consent_version': terms_version if submit_for_review else None,
                 'deleted': bool(deleted) if deleted_provided else False,
                 'created_at': now,
                 'updated_at': now,
@@ -334,8 +364,8 @@ def smp_list_user_cards():
         page = 1000
         while True:
             r = (sb.table('ax_smp_user_cards')
-                 .select('id,module,topic,front,back,status,deleted,'
-                         'created_at,updated_at')
+                 .select('id,module,topic,front,back,source_community_card_id,'
+                         'status,submitted_at,deleted,created_at,updated_at')
                  .eq('owner_token', token)
                  .order('created_at', desc=True)
                  .range(offset, offset + page - 1)

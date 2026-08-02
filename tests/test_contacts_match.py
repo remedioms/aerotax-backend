@@ -103,7 +103,13 @@ _PROFILES = {
 }
 
 
+def _clear_directory_cache():
+    with A._CONTACTS_DIRECTORY_CACHE_LOCK:
+        A._CONTACTS_DIRECTORY_CACHE.clear()
+
+
 def _call(body, blocked=None):
+    _clear_directory_cache()
     with patch.object(A, '_validate_token_exists', return_value='tibor@gmx.de'), \
          patch.object(A, '_token_rate_limited', return_value=False), \
          patch.object(A, 'SB_AVAILABLE', False), \
@@ -115,6 +121,43 @@ def _call(body, blocked=None):
                                              'profile': _PROFILES.get(t, {})}):
         client = A.app.test_client()
         return client.post('/api/user/contacts-match', json=body)
+
+
+def test_directory_snapshot_reuses_rows_until_ttl():
+    _clear_directory_cache()
+    calls = []
+
+    def load():
+        calls.append(True)
+        return [('mail@example.com', 'AT-ONE')]
+
+    with patch.object(A, '_contacts_match_auth_rows', side_effect=load):
+        first = A._contacts_match_directory_rows(need_profiles=False)[0]
+        second = A._contacts_match_directory_rows(need_profiles=False)[0]
+
+    assert first == second == [('mail@example.com', 'AT-ONE')]
+    assert len(calls) == 1
+
+
+def test_directory_snapshot_loads_auth_and_profiles_concurrently():
+    import threading
+    _clear_directory_cache()
+    barrier = threading.Barrier(2, timeout=1)
+
+    def auth_load():
+        barrier.wait()
+        return _AUTH_ROWS
+
+    def profile_load():
+        barrier.wait()
+        return _PROFILE_ROWS
+
+    with patch.object(A, '_contacts_match_auth_rows', side_effect=auth_load), \
+         patch.object(A, '_contacts_match_profile_rows', side_effect=profile_load):
+        auth, profiles = A._contacts_match_directory_rows(need_profiles=True)
+
+    assert auth == _AUTH_ROWS
+    assert profiles == _PROFILE_ROWS
 
 
 def test_endpoint_matches_by_email_hash():

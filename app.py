@@ -11511,6 +11511,51 @@ def _contacts_email_hash(email):
         str(email or '').strip().lower().encode('utf-8')).hexdigest()
 
 
+_CONTACTS_DIRECTORY_CACHE_TTL_S = max(
+    30, int(os.environ.get('AEROX_CONTACTS_DIRECTORY_CACHE_TTL_S', '300')))
+_CONTACTS_DIRECTORY_CACHE = {}
+_CONTACTS_DIRECTORY_CACHE_LOCK = _req_threading.Lock()
+_CONTACTS_DIRECTORY_LOAD_LOCKS = {
+    'auth': _req_threading.Lock(),
+    'profiles': _req_threading.Lock(),
+}
+
+
+def _contacts_directory_cached(key, loader):
+    """Kurzlebiger Snapshot fuer den teuren Kontakte-Abgleich.
+
+    Die zugrunde liegenden Verzeichnisdaten sind fuer alle Anfragen identisch.
+    Vorher hat trotzdem jeder einzelne Kontakte-Scan beide kompletten Supabase-
+    Tabellen seitenweise gelesen. Der Snapshot reduziert warme Scans auf einen
+    Speicherzugriff; das Lock verhindert einen Cache-Stampede beim Ablauf.
+    """
+    def _fresh_hit():
+        now = _req_time.monotonic()
+        hit = _CONTACTS_DIRECTORY_CACHE.get(key)
+        if hit and now - hit[0] < _CONTACTS_DIRECTORY_CACHE_TTL_S:
+            return list(hit[1])
+        return None
+
+    with _CONTACTS_DIRECTORY_CACHE_LOCK:
+        hit = _fresh_hit()
+        if hit is not None:
+            return hit
+
+    # Pro Verzeichnis ein eigenes Lock: zwei gleichzeitige auth-Loads werden
+    # zusammengelegt, auth + profiles duerfen dagegen parallel laufen.
+    load_lock = _CONTACTS_DIRECTORY_LOAD_LOCKS.setdefault(
+        key, _req_threading.Lock())
+    with load_lock:
+        with _CONTACTS_DIRECTORY_CACHE_LOCK:
+            hit = _fresh_hit()
+            if hit is not None:
+                return hit
+        rows = list(loader() or [])
+        with _CONTACTS_DIRECTORY_CACHE_LOCK:
+            _CONTACTS_DIRECTORY_CACHE[key] = (_req_time.monotonic(), rows)
+        return list(rows)
+
+
 def _contacts_match_auth_rows():
     """[(email, token)] aller Accounts — SB primary (paginiert), Disk-Fallback.
     NUR intern fürs Hash-Matching; E-Mails verlassen den Server nie."""
@@ -11579,6 +11624,27 @@ def _contacts_match_profile_rows():
     except FileNotFoundError:
         pass
     return rows
+
+
+def _contacts_match_directory_rows(need_profiles):
+    """Verzeichnis-Snapshots laden; bei Namens-/Telefon-Matching parallel.
+
+    Ein kalter Request braucht weiterhin die autoritativen Daten, wartet aber
+    nicht mehr erst auf auth_users und danach auf user_profiles. Warme Requests
+    treffen fuer bis zu fuenf Minuten ausschliesslich den In-Memory-Cache.
+    """
+    if not need_profiles:
+        return (_contacts_directory_cached(
+            'auth', _contacts_match_auth_rows), [])
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2,
+                            thread_name_prefix='contacts-directory') as pool:
+        auth_future = pool.submit(
+            _contacts_directory_cached, 'auth', _contacts_match_auth_rows)
+        profile_future = pool.submit(
+            _contacts_directory_cached, 'profiles',
+            _contacts_match_profile_rows)
+        return auth_future.result(), profile_future.result()
 
 
 # Kontakt-Kürzel → Airline-Namensfragment (casefold-contains gegen das
@@ -11681,7 +11747,8 @@ def user_contacts_match():
                                     'phone_hashes': 0}})
 
     matched = {}   # token -> 'email'|'phone'|'name' (starke Basen zuerst)
-    auth_rows = _contacts_match_auth_rows()
+    auth_rows, prof_rows = _contacts_match_directory_rows(
+        need_profiles=bool(contact_sets or phone_hashes))
     if hashes:
         for em, tok in auth_rows:
             if tok and em and _contacts_email_hash(em) in hashes:
@@ -11706,7 +11773,6 @@ def user_contacts_match():
                 if any(lp_toks <= cs or cs <= lp_toks for cs in _two_tok):
                     matched[tok] = 'name'
     if contact_sets or phone_hashes:
-        prof_rows = _contacts_match_profile_rows()
         for tok, name, _airline, ph in prof_rows:
             if not tok or tok in matched:
                 continue
@@ -24877,6 +24943,236 @@ def _dm_channel(token_a, token_b):
     return 'dm__' + '__'.join(sorted([a, b]))
 
 
+# ── Einmalige Nachrichtenanfrage ────────────────────────────────────────────
+# Nicht-Freunde duerfen jedem erreichbaren AeroX-Account genau EINE kurze
+# Nachricht senden. Erst nach Annahme wird der normale DM-Kanal fuer beide
+# Seiten freigeschaltet. Die eindeutige DB-Kante (sender_token,
+# recipient_token) verhindert Resends auch nach Ablehnung.
+_CREW_DM_REQUESTS_DISK = os.path.join(
+    _USER_HISTORY_DIR, 'crew_dm_requests.json')
+_CREW_DM_REQUESTS_LOCK = _req_threading.RLock()
+_CREW_DM_REQUEST_STATUSES = frozenset(('pending', 'accepted', 'declined'))
+
+
+def _crew_dm_requests_disk_load():
+    try:
+        with open(_CREW_DM_REQUESTS_DISK) as f:
+            rows = json.load(f) or []
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+def _crew_dm_requests_disk_save(rows):
+    try:
+        _atomic_write_json(_CREW_DM_REQUESTS_DISK, rows)
+        return True
+    except Exception as e:
+        app.logger.warning(
+            f'[crew-dm-request] disk-save-fail {type(e).__name__}: '
+            f'{str(e)[:120]}')
+        return False
+
+
+def _crew_dm_request_get(sender_token, recipient_token):
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table('crew_dm_requests').select('*')
+                 .eq('sender_token', sender_token)
+                 .eq('recipient_token', recipient_token)
+                 .limit(1).execute())
+            return (r.data or [None])[0]
+        except Exception as e:
+            app.logger.warning(
+                f'[crew-dm-request] sb-get-fail {type(e).__name__}: '
+                f'{str(e)[:120]}')
+    with _CREW_DM_REQUESTS_LOCK:
+        return next((row for row in _crew_dm_requests_disk_load()
+                     if row.get('sender_token') == sender_token
+                     and row.get('recipient_token') == recipient_token), None)
+
+
+def _crew_dm_requests_for(token):
+    if SB_AVAILABLE and sb is not None:
+        try:
+            incoming = (sb.table('crew_dm_requests').select('*')
+                        .eq('recipient_token', token).execute()).data or []
+            outgoing = (sb.table('crew_dm_requests').select('*')
+                        .eq('sender_token', token).execute()).data or []
+            unique = {}
+            for row in incoming + outgoing:
+                unique[row.get('id') or (
+                    row.get('sender_token'), row.get('recipient_token'))] = row
+            return list(unique.values())
+        except Exception as e:
+            app.logger.warning(
+                f'[crew-dm-request] sb-list-fail {type(e).__name__}: '
+                f'{str(e)[:120]}')
+    with _CREW_DM_REQUESTS_LOCK:
+        return [row for row in _crew_dm_requests_disk_load()
+                if token in (row.get('sender_token'), row.get('recipient_token'))]
+
+
+def _crew_dm_request_insert(row):
+    """Insert-only. Returns (stored_row, created)."""
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = sb.table('crew_dm_requests').insert(row).execute()
+            stored = (r.data or [row])[0]
+            # Disk ist nur Read-Fallback; der autoritative Insert ist erfolgt.
+            with _CREW_DM_REQUESTS_LOCK:
+                rows = _crew_dm_requests_disk_load()
+                rows.append(stored)
+                _crew_dm_requests_disk_save(rows)
+            return stored, True
+        except Exception:
+            # Ein Unique-Conflict ist der Normalfall beim zweiten Versuch. Erst
+            # lesen; nur bei echtem SB-Ausfall darf der Disk-Fallback schreiben.
+            existing = _crew_dm_request_get(
+                row.get('sender_token'), row.get('recipient_token'))
+            if not existing:
+                existing = _crew_dm_request_get(
+                    row.get('recipient_token'), row.get('sender_token'))
+            if existing:
+                return existing, False
+            if SB_AVAILABLE:
+                return None, False
+    with _CREW_DM_REQUESTS_LOCK:
+        rows = _crew_dm_requests_disk_load()
+        wanted_pair = {row.get('sender_token'), row.get('recipient_token')}
+        existing = next((x for x in rows
+                         if {x.get('sender_token'), x.get('recipient_token')}
+                         == wanted_pair), None)
+        if existing:
+            return existing, False
+        rows.append(row)
+        return (row, True) if _crew_dm_requests_disk_save(rows) else (None, False)
+
+
+def _crew_dm_request_set_status(sender_token, recipient_token, status):
+    if status not in _CREW_DM_REQUEST_STATUSES:
+        return None
+    decided_at = datetime.now(timezone.utc).isoformat()
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table('crew_dm_requests')
+                 .update({'status': status, 'decided_at': decided_at})
+                 .eq('sender_token', sender_token)
+                 .eq('recipient_token', recipient_token)
+                 .eq('status', 'pending').execute())
+            if r.data:
+                updated = r.data[0]
+                with _CREW_DM_REQUESTS_LOCK:
+                    rows = _crew_dm_requests_disk_load()
+                    for i, row in enumerate(rows):
+                        if (row.get('sender_token') == sender_token and
+                                row.get('recipient_token') == recipient_token):
+                            rows[i] = updated
+                            break
+                    else:
+                        rows.append(updated)
+                    _crew_dm_requests_disk_save(rows)
+                return updated
+            return _crew_dm_request_get(sender_token, recipient_token)
+        except Exception as e:
+            app.logger.warning(
+                f'[crew-dm-request] sb-update-fail {type(e).__name__}: '
+                f'{str(e)[:120]}')
+            if SB_AVAILABLE:
+                return None
+    with _CREW_DM_REQUESTS_LOCK:
+        rows = _crew_dm_requests_disk_load()
+        for row in rows:
+            if (row.get('sender_token') == sender_token and
+                    row.get('recipient_token') == recipient_token):
+                if row.get('status') == 'pending':
+                    row['status'] = status
+                    row['decided_at'] = decided_at
+                    if not _crew_dm_requests_disk_save(rows):
+                        return None
+                return row
+    return None
+
+
+def _crew_dm_pair_accepted(token_a, token_b):
+    for row in _crew_dm_requests_for(token_a):
+        if row.get('status') != 'accepted':
+            continue
+        pair = {row.get('sender_token'), row.get('recipient_token')}
+        if pair == {token_a, token_b}:
+            return True
+    return False
+
+
+def _crew_dm_pair_authorized(token_a, token_b):
+    try:
+        if (token_b in _blocked_by(token_a) or
+                token_a in _blocked_by(token_b)):
+            return False
+    except Exception:
+        return False
+    try:
+        a_friends = set((_friends_load(token_a).get('friends') or []))
+        b_friends = set((_friends_load(token_b).get('friends') or []))
+    except Exception:
+        a_friends = set()
+        b_friends = set()
+    return (token_b in a_friends or token_a in b_friends or
+            _crew_dm_pair_accepted(token_a, token_b))
+
+
+def _crew_dm_request_public(row, viewer_token):
+    sender = row.get('sender_token') or ''
+    recipient = row.get('recipient_token') or ''
+    peer = recipient if viewer_token == sender else sender
+    pr = ((_profile_load(peer) or {}).get('profile') or {})
+    return {
+        'id': row.get('id'),
+        'direction': 'outgoing' if viewer_token == sender else 'incoming',
+        'peer_token': peer,
+        'peer_name': pr.get('name') or 'Crew',
+        'peer_avatar_url': pr.get('avatar_url'),
+        'peer_position': pr.get('position'),
+        'message': row.get('message') or '',
+        'status': row.get('status') or 'pending',
+        'flight_number': row.get('flight_number'),
+        'flight_date': str(row.get('flight_date') or '')[:10],
+        'created_at': row.get('created_at'),
+        'decided_at': row.get('decided_at'),
+    }
+
+
+def _crew_dm_materialize_initial(row):
+    """Die akzeptierte Vorschau idempotent als erste echte DM persistieren."""
+    sender = row.get('sender_token') or ''
+    recipient = row.get('recipient_token') or ''
+    ch = _dm_channel(sender, recipient)
+    if not ch:
+        return False
+    stable_id = 'crq-' + hashlib.sha256(
+        f'{sender}|{recipient}'.encode()).hexdigest()[:20]
+    existing = _dm_load_messages(ch) or []
+    if any(m.get('id') == stable_id for m in existing):
+        return True
+    pr = ((_profile_load(sender) or {}).get('profile') or {})
+    msg = {
+        'id': stable_id,
+        'channel_id': ch,
+        'author_token': sender[:16] + '…',
+        'author_name': (pr.get('name') or 'Crew')[:60],
+        'author_avatar': pr.get('avatar_url'),
+        'text': (row.get('message') or '')[:500],
+        'ts': float(row.get('created_ts') or time.time()),
+        'iso': row.get('created_at') or datetime.now(timezone.utc).isoformat(),
+        'kind': 'crew_request_initial',
+    }
+    if not _dm_messages_save_to_supabase(ch, [msg]) and SB_AVAILABLE:
+        return False
+    existing.append(msg)
+    _dm_save_messages_disk(ch, existing)
+    return True
+
+
 def _resolve_friend_token(my_token, friend_token):
     """Eine über /friends-today gereichte friend_token-Variante kann PII-gekürzt
     sein (`fr[:16] + '…'`). Die DM-Endpoints brauchen aber den VOLLEN Token: sonst
@@ -25026,8 +25322,16 @@ def _channel_access_error(token, channel_id):
         import re
         safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
         parts = cid[len('dm__'):].split('__')
-        if safe and safe in parts:
-            return None
+        if safe and len(parts) == 2 and safe in parts:
+            peer = parts[1] if parts[0] == safe else parts[0]
+            # Der generische Channel-Pfad darf den Friend-/Accept-Gate der
+            # /dm-Wrapper nicht umgehen. Das war vor der Einmal-Nachricht ein
+            # bestehender Bypass: mit beiden Tokens konnte ein Fremder direkt
+            # `dm__a__b` lesen/schreiben. Freunde und angenommene Crew-Anfragen
+            # bleiben byte-kompatibel erlaubt.
+            if _crew_dm_pair_authorized(token, peer):
+                return None
+            return jsonify({'error': 'not_friends_or_accepted'}), 403
         return jsonify({'error': 'not_a_member'}), 403
     gid = _group_id_from_channel(cid)
     if gid is not None:
@@ -25064,7 +25368,10 @@ def get_chat_messages(token, channel_id):
     # (goodflight_*-Felder in get_dm_inbox).
     msgs = [m for m in msgs
             if not m.get('deleted') and m.get('kind') != 'goodflight']
-    since = float(request.args.get('since_ts') or 0)
+    try:
+        since = float(request.args.get('since_ts') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'invalid_since'}), 400
     if since:
         msgs = [m for m in msgs if (m.get('ts') or 0) > since]
     # `is_mine` explizit mitgeben → iOS muss nicht mehr den GEKÜRZTEN author_token
@@ -25161,7 +25468,9 @@ def send_chat_message(token, channel_id):
     _gate = _channel_access_error(token, channel_id)
     if _gate is not None:
         _, status = _gate
-        err = 'not_a_member' if status == 403 else 'invalid_channel'
+        err = ((_gate[0].get_json(silent=True) or {}).get('error')
+               if status == 403 else 'invalid_channel')
+        err = err or 'not_a_member'
         return jsonify({'ok': False, 'error': err}), status
     # Retry nach unklarem Transport-Ausgang: dieselbe Client-Operation darf
     # niemals eine zweite Chat-Nachricht und einen zweiten Push erzeugen.
@@ -25309,9 +25618,445 @@ def delete_chat_message(token, channel_id, message_id):
     _gate = _channel_access_error(token, channel_id)
     if _gate is not None:
         _, status = _gate
-        err = 'not_a_member' if status == 403 else 'invalid_channel'
+        err = ((_gate[0].get_json(silent=True) or {}).get('error')
+               if status == 403 else 'invalid_channel')
+        err = err or 'not_a_member'
         return jsonify({'ok': False, 'error': err}), status
     return _soft_delete_chat_message(token, channel_id, message_id)
+
+
+# ─── Layover Web-Gaeste (installierbare PWA, kein AeroX-Konto) ────────
+#
+# Der bestehende native Gruppen-Chat bleibt unveraendert `group__<group_id>`.
+# Ein Web-Invite legt nur eine zeitlich begrenzte, opake Capability davor. So
+# lesen/schreiben Browser-Gaeste denselben Verlauf wie iOS, ohne dass die kurze
+# interne Gruppen-ID als oeffentlicher Web-Schluessel dienen muss.
+_LAYOVER_WEB_INVITES_DISK = os.path.join(
+    _USER_HISTORY_DIR, 'layover_web_guests.json')
+_LAYOVER_WEB_LOCK = _req_threading.RLock()
+_LAYOVER_WEB_INVITE_DAYS = 7
+_LAYOVER_WEB_SESSION_DAYS = 7
+_LAYOVER_WEB_MAX_GUESTS = 50
+_LAYOVER_WEB_AVATARS = frozenset((
+    '✈️', '🌴', '🍹', '🏖️', '🌃', '🍻', '☕️', '🥂',
+    '🗺️', '🧳', '😎', '🔥', '⭐️', '🌍', '🎉', '🚀',
+))
+
+
+class _LayoverWebStorageError(RuntimeError):
+    pass
+
+
+def _layover_web_secret():
+    import secrets
+    # Fester Prefix verhindert, dass ein zufaellig mit "AT-" beginnendes
+    # Secret vom globalen Owner-Token-Pfad-Gate als AeroX-Konto missverstanden
+    # wird. Entropie bleibt die volle 256-Bit-Zufallsfolge dahinter.
+    return 'lw_' + secrets.token_urlsafe(32)
+
+
+def _layover_web_hash(secret):
+    return hashlib.sha256((secret or '').encode('utf-8')).hexdigest()
+
+
+def _layover_web_parse_dt(value):
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value or '').replace('Z', '+00:00'))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _layover_web_disk_load():
+    try:
+        with open(_LAYOVER_WEB_INVITES_DISK) as f:
+            raw = json.load(f) or {}
+        if isinstance(raw, dict):
+            return {
+                'invites': raw.get('invites') or [],
+                'sessions': raw.get('sessions') or [],
+            }
+    except Exception:
+        pass
+    return {'invites': [], 'sessions': []}
+
+
+def _layover_web_disk_save(data):
+    try:
+        _atomic_write_json(_LAYOVER_WEB_INVITES_DISK, data)
+        return True
+    except Exception as e:
+        app.logger.warning(
+            f'[layover-web] disk-save-fail {type(e).__name__}: {str(e)[:120]}')
+        return False
+
+
+def _layover_web_lookup(table, token_hash):
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table(table).select('*')
+                 .eq('token_hash', token_hash).limit(1).execute())
+            return (r.data or [None])[0]
+        except Exception as e:
+            app.logger.warning(
+                f'[layover-web] {table}-lookup-fail {type(e).__name__}: '
+                f'{str(e)[:120]}')
+            raise _LayoverWebStorageError() from e
+    key = 'invites' if table == 'layover_guest_invites' else 'sessions'
+    with _LAYOVER_WEB_LOCK:
+        return next((row for row in _layover_web_disk_load()[key]
+                     if row.get('token_hash') == token_hash), None)
+
+
+def _layover_web_insert(table, row):
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = sb.table(table).insert(row).execute()
+            return (r.data or [row])[0]
+        except Exception as e:
+            app.logger.warning(
+                f'[layover-web] {table}-insert-fail {type(e).__name__}: '
+                f'{str(e)[:120]}')
+            raise _LayoverWebStorageError() from e
+    key = 'invites' if table == 'layover_guest_invites' else 'sessions'
+    with _LAYOVER_WEB_LOCK:
+        data = _layover_web_disk_load()
+        if any(x.get('token_hash') == row.get('token_hash') for x in data[key]):
+            return None
+        data[key].append(row)
+        if not _layover_web_disk_save(data):
+            raise _LayoverWebStorageError()
+        return row
+
+
+def _layover_web_active(row):
+    if not row or row.get('revoked') is True:
+        return False
+    expires = _layover_web_parse_dt(row.get('expires_at'))
+    return bool(expires and expires > datetime.now(timezone.utc))
+
+
+def _layover_web_group_for_member(token, group_id):
+    """Serverseitige Invite-Berechtigung: Owner oder persistiertes Mitglied."""
+    row = _friend_group_row_by_id(group_id)
+    if row:
+        members = row.get('members') if isinstance(row.get('members'), list) else []
+        if token == row.get('owner_token') or token in members:
+            return row
+        return None
+    # Dev-/SB-down-Fallback: der Owner findet seine eigenen lokalen Gruppen.
+    try:
+        own = (_friends_load(token) or {}).get('groups') or []
+        group = next((g for g in own if g.get('id') == group_id), None)
+        if group:
+            return {'id': group_id, 'owner_token': token,
+                    'name': group.get('name') or 'Layover-Chat',
+                    'members': group.get('members') or []}
+    except Exception:
+        pass
+    return None
+
+
+def _layover_web_guest_session(invite_row):
+    bearer = _request_bearer_token()
+    if not bearer:
+        return None
+    try:
+        session = _layover_web_lookup(
+            'layover_guest_sessions', _layover_web_hash(bearer))
+    except _LayoverWebStorageError:
+        raise
+    if not _layover_web_active(session):
+        return None
+    if str(session.get('invite_id') or '') != str(invite_row.get('id') or ''):
+        return None
+    return session
+
+
+def _layover_web_invite_from_secret(invite_secret):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{32,96}', invite_secret or ''):
+        return None
+    return _layover_web_lookup(
+        'layover_guest_invites', _layover_web_hash(invite_secret))
+
+
+@app.route('/api/layover-web/<token>/groups/<group_id>/invite', methods=['POST'])
+def create_layover_web_invite(token, group_id):
+    """Erzeugt einen 7-Tage-Weblink. Alte native Gruppen/Clients bleiben intakt."""
+    if _token_rate_limited(token, 'layover_web_invite', limit=20, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    group = _layover_web_group_for_member(token, group_id)
+    if not group:
+        return jsonify({'ok': False, 'error': 'group_not_found_or_member'}), 404
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=_LAYOVER_WEB_INVITE_DAYS)
+    secret = _layover_web_secret()
+    row = {
+        'id': str(uuid.uuid4()),
+        'token_hash': _layover_web_hash(secret),
+        'group_id': group_id,
+        'group_name': str(group.get('name') or 'Layover-Chat')[:60],
+        'owner_token': group.get('owner_token') or token,
+        'created_at': now.isoformat(),
+        'expires_at': expires.isoformat(),
+        'max_guests': _LAYOVER_WEB_MAX_GUESTS,
+        'revoked': False,
+    }
+    try:
+        saved = _layover_web_insert('layover_guest_invites', row)
+    except _LayoverWebStorageError:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    if not saved:
+        return jsonify({'ok': False, 'error': 'create_failed'}), 503
+    public_base = (os.environ.get('AEROX_PUBLIC_BASE_URL') or
+                   'https://api.aerosteuer.de').rstrip('/')
+    return jsonify({
+        'ok': True,
+        'invite_id': saved.get('id') or row['id'],
+        'web_url': f'{public_base}/layover/{secret}',
+        'path': f'/layover/{secret}',
+        'expires_at': expires.isoformat(),
+    }), 201
+
+
+@app.route('/api/layover-web/invites/<invite_secret>', methods=['GET'])
+def get_layover_web_invite(invite_secret):
+    try:
+        row = _layover_web_invite_from_secret(invite_secret)
+    except _LayoverWebStorageError:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    if not _layover_web_active(row):
+        return jsonify({'ok': False, 'error': 'invite_invalid_or_expired'}), 404
+    response = jsonify({
+        'ok': True,
+        'group_name': row.get('group_name') or 'Layover-Chat',
+        'expires_at': row.get('expires_at'),
+        'avatars': sorted(_LAYOVER_WEB_AVATARS),
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/layover-web/invites/<invite_secret>/join', methods=['POST'])
+def join_layover_web_invite(invite_secret):
+    if _ip_rate_limited(request.remote_addr, 'layover_web_join',
+                        limit=30, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    try:
+        invite = _layover_web_invite_from_secret(invite_secret)
+    except _LayoverWebStorageError:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    if not _layover_web_active(invite):
+        return jsonify({'ok': False, 'error': 'invite_invalid_or_expired'}), 404
+    body = request.get_json(silent=True) or {}
+    name = re.sub(r'\s+', ' ', str(body.get('name') or '')).strip()
+    avatar = str(body.get('avatar') or '')
+    if (not name or len(name) > 32 or
+            any(ord(ch) < 32 for ch in name)):
+        return jsonify({'ok': False, 'error': 'invalid_name'}), 400
+    if avatar not in _LAYOVER_WEB_AVATARS:
+        return jsonify({'ok': False, 'error': 'invalid_avatar'}), 400
+
+    # Vorab-Cap; die Migration enthaelt zusaetzlich einen DB-Trigger, der das
+    # Limit auch bei parallelen Joins atomar erzwingt.
+    invite_id = str(invite.get('id') or '')
+    if SB_AVAILABLE and sb is not None:
+        try:
+            r = (sb.table('layover_guest_sessions').select('id')
+                 .eq('invite_id', invite_id).eq('revoked', False)
+                 .limit(_LAYOVER_WEB_MAX_GUESTS).execute())
+            if len(r.data or []) >= int(invite.get('max_guests') or
+                                        _LAYOVER_WEB_MAX_GUESTS):
+                return jsonify({'ok': False, 'error': 'invite_full'}), 409
+        except Exception:
+            return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    else:
+        with _LAYOVER_WEB_LOCK:
+            sessions = _layover_web_disk_load()['sessions']
+            if sum(1 for s in sessions if str(s.get('invite_id')) == invite_id
+                   and _layover_web_active(s)) >= int(
+                       invite.get('max_guests') or _LAYOVER_WEB_MAX_GUESTS):
+                return jsonify({'ok': False, 'error': 'invite_full'}), 409
+
+    secret = _layover_web_secret()
+    now = datetime.now(timezone.utc)
+    invite_expires = _layover_web_parse_dt(invite.get('expires_at'))
+    expires = min(now + timedelta(days=_LAYOVER_WEB_SESSION_DAYS),
+                  invite_expires or now)
+    session_row = {
+        'id': str(uuid.uuid4()),
+        'invite_id': invite_id,
+        'token_hash': _layover_web_hash(secret),
+        'display_name': name,
+        'avatar_emoji': avatar,
+        'created_at': now.isoformat(),
+        'expires_at': expires.isoformat(),
+        'revoked': False,
+    }
+    try:
+        saved = _layover_web_insert('layover_guest_sessions', session_row)
+    except _LayoverWebStorageError:
+        return jsonify({'ok': False, 'error': 'storage_unavailable_or_full'}), 503
+    if not saved:
+        return jsonify({'ok': False, 'error': 'join_failed'}), 503
+    return jsonify({
+        'ok': True,
+        'session_token': secret,
+        'display_name': name,
+        'avatar': avatar,
+        'expires_at': expires.isoformat(),
+    }), 201
+
+
+def _layover_web_author_token(session):
+    return 'WG-' + str(session.get('id') or '').replace('-', '')[:13]
+
+
+@app.route('/api/layover-web/invites/<invite_secret>/messages', methods=['GET'])
+def get_layover_web_messages(invite_secret):
+    try:
+        invite = _layover_web_invite_from_secret(invite_secret)
+        if not _layover_web_active(invite):
+            return jsonify({'ok': False, 'error': 'invite_invalid_or_expired'}), 404
+        session = _layover_web_guest_session(invite)
+    except _LayoverWebStorageError:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    if not session:
+        return jsonify({'ok': False, 'error': 'guest_session_required'}), 401
+    channel_id = 'group__' + str(invite.get('group_id') or '')
+    try:
+        since = float(request.args.get('since_ts') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'invalid_since'}), 400
+    mine = _layover_web_author_token(session)
+    messages = []
+    for item in (_dm_load_messages(channel_id) or []):
+        if item.get('deleted') or item.get('kind') == 'goodflight':
+            continue
+        if since and float(item.get('ts') or 0) <= since:
+            continue
+        messages.append({
+            'id': item.get('id'),
+            'text': _wall_img_sanitize_urls(item.get('text') or ''),
+            'ts': float(item.get('ts') or 0),
+            'author_name': item.get('author_name') or 'Crew',
+            'avatar': item.get('guest_avatar'),
+            'is_mine': item.get('author_token') == mine,
+        })
+    response = jsonify({'ok': True, 'messages': messages[-100:]})
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/layover-web/invites/<invite_secret>/messages', methods=['POST'])
+def send_layover_web_message(invite_secret):
+    try:
+        invite = _layover_web_invite_from_secret(invite_secret)
+        if not _layover_web_active(invite):
+            return jsonify({'ok': False, 'error': 'invite_invalid_or_expired'}), 404
+        session = _layover_web_guest_session(invite)
+    except _LayoverWebStorageError:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    if not session:
+        return jsonify({'ok': False, 'error': 'guest_session_required'}), 401
+    limiter_key = 'wg:' + _layover_web_hash(_request_bearer_token())[:20]
+    if _token_rate_limited(limiter_key, 'layover_web_send', limit=20, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    body = request.get_json(silent=True) or {}
+    text = str(body.get('text') or '').strip()
+    if not text:
+        return jsonify({'ok': False, 'error': 'empty_text'}), 400
+    if len(text) > 1000:
+        return jsonify({'ok': False, 'error': 'text_too_long'}), 413
+    # Web-Gaeste duerfen keine nativen Rich-Message-Protokolle vortaeuschen
+    # (`[aerox:photo]`, Standort, Voice, Reply-Header). V1 ist bewusst Text-only.
+    if '\x00' in text or '[aerox:' in text.casefold():
+        return jsonify({'ok': False, 'error': 'invalid_text'}), 400
+    channel_id = 'group__' + str(invite.get('group_id') or '')
+    now = time.time()
+    name = str(session.get('display_name') or 'Gast')[:32]
+    avatar = str(session.get('avatar_emoji') or '✈️')
+    msg = {
+        'id': 'wg-' + uuid.uuid4().hex[:16],
+        'channel_id': channel_id,
+        'author_token': _layover_web_author_token(session),
+        # Alte Builds kennen kein guest_avatar-Feld. Das Emoji im Namen macht
+        # den Gast dort trotzdem eindeutig; neue Web-Clients zeigen es separat.
+        'author_name': f'{avatar} {name}',
+        'guest_avatar': avatar,
+        'text': text,
+        'ts': now,
+        'iso': datetime.now(timezone.utc).isoformat(),
+        'kind': 'web_guest',
+    }
+    sb_ok = _dm_messages_save_to_supabase(channel_id, [msg])
+    if not sb_ok and SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    disk_msgs = _dm_load_messages_from_disk(channel_id) or []
+    disk_msgs.append(msg)
+    _dm_save_messages_disk(channel_id, disk_msgs)
+    try:
+        _chat_push_fanout_async(
+            msg['author_token'], channel_id, text, message_id=msg['id'],
+            sender_name_override=f'{avatar} {name}', ephemeral_author=True)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'message': {
+        'id': msg['id'], 'text': text, 'ts': now,
+        'author_name': msg['author_name'], 'avatar': avatar, 'is_mine': True,
+    }}), 201
+
+
+@app.route('/layover/<invite_secret>', methods=['GET'])
+def layover_web_app(invite_secret):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{32,96}', invite_secret or ''):
+        abort(404)
+    response = make_response(app.send_static_file('layover_guest/index.html'))
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
+
+
+@app.route('/layover/<invite_secret>/manifest.webmanifest', methods=['GET'])
+def layover_web_manifest(invite_secret):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{32,96}', invite_secret or ''):
+        abort(404)
+    response = jsonify({
+        'name': 'AeroX Layover Chat',
+        'short_name': 'Layover',
+        'description': 'Temporärer AeroX Layover-Chat',
+        'id': f'/layover/{invite_secret}',
+        'start_url': f'/layover/{invite_secret}',
+        'scope': '/layover/',
+        'display': 'standalone',
+        'background_color': '#07111d',
+        'theme_color': '#07111d',
+        'icons': [
+            {'src': '/static/layover_guest/icon-192.png',
+             'sizes': '192x192', 'type': 'image/png',
+             'purpose': 'any maskable'},
+            {'src': '/static/layover_guest/icon-512.png',
+             'sizes': '512x512', 'type': 'image/png',
+             'purpose': 'any maskable'},
+        ],
+    })
+    response.mimetype = 'application/manifest+json'
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/layover-sw.js', methods=['GET'])
+def layover_web_service_worker():
+    response = make_response(app.send_static_file('layover_guest/sw.js'))
+    response.mimetype = 'application/javascript'
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['Service-Worker-Allowed'] = '/layover/'
+    return response
 
 
 def _dm_lastseen_load_from_supabase(token):
@@ -25369,6 +26114,190 @@ def _dm_lastseen_load(token):
     return {}
 
 
+@app.route('/api/crew-chat/<token>/requests', methods=['GET'])
+def crew_dm_requests_inbox(token):
+    """Ein- und ausgehende Nachrichtenanfragen samt Public-Profil."""
+    rows = _crew_dm_requests_for(token)
+    out = []
+    for row in rows:
+        peer = (row.get('recipient_token') if row.get('sender_token') == token
+                else row.get('sender_token'))
+        if not peer:
+            continue
+        try:
+            if peer in _blocked_by(token) or token in _blocked_by(peer):
+                continue
+        except Exception:
+            continue
+        out.append(_crew_dm_request_public(row, token))
+    out.sort(key=lambda x: x.get('created_at') or '', reverse=True)
+    return jsonify({'ok': True, 'count': len(out), 'requests': out})
+
+
+@app.route('/api/crew-chat/<token>/requests/<target_token>/status',
+           methods=['GET'])
+def crew_dm_request_status(token, target_token):
+    target_token = _safe_token(target_token)
+    if not target_token or target_token == token:
+        return jsonify({'ok': False, 'error': 'invalid_target'}), 400
+    if not _validate_token_exists(target_token):
+        return jsonify({'ok': False, 'error': 'target_not_found'}), 404
+    # Kein gemeinsamer-Flug-Leak ueber den Vorschau-Status, wenn eine Seite die
+    # andere blockiert hat. `unavailable` verraet bewusst nicht, WER blockiert.
+    try:
+        if target_token in _blocked_by(token) or token in _blocked_by(target_token):
+            return jsonify({'ok': True, 'can_chat': False,
+                            'can_request': False, 'status': 'unavailable'})
+    except Exception:
+        return jsonify({'ok': False, 'error': 'moderation_unavailable'}), 503
+    if _crew_dm_pair_authorized(token, target_token):
+        return jsonify({'ok': True, 'can_chat': True,
+                        'can_request': False, 'status': 'accepted'})
+    existing = _crew_dm_request_get(token, target_token)
+    if existing:
+        return jsonify({'ok': True, 'can_chat': False, 'can_request': False,
+                        'status': existing.get('status') or 'pending'})
+    reverse = _crew_dm_request_get(target_token, token)
+    if reverse:
+        return jsonify({'ok': True,
+                        'can_chat': reverse.get('status') == 'accepted',
+                        'can_request': False,
+                        'status': reverse.get('status') or 'pending',
+                        'incoming': True})
+    return jsonify({
+        'ok': True,
+        'can_chat': False,
+        'can_request': True,
+        'status': 'available',
+        'flight_number': None,
+        'flight_date': None,
+    })
+
+
+@app.route('/api/crew-chat/<token>/requests/<target_token>',
+           methods=['POST'])
+def send_crew_dm_request(token, target_token):
+    """Genau eine Vorschau-Nachricht an einen AeroX-Account senden."""
+    target_token = _safe_token(target_token)
+    if not target_token or target_token == token:
+        return jsonify({'ok': False, 'error': 'invalid_target'}), 400
+    if not _validate_token_exists(target_token):
+        return jsonify({'ok': False, 'error': 'target_not_found'}), 404
+    if _is_family_account(target_token):
+        return jsonify({'ok': False, 'error': 'family_account_not_messageable'}), 400
+    try:
+        if target_token in _blocked_by(token) or token in _blocked_by(target_token):
+            return jsonify({'ok': False, 'error': 'blocked'}), 403
+    except Exception:
+        return jsonify({'ok': False, 'error': 'moderation_unavailable'}), 503
+    if _crew_dm_pair_authorized(token, target_token):
+        return jsonify({'ok': True, 'already_connected': True})
+    existing = _crew_dm_request_get(token, target_token)
+    if existing:
+        return jsonify({'ok': False, 'error': 'request_already_used',
+                        'status': existing.get('status') or 'pending'}), 409
+    reverse = _crew_dm_request_get(target_token, token)
+    if reverse:
+        return jsonify({'ok': False, 'error': 'request_already_used',
+                        'status': reverse.get('status') or 'pending'}), 409
+    if _token_rate_limited(token, 'crew_dm_request', limit=5,
+                           window_sec=86400):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    body = request.get_json(silent=True) or {}
+    message = str(body.get('message') or '').strip()
+    if not message:
+        return jsonify({'ok': False, 'error': 'empty_message'}), 400
+    if len(message) > 500:
+        return jsonify({'ok': False, 'error': 'message_too_long'}), 413
+    if re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', message):
+        return jsonify({'ok': False, 'error': 'invalid_message'}), 400
+    now = datetime.now(timezone.utc)
+    row = {
+        'id': str(uuid.uuid4()),
+        'sender_token': token,
+        'recipient_token': target_token,
+        'message': message,
+        'status': 'pending',
+        # Legacy-Spalten bleiben fuer bereits ausgerollte Tabellen NOT NULL.
+        # AEROX ist ein interner Marker und wird in der App nicht angezeigt.
+        'flight_number': 'AEROX',
+        'flight_date': now.date().isoformat(),
+        'created_at': now.isoformat(),
+        'created_ts': now.timestamp(),
+        'decided_at': None,
+    }
+    stored, created = _crew_dm_request_insert(row)
+    if not stored:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    if not created:
+        return jsonify({'ok': False, 'error': 'request_already_used',
+                        'status': stored.get('status') or 'pending'}), 409
+    try:
+        sender_name = (((_profile_load(token) or {}).get('profile') or {})
+                       .get('name') or 'Deine Crew')
+        _push_notify_async(
+            target_token, 'Neue Nachrichtenanfrage',
+            f'{sender_name} möchte dir eine Nachricht senden.',
+            data={'type': 'crew_dm_request', 'from': token},
+            idempotency_key=f'crew-dm-request:{token}:{target_token}',
+            actor_token=token)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'request':
+                    _crew_dm_request_public(stored, token)}), 201
+
+
+@app.route('/api/crew-chat/<token>/requests/<sender_token>/decision',
+           methods=['POST'])
+def decide_crew_dm_request(token, sender_token):
+    sender_token = _safe_token(sender_token)
+    body = request.get_json(silent=True) or {}
+    action = str(body.get('action') or '').strip().lower()
+    if action not in ('accept', 'decline'):
+        return jsonify({'ok': False, 'error': 'invalid_action'}), 400
+    row = _crew_dm_request_get(sender_token, token)
+    if not row:
+        return jsonify({'ok': False, 'error': 'request_not_found'}), 404
+    if row.get('status') != 'pending':
+        # Annahme ist idempotent und repariert einen eventuell unterbrochenen
+        # ersten Materialisierungsversuch.
+        if action == 'accept' and row.get('status') == 'accepted':
+            if not _crew_dm_materialize_initial(row):
+                return jsonify({'ok': False,
+                                'error': 'storage_unavailable'}), 503
+            return jsonify({'ok': True, 'status': 'accepted',
+                            'already_decided': True})
+        return jsonify({'ok': False, 'error': 'already_decided',
+                        'status': row.get('status')}), 409
+    try:
+        if sender_token in _blocked_by(token) or token in _blocked_by(sender_token):
+            return jsonify({'ok': False, 'error': 'blocked'}), 403
+    except Exception:
+        return jsonify({'ok': False, 'error': 'moderation_unavailable'}), 503
+    status = 'accepted' if action == 'accept' else 'declined'
+    updated = _crew_dm_request_set_status(sender_token, token, status)
+    if not updated:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    if status == 'accepted' and not _crew_dm_materialize_initial(updated):
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    try:
+        title = ('Crew-Chat angenommen' if status == 'accepted'
+                 else 'Crew-Chat nicht angenommen')
+        _push_notify_async(
+            sender_token, title,
+            ('Ihr könnt jetzt schreiben.' if status == 'accepted'
+             else 'Deine Nachrichtenanfrage wurde abgelehnt.'),
+            data={'type': 'crew_dm_request_decision', 'from': token,
+                  'status': status},
+            idempotency_key=(
+                f'crew-dm-request-decision:{sender_token}:{token}:{status}'),
+            actor_token=token)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'status': status,
+                    'peer_token': sender_token})
+
+
 @app.route('/api/crew-chat/<token>/inbox', methods=['GET'])
 def get_dm_inbox(token):
     """Aggregierter Inbox für den Crew-Chat-Tab.
@@ -25377,7 +26306,17 @@ def get_dm_inbox(token):
     DM-Channel-Files) + zählt unread (Messages neuer als last_seen_<channel>).
     Vorher: Frontend musste N+1 Calls machen pro Friend.
     """
-    friends = (_friends_load(token).get('friends') or [])
+    friends = list(_friends_load(token).get('friends') or [])
+    # Additiv fuer neue Builds: akzeptierte Crew-Chats bleiben bewusst KEINE
+    # Freundschaft, erscheinen aber im selben DM-Inbox-Vertrag. Alte Builds
+    # ignorieren unbekannte Request-Endpunkte und funktionieren unveraendert.
+    for row in _crew_dm_requests_for(token):
+        if row.get('status') != 'accepted':
+            continue
+        peer = (row.get('recipient_token') if row.get('sender_token') == token
+                else row.get('sender_token'))
+        if peer and peer not in friends and _crew_dm_pair_authorized(token, peer):
+            friends.append(peer)
     last_seen = _dm_lastseen_load(token) or {}
     inbox = []
     # send_chat_message speichert author_token PII-truncated als
@@ -25483,15 +26422,8 @@ def get_dm(token, friend_token):
     friend_token = _resolve_friend_token(token, friend_token)
     ch = _dm_channel(token, friend_token)
     if not ch: return jsonify({'error':'invalid_tokens'}), 400
-    # Friendship verifizieren — beide Richtungen prüfen, weil eine Seite
-    # entfernt sein kann (z.B. nach asymmetrischem Block).
-    try:
-        my_friends = set((_friends_load(token).get('friends') or []))
-        their_friends = set((_friends_load(friend_token).get('friends') or []))
-    except Exception:
-        my_friends = set(); their_friends = set()
-    if friend_token not in my_friends and token not in their_friends:
-        return jsonify({'error': 'not_friends'}), 403
+    if not _crew_dm_pair_authorized(token, friend_token):
+        return jsonify({'error': 'not_friends_or_accepted'}), 403
     return get_chat_messages(token, ch)
 
 
@@ -25502,16 +26434,11 @@ def send_dm(token, friend_token):
     friend_token = _resolve_friend_token(token, friend_token)
     ch = _dm_channel(token, friend_token)
     if not ch: return jsonify({'ok': False, 'error':'invalid_tokens'}), 400
-    # J14-Fix: DM nur zwischen Friends. Vorher: jeder mit token konnte
-    # jedem fremden DMs schicken → Spam/Harassment-Vektor.
-    try:
-        friends = set((_friends_load(token).get('friends') or []))
-    except Exception:
-        friends = set()
-    if friend_token not in friends:
-        # Empfänger muss erst Friend-Request annehmen
-        return jsonify({'ok': False, 'error': 'not_friends',
-                        'message': 'DMs sind nur an Buddies möglich. Sende erst eine Buddy-Anfrage.'}), 403
+    # Friends ODER explizit angenommene Crew-Anfrage. Der zweite Fall erzeugt
+    # absichtlich keine Freundschafts-Kante und ist damit voll rueckwaertskompatibel.
+    if not _crew_dm_pair_authorized(token, friend_token):
+        return jsonify({'ok': False, 'error': 'not_friends_or_accepted',
+                        'message': 'Sende zuerst eine Nachrichtenanfrage.'}), 403
     # Rate-Limit: 30 DMs/min/User (Spam-Bremse)
     if _token_rate_limited(token, 'dm_send', limit=30, window_sec=60):
         return jsonify({'ok': False, 'error': 'rate_limited',
@@ -32961,6 +33888,8 @@ def _push_outbox_drain(max_batches=4):
                             token, job_data.get('channel_id') or '',
                             payload.get('body') or '',
                             message_id=job_data.get('message_id'),
+                            sender_name_override=job_data.get('sender_name'),
+                            ephemeral_author=bool(job_data.get('ephemeral_author')),
                             _from_outbox=True)
                         delivery = {
                             'ok': bool(ok), 'terminal': bool(ok),
@@ -33094,6 +34023,7 @@ def _chat_push_preview(text):
 
 
 def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
+                            sender_name_override=None, ephemeral_author=False,
                             _from_outbox=False):
     """Push-Fanout für Chat-Messages (DM- UND Group-Channels) — der HEADLINE-
     Fix für 'keine Push bei neuer Nachricht' (2026-07-02): der generische
@@ -33115,7 +34045,10 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
             author_token, '__internal_chat_fanout__', text,
             data={'_internal_job': 'chat_fanout',
                   'channel_id': channel_id,
-                  'message_id': message_id},
+                  'message_id': message_id,
+                  'sender_name': (str(sender_name_override)[:60]
+                                  if sender_name_override else None),
+                  'ephemeral_author': bool(ephemeral_author)},
             idempotency_key=(f'chat-fanout:{message_id}'
                              if message_id else None))
         if fanout_id:
@@ -33155,7 +34088,8 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
                             # Owner-Group-Saves können das überschreiben — der
                             # nächste Post des Joiners repariert es wieder.
                             try:
-                                if (author_token
+                                if (not ephemeral_author
+                                        and author_token
                                         and author_token != row.get('owner_token')
                                         and author_token not in mem_list
                                         and len(mem_list) < 40):
@@ -33179,12 +34113,13 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
                         recipient_lookup_failed = True
             if not recipients:
                 return not recipient_lookup_failed
-            sender_name = ''
-            try:
-                sender_name = ((_profile_load(author_token) or {})
-                               .get('profile', {}) or {}).get('name') or ''
-            except Exception:
-                pass
+            sender_name = str(sender_name_override or '').strip()
+            if not sender_name:
+                try:
+                    sender_name = ((_profile_load(author_token) or {})
+                                   .get('profile', {}) or {}).get('name') or ''
+                except Exception:
+                    pass
             sender_name = sender_name.strip() or 'Crew'
             preview = _chat_push_preview(text)
             is_group = not cid.startswith('dm__')

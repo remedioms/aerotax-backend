@@ -252,7 +252,8 @@ def test_outbox_drain_resolves_internal_chat_fanout_job():
             patch.object(A, '_push_outbox_mark') as mark:
         A._push_outbox_drain(max_batches=2)
     fanout.assert_called_once_with(
-        USER, 'dm__a__b', 'hello', message_id='m-1', _from_outbox=True)
+        USER, 'dm__a__b', 'hello', message_id='m-1',
+        sender_name_override=None, ephemeral_author=False, _from_outbox=True)
     assert mark.call_args.args[1]['reason'] == 'chat_fanout_enqueued'
     assert mark.call_args.args[1]['terminal'] is True
 

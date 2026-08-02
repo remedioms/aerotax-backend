@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#07111d">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Layover">
+  <meta name="format-detection" content="telephone=no">
+  <title>AeroX Layover Chat</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="/static/layover_guest/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/layover_guest/apple-touch-icon.png">
+  <link rel="stylesheet" href="/static/layover_guest/app.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true">✈</div>
+      <div class="brand-copy">
+        <span class="eyebrow">AeroX</span>
+        <h1 id="group-name">Layover Chat</h1>
+      </div>
+      <button id="install-button" class="icon-button" type="button" aria-label="Zum Home-Bildschirm hinzufügen" title="Installieren">
+        <span aria-hidden="true">↓</span>
+      </button>
+    </header>
+
+    <section id="loading-view" class="center-card" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <p>Einladung wird geladen…</p>
+    </section>
+
+    <section id="error-view" class="center-card hidden" aria-live="assertive">
+      <div class="large-icon" aria-hidden="true">⚠️</div>
+      <h2>Link nicht verfügbar</h2>
+      <p id="error-text">Die Einladung ist abgelaufen oder wurde deaktiviert.</p>
+      <button id="retry-button" class="secondary-button" type="button">Erneut versuchen</button>
+    </section>
+
+    <section id="join-view" class="join-card hidden">
+      <div class="hero-icon" aria-hidden="true">🌍</div>
+      <p class="eyebrow">Temporärer Gastzugang</p>
+      <h2>Schreib im Layover-Chat mit</h2>
+      <p class="muted">Du brauchst kein AeroX-Konto. Wähle einen Namen und Avatar für diesen Chat.</p>
+
+      <form id="join-form">
+        <label for="guest-name">Dein Name</label>
+        <input id="guest-name" name="name" type="text" maxlength="32" autocomplete="nickname" placeholder="z. B. Alex" required>
+
+        <fieldset>
+          <legend>Avatar</legend>
+          <div id="avatar-grid" class="avatar-grid"></div>
+        </fieldset>
+
+        <p id="join-error" class="form-error hidden" role="alert"></p>
+        <button id="join-button" class="primary-button" type="submit">Chat beitreten</button>
+      </form>
+
+      <a id="native-link" class="native-link hidden" href="#">Ich habe AeroX · In der App öffnen</a>
+      <p class="privacy-note">Der Zugang gilt nur für diese Gruppe und läuft automatisch ab.</p>
+    </section>
+
+    <section id="chat-view" class="chat-view hidden">
+      <div id="connection-pill" class="connection-pill hidden" role="status">Offline · Nachrichten werden wieder geladen</div>
+      <ol id="message-list" class="message-list" aria-live="polite" aria-relevant="additions"></ol>
+      <div id="empty-chat" class="empty-chat hidden">
+        <span aria-hidden="true">👋</span>
+        <p>Noch keine Nachricht. Sag kurz Hallo!</p>
+      </div>
+      <form id="message-form" class="composer">
+        <label class="sr-only" for="message-input">Nachricht</label>
+        <textarea id="message-input" maxlength="1000" rows="1" placeholder="Nachricht…" required></textarea>
+        <button id="send-button" type="submit" aria-label="Nachricht senden">↑</button>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="install-dialog">
+    <form method="dialog" class="dialog-card">
+      <button class="dialog-close" aria-label="Schließen">×</button>
+      <div class="large-icon" aria-hidden="true">📲</div>
+      <h2>Wie eine App verwenden</h2>
+      <p id="install-help">Im Browser-Menü „Zum Home-Bildschirm“ wählen. Danach startet der Chat ohne Browserleisten.</p>
+      <button class="primary-button" value="close">Verstanden</button>
+    </form>
+  </dialog>
+
+  <script src="/static/layover_guest/app.js" defer></script>
+</body>
+</html>

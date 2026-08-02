@@ -22,6 +22,13 @@ REDACTED_TOKEN = "[redacted-token]"
 # five characters), while still leaving documentation literals such as
 # "AT-..." alone.
 _AT_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])AT-[A-Za-z0-9_-]{4,}")
+# Zeitlich begrenzte Layover-Web-Invites/-Sessions sind ebenfalls Bearer-
+# Capabilities. Sie beginnen absichtlich nicht mit AT-, muessen aber in Pfad-,
+# Werkzeug- und Sentry-Logs genauso vollstaendig verschwinden.
+_LAYOVER_WEB_SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9_])lw_[A-Za-z0-9_-]{32,}"
+)
+_LAYOVER_LEGACY_QUERY_RE = re.compile(r"([?&]c=)[^&#\s]*", re.IGNORECASE)
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 _SENSITIVE_QUERY_RE = re.compile(
     r"(?i)([?&](?:access_token|auth_token|authorization|bearer|token|"
@@ -44,7 +51,14 @@ def redact_text(value: Any) -> Any:
         return value
     value = _BEARER_RE.sub("Bearer " + REDACTED_TOKEN, value)
     value = _SENSITIVE_QUERY_RE.sub(lambda m: m.group(1) + REDACTED, value)
-    return _AT_TOKEN_RE.sub(REDACTED_TOKEN, value)
+    value = _AT_TOKEN_RE.sub(REDACTED_TOKEN, value)
+    value = _LAYOVER_WEB_SECRET_RE.sub(REDACTED_TOKEN, value)
+    # `c` ist nur auf dem Layover-Webpfad ein Legacy-Capability-Code; global ist
+    # der Ein-Buchstaben-Queryname zu unspezifisch fuer die normale Queryliste.
+    if '/layover/' in value:
+        value = _LAYOVER_LEGACY_QUERY_RE.sub(
+            lambda m: m.group(1) + REDACTED, value)
+    return value
 
 
 def redact_url(value: Any) -> Any:
