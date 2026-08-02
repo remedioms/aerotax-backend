@@ -528,6 +528,10 @@ def _baked_hex_for_reg(reg):
 _WATCH_TTL_SECONDS = 4 * 3600           # ~4h
 # Wie selten /flights/aircraft (Inbound-Origin) pro Hex erneut geholt wird.
 _FLIGHTS_REFRESH_SECONDS = 2 * 3600     # ~2h
+# PostgREST-IN-Queries bewusst begrenzen: 200 ICAO-Hexwerte bleiben weit unter
+# typischen Proxy-URL-Limits, reduzieren den bisherigen N+1-Pfad aber trotzdem
+# von bis zu 2.000 Roundtrips auf höchstens 10.
+_KEYFRAME_BATCH_SIZE = 200
 
 
 def _touch_watch(hex_id, registration=None, priority=None):
@@ -2687,23 +2691,60 @@ def _tier_for_watch_rows(rows):
 def _attach_keyframes(rows):
     """Reichert Watch-Rows um ihren letzten persistierten Keyframe an
     (on_ground/altitude_m/lat/lon für die Tier-Heuristik + bbox-Zuordnung).
-    Best-effort: pro Hex ein Lookup; fehlende Keyframes bleiben leer."""
+    Best-effort: Hexwerte werden in kleinen PostgREST-IN-Chunks geladen. Damit
+    bleibt das Ergebnis/API-Verhalten unverändert, der Poll-Tick macht aber bei
+    einem vollen Watch-Set höchstens 10 statt bis zu 2.000 DB-Roundtrips.
+
+    Falls ein Deployment/Proxy eine Batch-Query ablehnt, fällt nur dieser Chunk
+    auf den alten Einzel-Lookup zurück. Alte Daten und alte Builds bleiben damit
+    vollständig kompatibel; fehlende Keyframes bleiben wie bisher leer."""
     sb, ok = _sb_client()
     if not ok:
         return rows
+
+    rows_by_hex = {}
     for r in rows:
         hex_l = (r.get('hex24') or '').strip().lower()
         if not hex_l:
             continue
+        rows_by_hex.setdefault(hex_l, []).append(r)
+
+    unique_hexes = list(rows_by_hex)
+    for offset in range(0, len(unique_hexes), _KEYFRAME_BATCH_SIZE):
+        chunk = unique_hexes[offset:offset + _KEYFRAME_BATCH_SIZE]
         try:
             res = (sb.table('aircraft_positions')
-                   .select('latitude,longitude,altitude_m,on_ground')
-                   .eq('hex24', hex_l).limit(1).execute())
-            data = res.data or []
-            if data:
-                r['_keyframe'] = data[0]
+                   .select('hex24,latitude,longitude,altitude_m,on_ground')
+                   .in_('hex24', chunk)
+                   .limit(max(len(chunk), 1) * 4)
+                   .execute())
+            by_hex = {}
+            for keyframe in (res.data or []):
+                key = (keyframe.get('hex24') or '').strip().lower()
+                if key and key not in by_hex:
+                    # `hex24` war nur der Join-Key; Call-Sites sehen exakt das
+                    # bisherige Keyframe-Schema ohne zusätzliche Felder.
+                    by_hex[key] = {
+                        k: keyframe.get(k)
+                        for k in ('latitude', 'longitude', 'altitude_m', 'on_ground')
+                    }
+            for hex_l, keyframe in by_hex.items():
+                for row in rows_by_hex.get(hex_l, ()):
+                    row['_keyframe'] = keyframe
         except Exception:
-            pass
+            # Kompatibilitäts-Fallback: das war der bisherige Pfad. Er läuft nur,
+            # wenn eine Batch-Query als Ganzes scheitert, nie im Normalbetrieb.
+            for hex_l in chunk:
+                try:
+                    res = (sb.table('aircraft_positions')
+                           .select('latitude,longitude,altitude_m,on_ground')
+                           .eq('hex24', hex_l).limit(1).execute())
+                    data = res.data or []
+                    if data:
+                        for row in rows_by_hex.get(hex_l, ()):
+                            row['_keyframe'] = data[0]
+                except Exception:
+                    pass
     return rows
 
 
