@@ -366,3 +366,91 @@ def test_scan_nimmt_nur_die_richtige_station():
     profs = {'AT-BKK': {}, 'AT-FRA': {}}
     iatas = {'AT-BKK': 'BKK', 'AT-FRA': 'FRA'}
     assert [m['token'] for m in _scan(tokens, profs, iatas)] == ['AT-BKK']
+
+
+# ── Stale-while-revalidate (Owner-Vorfall 2026-08-02 abends) ────────────────
+#
+# Der Members-Sweep dauert auf Prod real 142–273 s (Roster-Read pro Token).
+# Er darf deshalb NIE im Request-Pfad laufen: frisch → Treffer, abgelaufen →
+# alter Stand sofort + EIN Hintergrund-Rebuild, kalt → None (Endpoint:
+# reason='warming'). Diese Tests fixieren genau diesen Vertrag.
+
+class TestCrewHereStaleWhileRevalidate:
+
+    def _clear(self):
+        with A._CREW_HERE_LOCK:
+            A._CREW_HERE_MEMO.clear()
+            A._CREW_HERE_REBUILDING.clear()
+
+    def _wait_rebuilt(self, key, timeout=3.0):
+        import time as _t
+        end = _t.time() + timeout
+        while _t.time() < end:
+            with A._CREW_HERE_LOCK:
+                if key in A._CREW_HERE_MEMO and key not in A._CREW_HERE_REBUILDING:
+                    return True
+            _t.sleep(0.02)
+        return False
+
+    def test_kalt_gibt_none_und_baut_im_hintergrund(self):
+        self._clear()
+        members = [{'token': 'AT-X', 'profile': {}, 'ops': {'here': True}}]
+        with patch.object(A, '_crew_here_members_uncached',
+                          return_value=members) as mock_sweep:
+            assert A._crew_here_members('FRA', TODAY) is None
+            assert self._wait_rebuilt(('FRA', TODAY)), 'Rebuild kam nie an'
+            assert A._crew_here_members('FRA', TODAY) == members
+            assert mock_sweep.call_count == 1, 'zweiter Aufruf muss Memo-Treffer sein'
+        self._clear()
+
+    def test_abgelaufen_liefert_stale_sofort_und_erneuert(self):
+        import time as _t
+        self._clear()
+        alt = [{'token': 'AT-ALT', 'profile': {}, 'ops': {'here': True}}]
+        neu = [{'token': 'AT-NEU', 'profile': {}, 'ops': {'here': True}}]
+        key = ('FRA', TODAY)
+        with A._CREW_HERE_LOCK:
+            A._CREW_HERE_MEMO[key] = (alt, _t.time() - A._CREW_HERE_TTL - 1)
+        with patch.object(A, '_crew_here_members_uncached', return_value=neu):
+            # Der abgelaufene Stand kommt SOFORT zurück — kein Blockieren.
+            assert A._crew_here_members('FRA', TODAY) == alt
+            assert self._wait_rebuilt(key), 'Hintergrund-Rebuild kam nie an'
+            assert A._crew_here_members('FRA', TODAY) == neu
+        self._clear()
+
+    def test_single_flight_nur_ein_rebuild_pro_key(self):
+        import threading as _th
+        self._clear()
+        gate = _th.Event()
+        calls = []
+
+        def _langsam(st, ref):
+            calls.append(st)
+            gate.wait(2.0)
+            return []
+
+        with patch.object(A, '_crew_here_members_uncached', side_effect=_langsam):
+            assert A._crew_here_members('FRA', TODAY) is None
+            assert A._crew_here_members('FRA', TODAY) is None   # kein 2. Sweep
+            gate.set()
+            self._wait_rebuilt(('FRA', TODAY))
+            assert len(calls) == 1, f'Single-flight verletzt: {len(calls)} Sweeps'
+        self._clear()
+
+    def test_endpoint_meldet_warming_statt_erfundener_null(self):
+        # Aufbau wie `_crew_here` oben — nur liefert der Members-Layer None
+        # („wissen wir noch nicht", Sweep läuft): der Endpoint muss das als
+        # reason='warming' durchreichen statt eine 0 zu behaupten.
+        with patch.object(A, '_crew_ops_today', return_value=TODAY), \
+             patch.object(A, '_crew_roster_days', return_value=_days(
+                 ('2026-07-29', 'BKK'))), \
+             patch.object(A, '_profile_load', return_value={'profile': LH_PROFILE}), \
+             patch.object(A, '_friends_load', return_value={'friends': []}), \
+             patch.object(A, '_crew_hotel_at', return_value=None), \
+             patch.object(A, '_crew_here_members', return_value=None), \
+             A.app.test_request_context(f'/api/user/crew-here/{VIEWER}?iata=BKK'):
+            body = A.get_crew_here(VIEWER).get_json()
+        assert body.get('ok') is True
+        assert body.get('reason') == 'warming'
+        assert body.get('counts', {}).get('total') == 0
+        assert body.get('crew') == []

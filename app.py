@@ -14234,6 +14234,11 @@ def _crew_ops_facts(token, iata, ref_date=None, profile=None, days=None):
 _CREW_HERE_TTL = 300.0
 _CREW_HERE_MEMO = {}
 _CREW_HERE_LOCK = _req_threading.Lock()
+# Single-flight-Buchhaltung für die Hintergrund-Rebuilds (siehe
+# _crew_here_members): pro (Station, Datum) höchstens ein Sweep, global
+# gedeckelt — ein Sweep dauert real Minuten (Roster-Read pro Token).
+_CREW_HERE_REBUILDING = set()
+_CREW_HERE_REBUILD_MAX = 3
 _CREW_HERE_DEEP_MAX = 200        # Deckel für Phase 2 (Roster-Reads)
 _CREW_HERE_PREVIEW_MAX = 12      # „kleine Vorschau-Liste"
 
@@ -14299,21 +14304,65 @@ def _crew_here_members_uncached(iata, ref_date):
 
 
 def _crew_here_members(iata, ref_date=None):
-    """Memoisierte Fassung von _crew_here_members_uncached (5 min pro Station)."""
+    """Memoisierte Fassung von _crew_here_members_uncached — **blockiert NIE**.
+
+    WARUM (Owner-Vorfall 2026-08-02 abends, „sehe die anderen nicht"):
+    der Rebuild sweept alle Push-Tokens und liest pro Token den Roster-
+    Snapshot — auf Prod real gemessen **142–273 s** pro Aufruf. Er lief
+    bisher IM Request-Pfad: Cloudflare kappt bei 100 s (524), die App bekam
+    nichts, und weil die TTL (5 min) kürzer als der Rebuild selbst sein
+    kann, war der Endpoint nach jedem Container-Restart minutenlang faktisch
+    tot — und band dabei Gunicorn-Worker + hämmerte Supabase (die
+    roster_snapshots-Flut im Log). Mehrere gleichzeitige Cold-Calls sweepten
+    zusätzlich PARALLEL (der Lock schützte nur das Dict, nicht den Rebuild).
+
+    Jetzt: Stale-while-revalidate + Single-flight.
+      · frischer Treffer  → sofort zurück (wie bisher).
+      · abgelaufener Treffer → der ALTE Stand kommt sofort zurück, EIN
+        Daemon-Thread baut im Hintergrund neu (pro Key höchstens einer).
+        „Wer ist heute in FRA" darf ein paar Minuten alt sein — eine
+        blockierte Karte darf es nicht.
+      · gar kein Stand (Prozess-Start) → **None** („wissen wir noch
+        nicht"), Rebuild läuft an. Der Aufrufer antwortet ehrlich mit
+        reason='warming' statt einer erfundenen 0 — und die App fragt
+        später erneut (Retry-Fix in CityHangoutFeedCard, gleicher Abend).
+    """
     st = str(iata or '').strip().upper()
     ref = str(ref_date or '')[:10] or _crew_ops_today()
     key = (st, ref)
     now = time.time()
+    spawn = False
     with _CREW_HERE_LOCK:
         hit = _CREW_HERE_MEMO.get(key)
         if hit is not None and (now - hit[1]) < _CREW_HERE_TTL:
             return hit[0]
-    val = _crew_here_members_uncached(st, ref)
-    with _CREW_HERE_LOCK:
-        _CREW_HERE_MEMO[key] = (val, now)
-        if len(_CREW_HERE_MEMO) > 500:
-            _CREW_HERE_MEMO.clear()
-    return val
+        # Veraltet oder fehlend → höchstens EIN Rebuild pro Key, und global
+        # gedeckelt: nach einem Restart fragt jede Station gleichzeitig an —
+        # ohne Deckel liefen Dutzende Sweeps parallel gegen Supabase.
+        if key not in _CREW_HERE_REBUILDING \
+                and len(_CREW_HERE_REBUILDING) < _CREW_HERE_REBUILD_MAX:
+            _CREW_HERE_REBUILDING.add(key)
+            spawn = True
+        stale = hit[0] if hit is not None else None
+    if spawn:
+        def _rebuild(k=key, s=st, r=ref):
+            try:
+                val = _crew_here_members_uncached(s, r)
+                with _CREW_HERE_LOCK:
+                    _CREW_HERE_MEMO[k] = (val, time.time())
+                    if len(_CREW_HERE_MEMO) > 500:
+                        _CREW_HERE_MEMO.clear()
+                        _CREW_HERE_MEMO[k] = (val, time.time())
+            except Exception as e:
+                app.logger.warning(
+                    f'[crew-ops] crew_here_rebuild_fail st={s} '
+                    f'err={type(e).__name__}: {str(e)[:120]}')
+            finally:
+                with _CREW_HERE_LOCK:
+                    _CREW_HERE_REBUILDING.discard(k)
+        _req_threading.Thread(target=_rebuild, daemon=True,
+                              name=f'crew-here-{st}').start()
+    return stale
 
 
 @app.route('/api/user/crew-here/<token>', methods=['GET'])
@@ -14374,7 +14423,13 @@ def get_crew_here(token):
     my_hotel_key = _crew_hotel_key(mine.get('hotel'))
     friend_set = set(_friends_load(token).get('friends') or [])
 
-    members = [m for m in _crew_here_members(st, ref)
+    raw_members = _crew_here_members(st, ref)
+    if raw_members is None:
+        # Prozess frisch gestartet, Sweep läuft im Hintergrund: „wissen wir
+        # noch nicht" ist die ehrliche Antwort — KEINE erfundene 0 (die App
+        # liest reason='warming' und latcht diesen Stand nicht).
+        return jsonify(dict(empty, reason='warming'))
+    members = [m for m in raw_members
                if m.get('token') and m['token'] != token]
     counts = {'total': len(members), 'same_hotel': 0, 'free_tomorrow': 0,
               'staying_2plus': 0, 'arriving_today': 0, 'departing_tomorrow': 0}
