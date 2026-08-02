@@ -274,6 +274,26 @@ def test_june_build_is_untouched_by_the_alias():
     assert payload["current_manifest"]["hash"] == L.CURRENT_LEGAL_MANIFEST["manifest_hash"]
 
 
+def test_build_after_withdrawn_range_gets_canonical_manifest():
+    """Build 287+ enthält nach dem Rollback wieder das Juni-Manifest.
+
+    Eine offene Untergrenze (>= 285) lieferte ihm zuvor fälschlich August und
+    löste dadurch bei jedem erneuten Status-Check die Consent-Wand aus.
+    """
+    sb = _SB(_rows_for_current_manifest())
+    with patch.object(L, "_auth_result", side_effect=_valid_auth), patch.object(
+        L, "_get_sb", return_value=(True, sb)
+    ):
+        response = _client().get(
+            "/api/legal-consent/status",
+            headers={"User-Agent": "AeroX/287 CFNetwork/1498.700.2 Darwin/23.6.0"},
+        )
+    payload = response.get_json()
+    assert payload["accepted"] is True
+    assert payload["current_manifest"]["version"] == "2026-06"
+    assert payload["current_manifest"]["hash"] == L.CURRENT_LEGAL_MANIFEST["manifest_hash"]
+
+
 def test_june_build_accepts_alias_only_ledger_as_valid():
     """Wer auf 285/286 getippt hat, hat eine August-Zeile im Ledger. Fuer
     einen Alt-Build darf das nicht wieder zur Wand werden."""

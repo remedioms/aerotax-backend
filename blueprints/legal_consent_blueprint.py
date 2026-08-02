@@ -93,9 +93,10 @@ _WITHDRAWN_AUGUST_2026_MANIFEST: dict[str, Any] = {
             "hash": "4907813a93513e8238f2dfde26b0b914e507b2925c57d288b7aa5dd4923dd02a",
         },
     ],
-    # Ab diesem Build liegt das August-Manifest im Binary. Alles darunter
-    # (bis einschliesslich 271, im Ledger belegt) traegt das Juni-Manifest.
+    # Nur diese beiden bereits verteilten Builds trugen das August-Manifest.
+    # Build 287+ enthält nach dem Owner-Rollback wieder das Juni-Manifest.
     "min_client_build": 285,
+    "max_client_build": 286,
 }
 _verify_manifest(_WITHDRAWN_AUGUST_2026_MANIFEST, "withdrawn august manifest")
 
@@ -135,7 +136,12 @@ def _client_manifest() -> dict[str, Any]:
         return CURRENT_LEGAL_MANIFEST
     for manifest in EQUIVALENT_LEGAL_MANIFESTS:
         minimum = manifest.get("min_client_build")
-        if minimum is not None and build >= minimum:
+        maximum = manifest.get("max_client_build")
+        if (
+            minimum is not None
+            and build >= minimum
+            and (maximum is None or build <= maximum)
+        ):
             return manifest
     return CURRENT_LEGAL_MANIFEST
 
@@ -387,4 +393,3 @@ def legal_consent_accept():
     except Exception as exc:
         _log().warning("[legal-consent] accept unavailable: %s", type(exc).__name__)
         return _ledger_unavailable()
-
