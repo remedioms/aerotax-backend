@@ -752,3 +752,60 @@ def test_arr_row_plausible_status_kept(monkeypatch):
                                dep_iata='FRA', arr_iata='BCN')
     assert f['arr_status'] == 'Gelandet'
     assert f['est_arr'] == '2026-07-15T12:13:00+02:00'
+
+
+# ── `esti_changed_at` — WANN hat sich diese Schaetzung zuletzt geaendert? ────
+# Owner-Befund 02.08.2026 (Kalender FRA→CAI 26.07., "Ist" ueber einem exakten
+# Planwert): die Physik-Huerde in `_enrich_leg_delays` stuetzte sich auf
+# `updated_at`. Das rueckt bei JEDEM Repoll vor — eine eingefrorene Prognose
+# sah dadurch ewig "frisch geschrieben" aus. Der DB-Trigger
+# (Migration 20260802) stempelt jetzt `esti_changed_at`; dieser Mapper muss den
+# Wert durchreichen, sonst laeuft die Huerde still ins Leere.
+
+def test_arr_esti_changed_at_wird_durchgereicht():
+    arr = {'airport': 'CAI#ARR', 'flight': 'LH582', 'dest_iata': 'FRA',
+           'date': '2026-07-26', 'sched': '15:43', 'esti': '15:43',
+           'status': 'Gelandet',
+           'updated_at': '2026-07-26T16:40:00+00:00',
+           'esti_changed_at': '2026-07-25T21:02:00+00:00'}
+    f = _obs_rows_to_facts(None, arr)
+    assert f['arr_obs_at'] == '2026-07-26T16:40:00+00:00'
+    assert f['arr_esti_changed_at'] == '2026-07-25T21:02:00+00:00', (
+        'Ohne diesen Wert kann die Physik-Huerde eine eingefrorene '
+        'Tafel-Prognose nicht von einer echten Messung unterscheiden.')
+
+
+def test_altbestand_ohne_esti_changed_at_setzt_das_feld_nicht():
+    """Zeilen von VOR der Migration: kein erfundener Stempel (Owner-Regel
+    „keine Fake-Werte") — das Feld fehlt schlicht und der Lesepfad faellt auf
+    `arr_obs_at` zurueck."""
+    arr = {'airport': 'CAI#ARR', 'flight': 'LH582', 'dest_iata': 'FRA',
+           'date': '2026-07-26', 'sched': '15:43', 'esti': '15:43',
+           'updated_at': '2026-07-26T16:40:00+00:00'}
+    f = _obs_rows_to_facts(None, arr)
+    assert 'arr_esti_changed_at' not in f
+    assert f['arr_obs_at'] == '2026-07-26T16:40:00+00:00'
+
+
+def test_lh_ueberschreibt_ist_ankunft_dann_faellt_der_board_stempel_weg():
+    """LH ist bei `est_arr` autoritativ. Der Board-Stempel beschreibt dann eine
+    ANDERE Uhrzeit — ihn stehen zu lassen hiesse, einem LH-Wert eine fremde
+    Messzeit anzuheften."""
+    obs = {'est_arr': '2026-07-26T15:43:00+02:00', 'arr_status': 'Gelandet',
+           'arr_obs_at': '2026-07-26T16:40:00+00:00',
+           'arr_esti_changed_at': '2026-07-25T21:02:00+00:00'}
+    merged = axd._merge_lh_into_facts(obs, {'est_arr': '2026-07-26T15:51:00+02:00'})
+    assert merged['est_arr'] == '2026-07-26T15:51:00+02:00'
+    assert 'arr_esti_changed_at' not in merged
+    assert 'arr_obs_at' not in merged
+
+
+def test_lh_bestaetigt_dieselbe_ist_ankunft_dann_bleibt_der_stempel():
+    """Der Normalfall — beide Quellen sehen dieselbe Realitaet. Dann beschreibt
+    der Stempel weiterhin genau diesen Wert und muss erhalten bleiben."""
+    obs = {'est_arr': '2026-07-26T15:43:00+02:00', 'arr_status': 'Gelandet',
+           'arr_obs_at': '2026-07-26T16:40:00+00:00',
+           'arr_esti_changed_at': '2026-07-26T15:44:00+00:00'}
+    merged = axd._merge_lh_into_facts(obs, {'est_arr': '2026-07-26T15:43:00+02:00'})
+    assert merged['arr_esti_changed_at'] == '2026-07-26T15:44:00+00:00'
+    assert merged['arr_obs_at'] == '2026-07-26T16:40:00+00:00'

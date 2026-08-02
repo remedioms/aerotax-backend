@@ -3818,6 +3818,21 @@ def _obs_rows_to_facts(dep_row, arr_row):
         _ua = _s(arr_row.get('updated_at'))
         if _ua is not None:
             facts['arr_obs_at'] = _ua
+        # WANN hat sich diese ANKUNFTS-SCHÄTZUNG zuletzt GEÄNDERT? (DB-Trigger
+        # `trg_airport_delay_obs_esti_changed`, Migration 20260802.)
+        # `updated_at` allein trägt die Physik-Hürde NICHT: es rückt bei JEDEM
+        # Repoll vor, auch wenn die Tafel exakt dasselbe sagt — eine
+        # eingefrorene PROGNOSE sah damit ewig „frisch geschrieben" aus. Der
+        # Write-on-Change-Schutz im Poller ist IN-PROCESS (3 Gunicorn-Worker
+        # mit eigenem Memo + Worker-Recycling + NAS-Scraper als separater
+        # Schreiber) und konnte das nie garantieren. `esti_changed_at` entsteht
+        # in der DB und gilt deshalb für ALLE Schreiber.
+        # Die gewählte `arr_row` liefert `esti` und `esti_changed_at` aus
+        # DERSELBEN Zeile (nur `status` wird aus einer jüngeren Row gemergt) —
+        # der Stempel beschreibt also genau diese Uhrzeit.
+        _ec = _s(arr_row.get('esti_changed_at'))
+        if _ec is not None:
+            facts['arr_esti_changed_at'] = _ec
         if arr_row.get('cancelled'):
             facts['cancelled'] = True
         # Route auch aus der ARR-Row ableitbar (falls keine DEP-Row): airport=Ziel+#ARR,
@@ -3950,8 +3965,12 @@ def _scrub_wrong_day_esti(facts, service_date=None):
             return facts
         # Fremd-Instanz: alle Ist-abgeleiteten Felder scrubben, Soll behalten.
         facts['esti_scrubbed'] = True
+        # Die Beobachtungs-Zeitstempel beschreiben GENAU die eben verworfene
+        # `est_arr` — ohne sie sind sie sinnlos und dürften nie mit einer
+        # später nachgemergten Ist-Ankunft gepaart werden.
         for _k in ('est_arr', 'est_dep', 'arr_status', 'dep_status',
-                   'arr_delay_min', 'dep_delay_min'):
+                   'arr_delay_min', 'dep_delay_min',
+                   'arr_obs_at', 'arr_esti_changed_at'):
             facts.pop(_k, None)
         return facts
     except Exception:
@@ -4416,9 +4435,19 @@ def _merge_lh_into_facts(obs, lh):
         return {k: v for k, v in lh.items()
                 if k not in ('facts_stale', 'facts_age_s')}
     out = dict(obs or {})
+    _obs_est_arr = out.get('est_arr')
     for k in _LH_AUTHORITATIVE:
         if lh.get(k) is not None:
             out[k] = lh[k]
+    # ÜBERSCHREIBT LH DIE IST-ANKUNFT, gehören die Beobachtungs-Zeitstempel des
+    # BOARDS nicht mehr dazu — sie beschreiben die alte, gerade ersetzte
+    # Uhrzeit. Sie stehen zu lassen hieße, einem LH-Wert eine fremde Messzeit
+    # anzuheften (Owner-Regel „keine Fake-Werte"); die Physik-Hürde fällt dann
+    # ehrlich auf den Altbestands-Pfad zurück. Bleibt der Wert gleich (der
+    # Normalfall — beide sehen dieselbe Realität), bleibt der Stempel gültig.
+    if out.get('est_arr') != _obs_est_arr:
+        out.pop('arr_esti_changed_at', None)
+        out.pop('arr_obs_at', None)
     for k in _LH_FILL_ONLY:
         if out.get(k) is None and lh.get(k) is not None:
             out[k] = lh[k]
@@ -4523,9 +4552,14 @@ def _flight_facts_from_obs_uncached(flight_no, date, dep_iata=None, arr_iata=Non
     # daher auf d+1; nur d/yday erwischte stattdessen die vorige Tagesrotation.
     dates = [d] + ([yday] if yday else []) + ([nday] if nday else [])
 
+    # `updated_at`/`esti_changed_at` gehören in die Projektion, sonst liefert
+    # der Batch-Prefetch-Pfad (unten) systematisch ANDERE Fakten als der
+    # Einzel-Read: die Physik-Hürde in `_enrich_leg_delays` fiele auf dem
+    # Fan-out (friend-roster/Briefings) still aus, weil ihr Zeitstempel fehlt.
     _FACTS_OBS_COLS = ('airport', 'flight', 'dest_iata', 'sched', 'esti',
                        'gate', 'terminal', 'status', 'max_delay_min',
-                       'cancelled', 'reg', 'type_code', 'date')
+                       'cancelled', 'reg', 'type_code', 'date',
+                       'updated_at', 'esti_changed_at')
 
     def _rows_from_prefetch():
         """Batch-Prefetch-Konsult (friend-roster-Kalt-Profiling 2026-07-22):
@@ -4558,25 +4592,35 @@ def _flight_facts_from_obs_uncached(flight_no, date, dep_iata=None, arr_iata=Non
         # skip_prefetch: nach einem FR24-Ankunfts-Backfill-WRITE muss der
         # Re-Read die frisch geschriebene Row sehen — der (≤60 s alte)
         # Prefetch-Seed wäre hier nachweislich stale.
+        _BASE_SEL = ('airport,flight,dest_iata,sched,esti,gate,terminal,'
+                     'status,max_delay_min,cancelled,reg,type_code,date,'
+                     # `updated_at` wurde lange nur SORTIERT, nie gelesen. Es
+                     # belegt, WANN eine Beobachtung zuletzt geschrieben wurde
+                     # — bleibt als Altbestands-Fallback der Physik-Hürde.
+                     'updated_at')
+        # `esti_changed_at` (Migration 20260802 + DB-Trigger) ist der EIGENTLICHE
+        # Beleg: wann hat sich diese Schätzung zuletzt geändert. Nur damit lässt
+        # sich eine echte Landung von einer stehengebliebenen Prognose trennen
+        # (eine Landung kann nicht vor der Landung aufgezeichnet worden sein).
+        _SEL = _BASE_SEL + ',esti_changed_at'
         rows = None if skip_prefetch else _rows_from_prefetch()
         if rows is None:
             try:
-                q = (sb.table('airport_delay_obs')
-                     .select('airport,flight,dest_iata,sched,esti,gate,terminal,'
-                             'status,max_delay_min,cancelled,reg,type_code,date,'
-                             # `updated_at` wurde bisher nur SORTIERT, nie
-                             # gelesen. Es ist aber der einzige Beleg dafuer,
-                             # WANN eine Beobachtung entstand — und damit die
-                             # einzige Moeglichkeit, eine echte Landung von
-                             # einer stehengebliebenen Prognose zu trennen
-                             # (eine Landung kann nicht vor der Landung
-                             # aufgezeichnet worden sein). Kostet keine
-                             # zusaetzliche Abfrage, nur eine Spalte.
-                             'updated_at')
+                q = (sb.table('airport_delay_obs').select(_SEL)
                      .in_('date', dates).eq('flight', fn)
                      .order('updated_at', desc=True).limit(20).execute())
             except Exception:
-                return None
+                # SCHEMA-SAFE (Muster _delay_obs_write_through / fcm_token-Lehre
+                # 01.08.): läuft die Migration irgendwo noch nicht oder hat
+                # PostgREST sein Schema-Cache noch nicht neu geladen, darf NICHT
+                # die ganze Fakten-Kette ausfallen — dann ohne die neue Spalte
+                # lesen (Verhalten = Stand vor dieser Änderung).
+                try:
+                    q = (sb.table('airport_delay_obs').select(_BASE_SEL)
+                         .in_('date', dates).eq('flight', fn)
+                         .order('updated_at', desc=True).limit(20).execute())
+                except Exception:
+                    return None
             rows = q.data or []
         _dep, _arr = [], []
         for r in rows:

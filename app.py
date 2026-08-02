@@ -39516,8 +39516,14 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
             _la_dt = _la_dt.replace(tzinfo=timezone.utc)
         if _ea_dt < _la_dt - timedelta(hours=_OVERNIGHT_ARR_MARGIN_H):
             # Fremd-Rotations-Ankunft: arr-Seite verwerfen (dep/reg behalten).
+            # Die Beobachtungs-Zeitstempel MÜSSEN mit weg: sie beschreiben die
+            # eben verworfene Fremd-est_arr. Bliebe `arr_esti_changed_at`
+            # stehen, würde er unten (ARR-Tag-Nachladen, Lücken-Merge) mit der
+            # RICHTIGEN Ist-Ankunft gepaart — ein fremder Messzeitpunkt an
+            # einem echten Wert.
             for _k in ('est_arr', 'arr_delay_min', 'arr_status',
-                       'arr_gate', 'arr_terminal'):
+                       'arr_gate', 'arr_terminal',
+                       'arr_obs_at', 'arr_esti_changed_at'):
                 facts[_k] = None
         return facts
     except Exception:
@@ -39864,7 +39870,11 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                             _facts = _fc2
                         else:
                             for _ak in ('est_arr', 'arr_delay_min', 'arr_status',
-                                        'sched_arr', 'arr_gate', 'arr_terminal'):
+                                        'sched_arr', 'arr_gate', 'arr_terminal',
+                                        # Die Mess-Zeitstempel gehören zur
+                                        # est_arr, die hier nachrückt — ohne
+                                        # sie liefe die Physik-Hürde blind.
+                                        'arr_obs_at', 'arr_esti_changed_at'):
                                 if _facts.get(_ak) is None and _fc2.get(_ak) is not None:
                                     _facts[_ak] = _fc2.get(_ak)
             except Exception:
@@ -39907,15 +39917,38 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # geschrieben, BEVOR die behauptete Ankunftszeit erreicht war, ist der
         # Wert eine Vorhersage — dann (und nur dann) wird eskaliert. Ein echt
         # gemessenes Leg kostet weiterhin nichts.
-        # `arr_obs_at` fehlt bei Altbeständen → dann wie bisher dem Status
-        # glauben (fail-open, keine Kostenlawine für historische Zeilen).
+        # WELCHER ZEITSTEMPEL TRÄGT DIE HÜRDE? (Owner-Befund 02.08.2026,
+        # FRA→CAI 26.07. „Ist 10:40–15:43" mit Ankunft = exaktem Planwert.)
+        # Bisher `arr_obs_at` (= airport_delay_obs.updated_at). Das rückt bei
+        # JEDEM Repoll vor, auch wenn die Tafel exakt dasselbe sagt — eine
+        # eingefrorene PROGNOSE sah damit dauerhaft „frisch geschrieben" aus
+        # und rutschte als Messung durch. Der Write-on-Change-Schutz im Poller
+        # (`poll_scheduler._OBS_HASH_MEMO`) hätte das verhindern können, ist
+        # aber IN-PROCESS: drei Gunicorn-Worker mit je eigenem Memo, Worker-
+        # Recycling, und der NAS-Playwright-Scraper schreibt als völlig
+        # separater Client. Keiner kennt die Historie der anderen.
+        # JETZT: `arr_esti_changed_at` — vom DB-Trigger gesetzt, wenn sich die
+        # SCHÄTZUNG ändert (Migration 20260802). Er gilt für alle Schreiber und
+        # altert bei einem reinen Repoll ehrlich weiter.
+        # ALTBESTAND (Zeilen von vor der Migration, kein Stempel): Fallback auf
+        # `arr_obs_at` = exakt das bisherige Verhalten, damit historische Legs
+        # keine Kosten-Lawine auslösen. Dieser Zweig läuft mit wachsendem
+        # Trigger-Bestand von selbst aus und kann dann entfallen.
         _mess_zeitstempel_ok = True
-        _obs_at = (_facts or {}).get('arr_obs_at')
-        if _obs_at and (_facts or {}).get('est_arr'):
-            _delta = _minutes_between((_facts or {}).get('est_arr'), _obs_at)
+        _esti_stempel_ok = False        # STRENG: nur mit echtem esti-Stempel
+        _est_arr_f = (_facts or {}).get('est_arr')
+        if _est_arr_f:
+            _delta = _minutes_between(_est_arr_f,
+                                      (_facts or {}).get('arr_esti_changed_at'))
             if _delta is not None:
                 _mess_zeitstempel_ok = _delta >= -_ARR_OBS_SETTLE_MIN
-        _freie_messung = (bool((_facts or {}).get('est_arr'))
+                _esti_stempel_ok = _mess_zeitstempel_ok
+            else:
+                _delta = _minutes_between(_est_arr_f,
+                                          (_facts or {}).get('arr_obs_at'))
+                if _delta is not None:
+                    _mess_zeitstempel_ok = _delta >= -_ARR_OBS_SETTLE_MIN
+        _freie_messung = (bool(_est_arr_f)
                           and _arr_status_terminal((_facts or {}).get('arr_status'))
                           and _mess_zeitstempel_ok)
         if _arr_vorbei and not _freie_messung:
@@ -39931,6 +39964,10 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                         and (not _f24.get('dep_iata') or _f24.get('dep_iata') == frm)):
                     _facts = dict(_facts or {})
                     _facts['est_arr'] = _f24.get('sched_arr')
+                    # Die Board-Zeitstempel beschrieben die eben ERSETZTE
+                    # Uhrzeit — sie dürfen der FR24-Landung nicht anhaften.
+                    _facts.pop('arr_esti_changed_at', None)
+                    _facts.pop('arr_obs_at', None)
                     # Die Verspätungs-ZAHL muss zur neuen Zeit passen, sonst
                     # stünde neben 10:03 weiter „+10". FR24 liefert keine
                     # Soll-Zeit → gegen die Fahrplan-Ankunft des Boards rechnen.
@@ -40067,10 +40104,24 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # Wert eine Vorhersage und gehört als „Erwartet" beschriftet. Vorher gab
         # es diese Unterscheidung im Sektor gar nicht — deshalb stand „Ist"
         # auch über einer hochgerechneten Zeit.
+        #
+        # ODER-LOCH (Owner-Befund 02.08.2026, FRA→CAI 26.07.): die beiden
+        # Status-Zweige hoben `arr_measured` OHNE jeden Zeitstempel-Check auf
+        # True. Ein terminaler Status beweist aber nur die LANDUNG — nicht,
+        # dass die ZEIT gemessen wurde. Genau das machen Boards: sie frieren
+        # `esti` auf dem Planwert ein und schalten nur den Status auf
+        # „Gelandet". Ergebnis war „Ist 15:43" über einer reinen Plan-Zeit.
+        # JETZT: der Status zählt nur zusammen mit einem plausiblen
+        # `esti_changed_at` (Stempel NACH der Landung, s. Hürde oben).
+        # Terminaler Status ALLEIN ⇒ arr_measured=False; für ein gelandetes Leg
+        # mit ungemessener Zeit greift stattdessen die FR24-Eskalation oben
+        # (`_arr_vorbei and not _freie_messung`), die dann eine echte Landezeit
+        # holt und `_freie_messung` setzt.
         s['arr_measured'] = bool(s.get('est_arr_iso')) and bool(
             _freie_messung
-            or _arr_status_terminal((m or {}).get('status_arr'))
-            or _arr_status_terminal((_facts or {}).get('arr_status')))
+            or (_esti_stempel_ok
+                and (_arr_status_terminal((m or {}).get('status_arr'))
+                     or _arr_status_terminal((_facts or {}).get('arr_status')))))
         # ── STATUS PLAUSIBILITÄTS-/PHYSIK-GATE (Owner/Fable 2026-07-13, LH454→SFO)
         # Bisher: der ROHE Board-Status floss ungegatet in dieses Feld und weiter
         # in Kalender-Leg-Anzeige, Feed-Bordkarte und flights_live[].status. Manche

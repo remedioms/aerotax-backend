@@ -32,6 +32,9 @@ import app as A
 import blueprints.aerox_data_blueprint as ADB
 
 
+_MISSING = object()     # „Feld gibt es in diesen Fakten gar nicht" (Altbestand)
+
+
 def _iso(dt):
     # Genau die Form, die im Roster steht ('…Z'). `%z` liefert '+0000' OHNE
     # Doppelpunkt — das parst `datetime.fromisoformat` nicht, das Leg gälte
@@ -314,7 +317,13 @@ def test_ohne_jede_messung_bleibt_die_zeit_als_erwartet_markiert(monkeypatch):
 # 13:20). Sie haette bei fast jedem gelandeten Leg gefeuert. Der Zeitstempel
 # der Beobachtung traegt.
 
-def _run_zeitstempel(monkeypatch, *, est_arr, obs_at, fr24_arr):
+def _run_zeitstempel(monkeypatch, *, est_arr, obs_at, fr24_arr,
+                     esti_changed_at=_MISSING, status_arr='Gelandet',
+                     facts_arr_status='Gelandet'):
+    """`esti_changed_at=_MISSING` (Default) = Altbestand, die Spalte fehlt in
+    den Fakten. `status_arr` ist der Tafel-seitige Ankunftsstatus des Merges,
+    `facts_arr_status` der der persistenten Fakten — die beiden ODER-Zweige von
+    `arr_measured` lassen sich so getrennt scharf schalten."""
     base = datetime.now(timezone.utc).replace(microsecond=0)
     arr_iso = base - timedelta(hours=3)
     sec = {'flight': 'LH1137', 'from': 'BCN', 'to': 'FRA',
@@ -322,15 +331,18 @@ def _run_zeitstempel(monkeypatch, *, est_arr, obs_at, fr24_arr):
     monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: {
         'delay_known': True, 'delay_min': 10, 'delay_side': 'arr',
         'dep_delay_min': 0, 'arr_delay_min': 10, 'status': 'Gelandet',
+        'status_arr': status_arr,
         'cancelled': False, 'esti_dep': None, 'esti_arr': None,
         'reg': 'DAIRM', 'sides': {'dep': 'obs', 'arr': 'obs'},
         'sched_dep': None, 'sched_arr': '2026-08-01T10:05:00+02:00'})
     monkeypatch.setattr(A, '_board_local_to_utc_iso', lambda v, station=None: v)
     monkeypatch.setattr(A, '_gate_facts_arr_against_leg', lambda f, _a: f)
     ruf = {'fr24': 0}
-    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: {
-        'est_arr': est_arr, 'arr_status': 'Gelandet',
-        'arr_delay_min': 10, 'arr_obs_at': obs_at})
+    _facts = {'est_arr': est_arr, 'arr_status': facts_arr_status,
+              'arr_delay_min': 10, 'arr_obs_at': obs_at}
+    if esti_changed_at is not _MISSING:
+        _facts['arr_esti_changed_at'] = esti_changed_at
+    monkeypatch.setattr(ADB, '_flight_facts_from_obs', lambda *a, **k: dict(_facts))
 
     def _f24(fn, d=None):
         ruf['fr24'] += 1
@@ -378,3 +390,113 @@ def test_ohne_zeitstempel_wird_dem_status_geglaubt(monkeypatch):
                               obs_at=None,
                               fr24_arr='2026-08-01T10:03:00+02:00')
     assert ruf['fr24'] == 0
+
+
+# ── `esti_changed_at`: der Repoll darf keine Messung vortaeuschen ────────────
+# Owner-Befund 02.08.2026 (Kalender FRA→CAI 26.07., "Ist 10:40-15:43" mit einer
+# Ankunft, die exakt der Planwert war). Die Physik-Huerde stuetzte sich auf
+# `updated_at` — und das rueckt bei JEDEM Repoll vor, auch wenn die Tafel
+# unveraendert dasselbe sagt. Eine eingefrorene PROGNOSE sah damit fuer immer
+# "frisch geschrieben" aus. Der Write-on-Change-Schutz im Poller ist
+# IN-PROCESS (3 Gunicorn-Worker mit eigenem Memo, Worker-Recycling, NAS-Scraper
+# als separater Schreiber) und konnte das nie garantieren.
+# Der DB-Trigger stempelt jetzt `esti_changed_at` — WANN sich die Schaetzung
+# zuletzt GEAENDERT hat. Das ist der einzige Wert, der eine Messung belegen kann.
+
+def test_repoll_ruckt_updated_at_vor_aber_die_prognose_bleibt_prognose(monkeypatch):
+    """(a) Genau die Luecke: `arr_obs_at` ist brandaktuell (Repoll von eben),
+    aber die Schaetzung selbst steht seit Stunden unveraendert — geschrieben
+    VOR der behaupteten Ankunft. Also Vorhersage, nicht Messung."""
+    sec, ruf = _run_zeitstempel(monkeypatch,
+                                est_arr='2026-08-01T10:15:00+02:00',
+                                # frischer Repoll — wuerde die alte Huerde
+                                # bestehen (updated_at > est_arr)
+                                obs_at='2026-08-01T14:00:00+02:00',
+                                esti_changed_at='2026-08-01T06:30:00+02:00',
+                                fr24_arr=None)
+    assert ruf['fr24'] == 1, (
+        'Ein frisches updated_at darf eine eingefrorene Schaetzung nicht mehr '
+        'zur Messung machen — die Eskalation MUSS greifen.')
+    assert sec['arr_measured'] is False, 'Vorhersage darf nie "Ist" heissen.'
+    assert sec['est_arr_iso'] == '2026-08-01T10:15:00+02:00', (
+        'Ohne bessere Quelle bleibt die Zeit stehen — nur eben als "Erwartet".')
+
+
+def test_esti_wechselte_nach_der_landung_ist_eine_messung(monkeypatch):
+    """(b) Die Tafel korrigierte die Schaetzung NACH der Ankunft auf den
+    tatsaechlichen Wert — das ist eine Beobachtung und kostet nichts."""
+    sec, ruf = _run_zeitstempel(monkeypatch,
+                                est_arr='2026-08-01T10:03:00+02:00',
+                                obs_at='2026-08-01T14:00:00+02:00',
+                                esti_changed_at='2026-08-01T10:04:00+02:00',
+                                fr24_arr='2026-08-01T09:00:00+02:00')
+    assert ruf['fr24'] == 0, 'gemessenes Leg darf keinen Cent kosten'
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
+    assert sec['arr_measured'] is True
+
+
+def test_terminaler_status_allein_ist_keine_gemessene_zeit(monkeypatch):
+    """(c) DAS ODER-LOCH: Board meldet "Gelandet", haelt die Schaetzung aber
+    auf dem PLANWERT fest (esti_changed_at stammt vom Vortag, als der Flug
+    eingeplant wurde). Der Status beweist die Landung — nicht die Uhrzeit.
+    Frueher hob genau dieser Zweig `arr_measured` ungeprueft auf True."""
+    sec, ruf = _run_zeitstempel(monkeypatch,
+                                est_arr='2026-08-01T10:05:00+02:00',   # = Plan
+                                obs_at='2026-08-01T14:00:00+02:00',
+                                esti_changed_at='2026-07-31T22:10:00+02:00',
+                                fr24_arr=None)          # niemand kann helfen
+    assert ruf['fr24'] == 1, 'gelandetes Leg mit ungemessener Zeit MUSS eskalieren'
+    assert sec['arr_measured'] is False, (
+        'Terminaler Status allein darf keine Plan-Zeit zur "Ist"-Zeit machen.')
+
+
+def test_terminaler_board_status_ohne_facts_status_braucht_den_stempel(monkeypatch):
+    """(c2) Derselbe Zweig ueber `m['status_arr']` statt ueber die Fakten:
+    auch er darf ohne plausiblen Stempel keine Messung behaupten."""
+    sec, _ = _run_zeitstempel(monkeypatch,
+                              est_arr='2026-08-01T10:05:00+02:00',
+                              obs_at='2026-08-01T14:00:00+02:00',
+                              esti_changed_at='2026-07-31T22:10:00+02:00',
+                              status_arr='Gelandet',
+                              facts_arr_status=None,
+                              fr24_arr=None)
+    assert sec['arr_measured'] is False
+
+
+def test_altbestand_ohne_esti_stempel_verhaelt_sich_wie_bisher(monkeypatch):
+    """(d) Zeilen von VOR der Migration tragen keinen `esti_changed_at`. Fuer
+    sie gilt unveraendert der `updated_at`-Fallback — kein rueckwirkender
+    Kosten- oder Anzeige-Umschwung auf historischen Daten. Dieser Zweig laeuft
+    mit wachsendem Trigger-Bestand von selbst aus."""
+    sec, ruf = _run_zeitstempel(monkeypatch,
+                                est_arr='2026-08-01T10:15:00+02:00',
+                                obs_at='2026-08-01T10:20:00+02:00',
+                                fr24_arr='2026-08-01T10:03:00+02:00')
+    assert ruf['fr24'] == 0, 'Altbestand bleibt fail-open (bisheriges Verhalten)'
+    assert sec['est_arr_iso'] == '2026-08-01T10:15:00+02:00'
+    assert sec['arr_measured'] is True, (
+        'Altbestand behaelt das heutige Verhalten — sonst wuerden historische '
+        'Legs ohne neuen Erkenntnisgewinn auf "Erwartet" umspringen.')
+
+
+def test_altbestand_mit_verdaechtigem_updated_at_eskaliert_weiterhin(monkeypatch):
+    """(d2) Gegenprobe: der alte Pfad bleibt auch in seiner scharfen Richtung
+    erhalten — `updated_at` VOR der behaupteten Ankunft eskaliert wie bisher."""
+    _, ruf = _run_zeitstempel(monkeypatch,
+                              est_arr='2026-08-01T10:15:00+02:00',
+                              obs_at='2026-08-01T10:05:00+02:00',
+                              fr24_arr='2026-08-01T10:03:00+02:00')
+    assert ruf['fr24'] == 1
+
+
+def test_fr24_landung_ist_eine_messung_auch_ohne_board_stempel(monkeypatch):
+    """Die Eskalation liefert `datetime_landed` — das IST die Messung. Der
+    Board-Stempel der ersetzten Zeit darf daran nichts aendern."""
+    sec, ruf = _run_zeitstempel(monkeypatch,
+                                est_arr='2026-08-01T10:05:00+02:00',
+                                obs_at='2026-08-01T14:00:00+02:00',
+                                esti_changed_at='2026-07-31T22:10:00+02:00',
+                                fr24_arr='2026-08-01T10:03:00+02:00')
+    assert ruf['fr24'] == 1
+    assert sec['est_arr_iso'] == '2026-08-01T10:03:00+02:00'
+    assert sec['arr_measured'] is True
