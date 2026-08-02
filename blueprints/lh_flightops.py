@@ -319,6 +319,101 @@ _ROTATED_SAVE_RETRIES = 4
 _ROTATED_SAVE_BACKOFF_S = 0.5
 _ROTATED_PENDING_MAX_AGE_S = 24 * 3600
 
+# ── DEPLOY-FESTER PARK (Vorfall 31.07.–01.08.2026: 275 Familien tot) ─────────
+# Der Prozess-Park oben stirbt mit dem Worker — und der Poll-Worker stirbt
+# ÖFTER als gedacht (Deploy-Recreate UND gunicorn-Worker-Recycle). Ein
+# geparkter neuer RT ist das einzige lebende Exemplar seiner Familie; geht er
+# mit dem Prozess, ist der Grant deterministisch verbrannt (LH: 400
+# invalid_request auf den konsumierten RT, für immer). Deshalb wird jeder Park
+# ZUSÄTZLICH auf ein Host-Volume gespiegelt (compose: /opt/aerox/fo-state →
+# AEROX_FO_STATE_DIR) und beim Refresher-Start zurückgeladen. Ohne Volume
+# (Dev/Tests) degradiert alles lautlos zum reinen Prozess-Park von vorher.
+_FO_STATE_DIR = (os.environ.get('AEROX_FO_STATE_DIR') or '/var/aerox-fo-state')
+
+
+def _parked_disk_path(user_token):
+    """Dateiname über Hash — kein Roh-Token im Verzeichnis-Listing (das
+    AT-Token IST das Credential). None, wenn kein State-Dir nutzbar ist."""
+    try:
+        if not os.path.isdir(_FO_STATE_DIR):
+            return None
+        h = hashlib.sha256((user_token or '').encode()).hexdigest()[:16]
+        return os.path.join(_FO_STATE_DIR, f'parked-{h}.json')
+    except Exception:
+        return None
+
+
+def _parked_disk_write(user_token, pend):
+    """Park-Stand atomar aufs Volume (tmp + rename). Best-effort, wirft nie —
+    der Prozess-Park bleibt die primäre Wahrheit."""
+    p = _parked_disk_path(user_token)
+    if not p:
+        return
+    try:
+        payload = dict(pend)
+        payload['user_token'] = user_token
+        tmp = p + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, p)
+    except Exception as e:
+        log.warning('[lh_flightops] parked-disk write: %s', type(e).__name__)
+
+
+def _parked_disk_rm(user_token):
+    p = _parked_disk_path(user_token)
+    if not p:
+        return
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def _rotated_pending_drop(user_token):
+    """Park-Eintrag in BEIDEN Speichern räumen (Prozess + Volume) — die eine
+    Stelle für jede Heilung/Verwerfung, damit Disk und RAM nie divergieren."""
+    with _rotated_pending_lock:
+        _rotated_pending.pop(user_token, None)
+    _parked_disk_rm(user_token)
+
+
+def _parked_disk_restore():
+    """Beim Refresher-Start: überlebende Park-Stände vom Volume zurück in den
+    Prozess-Park (nur wenn dort nichts Neueres liegt). Zu alte Dateien
+    (> _ROTATED_PENDING_MAX_AGE_S) werden gelöscht — deren Familie ist ohnehin
+    entschieden. Gibt die Zahl der restaurierten Einträge zurück, wirft nie."""
+    n = 0
+    try:
+        if not os.path.isdir(_FO_STATE_DIR):
+            return 0
+        now = time.time()
+        for fn in os.listdir(_FO_STATE_DIR):
+            if not (fn.startswith('parked-') and fn.endswith('.json')):
+                continue
+            p = os.path.join(_FO_STATE_DIR, fn)
+            try:
+                with open(p) as f:
+                    rec = json.load(f) or {}
+                tok = rec.pop('user_token', None)
+                if (not tok or not rec.get('tokens')
+                        or now - (rec.get('ts') or 0) > _ROTATED_PENDING_MAX_AGE_S):
+                    os.remove(p)
+                    continue
+                with _rotated_pending_lock:
+                    if tok not in _rotated_pending:
+                        _rotated_pending[tok] = rec
+                        n += 1
+            except Exception:
+                continue
+        if n:
+            log.warning('[lh_flightops] %d geparkte Rotation(en) vom Volume '
+                        'restauriert — Nachsave läuft über _tokens_load', n)
+    except Exception as e:
+        log.warning('[lh_flightops] parked-disk restore: %s', type(e).__name__)
+    return n
+
 
 def _rotated_pending_take(user_token, mirror_tokens):
     """Geparkten Rotations-Stand gegen den Mirror abgleichen. Gibt die
@@ -331,23 +426,20 @@ def _rotated_pending_take(user_token, mirror_tokens):
     if not pend:
         return None
     if time.time() - (pend.get('ts') or 0) > _ROTATED_PENDING_MAX_AGE_S:
-        with _rotated_pending_lock:
-            _rotated_pending.pop(user_token, None)
+        _rotated_pending_drop(user_token)
         return None
     mirror_rt = (mirror_tokens or {}).get('refresh') or ''
     ours = (pend.get('tokens') or {}).get('refresh') or ''
     if mirror_rt and mirror_rt not in (pend.get('consumed_rt') or '', ours):
         # Jemand anders hat inzwischen erfolgreich rotiert UND persistiert —
         # dessen Stand ist neuer, unsere Kopie ist Geschichte.
-        with _rotated_pending_lock:
-            _rotated_pending.pop(user_token, None)
+        _rotated_pending_drop(user_token)
         return None
     # Mirror hängt noch am konsumierten RT → unsere Kopie ist die Wahrheit.
     if _tokens_save(user_token, pend['tokens']):
         log.info('[lh_flightops] rotation-nachsave gelungen token=%s',
                  (user_token or '')[:8])
-        with _rotated_pending_lock:
-            _rotated_pending.pop(user_token, None)
+        _rotated_pending_drop(user_token)
     return dict(pend['tokens'])
 
 
@@ -390,15 +482,13 @@ def _tokens_save_rotated(user_token, consumed_rt, tokens):
                             'gelungen token=%s', attempt + 1,
                             (user_token or '')[:8])
             _tokens_disk_mirror(user_token, tokens)
-            with _rotated_pending_lock:
-                _rotated_pending.pop(user_token, None)
+            _rotated_pending_drop(user_token)
             return True
         if cas == 'superseded':
             log.warning('[lh_flightops] rotation-save superseded (Re-Login/'
                         'fremder neuerer Stand) — Kopie verworfen token=%s',
                         (user_token or '')[:8])
-            with _rotated_pending_lock:
-                _rotated_pending.pop(user_token, None)
+            _rotated_pending_drop(user_token)
             return True
         if cas in (None, 'no_row'):
             # RPC (noch) nicht da: Supersede von Hand prüfen, dann
@@ -408,25 +498,27 @@ def _tokens_save_rotated(user_token, consumed_rt, tokens):
                                          tokens.get('refresh') or ''):
                 log.warning('[lh_flightops] rotation-save superseded (readback)'
                             ' — Kopie verworfen token=%s', (user_token or '')[:8])
-                with _rotated_pending_lock:
-                    _rotated_pending.pop(user_token, None)
+                _rotated_pending_drop(user_token)
                 return True
             if _tokens_save(user_token, tokens):
                 if attempt:
                     log.warning('[lh_flightops] rotation-save nach %d Versuchen'
                                 ' gelungen token=%s', attempt + 1,
                                 (user_token or '')[:8])
-                with _rotated_pending_lock:
-                    _rotated_pending.pop(user_token, None)
+                _rotated_pending_drop(user_token)
                 return True
         time.sleep(delay)
         delay = min(delay * 2, 4.0)
-    with _rotated_pending_lock:
-        _rotated_pending[user_token] = {
-            'tokens': dict(tokens), 'consumed_rt': consumed_rt or '',
+    pend = {'tokens': dict(tokens), 'consumed_rt': consumed_rt or '',
             'ts': time.time()}
+    with _rotated_pending_lock:
+        _rotated_pending[user_token] = pend
+    # Deploy-fest: der Park überlebt Worker-Recycle UND Container-Recreate auf
+    # dem Host-Volume — genau die zwei Tode, die am 31.07./01.08. Familien
+    # gekostet haben.
+    _parked_disk_write(user_token, pend)
     log.error('[lh_flightops] ROTATION-SAVE FEHLGESCHLAGEN token=%s rt8=%s — '
-              'neuer Refresh-Token nur noch im Prozess (wird bei jedem '
+              'neuer Refresh-Token geparkt (Prozess + Volume; wird bei jedem '
               'Load nachpersistiert; Refresher rotiert diesen Grant NICHT '
               'weiter, bis der Nachsave bestätigt ist)', (user_token or '')[:8],
               _rt8(tokens.get('refresh')))
@@ -505,6 +597,49 @@ def _refresh(refresh_token):
 # andere (service_unavailable=Wartung, 403 Rate-Limit, 5xx, Netz) ist
 # transient: Tokens BEHALTEN, später erneut.
 _FATAL_OAUTH_ERRORS = ('invalid_grant', 'invalid_client', 'invalid_token')
+
+# ── 400/invalid_request = LH-Dialekt für einen VERBRAUCHTEN Refresh-Token ────
+# Gemessen 02.08.2026 (Vorfall 275 Grants): ein UNBEKANNTER RT bekommt
+# 401/invalid_token (fatal, korrekt), ein bereits eingelöster/übersprungener
+# RT dagegen 400/invalid_request — und der lief als »transient« in einen
+# EWIGEN stündlichen Retry (441 Fehlversuche allein an einem Vormittag),
+# während der User nie die »Neu verbinden«-Karte sah. Ein einzelner
+# invalid_request bleibt transient (LH-Schluckauf ist real); erst das MUSTER
+# — derselbe RT, mehrfach, über einen längeren Zeitraum — ist der Beweis für
+# einen toten Grant. Owner-Regel dazu (02.08.): »wenn länger nichts mehr kommt
+# von api … am besten sogar komplett pausiert« — genau das passiert über den
+# needs_relogin-Weg (Refresher fasst den Grant nie wieder an, App zeigt still
+# die Reconnect-Karte, kein Push).
+_INVREQ_DEAD_N = 3               # Fehlschläge in Folge auf DEMSELBEN RT …
+_INVREQ_DEAD_SPAN_S = 1800       # … über mindestens diese Zeitspanne
+
+
+def _invreq_track(user_token, tokens, rt):
+    """400/invalid_request-Fehlschlag DURABEL am Token-Stand zählen (im
+    Token-Dict selbst — überlebt Worker-Recycle und Deploy, resettet
+    automatisch bei jedem neuen RT, weil der Zähler an rt8 gebunden ist).
+    True erst, wenn das Muster den toten Grant beweist. Wirft nie."""
+    try:
+        now = time.time()
+        rec = tokens.get('invreq')
+        rec = dict(rec) if isinstance(rec, dict) else {}
+        if rec.get('rt8') != _rt8(rt):
+            rec = {'rt8': _rt8(rt), 'first': now, 'n': 0}
+        rec['n'] = int(rec.get('n') or 0) + 1
+        rec['last'] = now
+        if (rec['n'] >= _INVREQ_DEAD_N
+                and now - float(rec.get('first') or now) >= _INVREQ_DEAD_SPAN_S):
+            return True
+        t2 = dict(tokens)
+        t2['invreq'] = rec
+        if not _tokens_save(user_token, t2):
+            # Best-effort: ohne persistierten Zähler dauert die Eskalation nur
+            # länger — sie kippt nie fälschlich auf »tot«.
+            log.warning('[lh_flightops] invreq-zähler nicht persistiert '
+                        'token=%s n=%d', (user_token or '')[:8], rec['n'])
+    except Exception as e:
+        log.warning('[lh_flightops] invreq-track: %s', type(e).__name__)
+    return False
 
 
 def _token_request(body):
@@ -763,7 +898,16 @@ def _refresher_refresh_grant(user_token):
                     else 'rotated_parked')
         if err and err.get('refused'):
             return 'refused'
+        dead_why = None
         if err and err.get('fatal'):
+            dead_why = 'oauth_fatal'
+        elif (err and err.get('http') == 400
+                and (err.get('oauth') or '') == 'invalid_request'
+                and _invreq_track(user_token, t, rt)):
+            # LH kennt den RT, weist die Anfrage aber dauerhaft zurück —
+            # das Muster des verbrauchten Tokens (Vorfall 02.08.2026).
+            dead_why = 'invalid_request_persistent'
+        if dead_why:
             # GRACE-RELOAD (Deploy-Übergang): hat ein Alt-Code-Container
             # parallel rotiert, ist unser fatal nur der Race-Verlierer —
             # Grant lebt, nichts flaggen.
@@ -779,9 +923,9 @@ def _refresher_refresh_grant(user_token):
             # rekonstruiert.
             _last_ok_min = (time.time() - ((cur.get('expires_at') or 0) - 3540)) / 60.0
             log.error('[lh_flightops] GRANT-BURN token=%s rt8=%s http=%s '
-                      'oauth=%s last_ok_vor_min=%.0f',
+                      'oauth=%s grund=%s last_ok_vor_min=%.0f',
                       user_token[:8], _rt8(rt),
-                      err.get('http'), err.get('oauth'), _last_ok_min)
+                      err.get('http'), err.get('oauth'), dead_why, _last_ok_min)
             cur['needs_relogin'] = True
             cur['relogin_at'] = time.time()
             cur.pop('access', None)
@@ -7295,6 +7439,10 @@ def _refresher_main():
     _refresher_beat_write(_refresher_state['active_since'])
     log.warning('[fo-refresher] aktiv pid=%s — einziger RT-Rotierer des '
                 'Systems', os.getpid())
+    # Deploy-/Recycle-Überlebende einsammeln, BEVOR irgendein Grant rotiert:
+    # ein geparkter neuer RT muss den Nachsave bekommen, sonst verbrennt der
+    # nächste Refresh-Versuch seine Familie (Vorfall 31.07.–01.08.2026).
+    _parked_disk_restore()
     try:
         while not _refresher_state['drain']:
             try:
@@ -7568,6 +7716,18 @@ def flightops_relogin_watch():
         # Prozess, der es nicht wissen KANN, darf nichts behaupten; er sagt
         # nur, dass er nicht zuständig ist (der Wächter-Cron fragt :8081).
         health['state'] = 'not_my_role'
+    # ── RÜCKSTAU-ALARM (Lücke des 02.08.-Vorfalls: 291 Grants hingen in der
+    # Rotations-Bremse, 199 needs_relogin — und der Wächter schwieg, weil nur
+    # der STÜNDLICHE Delta-Anstieg alarmierte, nicht der Dauerzustand) ──────
+    if _refresher_enabled():
+        _beat_last = health.get('last')
+        _gated = (_beat_last or {}).get('gated') if isinstance(_beat_last, dict) else None
+        if isinstance(_gated, int) and _gated >= 50:
+            reasons.append(f'{_gated} Grants im Rotations-Rückstau '
+                           f'(Dauer-Fehlschlag — GRANT-BURN-Log prüfen)')
+        if _rotated_pending:
+            reasons.append(f'{len(_rotated_pending)} Rotation(en) geparkt '
+                           f'(Nachsave klemmt — Familienverlust droht)')
     alerted = False
     if reasons and now - (prev.get('alerted_at') or 0) > _RELOGIN_ALERT_COOLDOWN_S:
         alerted = _fo_watch_alert_mail(reasons, cnt, delta)

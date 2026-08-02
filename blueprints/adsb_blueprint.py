@@ -687,8 +687,15 @@ USER_AGENT = "AeroTax-Backend/1.1 (ADS-B-Proxy; mailto:ops@aerotax.de)"
 # In-Process OAuth2-Token-Cache (zusätzlich zum persistenten poll_state-Cache).
 # Spart pro Cloud-Run-Instanz den Token-Roundtrip; bei Cold-Start re-fetcht die
 # erste Anfrage. Token leben ~30min, wir nutzen 25min als sichere TTL.
-_OAUTH_CACHE = {"token": None, "expires_at": 0.0, "lock": threading.Lock()}
+_OAUTH_CACHE = {"token": None, "expires_at": 0.0, "fail_until": 0.0,
+                "lock": threading.Lock()}
 _OAUTH_TTL_SAFETY = 25 * 60  # 25 min, OpenSky-Token gilt ~30min
+# Negativ-Cache nach Fetch-Fehlschlag (02.08.2026: tote OpenSky-Creds → 401
+# im SEKUNDENTAKT aus jedem Poll-Pfad, Log-Spam + verschenkte Calls). Bei
+# 401/403 sind die Creds tot — schnelles Wiederkommen heilt nichts; bei
+# Netz/5xx reicht eine kurze Pause. Owner-Regel: pausieren statt hämmern.
+_OAUTH_FAIL_PAUSE_AUTH_S = 30 * 60
+_OAUTH_FAIL_PAUSE_NET_S = 5 * 60
 
 
 def _opensky_oauth_token():
@@ -708,10 +715,12 @@ def _opensky_oauth_token():
         return None
 
     now = time.time()
-    # 1) In-Process-Cache.
+    # 1) In-Process-Cache (inkl. Negativ-Cache nach Fehlschlag).
     with _OAUTH_CACHE["lock"]:
         if _OAUTH_CACHE["token"] and now < _OAUTH_CACHE["expires_at"]:
             return _OAUTH_CACHE["token"]
+        if now < _OAUTH_CACHE["fail_until"]:
+            return None
 
     # 2) Persistenter poll_state-Cache (geteilt über Instanzen).
     cached = _poll_state_get('oauth_token')
@@ -749,9 +758,14 @@ def _opensky_oauth_token():
             with urllib.request.urlopen(req, timeout=OPENSKY_TOKEN_TIMEOUT) as resp:
                 obj = json.loads(resp.read())
         except Exception as e:
+            code = getattr(e, 'code', None)
+            pause = (_OAUTH_FAIL_PAUSE_AUTH_S if code in (401, 403)
+                     else _OAUTH_FAIL_PAUSE_NET_S)
+            _OAUTH_CACHE["fail_until"] = time.time() + pause
             try:
                 current_app.logger.warning(
-                    f'[adsb] oauth_token_fetch_FAIL {type(e).__name__}: {str(e)[:120]}')
+                    f'[adsb] oauth_token_fetch_FAIL {type(e).__name__}: '
+                    f'{str(e)[:120]} — pausiert {int(pause / 60)}min')
             except Exception:
                 pass
             return None

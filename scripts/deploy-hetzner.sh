@@ -244,6 +244,45 @@ if [ "$OK" = "OK" ]; then
   # 12 Images à 767 MB → 89 % → Monitor-Alerts).
   echo "[6/6] Image-Cleanup (behalte aktuelles + Rollback)…"
   rsh "PREV=\$(grep 'image:' /opt/aerox/compose.yaml.prev 2>/dev/null | head -1 | awk '{print \$2}'); docker images --format '{{.Repository}}:{{.Tag}}' | grep aerotax-backend | grep -v -e '$IMG' -e \"\$PREV\" | xargs -r docker rmi >/dev/null 2>&1; docker image prune -f >/dev/null; echo OK"
+
+  # ── [7/7] NAS-ZWEITORIGIN NACHZIEHEN (Pflicht — Vorfälle 01.08.+02.08.) ────
+  # api.aerosteuer.de hat ZWEI Origins (Cloudflare-Worker verteilt): Hetzner
+  # UND die NAS-Kopie (nas-api.aerosteuer.de). Ein Hetzner-only-Deploy ließ
+  # am 01.08. die Security-Lücke am NAS offen und am 31.07./01.08. rotierte
+  # dort ALT-CODE (vor dem Claim-Umbau) parallel Refresh-Tokens → 275
+  # verbrannte LH-Grant-Familien. Deshalb zieht JEDER Deploy das NAS mit —
+  # scheitert das (nicht im Heimnetz o.ä.), schlägt der Deploy NICHT fehl,
+  # aber es wird LAUT gewarnt und in NAS-PENDING vermerkt.
+  echo "[7/7] NAS-Zweitorigin nachziehen…"
+  NAS_HOST="miguelschumann@192.168.0.211"
+  NAS_OK=0
+  if ssh -o ConnectTimeout=6 -o BatchMode=yes "$NAS_HOST" true >/dev/null 2>&1; then
+    NAS_TOK=$(gcloud auth print-access-token 2>/dev/null || true)
+    if [ -n "$NAS_TOK" ]; then
+      echo "$NAS_TOK" | ssh "$NAS_HOST" "cat > /tmp/artok && sudo sh -c 'cat /tmp/artok | /usr/local/bin/docker login -u oauth2accesstoken --password-stdin https://europe-west3-docker.pkg.dev' >/dev/null 2>&1; rm -f /tmp/artok" || true
+      NAS_REWROTE=$(ssh "$NAS_HOST" "sudo /usr/local/bin/docker pull '$IMG' >/dev/null 2>&1 && sudo sh -c 'cd /volume1/docker/aerotax-backend && cp compose.yaml compose.yaml.prev && sed -i -E \"s#^([[:space:]]*image:[[:space:]]*).*aerotax-backend.*\$#\\\\1$IMG#\" compose.yaml && grep -c \"$IMG\" compose.yaml'" 2>/dev/null || echo 0)
+      if [ "${NAS_REWROTE:-0}" -ge 1 ]; then
+        ssh "$NAS_HOST" "sudo sh -c 'cd /volume1/docker/aerotax-backend && /usr/local/bin/docker-compose -p aerotax-backend up -d' >/dev/null 2>&1" || true
+        NAS_IMG=$(ssh "$NAS_HOST" "sudo /usr/local/bin/docker inspect aerotax-backend --format '{{.Config.Image}}' 2>/dev/null" || true)
+        [ "$NAS_IMG" = "$IMG" ] && NAS_OK=1
+      fi
+    fi
+  fi
+  if [ "$NAS_OK" = 1 ]; then
+    # Verifikation am ÖFFENTLICHEN Ingress („deployt ≠ was das Internet
+    # sieht"): der Security-Kanarienvogel MUSS 401 liefern.
+    sleep 5
+    NAS_CANARY=$(curl -s -o /dev/null -w '%{http_code}' -m10 "https://nas-api.aerosteuer.de/api/user/search?q=an" || echo ERR)
+    echo "     ✅ NAS auf $IMG (Kanarienvogel user/search: HTTP $NAS_CANARY — Soll 401)"
+    if [ "$NAS_CANARY" != "401" ]; then
+      echo "     🚨 KANARIENVOGEL NICHT 401 — NAS-Stand SOFORT manuell prüfen!"
+    fi
+  else
+    echo "     🚨 NAS NICHT AKTUALISIERT — ZWEITES ORIGIN LÄUFT AUF ALTEM STAND!"
+    echo "        Sobald im Heimnetz: erneut deployen oder manuell nachziehen"
+    echo "        (Memory aerox-zweites-origin-nas). Vermerkt in NAS-PENDING."
+    date "+%Y-%m-%dT%H:%M:%S ausstehend: $IMG" >> "$HOME/aerox-oracle-prep/NAS-PENDING"
+  fi
 else
   echo "[5/5] ❌ ungesund → automatischer Rollback aufs vorige Image…"
   rsh "cd /opt/aerox && cp compose.yaml.prev compose.yaml && docker compose up -d"

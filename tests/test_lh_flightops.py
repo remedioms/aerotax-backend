@@ -4503,3 +4503,129 @@ def test_w0_import_laufendes_fenster_reicht_fakten_durch(monkeypatch):
     assert seen['rot_legs'][('LH500', 'FRA', 'GRU', '20260910')]['hotel'] \
         == 'Pullman Sao Paulo Guarulhos'
     assert audits == [1]
+
+
+# ── Vorfall 02.08.2026: 275 Grants in ewiger invalid_request-Schleife ────────
+def test_invalid_request_einmalig_bleibt_transient(monkeypatch):
+    """Ein einzelner 400/invalid_request ist ein LH-Schluckauf — kein Flag,
+    kein Re-Login, aber der Zähler wandert durabel in den Token-Stand."""
+    import time as _t
+    saves = []
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: {
+        'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 400, 'oauth': 'invalid_request', 'fatal': False}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
+        AssertionError('einzelner invalid_request darf keinen Re-Login ausrufen')))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'transient'
+    rec = saves[-1].get('invreq')
+    assert rec and rec['n'] == 1 and rec['rt8'] == fo._rt8('R')
+
+
+def test_invalid_request_dauerhaft_wird_dead(monkeypatch):
+    """Das Muster des verbrauchten RT (>=N Fehlschläge über >=Spanne auf
+    DEMSELBEN RT) flaggt needs_relogin — der Grant ist bei LH nie wieder
+    einlösbar, ewiges Retry wäre eine Lüge gegenüber dem User."""
+    import time as _t
+    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)
+    monkeypatch.setattr(fo, '_INVREQ_DEAD_SPAN_S', 0)
+    saves = []
+    relogins = []
+    state = {'access': 'OLD', 'refresh': 'R', 'expires_at': _t.time() - 10}
+
+    def _save(tok, t):
+        saves.append(dict(t))
+        state.clear(); state.update(t)
+        return True
+
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: dict(state))
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: dict(state))
+    monkeypatch.setattr(fo, '_tokens_save', _save)
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 400, 'oauth': 'invalid_request', 'fatal': False}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: relogins.append(tok))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'transient'   # n=1
+        assert fo._refresher_refresh_grant('AT-U') == 'transient'   # n=2
+        assert fo._refresher_refresh_grant('AT-U') == 'dead'        # n=3 ⇒ tot
+    flagged = saves[-1]
+    assert flagged.get('needs_relogin') is True and 'access' not in flagged
+    assert relogins == ['AT-U']
+
+
+def test_invalid_request_zaehler_resettet_bei_neuem_rt(monkeypatch):
+    """Der Zähler hängt am rt8: ein NEUER Refresh-Token (Re-Login/erfolgreiche
+    Rotation) startet sauber — alte Fehlschläge zählen nie gegen den neuen
+    Grant."""
+    import time as _t
+    saves = []
+    tok_state = {'access': 'OLD', 'refresh': 'R2', 'expires_at': _t.time() - 10,
+                 'invreq': {'rt8': fo._rt8('R1'), 'n': 99, 'first': 0.0,
+                            'last': _t.time()}}
+    monkeypatch.setattr(fo, '_FATAL_GRACE_SEC', 0)
+    monkeypatch.setattr(fo, '_INVREQ_DEAD_SPAN_S', 0)
+    monkeypatch.setattr(fo, '_claim_refresh_sb', lambda tok, rt: True)
+    monkeypatch.setattr(fo, '_tokens_load', lambda tok, fresh=False: dict(tok_state))
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: saves.append(dict(t)) or True)
+    monkeypatch.setattr(fo, '_refresh', lambda r: (
+        None, {'http': 400, 'oauth': 'invalid_request', 'fatal': False}))
+    monkeypatch.setattr(fo, '_notify_relogin', lambda tok: (_ for _ in ()).throw(
+        AssertionError('frischer RT: 99 Alt-Fehlschläge zählen NICHT')))
+    with _as_refresher():
+        assert fo._refresher_refresh_grant('AT-U') == 'transient'
+    rec = saves[-1].get('invreq')
+    assert rec['rt8'] == fo._rt8('R2') and rec['n'] == 1
+
+
+# ── Vorfall 02.08.2026: geparkte Rotation stirbt mit dem Prozess ─────────────
+def test_geparkte_rotation_ueberlebt_prozess_tod_via_volume(monkeypatch, tmp_path):
+    """DER Deploy-Fest-Beweis: Save nach Rotation scheitert komplett → Park
+    liegt auch auf dem Volume; Prozess-Tod (Park leeren) + Restore beim
+    Refresher-Start bringt den Stand zurück; Nachsave heilt und räumt die
+    Datei."""
+    import time as _t
+    monkeypatch.setattr(fo, '_FO_STATE_DIR', str(tmp_path))
+    monkeypatch.setattr(fo, '_ROTATED_SAVE_RETRIES', 1)
+    monkeypatch.setattr(fo, '_ROTATED_SAVE_BACKOFF_S', 0.0)
+    monkeypatch.setattr(fo, '_save_rotated_cas', lambda tok, c, t: None)
+    monkeypatch.setattr(fo, '_tokens_mirror_raw', lambda tok: {'refresh': 'R1'})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: False)
+    fo._rotated_pending.clear()
+    new_tokens = {'access': 'NEW', 'refresh': 'R2', 'expires_at': _t.time() + 3000}
+    assert fo._tokens_save_rotated('AT-U', 'R1', new_tokens) is False
+    files = list(tmp_path.glob('parked-*.json'))
+    assert len(files) == 1
+    # Prozess-Tod: RAM-Park weg, Volume bleibt
+    fo._rotated_pending.clear()
+    assert fo._parked_disk_restore() == 1
+    assert fo._rotated_pending['AT-U']['tokens']['refresh'] == 'R2'
+    # SB wieder da → Nachsave über _tokens_load heilt Park UND Volume
+    import app as backend
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda tok, fresh=False: {'profile': {
+                            'flightops_tokens': {'access': 'OLD',
+                                                 'refresh': 'R1'}}})
+    monkeypatch.setattr(fo, '_tokens_save', lambda tok, t: True)
+    healed = fo._tokens_load('AT-U', fresh=True)
+    assert healed['refresh'] == 'R2'
+    assert 'AT-U' not in fo._rotated_pending
+    assert list(tmp_path.glob('parked-*.json')) == []
+
+
+def test_parked_restore_verwirft_uralte_und_defekte_dateien(monkeypatch, tmp_path):
+    """Restore-Hygiene: Einträge älter als der Park-Deckel (Familie längst
+    entschieden) und kaputte Dateien fliegen raus statt zu restaurieren."""
+    import json as _json, time as _t
+    monkeypatch.setattr(fo, '_FO_STATE_DIR', str(tmp_path))
+    fo._rotated_pending.clear()
+    (tmp_path / 'parked-alt.json').write_text(_json.dumps({
+        'user_token': 'AT-ALT', 'tokens': {'refresh': 'RX'},
+        'consumed_rt': 'R0', 'ts': _t.time() - fo._ROTATED_PENDING_MAX_AGE_S - 60}))
+    (tmp_path / 'parked-kaputt.json').write_text('{nicht json')
+    assert fo._parked_disk_restore() == 0
+    assert fo._rotated_pending == {}
+    assert not (tmp_path / 'parked-alt.json').exists()
