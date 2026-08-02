@@ -1512,6 +1512,29 @@ def test_turnaround_verliert_seine_karte_nicht(client, sb, auth, apns, frozen):
     assert not apns['client'].sent
 
 
+def test_lh455_vortags_instanz_beendet_die_karte_nicht(client, sb, auth, apns,
+                                                       frozen):
+    """Vorfall 02.08. (Check-in-Pushes) auf der Live-Activity-Achse
+    gegengeprueft: LH455 SFO-FRA ist ein Rot-Augen-Flug, die HEUTE in FRA
+    gelandete Maschine gehoert zur Instanz von GESTERN. Die Board-Zeile traegt
+    das ANKUNFTS-Lokaldatum und damit dieselbe Flugnummer am selben Tag — sie
+    darf die Karte des heute abend startenden Legs nicht beenden.
+
+    Zwei unabhaengige Riegel greifen: `_closing_sector` gibt None, solange ein
+    Abflug aussteht, und `confirmed_arrival` verwirft jede Ankunft VOR dem
+    eigenen Abflug."""
+    _register(client)
+    _age_row(sb, 0)
+    # Juliens Leg startet in 3 h (SFO) und landet morgen frueh in FRA.
+    leg = _leg(3, 14, flight='LH455', frm='SFO', to='FRA')
+    sb.briefings.append(_brief([leg]))
+    sb.obs.append(_obs(landed_min_ago=60, flight='LH455'))
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    assert counts['landed'] == 0 and not apns['client'].sent
+    # Auch die reine Funktion sagt Nein — unabhaengig vom Turnaround-Riegel.
+    assert LA.confirmed_arrival(sb.obs, leg, FROZEN_UTC) is None
+
+
 def test_landung_eines_fremden_legs_beendet_nichts(client, sb, auth, apns,
                                                    frozen):
     """Der Board-Read ist gebuendelt — die Landung einer ANDEREN Flugnummer

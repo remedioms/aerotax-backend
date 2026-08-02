@@ -14,6 +14,29 @@ Verbindungen wurde am selben Tag ausdrücklich abgelehnt):
 Jede Meldung höchstens EINMAL pro Abo (`sent`-Flags an der Zeile + wertbasierter
 Outbox-idempotency_key als zweite Sicherung).
 
+DIE ZWEITE HARTE REGEL — DIE FLUGNUMMER IST NICHT DIE INSTANZ.
+(Vorfall 02.08.2026, LH455 SFO→FRA.)
+Tibor war über Juliens Bordkarte für LH455 am 02.08. eingecheckt (Abflug SFO
+02.08. 21:40Z). Um 09:31 Ortszeit kam „Landet bald · LH455", um 10:39
+„gelandet" — für eine Maschine, die am 01.08. in SFO gestartet war. Belegt in
+der Prod-DB: `flight_checkins.dep_iso = 2026-08-02T21:40Z`, aber
+`airport_delay_obs` trug für `FRA#ARR` eine Zeile mit **date = 2026-08-02**
+(„Gelandet", esti 10:27 Ortszeit) — DAS ANKUNFTS-LOKALDATUM DER VORTAGS-
+INSTANZ. Bei einem Rot-Augen-Flug ist das Ankunftsdatum systematisch
+Abflugdatum + 1; der Board-Reader (`_flight_facts_from_obs`) liest bewusst
+d−1/d/d+1 und bevorzugt den exakten Datums-Treffer — also genau die falsche
+Instanz. Der Sweep hielt das für „meinen" Flug, schaltete still `departed`
+frei (07:12Z), pushte die ETA (07:31Z) und die Landung (08:39Z).
+
+Konsequenz, an drei Stellen erzwungen (`instance_started`,
+`arrival_fits_instance`, `facts_for_instance`):
+  · Ereignisse werden über das ABFLUGDATUM gematcht — nie über ein
+    Board-/Ankunftsdatum.
+  · Ein Abo, dessen EIGENER Abflug (`dep_iso`) noch in der Zukunft liegt,
+    bekommt WEDER „landet bald" NOCH „gelandet" — egal was ein Board sagt.
+  · Eine Ankunft VOR dem eigenen Abflug (oder mehr als 20 h danach) gehört
+    einer anderen Rotation und wird verworfen, samt Status-Bucket.
+
 DIE WICHTIGSTE REGEL — EINE VERSTRICHENE PLANZEIT IST KEIN EREIGNIS.
 Die Maschine kann am Gate stehen. Genau diese Unterscheidung wurde am
 2026-07-31 auch in die Live Activity eingebaut (`depConfirmed`/`arrConfirmed`),
@@ -77,6 +100,13 @@ ETA_LEAD_MIN_MIN = 5
 LANDED_MIN_BLOCK_MIN = 20
 # Ein Abo lebt bis Abflugdatum + 2 Tage; danach räumt der Sweep es weg.
 PRUNE_AFTER_DAYS = 2
+# ── INSTANZ-ACHSE (Vorfall 02.08.2026, s. „DIE ZWEITE HARTE REGEL" oben) ────
+# Kein Linienflug startet drei Stunden zu früh. Alles, was VOR diesem Fenster
+# behauptet wird, kann meine Instanz nicht meinen.
+INSTANCE_EARLY_SLACK_MIN = 180
+# Längster plausibler Block (identisch zu `lh_mqtt._SUB_BLOCK_MAX_H`): eine
+# „Ankunft" jenseits davon gehört zu einer anderen Rotation.
+INSTANCE_MAX_BLOCK_H = 20
 # Deckel pro Sweep-Lauf: ein Sweep darf nie unbegrenzt Board-Abfragen machen.
 SWEEP_ROW_CAP = 200
 _SWEEP_MIN_GAP_S = 240
@@ -212,6 +242,70 @@ def landed_confirmed_by_board(status_bucket, now_utc, departed_at_iso):
     if dep_at is None or now_utc is None:
         return False
     return (now_utc - dep_at) >= timedelta(minutes=LANDED_MIN_BLOCK_MIN)
+
+
+# ── Instanz-Achse: gehört dieses Ereignis überhaupt zu MEINEM Flug? ─────────
+
+def instance_started(dep_iso, now_utc, slack_min=INSTANCE_EARLY_SLACK_MIN):
+    """Kann meine Instanz JETZT schon unterwegs sein? Pure.
+
+    `dep_iso` ist der Abflug-Instant, den der Nutzer beim Einchecken gesehen
+    hat — die einzige Zeitangabe, die eindeutig MEINE Instanz beschreibt (die
+    Flugnummer tut es nicht, sie wiederholt sich täglich).
+
+    Unbekannter Abflug ⇒ True: alte Zeilen ohne `dep_iso` verhalten sich wie
+    bisher. Ein Urteil „nicht gestartet" wird nur gefällt, wenn es belegt ist.
+    """
+    dep = parse_iso_utc(dep_iso)
+    if dep is None or now_utc is None:
+        return True
+    return now_utc >= dep - timedelta(minutes=slack_min)
+
+
+def arrival_fits_instance(est_arr_iso, dep_iso,
+                          max_block_h=INSTANCE_MAX_BLOCK_H):
+    """Kann diese Ankunftszeit zu MEINEM Abflug gehören? Pure.
+
+    Der Fall aus dem Vorfall: „Ankunft" 08:27Z, mein Abflug 21:40Z desselben
+    Tages. Eine Maschine landet nicht 13 h vor ihrem Start — das ist die
+    Vortags-Instanz derselben Flugnummer.
+    """
+    est = parse_iso_utc(est_arr_iso)
+    if est is None:
+        return False
+    dep = parse_iso_utc(dep_iso)
+    if dep is None:
+        return True                     # ohne Abflug-Instant kein Urteil
+    return dep < est <= dep + timedelta(hours=max_block_h)
+
+
+def facts_for_instance(facts, dep_iso, now_utc):
+    """Board-Fakten auf MEINE Instanz eindampfen. Pure, wirft nie.
+
+    Drei Schnitte, alle drei sind der Vorfall vom 02.08.:
+      1. Meine Instanz ist noch gar nicht gestartet ⇒ NICHTS gilt. Ein Board,
+         das jetzt „gelandet" sagt, meint zwangsläufig eine andere Rotation.
+      2. Eine Ankunftszeit, die nicht zwischen meinen Abflug und +20 h passt,
+         wird verworfen.
+      3. Ein `landed`-Bucket OHNE passende, bereits vergangene Ankunftszeit ist
+         nicht überprüfbar — und wird deshalb fallengelassen, statt eine
+         fremde Landung zu melden. (Der Bucket ist die einzige Angabe ohne
+         eigenen Zeitstempel; er kann sich nur an der Ankunftszeit ausweisen.)
+    """
+    out = {'est_arr': None, 'bucket': None}
+    src = facts or {}
+    if not instance_started(dep_iso, now_utc):
+        return out
+    est = src.get('est_arr')
+    if est and arrival_fits_instance(est, dep_iso):
+        out['est_arr'] = est
+    bucket = src.get('bucket')
+    if bucket == 'landed' and parse_iso_utc(dep_iso) is not None:
+        arr = parse_iso_utc(out['est_arr'])
+        if arr is None or (now_utc is not None and arr > now_utc):
+            bucket = None
+    out['bucket'] = bucket
+    return out
 
 
 def clean_via_name(raw):
@@ -375,6 +469,23 @@ def _mark_sent(row_id, sent, kind, now_utc):
                     type(e).__name__)
 
 
+def _reset_sent(row_id, now_utc):
+    """Ereignis-Buchführung eines Abos leeren (Selbstheilung nach dem Vorfall
+    02.08.). Wird NUR gerufen, wenn der eigene Abflug noch in der Zukunft
+    liegt — dann kann kein Flag echt sein, und der Nutzer bekäme für seinen
+    tatsächlichen Flug sonst nie wieder eine Meldung."""
+    client = _sb()
+    if client is None or not row_id:
+        return
+    try:
+        (client.table('flight_checkins')
+         .update({'sent': {}, 'updated_at': now_utc.isoformat()})
+         .eq('id', row_id).execute())
+    except Exception as e:
+        log.warning('[fcheck] reset_sent fail id=%s: %s', row_id,
+                    type(e).__name__)
+
+
 def _push_for_row(row, kind, now_utc):
     """Eine Meldung für EIN Abo. Gibt True zurück, wenn wirklich gepusht
     wurde. Setzt das `sent`-Flag NUR nach erfolgreichem Enqueue — ein
@@ -440,7 +551,16 @@ def notify_flight_event(kind, flight_disp, topic_date, facts=None,
         return 0
     facts = facts or {}
     pushed = 0
+    skipped = 0
     for row in rows:
+        # ZWEITER RIEGEL AUF DER INSTANZ-ACHSE (Vorfall 02.08.). Das
+        # Topic-Datum ist bereits das ABFLUGDATUM und pinnt die Instanz — aber
+        # eine Meldung über einen Flug, dessen eigener Abflug noch Stunden in
+        # der Zukunft liegt, kann NIE richtig sein. Das gilt für „gestartet"
+        # (mit 3 h Frühstart-Kulanz) genauso wie für „gelandet".
+        if not instance_started(row.get('dep_iso'), now_utc):
+            skipped += 1
+            continue
         # Fehlt der Route-Teil im Abo, ergänzen die Fakten ihn — aber sie
         # ERSETZEN nichts, was der Nutzer beim Einchecken schon gesehen hat.
         merged = dict(row)
@@ -449,6 +569,10 @@ def notify_flight_event(kind, flight_disp, topic_date, facts=None,
                 merged[dst] = facts.get(src)
         if _push_for_row(merged, kind, now_utc):
             pushed += 1
+    if skipped:
+        log.warning('[fcheck] event %s %s %s: %d Abos übersprungen — eigener '
+                    'Abflug liegt noch in der Zukunft', flight_no, want, kind,
+                    skipped)
     if pushed:
         log.info('[fcheck] event %s %s %s: %d Meldungen', flight_no, want,
                  kind, pushed)
@@ -542,7 +666,8 @@ def sweep(now_utc=None):
     """
     now_utc = now_utc or datetime.now(timezone.utc)
     client = _sb()
-    stats = {'rows': 0, 'eta': 0, 'landed': 0, 'pruned': 0}
+    stats = {'rows': 0, 'eta': 0, 'landed': 0, 'pruned': 0, 'not_started': 0,
+             'repaired': 0}
     if client is None:
         return stats
     dates = [(now_utc.date() + timedelta(days=o)).isoformat()
@@ -568,13 +693,33 @@ def sweep(now_utc=None):
     stats['rows'] = len(rows)
     for row in rows:
         sent = row.get('sent') or {}
+        # ── INSTANZ-RIEGEL (Vorfall 02.08., LH455) ─────────────────────────
+        # Ein Abo, dessen EIGENER Abflug noch in der Zukunft liegt, kann kein
+        # Ereignis haben. Hier wird deshalb NICHTS gemeldet — und ein bereits
+        # gesetztes Flag ist nachweislich falsch (es kann nur aus einer
+        # fremden Instanz derselben Flugnummer stammen) und wird zurückgesetzt.
+        # Ohne diese Selbstheilung bliebe Tibors Zeile mit allen drei Flags auf
+        # `true` stehen und er bekäme für den ECHTEN Flug heute Abend gar
+        # nichts mehr. Der Riegel steht VOR `_facts_for` — er spart zugleich
+        # jede Board-Abfrage für Flüge, die noch gar nicht laufen.
+        if not instance_started(row.get('dep_iso'), now_utc):
+            stats['not_started'] += 1
+            if any(sent.get(k) for k in ('departed', 'eta_1h', 'arrived')):
+                _reset_sent(row.get('id'), now_utc)
+                stats['repaired'] += 1
+                log.warning('[fcheck] %s %s: sent-Flags zurückgesetzt — Abflug '
+                            'liegt noch in der Zukunft (fremde Instanz)',
+                            row.get('flight_no'), row.get('flight_date'))
+            continue
         if sent.get('arrived'):
             continue
         need_eta = not sent.get('eta_1h')
         need_landed = bool(sent.get('departed'))
         if not need_eta and not need_landed:
             continue
-        facts = _facts_for(row)
+        # Board-Fakten auf MEINE Instanz eindampfen: eine Ankunft vor dem
+        # eigenen Abflug ist die Vortags-Rotation, kein Ereignis meines Flugs.
+        facts = facts_for_instance(_facts_for(row), row.get('dep_iso'), now_utc)
         departed = bool(sent.get('departed')) or facts.get('bucket') in (
             'airborne', 'landed')
         if departed and not sent.get('departed'):
@@ -604,10 +749,11 @@ def sweep(now_utc=None):
         stats['pruned'] = len(d.data or [])
     except Exception as e:
         log.warning('[fcheck] prune fail: %s', type(e).__name__)
-    if stats['eta'] or stats['landed'] or stats['pruned']:
-        log.info('[fcheck] sweep rows=%d eta=%d landed=%d pruned=%d',
-                 stats['rows'], stats['eta'], stats['landed'],
-                 stats['pruned'])
+    if stats['eta'] or stats['landed'] or stats['pruned'] or stats['repaired']:
+        log.info('[fcheck] sweep rows=%d eta=%d landed=%d pruned=%d '
+                 'not_started=%d repaired=%d', stats['rows'], stats['eta'],
+                 stats['landed'], stats['pruned'], stats['not_started'],
+                 stats['repaired'])
     return stats
 
 

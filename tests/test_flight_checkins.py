@@ -394,6 +394,136 @@ def test_checkin_ohne_flugnummer_ist_400(monkeypatch):
     assert r.status_code == 400
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# VORFALL 02.08.2026 — die Flugnummer ist NICHT die Instanz (LH455 SFO→FRA)
+# ══════════════════════════════════════════════════════════════════════════
+# Belegt in der Prod-DB: Tibors Abo trug flight_date 2026-08-02 und
+# dep_iso 2026-08-02T21:40Z (Abflug SFO heute Abend). In airport_delay_obs lag
+# eine FRA#ARR-Zeile mit date=2026-08-02, esti 10:27 Ortszeit, Status
+# „Gelandet" — das ANKUNFTSDATUM der Instanz vom 01.08. Bei Rot-Augen-Fluegen
+# ist das Ankunftsdatum systematisch Abflugdatum+1; der Board-Reader liest
+# d-1/d/d+1 und bevorzugt den exakten Datums-Treffer, also die falsche
+# Instanz. Ergebnis: „Landet bald" 07:31Z und „Gelandet" 08:39Z fuer einen
+# Flug, der noch gar nicht gestartet war.
+
+# Der echte Zeitpunkt des Vorfalls (UTC) und die echten Werte der Zeile.
+UNFALL_NOW = datetime(2026, 8, 2, 8, 39, tzinfo=timezone.utc)
+UNFALL_DEP = '2026-08-02T21:40:00+00:00'        # Juliens Abflug SFO, heute Abend
+FREMDE_ANKUNFT = '2026-08-02T08:27:00+00:00'    # Landung der Instanz vom 01.08.
+
+
+def _lh455_row(**over):
+    r = _row(flight_date='2026-08-02', dep_iso=UNFALL_DEP, via_name='Julien')
+    r.update(over)
+    return r
+
+
+def test_lh455_kein_push_fuer_eine_fremde_instanz(monkeypatch, rec):
+    """DER Vorfall, Ende-zu-Ende durch den Sweep: das Board meldet eine
+    Landung, Juliens Maschine steht aber noch in SFO. Erwartung: 0 Pushes."""
+    sb = _FakeSB([_lh455_row()])
+    monkeypatch.setattr(FC, '_sb', lambda: sb)
+    monkeypatch.setattr(FC, '_facts_for', lambda row: {
+        'est_arr': FREMDE_ANKUNFT, 'bucket': 'landed'})
+    stats = FC.sweep(now_utc=UNFALL_NOW)
+    assert rec.pushes == []
+    assert stats['eta'] == 0 and stats['landed'] == 0
+    assert stats['not_started'] == 1
+
+
+def test_lh455_falsche_flags_werden_zurueckgesetzt(monkeypatch, rec):
+    """Selbstheilung: die Zeile stand mit departed/eta_1h/arrived=true da —
+    ohne Reset bekaeme Tibor fuer den ECHTEN Flug heute Abend nie wieder eine
+    Meldung."""
+    sb = _FakeSB([_lh455_row(sent={'departed': True, 'eta_1h': True,
+                                   'arrived': True,
+                                   'departed_at': '2026-08-02T07:12:35Z'})])
+    monkeypatch.setattr(FC, '_sb', lambda: sb)
+    monkeypatch.setattr(FC, '_facts_for', lambda row: {
+        'est_arr': FREMDE_ANKUNFT, 'bucket': 'landed'})
+    stats = FC.sweep(now_utc=UNFALL_NOW)
+    assert stats['repaired'] == 1
+    assert sb.sink['updates'][0]['sent'] == {}
+    assert rec.pushes == []
+
+
+def test_lh455_mqtt_arrived_der_vortags_instanz_meldet_nichts(monkeypatch, rec):
+    """Zweiter Riegel: selbst wenn ein `arrived`-Event dieselbe Zeile traefe,
+    darf es fuer einen Flug, der erst heute Abend startet, nichts ausloesen."""
+    monkeypatch.setattr(FC, '_rows_for_flight', lambda f, d: [_lh455_row()])
+    assert FC.notify_flight_event('arrived', 'LH455', '2026-08-02',
+                                  now_utc=UNFALL_NOW) == 0
+    assert FC.notify_flight_event('departed', 'LH455', '2026-08-02',
+                                  now_utc=UNFALL_NOW) == 0
+    assert rec.pushes == []
+
+
+def test_nach_dem_eigenen_abflug_meldet_der_pfad_wieder(monkeypatch, rec):
+    """Gegenprobe — der Riegel darf den ECHTEN Flug nicht mitnehmen. Sieben
+    Stunden nach Juliens Abflug ist die Instanz unterwegs, die Ankunft passt
+    zum Abflug, und die Meldung geht raus."""
+    dep = datetime(2026, 8, 2, 21, 40, tzinfo=timezone.utc)
+    spaeter = dep + timedelta(hours=7)
+    sb = _FakeSB([_lh455_row(sent={'departed': True,
+                                   'departed_at': dep.isoformat()})])
+    monkeypatch.setattr(FC, '_sb', lambda: sb)
+    monkeypatch.setattr(FC, '_facts_for', lambda row: {
+        'est_arr': (spaeter + timedelta(minutes=45)).isoformat(),
+        'bucket': 'airborne'})
+    assert FC.sweep(now_utc=spaeter)['eta'] == 1
+    assert rec.pushes[0]['title'] == 'Juliens Flug · LH455'
+
+
+def test_eine_ankunft_vor_dem_eigenen_abflug_gehoert_nicht_mir():
+    assert FC.arrival_fits_instance(FREMDE_ANKUNFT, UNFALL_DEP) is False
+    ok = '2026-08-03T06:00:00+00:00'                  # ~8 h nach dem Abflug
+    assert FC.arrival_fits_instance(ok, UNFALL_DEP) is True
+    zu_spaet = '2026-08-03T20:00:00+00:00'            # +22 h, andere Rotation
+    assert FC.arrival_fits_instance(zu_spaet, UNFALL_DEP) is False
+    # Ohne Abflug-Instant (alte Zeilen) gibt es kein Urteil.
+    assert FC.arrival_fits_instance(ok, None) is True
+    assert FC.arrival_fits_instance(None, UNFALL_DEP) is False
+
+
+def test_instanz_start_hat_eine_fruehstart_kulanz():
+    dep = datetime(2026, 8, 2, 21, 40, tzinfo=timezone.utc)
+    assert FC.instance_started(dep.isoformat(), UNFALL_NOW) is False
+    assert FC.instance_started(dep.isoformat(),
+                               dep - timedelta(minutes=30)) is True
+    assert FC.instance_started(dep.isoformat(),
+                               dep - timedelta(hours=5)) is False
+    # Unbekannter Abflug: verhaelt sich wie bisher (kein Urteil).
+    assert FC.instance_started(None, UNFALL_NOW) is True
+
+
+def test_fakten_der_fremden_instanz_werden_eingedampft():
+    roh = {'est_arr': FREMDE_ANKUNFT, 'bucket': 'landed'}
+    assert FC.facts_for_instance(roh, UNFALL_DEP, UNFALL_NOW) == {
+        'est_arr': None, 'bucket': None}
+
+
+def test_landed_ohne_pruefbare_ankunft_wird_fallengelassen():
+    """Der Bucket ist die einzige Angabe OHNE eigenen Zeitstempel — er kann
+    sich nur an einer passenden Ankunftszeit ausweisen."""
+    dep = '2026-08-02T00:10:00+00:00'
+    now = datetime(2026, 8, 2, 6, 0, tzinfo=timezone.utc)
+    # Landung behauptet, aber keine Ankunftszeit dazu:
+    assert FC.facts_for_instance({'bucket': 'landed'}, dep, now)['bucket'] is None
+    # Landung behauptet, Ankunft liegt aber noch in der Zukunft:
+    spaet = {'bucket': 'landed', 'est_arr': '2026-08-02T09:00:00+00:00'}
+    assert FC.facts_for_instance(spaet, dep, now)['bucket'] is None
+    # Mit passender, vergangener Ankunft zaehlt sie:
+    echt = {'bucket': 'landed', 'est_arr': '2026-08-02T05:30:00+00:00'}
+    got = FC.facts_for_instance(echt, dep, now)
+    assert got['bucket'] == 'landed' and got['est_arr'] == echt['est_arr']
+
+
+def test_alte_zeilen_ohne_dep_iso_verhalten_sich_wie_bisher():
+    """`dep_iso` ist nullable; ohne den Instant faellt kein Urteil."""
+    roh = {'est_arr': FREMDE_ANKUNFT, 'bucket': 'landed'}
+    assert FC.facts_for_instance(roh, None, UNFALL_NOW) == roh
+
+
 class _ColumnMissingTable(_FakeTable):
     """PostgREST vor dem Schema-Reload: JEDER Select mit `via_name` scheitert."""
 
