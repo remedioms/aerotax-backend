@@ -21,12 +21,17 @@ class _Query:
     def __init__(self, rows):
         self.rows = rows
         self.filters = {}
+        self.in_filters = {}
 
     def select(self, _columns):
         return self
 
     def eq(self, key, value):
         self.filters[key] = value
+        return self
+
+    def in_(self, key, values):
+        self.in_filters[key] = [str(v) for v in values]
         return self
 
     def limit(self, _count):
@@ -36,6 +41,9 @@ class _Query:
         rows = [
             row for row in self.rows
             if all(str(row.get(k)) == str(v) for k, v in self.filters.items())
+            and all(
+                str(row.get(k)) in values for k, values in self.in_filters.items()
+            )
         ]
         return _Result(rows)
 
@@ -191,3 +199,153 @@ def test_auth_store_unavailable_is_503_not_invalid_token():
     assert response.status_code == 503
     assert response.get_json()["error"] == "auth_store_unavailable"
 
+
+
+# ── Zurueckgezogene August-Aenderung (Owner-Entscheid 2026-08-02) ───────────
+#
+# Die AGB-Aenderung wurde zurueckgenommen; niemand soll erneut zustimmen.
+# Die TestFlight-Builds 285/286 tragen das August-Manifest aber fest im
+# Binary. Diese Tests nageln fest, dass beide Generationen gleichzeitig
+# funktionieren — ohne dass irgendwo eine Zustimmung erfunden wird.
+
+UA_AUGUST_BUILD = "AeroX/286 CFNetwork/3860.600.12 Darwin/25.5.0"
+UA_JUNE_BUILD = "AeroX/271 CFNetwork/3860.600.12 Darwin/25.5.0"
+
+
+def _rows_for_withdrawn_manifest():
+    manifest = L._WITHDRAWN_AUGUST_2026_MANIFEST
+    return [
+        {
+            "account_id": ACCOUNT_ID,
+            "manifest_hash": manifest["manifest_hash"],
+            "document_id": doc["id"],
+            "document_version": doc["version"],
+            "document_hash": doc["hash"],
+            "accepted_at": "2026-08-02T12:12:38Z",
+        }
+        for doc in manifest["documents"]
+    ]
+
+
+def test_withdrawn_manifest_hash_is_canonical_sha256_too():
+    manifest = L._WITHDRAWN_AUGUST_2026_MANIFEST
+    canonical = json.dumps(manifest["documents"], sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(canonical.encode()).hexdigest() == manifest["manifest_hash"]
+    # Die Datenschutzerklaerung ist in beiden Manifesten bitgleich dieselbe —
+    # nur die AGB trug den zurueckgezogenen Zusatz.
+    privacy = [d for d in manifest["documents"] if d["id"] == "privacy-policy"][0]
+    canonical_privacy = [
+        d for d in L.CURRENT_LEGAL_MANIFEST["documents"] if d["id"] == "privacy-policy"
+    ][0]
+    assert privacy == canonical_privacy
+
+
+def test_august_build_with_june_consent_sees_no_wall():
+    """Der Kern des Owner-Entscheids: Build 286, Zustimmung von Juni im
+    Ledger, KEINE neue Zeile — und trotzdem keine Rechts-Wand."""
+    sb = _SB(_rows_for_current_manifest())
+    with patch.object(L, "_auth_result", side_effect=_valid_auth), patch.object(
+        L, "_get_sb", return_value=(True, sb)
+    ):
+        response = _client().get(
+            "/api/legal-consent/status", headers={"User-Agent": UA_AUGUST_BUILD}
+        )
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert payload["accepted"] is True
+    # Der Client vergleicht Version UND Hash gegen seine eigenen Konstanten.
+    manifest = L._WITHDRAWN_AUGUST_2026_MANIFEST
+    assert payload["current_manifest"]["version"] == manifest["manifest_version"]
+    assert payload["current_manifest"]["hash"] == manifest["manifest_hash"]
+    # Es wurde NICHTS geschrieben — Zustimmungen werden nicht fabriziert.
+    assert sb.rpc_calls == []
+
+
+def test_june_build_is_untouched_by_the_alias():
+    sb = _SB(_rows_for_current_manifest())
+    with patch.object(L, "_auth_result", side_effect=_valid_auth), patch.object(
+        L, "_get_sb", return_value=(True, sb)
+    ):
+        response = _client().get(
+            "/api/legal-consent/status", headers={"User-Agent": UA_JUNE_BUILD}
+        )
+    payload = response.get_json()
+    assert payload["accepted"] is True
+    assert payload["current_manifest"]["hash"] == L.CURRENT_LEGAL_MANIFEST["manifest_hash"]
+
+
+def test_june_build_accepts_alias_only_ledger_as_valid():
+    """Wer auf 285/286 getippt hat, hat eine August-Zeile im Ledger. Fuer
+    einen Alt-Build darf das nicht wieder zur Wand werden."""
+    sb = _SB(_rows_for_withdrawn_manifest())
+    with patch.object(L, "_auth_result", side_effect=_valid_auth), patch.object(
+        L, "_get_sb", return_value=(True, sb)
+    ):
+        response = _client().get(
+            "/api/legal-consent/status", headers={"User-Agent": UA_JUNE_BUILD}
+        )
+    payload = response.get_json()
+    assert payload["accepted"] is True
+    assert payload["current_manifest"]["hash"] == L.CURRENT_LEGAL_MANIFEST["manifest_hash"]
+
+
+def test_accept_of_withdrawn_manifest_is_booked_not_409():
+    sb = _SB()
+    manifest = L._WITHDRAWN_AUGUST_2026_MANIFEST
+    with patch.object(L, "_auth_result", side_effect=_valid_auth), patch.object(
+        L, "_get_sb", return_value=(True, sb)
+    ):
+        response = _client().post(
+            "/api/legal-consent/accept",
+            headers={"User-Agent": UA_AUGUST_BUILD},
+            json={
+                "manifest_version": manifest["manifest_version"],
+                "manifest_hash": manifest["manifest_hash"],
+                "locale": "de-DE",
+                "app_build": "286",
+            },
+        )
+    assert response.status_code == 200
+    assert response.get_json()["accepted"] is True
+    name, params = sb.rpc_calls[0]
+    assert name == "accept_legal_manifest"
+    # Verbucht wird, was der Nutzer wirklich gesehen hat — nicht das kanonische.
+    assert params["p_manifest_version"] == manifest["manifest_version"]
+    assert params["p_manifest_hash"] == manifest["manifest_hash"]
+    assert params["p_documents"] == manifest["documents"]
+    # Alias-Vermerk fuer die Revision.
+    assert params["p_app_build"] == "286 alias:2026-06"
+    assert len(params["p_app_build"]) <= 64
+
+
+def test_unknown_manifest_still_409_for_august_build():
+    sb = _SB()
+    with patch.object(L, "_auth_result", side_effect=_valid_auth), patch.object(
+        L, "_get_sb", return_value=(True, sb)
+    ):
+        response = _client().post(
+            "/api/legal-consent/accept",
+            headers={"User-Agent": UA_AUGUST_BUILD},
+            json={"manifest_version": "2027-01", "manifest_hash": "0" * 64},
+        )
+    assert response.status_code == 409
+    assert sb.rpc_calls == []
+    # Auch die Absage spiegelt dem Client sein eigenes Manifest zurueck.
+    assert (
+        response.get_json()["current_manifest"]["hash"]
+        == L._WITHDRAWN_AUGUST_2026_MANIFEST["manifest_hash"]
+    )
+
+
+def test_unknown_user_agent_falls_back_to_canonical_manifest():
+    sb = _SB(_rows_for_current_manifest())
+    with patch.object(L, "_auth_result", side_effect=_valid_auth), patch.object(
+        L, "_get_sb", return_value=(True, sb)
+    ):
+        response = _client().get(
+            "/api/legal-consent/status", headers={"User-Agent": "curl/8.7.1"}
+        )
+    assert (
+        response.get_json()["current_manifest"]["hash"]
+        == L.CURRENT_LEGAL_MANIFEST["manifest_hash"]
+    )
