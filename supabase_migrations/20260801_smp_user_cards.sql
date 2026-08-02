@@ -39,4 +39,30 @@ alter table public.ax_smp_user_cards enable row level security;
 -- Kein policy-Grant: der Zugriff läuft ausschließlich über den service_role-
 -- Client des Backends (siehe Kommentar oben).
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- Geräte-Transfer-Sync des SMP-Lernfortschritts (2026-08-02): EIN JSON-Blob
+-- pro User (iOS speichert den kompletten Lernstand lokal, dieser Endpoint
+-- ist nur die Kopie fürs nächste Gerät — kein Query auf einzelne Felder,
+-- daher reicht `jsonb` ohne weitere Spalten/Indizes auf den Blob-Inhalt).
+--
+-- Zwei Zeitstempel bewusst getrennt:
+--   updated_at        vom Client gesendet — der inhaltliche „Versionsstand"
+--                      des Blobs, den das Gerät für Konflikt-/Neuer-Vergleiche
+--                      selbst führt (Server übernimmt ihn unverändert).
+--   server_updated_at NUR vom Server gesetzt (now() bei jedem Schreiben) —
+--                      wann der Blob hier zuletzt ankam, unabhängig davon
+--                      was der Client als eigenen Stand behauptet.
+-- Gleiches Zugriffsmuster wie ax_smp_user_cards: RLS an, kein Policy-Grant,
+-- ausschließlich service_role über das Backend.
+create table if not exists public.ax_smp_progress (
+    owner_token       text primary key,
+    blob              jsonb not null,
+    updated_at        timestamptz not null default now(),
+    server_updated_at timestamptz not null default now()
+);
+
+alter table public.ax_smp_progress enable row level security;
+-- Kein policy-Grant: der Zugriff läuft ausschließlich über den service_role-
+-- Client des Backends (siehe Kommentar oben).
+
 NOTIFY pgrst, 'reload schema';

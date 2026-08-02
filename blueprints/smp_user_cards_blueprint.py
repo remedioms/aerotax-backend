@@ -24,6 +24,10 @@
 #                                                    anonymisiert
 #      GET  /api/ax/smp/review/pending      Admin   Review-Queue (pending)
 #      POST /api/ax/smp/review/<id>         Admin   {"decision": approved|rejected}
+#      PUT  /api/ax/smp/progress            Bearer  Geräte-Transfer-Sync: EIN
+#                                                    JSON-Blob (Lernfortschritt)
+#                                                    upserten (2026-08-02)
+#      GET  /api/ax/smp/progress            Bearer  eigenen Fortschritt lesen
 #
 #  Admin-Gate: X-Admin-Token == RECOVERY_SECRET (bestehender Mechanismus,
 #  identisch zu admin_support_list/ax_crew_hotels-Admin/ax_lh_quota in
@@ -36,6 +40,12 @@
 #  ehrliches 503 (Owner-Regel „lieber keine Zeile als ein synthetisierter
 #  Wert" gilt sinngemäß: lieber ein 503 als eine stille Karte, die nach dem
 #  nächsten Cloud-Restart wieder weg ist).
+#
+#  /api/ax/smp/progress liegt in derselben (noch nicht angewendeten)
+#  Migration, zweite Tabelle ax_smp_progress — EIN JSON-Blob pro
+#  owner_token, damit ein Geräte-Wechsel (altes iPhone -> neues iPhone) den
+#  SMP-Lernfortschritt nicht auf Null zurücksetzt. Gleiches Auth-/Storage-
+#  Muster wie oben (Tri-State-Bearer, service-role-only, kein Disk-Fallback).
 # ═══════════════════════════════════════════════════════════════
 
 import html as _html_lib
@@ -459,3 +469,126 @@ def smp_review_decide(card_id):
         return jsonify({'ok': False, 'error': 'storage_error'}), 503
 
     return jsonify({'ok': True, 'id': cid, 'status': decision})
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Geräte-Transfer-Sync: SMP-Lernfortschritt (2026-08-02)
+#
+#  EIN JSON-Blob pro User (iOS führt den kompletten Lernstand lokal; dieser
+#  Endpoint ist nur die Kopie fürs nächste Gerät). Storage: ax_smp_progress
+#  (zweite Tabelle in derselben — noch nicht angewendeten — Migration
+#  supabase_migrations/20260801_smp_user_cards.sql). Gleiches Auth-Muster
+#  wie oben (_authed_token, Tri-State), service-role-only.
+# ═══════════════════════════════════════════════════════════════
+
+# 256 KB Cap. DoS-Lehre des Repos (app.py:post_telemetry_diagnostics /
+# _MK_MAX_BODY_BYTES): der Größen-Check muss VOR dem JSON-Parse laufen,
+# sonst kostet ein riesiger Body schon CPU/Speicher, bevor er verworfen wird.
+_PROGRESS_MAX_BODY_BYTES = 256 * 1024
+
+
+def _parse_client_updated_at(raw):
+    """Validiert das vom Client gesendete ISO-Datum, BEVOR es an Supabase
+    geht — ein kaputter String soll ein sauberes 400 geben, nicht ein
+    storage_error, das wie ein Supabase-Ausfall aussieht. Der Wert selbst
+    wird unverändert gespeichert (Client führt seine eigene Versions-Uhr)."""
+    if not raw or not isinstance(raw, str):
+        return None
+    candidate = raw.strip()
+    if not candidate:
+        return None
+    probe = candidate[:-1] + '+00:00' if candidate.endswith('Z') else candidate
+    try:
+        datetime.fromisoformat(probe)
+    except (ValueError, TypeError):
+        return None
+    return candidate
+
+
+# ─── PUT /api/ax/smp/progress — Upsert des Lernfortschritt-Blobs ────
+@smp_user_cards_bp.route('/api/ax/smp/progress', methods=['PUT'])
+def smp_put_progress():
+    token, err = _authed_token()
+    if err:
+        return err
+
+    # Größen-Cap ZUERST: Content-Length wenn gesetzt, sonst gelesene Bytes —
+    # vor jedem JSON-Parse (siehe Modul-Docstring oben).
+    if (request.content_length or 0) > _PROGRESS_MAX_BODY_BYTES:
+        return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+    raw = request.get_data(cache=True) or b''
+    if len(raw) > _PROGRESS_MAX_BODY_BYTES:
+        return jsonify({'ok': False, 'error': 'payload_too_large'}), 413
+
+    if _rate_limited(token, 'smp_progress_write', limit=30, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+
+    sb, sb_ok = _sb_client()
+    if not sb_ok:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
+
+    blob = body.get('blob')
+    if blob is None:
+        return jsonify({'ok': False, 'error': 'invalid_blob'}), 400
+
+    client_updated_at = _parse_client_updated_at(body.get('updated_at'))
+    if not client_updated_at:
+        return jsonify({'ok': False, 'error': 'invalid_updated_at'}), 400
+
+    try:
+        (sb.table('ax_smp_progress')
+         .upsert({
+             'owner_token': token,
+             'blob': blob,
+             'updated_at': client_updated_at,
+             'server_updated_at': _now_iso(),
+         }, on_conflict='owner_token')
+         .execute())
+    except Exception as e:
+        _log().warning(
+            f'[smp-progress] upsert_fail err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return jsonify({'ok': False, 'error': 'storage_error'}), 503
+
+    return jsonify({'ok': True, 'updated_at': client_updated_at})
+
+
+# ─── GET /api/ax/smp/progress — eigener Lernfortschritt ─────────────
+@smp_user_cards_bp.route('/api/ax/smp/progress', methods=['GET'])
+def smp_get_progress():
+    token, err = _authed_token()
+    if err:
+        return err
+
+    sb, sb_ok = _sb_client()
+    if not sb_ok:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+
+    try:
+        r = (sb.table('ax_smp_progress')
+             .select('blob,updated_at')
+             .eq('owner_token', token)
+             .limit(1)
+             .execute())
+        rows = r.data or []
+    except Exception as e:
+        _log().warning(
+            f'[smp-progress] get_fail err={type(e).__name__}: {str(e)[:160]}'
+        )
+        return jsonify({'ok': False, 'error': 'storage_error'}), 503
+
+    if not rows:
+        # Kein echtes 404 — device-transfer-sync ist ein Normalfall ohne
+        # Vorgeschichte (frisches Gerät, noch kein Fortschritt hochgeladen).
+        return jsonify({'ok': True, 'blob': None, 'updated_at': None})
+
+    row = rows[0]
+    return jsonify({
+        'ok': True,
+        'blob': row.get('blob'),
+        'updated_at': row.get('updated_at'),
+    })
