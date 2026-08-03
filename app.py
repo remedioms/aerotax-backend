@@ -50833,10 +50833,13 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
     (z.B. eine stornierte SFO-Tour) überlebten für immer (User C: „Flüge im Kalender
     die ich nicht habe"). Jetzt räumen beide Pfade identisch.
 
-    Fenster: [Monatsanfang(aktuell) .. max(feed_dates)]. Voll-vergangene Monate
-    bleiben eingefroren (Historie). `full_clean=True` zieht den Anfang NICHT auf den
-    Monatsanfang hoch, sondern räumt das GANZE vom Feed abgedeckte Fenster
-    (min(feed_dates)..max) — für ein explizites „force full re-import/clean".
+    Fenster: [Monatsanfang(Vormonat) .. max(feed_dates)]. Ältere Monate bleiben
+    eingefroren (Historie). Der Vormonat gehört bewusst noch zum normalen
+    Reparaturfenster: Krankmeldung, Reserve-Zuteilung oder Monatswechsel können
+    einen Umlauf rückwirkend entfernen. Bliebe er gespeichert, würde der
+    Flight-Fanout weiter Meldungen zu diesem nicht mehr aktuellen Umlauf senden.
+    `full_clean=True` zieht den Anfang nicht auf den Vormonat hoch, sondern räumt
+    das GANZE vom Feed abgedeckte Fenster (min(feed_dates)..max).
 
     Gibt ein Debug-Dict zurück (feed_dates/cleared/window/...). Wirft nie.
     """
@@ -50859,13 +50862,16 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
         removed_dates = set()
         if feed_dates:
             fmin, fmax = min(feed_dates), max(feed_dates)
-            # GANZEN AKTUELLEN MONAT NEU SCHREIBEN, vergangene Monate einfrieren.
-            # Krankmeldungen ändern Touren rückwirkend INNERHALB des laufenden Monats;
-            # ein „ab-heute"-Fenster ließe stornierte Tage VOR heute stehen.
+            # AKTUELLEN + VORHERIGEN MONAT neu schreiben, ältere Historie
+            # einfrieren. Planänderungen kommen auch kurz nach dem Monatswechsel
+            # rückwirkend rein. Nur der aktuelle Monat ließ den entfernten
+            # Vormonats-Umlauf als Sektoren-Zombie im Push-Fanout stehen.
             if not full_clean:
-                _month_start = datetime.now().strftime('%Y-%m-01')
-                if fmin < _month_start:
-                    fmin = _month_start
+                _this_month = datetime.now().replace(day=1)
+                _previous_month_start = (
+                    _this_month - timedelta(days=1)).replace(day=1).strftime('%Y-%m-%d')
+                if fmin < _previous_month_start:
+                    fmin = _previous_month_start
             dbg['window'] = f'{fmin}..{fmax}'
             # ZUKUNFTS-GEIST-PRUNE (Jennifer Orhan 2026-07-18: stornierter SFO-Trip
             # 31.07–01.08 überlebte, weil er HINTER dem geschrumpften Feed-Horizont
