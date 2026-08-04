@@ -52790,6 +52790,11 @@ def import_calendar_feed(token):
     _src_hint = str(body.get('source') or '').strip().lower()
     if _src_hint not in _DIRECT_ICS_SOURCES:
         _src_hint = 'ics_direct'
+    # Kontrollierter PDF-Archivimport: ein Benutzer kann mehrere historische
+    # Monatspläne als EINEN kombinierten Feed importieren. Nur dieser interne
+    # Pfad darf den normalen 300/200-Deckel bis 800 anheben; alle URL-, Geräte-
+    # und Einzel-PDF-Importe bleiben byte-identisch begrenzt.
+    _archive_direct = bool(body.get('archive')) and _src_hint == 'pdf'
     if ics_text_direct and len(ics_text_direct) > 1_000_000:
         return jsonify({'ok': False, 'error': 'response_too_large'}), 413
     if ics_text_2_direct and len(ics_text_2_direct) > 1_000_000:
@@ -53003,7 +53008,8 @@ def import_calendar_feed(token):
     # Relevanz-Auswahl VOR den Caps: Jahre-lange iCloud-Feeds (ITA: 1385 Events
     # seit 2023, unsortiert) würden sonst per Prefix-Slice die AKTUELLEN
     # Dienste verlieren. ≤300 Events (LH/SWISS-Fenster) = unverändert.
-    events = _select_relevant_feed_events(events, 300)
+    _profile_event_cap = 800 if _archive_direct else 300
+    events = _select_relevant_feed_events(events, _profile_event_cap)
     # Save Events — über _profile_save routen, damit calendar_feed in SB
     # (metadata-jsonb) landet und Cloud-Run-Redeploy überlebt.
     # MERGE statt ERSETZEN (ical-Clobber-Audit 2026-07-10): zwei Sync-Pfade
@@ -53042,7 +53048,7 @@ def import_calendar_feed(token):
         # Der Primär-Slot trägt die MERGED Event-Liste (Duty + Off-Days) — alle
         # bestehenden Reader (Friend-Roster-Fallback, get_briefings-Pfade) sehen
         # damit den kompletten Plan, ohne calendar_feed_2 kennen zu müssen.
-        feed_obj.update({'url': url, 'events': events[:300],
+        feed_obj.update({'url': url, 'events': events[:_profile_event_cap],
                          'imported_at': datetime.now().isoformat()})
         # Sweep-P3 2026-07-10: EK-Reste räumen — 'source'/'ek_imported_at' stammen
         # vom EKEventStore-Upload; die 'events' sind ab hier aber URL-Import. Die
@@ -53115,8 +53121,10 @@ def import_calendar_feed(token):
         existing = dict(_ical_briefings_load(token) or {})
         # Hoher Notdeckel statt des alten 200er-Caps: reguläre Jahresfeeds
         # vollständig verarbeiten; nur absurde/unbegrenzte Feeds begrenzen.
-        _ev_sel = _select_relevant_feed_events(
-            events, _feed_process_event_cap(token))
+        _process_cap = _feed_process_event_cap(token)
+        if _archive_direct:
+            _process_cap = max(_process_cap, 800)
+        _ev_sel = _select_relevant_feed_events(events, _process_cap)
         if _roster_v2_shadow_enabled():
             _v2_sel = _select_relevant_feed_events(
                 events, _FEED_PROCESS_EVENT_CAP_V2)
@@ -53483,6 +53491,147 @@ def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
         lines.append('END:VEVENT')
     lines.append('END:VCALENDAR')
     return '\r\n'.join(lines)
+
+
+def _roster_join_ics(calendars, prodid='AeroX Combined Roster PDF Import'):
+    """Combine already generated calendars without reparsing their VEVENTs."""
+    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', f'PRODID:-//{prodid}//DE']
+    for calendar_text in calendars or []:
+        inside = False
+        for raw in (calendar_text or '').replace('\r\n', '\n').split('\n'):
+            line = raw.rstrip('\r')
+            if line == 'BEGIN:VEVENT':
+                inside = True
+            if inside:
+                lines.append(line)
+            if line == 'END:VEVENT':
+                inside = False
+    lines.append('END:VCALENDAR')
+    return '\r\n'.join(lines)
+
+
+def _roster_ics_text(value):
+    """RFC-5545 text escaping for stored-event archive reconstruction."""
+    return (str(value or '').replace('\\', '\\\\').replace('\r', '')
+            .replace('\n', '\\n').replace(';', '\\;').replace(',', '\\,'))
+
+
+def _stored_calendar_events_to_ics(events):
+    """Losslessly-enough re-serialize the already persisted current roster.
+
+    Raw DTSTART/DTEND values and their TZID/VALUE parameters win when present;
+    the UTC/date fields are only a fallback for normalized synthetic events.
+    This lets a historical PDF archive be added without replacing the active
+    current feed that the user already verified.
+    """
+    lines = ['BEGIN:VCALENDAR', 'VERSION:2.0',
+             'PRODID:-//AeroX Preserved Current Roster//DE']
+
+    def _raw_prop(name, event, value_key, params_key):
+        value = str(event.get(value_key) or '').strip()
+        if not value or not re.fullmatch(r'[A-Za-z0-9:+\-]+', value):
+            return None
+        params = event.get(params_key) or {}
+        suffix = ''
+        if isinstance(params, dict):
+            safe = []
+            for key, val in params.items():
+                key_s = str(key or '').upper()
+                val_s = str(val or '')
+                if (re.fullmatch(r'[A-Z][A-Z0-9-]*', key_s)
+                        and re.fullmatch(r'[A-Za-z0-9_./+\-]+', val_s)):
+                    safe.append(f'{key_s}={val_s}')
+            if safe:
+                suffix = ';' + ';'.join(safe)
+        return f'{name}{suffix}:{value}'
+
+    def _fallback_prop(name, event, iso_key, date_key, date_only_key):
+        date_only = bool(event.get(date_only_key))
+        date_value = str(event.get(date_key) or '')[:10]
+        if date_only and re.fullmatch(r'\d{4}-\d{2}-\d{2}', date_value):
+            return f'{name};VALUE=DATE:{date_value.replace("-", "")}'
+        iso = str(event.get(iso_key) or '').strip()
+        try:
+            parsed = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return f'{name}:{parsed.strftime("%Y%m%dT%H%M%S")}Z'
+        except Exception:
+            return None
+
+    for index, event in enumerate(events or []):
+        if not isinstance(event, dict):
+            continue
+        start = (_raw_prop('DTSTART', event, '_dtstart_value', '_dtstart_params')
+                 or _fallback_prop('DTSTART', event, 'start_iso', 'start',
+                                      '_is_date_only_start'))
+        end = (_raw_prop('DTEND', event, '_dtend_value', '_dtend_params')
+               or _fallback_prop('DTEND', event, 'end_iso', 'end',
+                                    '_is_date_only_end'))
+        if not start or not end:
+            continue
+        raw_uid = str(event.get('uid') or '').strip()
+        if not raw_uid or '\n' in raw_uid or '\r' in raw_uid:
+            raw_uid = 'preserved-' + _hashlib.sha256(
+                json.dumps({
+                    'i': index,
+                    's': event.get('summary'),
+                    'a': event.get('start_iso') or event.get('start'),
+                    'e': event.get('end_iso') or event.get('end'),
+                }, sort_keys=True, default=str).encode()).hexdigest()[:24]
+        lines.extend(['BEGIN:VEVENT', f'UID:{raw_uid[:120]}', start, end,
+                      f'SUMMARY:{_roster_ics_text(event.get("summary") or "Roster")}'])
+        if event.get('location'):
+            lines.append(f'LOCATION:{_roster_ics_text(event.get("location"))}')
+        if event.get('description'):
+            lines.append(f'DESCRIPTION:{_roster_ics_text(event.get("description"))}')
+        categories = event.get('categories') or []
+        if isinstance(categories, list) and categories:
+            lines.append('CATEGORIES:' + ','.join(
+                _roster_ics_text(category) for category in categories if category))
+        lines.append('END:VEVENT')
+    lines.append('END:VCALENDAR')
+    return '\r\n'.join(lines)
+
+
+def _stored_event_date_bounds(events):
+    dates = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        value = (str(event.get('start') or '')[:10]
+                 or str(event.get('start_iso') or '')[:10])
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            dates.append(value)
+    return (min(dates), max(dates)) if dates else (None, None)
+
+
+def _archive_protected_date_bounds(token, events):
+    """Date span where the already verified active roster must always win.
+
+    ``calendar_feed.events`` is rolling and can begin later than durable
+    briefings. Extend its lower edge only through the recent six-month
+    briefing window; years-old accumulated history must not block an archive
+    repair of those same old months.
+    """
+    lower, upper = _stored_event_date_bounds(events)
+    if not upper:
+        return lower, upper
+    try:
+        upper_date = datetime.strptime(upper, '%Y-%m-%d').date()
+        cutoff = (upper_date - timedelta(days=180)).isoformat()
+        trailing = (upper_date + timedelta(days=7)).isoformat()
+        recent = [
+            str(day)[:10] for day in (_ical_briefings_load(token) or {}).keys()
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(day)[:10])
+            and cutoff <= str(day)[:10] <= trailing
+        ]
+        if recent:
+            lower = min([value for value in (lower, min(recent)) if value])
+            upper = max(upper, max(recent))
+    except Exception:
+        pass
+    return lower, upper
 
 
 def _crewaccess_carrier_for(airline_hint, token):
@@ -53881,55 +54030,148 @@ def _roster_pdf_upload_store(token, filename, blob):
 
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
 def import_roster_pdf(token):
-    """Roster-PDF-Upload (Lufthansa City/Discover — kein iCal-Export).
-    Multipart `pdf` (oder `file`) + optional Form-Feld `airline`.
-    Parst das CrewAccess-„Roster Preview"-PDF und schickt das Ergebnis durch
-    die bestehende Kalender-Import-Pipeline (Response-Shape = CalendarFeedResp,
-    additiv `source: pdf` + `period`)."""
-    f = request.files.get('pdf') or request.files.get('file')
-    if f is None:
+    """Roster-PDF-Upload for CrewAccess, Discover and Lufthansa CAS.
+
+    Repeated multipart ``pdf`` fields form one archive import. CAS revisions
+    are resolved day-by-day before the single calendar write. Optional
+    ``merge_existing=1`` preserves a verified active roster while historical
+    months are added around its covered date range.
+    """
+    files = request.files.getlist('pdf') or request.files.getlist('file')
+    files = [upload for upload in files if upload is not None]
+    if not files:
         return jsonify({'ok': False, 'error': 'no_pdf'}), 400
-    data = f.read()
-    if len(data) > 8 * 1024 * 1024:
-        return jsonify({'ok': False, 'error': 'too_large_8mb'}), 413
-    if not data[:5] == b'%PDF-':
-        return jsonify({'ok': False, 'error': 'invalid_pdf'}), 415
+    if len(files) > 20:
+        return jsonify({'ok': False, 'error': 'too_many_pdfs_20'}), 413
+
     import hashlib as _hl
-    _upload_sha = _hl.sha256(data).hexdigest()[:16]
-    # Durable private inbox before parsing: even a parser/extractor failure can
-    # now be reproduced by the import watcher after this request has ended.
-    _monitoring_queued = _roster_pdf_upload_store(
-        token, f.filename or 'roster.pdf', data)
-    try:
-        import io
-        import pdfplumber
-        pages = []
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            for pg in pdf.pages[:20]:
-                pages.append(pg.extract_text() or '')
-        text = _repair_ios_reprinted_roster_text('\n'.join(pages))
-    except Exception as e:
-        app.logger.warning(
-            f'[roster-pdf] extract-fail tok={token[:8]} sha={_upload_sha} '
-            f'err={type(e).__name__}: {str(e)[:160]}')
-        return jsonify({'ok': False, 'error': 'pdf_extract_failed',
-                        'monitoring_queued': _monitoring_queued}), 422
     carrier = _crewaccess_carrier_for(request.form.get('airline'), token)
-    ics, perr = _crewaccess_text_to_ics(text, carrier=carrier)
-    if perr == 'unsupported_pdf_format':
-        # Natives Discover-„Roster"-Format (myTime-Export) — die Format-
-        # Quelle impliziert den Carrier: 4Y, unabhängig vom Client-Hint.
-        ics, perr = _discover_roster_text_to_ics(text, carrier='4Y')
-    if perr:
-        app.logger.warning(
-            f'[roster-pdf] parse-fail tok={token[:8]} sha={_upload_sha} '
-            f'error={perr}')
-        return jsonify({'ok': False, 'error': perr,
-                        'monitoring_queued': _monitoring_queued}), 422
+    queued = []
+    upload_shas = []
+    standard_calendars = []
+    cas_results = []
+    periods = []
+
+    for upload in files:
+        data = upload.read()
+        if len(data) > 8 * 1024 * 1024:
+            return jsonify({'ok': False, 'error': 'too_large_8mb'}), 413
+        if not data[:5] == b'%PDF-':
+            return jsonify({'ok': False, 'error': 'invalid_pdf'}), 415
+        upload_sha = _hl.sha256(data).hexdigest()[:16]
+        upload_shas.append(upload_sha)
+        # Durable private inbox before parsing: even a parser/extractor failure
+        # can be reproduced after this request has ended.
+        queued.append(_roster_pdf_upload_store(
+            token, upload.filename or 'roster.pdf', data))
+        try:
+            import io
+            import pdfplumber
+            pages = []
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for pg in pdf.pages[:20]:
+                    pages.append(pg.extract_text() or '')
+            text = _repair_ios_reprinted_roster_text('\n'.join(pages))
+        except Exception as e:
+            app.logger.warning(
+                f'[roster-pdf] extract-fail tok={token[:8]} sha={upload_sha} '
+                f'err={type(e).__name__}: {str(e)[:160]}')
+            return jsonify({'ok': False, 'error': 'pdf_extract_failed',
+                            'monitoring_queued': all(queued)}), 422
+
+        ics, perr = _crewaccess_text_to_ics(text, carrier=carrier)
+        if perr == 'unsupported_pdf_format':
+            # Native Discover „Roster" format implies carrier 4Y.
+            ics, perr = _discover_roster_text_to_ics(text, carrier='4Y')
+        if perr == 'unsupported_pdf_format':
+            # Lufthansa's older CAS „Persönlicher Einsatzplan" uses UTC rows
+            # and coordinate layout. It must parse from the original PDF,
+            # never from guessed plain-text columns.
+            try:
+                from cas_roster_parser import parse_cas_roster_pdf
+                cas_result, cas_error = parse_cas_roster_pdf(data, carrier='LH')
+            except Exception:
+                cas_result, cas_error = None, 'pdf_extract_failed'
+            if cas_error is None and cas_result:
+                cas_results.append(cas_result)
+                periods.append(cas_result.get('period'))
+                perr = None
+            else:
+                perr = cas_error or perr
+        elif not perr and ics:
+            standard_calendars.append(ics)
+            mp = (re.search(r'Planning period:\s*([A-Za-z]+\s+\d{4})', text)
+                  or re.search(r'Period:\s*([A-Za-z]+\s+\d{4})', text))
+            if mp:
+                periods.append(mp.group(1))
+        if perr:
+            app.logger.warning(
+                f'[roster-pdf] parse-fail tok={token[:8]} sha={upload_sha} '
+                f'error={perr}')
+            return jsonify({'ok': False, 'error': perr,
+                            'monitoring_queued': all(queued)}), 422
+
+    cas_events = []
+    cas_coverage = []
+    cas_warnings = []
+    if cas_results:
+        from cas_roster_parser import merge_cas_roster_results
+        merged_cas = merge_cas_roster_results(cas_results)
+        cas_events = list(merged_cas.get('events') or [])
+        cas_coverage = list(merged_cas.get('coverage_dates') or [])
+        cas_warnings = list(merged_cas.get('warnings') or [])
+
+    merge_existing = str(request.form.get('merge_existing') or '').lower() \
+        in ('1', 'true', 'yes')
+    existing_events = []
+    existing_bounds = (None, None)
+    if merge_existing:
+        try:
+            full = _profile_load(token) or {}
+            for source in ((full.get('profile') or {}), full):
+                feed = source.get('calendar_feed')
+                if isinstance(feed, dict) and isinstance(feed.get('events'), list):
+                    existing_events = list(feed['events'])
+                    break
+        except Exception:
+            existing_events = []
+        existing_bounds = _archive_protected_date_bounds(
+            token, existing_events)
+        if existing_bounds[0] and existing_bounds[1]:
+            # The active feed is authoritative for its complete covered span.
+            # A missing day inside that span is meaningful and must not be
+            # resurrected from an older monthly PDF.
+            cas_events = [
+                event for event in cas_events
+                if not (existing_bounds[0]
+                        <= event[1].isoformat()[:10]
+                        <= existing_bounds[1])
+            ]
+
+    calendars = list(standard_calendars)
+    if cas_events:
+        first_value = min(
+            (event[1] for event in cas_events),
+            key=lambda value: value.isoformat(),
+        )
+        first_day = (first_value.date()
+                     if isinstance(first_value, datetime) else first_value)
+        calendars.append(_pdf_events_to_ics(
+            cas_events, first_day.year, first_day.month,
+            prodid='AeroX Lufthansa CAS Roster PDF Import'))
+    if existing_events:
+        calendars.append(_stored_calendar_events_to_ics(existing_events))
+    ics = _roster_join_ics(calendars)
+    if 'BEGIN:VEVENT' not in ics:
+        return jsonify({'ok': False, 'error': 'no_roster_days',
+                        'monitoring_queued': all(queued)}), 422
+
     # Interner Dispatch in die EINE Feed-Pipeline (wallreply-Muster) — kein
     # Fetch, volles Parse/Merge/Briefings/Reconcile/Sektoren-Verhalten.
     # `source` explizit — hier ist es WIRKLICH ein PDF (s. _DIRECT_ICS_SOURCES).
-    with app.test_request_context(json={'ics_text': ics, 'source': 'pdf'}):
+    archive = len(files) > 1 or merge_existing
+    with app.test_request_context(json={
+            'ics_text': ics, 'source': 'pdf', 'archive': archive}):
         rv = import_calendar_feed(token)
     resp_obj, status = (rv if isinstance(rv, tuple) else (rv, 200))
     try:
@@ -53938,20 +54180,29 @@ def import_roster_pdf(token):
         payload = {}
     if status == 200 and payload.get('ok'):
         payload['source'] = 'pdf'
-        mp = (re.search(r'Planning period:\s*([A-Za-z]+\s+\d{4})', text)
-              or re.search(r'Period:\s*([A-Za-z]+\s+\d{4})', text))
-        if mp:
-            payload['period'] = mp.group(1)
+        periods = [period for period in periods if period]
+        if len(periods) == 1:
+            payload['period'] = periods[0]
+        elif periods:
+            payload['periods_count'] = len(periods)
+        if archive:
+            payload['archive_files'] = len(files)
+            payload['archive_coverage_days'] = len(cas_coverage)
+            payload['archive_events'] = len(cas_events)
+            payload['existing_events_preserved'] = len(existing_events)
+            payload['archive_warnings'] = cas_warnings
+        sha_label = upload_shas[0] if len(upload_shas) == 1 else f'{upload_shas[0]}+{len(upload_shas)-1}'
         app.logger.info(
-            f'[roster-pdf] import-ok tok={token[:8]} sha={_upload_sha} '
+            f'[roster-pdf] import-ok tok={token[:8]} sha={sha_label} '
             f'events={payload.get("events_count")} '
             f'briefings={payload.get("briefings_imported")} '
             f'period={payload.get("period") or "?"}')
     else:
+        sha_label = upload_shas[0] if len(upload_shas) == 1 else f'{upload_shas[0]}+{len(upload_shas)-1}'
         app.logger.warning(
-            f'[roster-pdf] import-fail tok={token[:8]} sha={_upload_sha} '
+            f'[roster-pdf] import-fail tok={token[:8]} sha={sha_label} '
             f'status={status} error={payload.get("error") or "unknown"}')
-    payload['monitoring_queued'] = _monitoring_queued
+    payload['monitoring_queued'] = all(queued)
     return jsonify(payload), status
 
 
