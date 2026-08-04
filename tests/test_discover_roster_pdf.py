@@ -125,6 +125,55 @@ def test_overnight_closer_with_dated_row():
     assert d3[0]['arr_iso'] == '2026-05-04T07:04:00Z'
 
 
+def test_overnight_closer_rolls_into_next_month():
+    """31. August -> explizite Closer-Zeile „01" ist der 1. September.
+
+    Regression des Forum-Falls: ``day_date`` band die Closer-Zeile bisher
+    erneut an den Planungsmonat und erzeugte dadurch eine Ankunft am
+    1. August, also einen Monat VOR dem Abflug.
+    """
+    text = """Roster
+Period: August 2026
+Rank: CM Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+31 Mon 18:20 CM 753 FRA 21:20 333
+01 Tue 07:05 CM 753 HYD 07:05 333
+Created 31Aug2026 10:00 (UTC) by TEST 1 ( 1)
+"""
+    ics, err = backend._discover_roster_text_to_ics(text)
+    assert err is None, err
+    assert 'DTSTART;TZID=Europe/Berlin:20260831T212000' in ics
+    assert 'DTEND:20260901T013500Z' in ics
+
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    leg = next(s for s in secs['2026-08-31'] if s.get('flight') == '4Y753')
+    assert leg['arr_iso'] == '2026-09-01T01:35:00Z'
+
+
+def test_overnight_closer_rolls_into_next_year():
+    """Dasselbe gilt am Jahresende: 31. Dezember -> 1. Januar 2027."""
+    text = """Roster
+Period: December 2026
+Rank: CM Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+31 Thu 18:20 CM 754 FRA 21:20 333
+01 Fri 07:05 CM 754 CAI 07:05 333
+Created 31Dec2026 10:00 (UTC) by TEST 1 ( 1)
+"""
+    ics, err = backend._discover_roster_text_to_ics(text)
+    assert err is None, err
+    assert 'DTSTART;TZID=Europe/Berlin:20261231T212000' in ics
+    assert 'DTEND:20270101T050500Z' in ics
+
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    leg = next(s for s in secs['2026-12-31'] if s.get('flight') == '4Y754')
+    assert leg['arr_iso'] == '2027-01-01T05:05:00Z'
+
+
 def test_overnight_closer_without_date_row():
     """Der Ankunftstag kann im Text KOMPLETT fehlen (echtes Beispiel: „18 Mon"
     existiert nicht als Zeile) — Ankunftsdatum via „Ende ≤ Start → +1 Tag".

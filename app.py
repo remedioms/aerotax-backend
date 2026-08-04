@@ -53543,11 +53543,31 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
     from datetime import date as _date, timedelta as _td, timezone as _tzu
     from zoneinfo import ZoneInfo as _ZI
 
-    def day_date(dom):
+    def day_date(dom, not_before=None):
+        """Resolve a roster day monotonically across month/year boundaries.
+
+        Discover prints only the day-of-month. A period can still contain the
+        explicit closer row of a last-day departure (``31`` followed by
+        ``01``). The earliest valid occurrence on or after the preceding
+        dated row is therefore the deterministic interpretation.
+        """
         try:
-            return _date(year, month, int(dom))
-        except ValueError:
+            day = int(dom)
+        except (TypeError, ValueError):
             return None
+        candidates = []
+        for offset in (0, 1):
+            serial_month = (month - 1) + offset
+            candidate_year = year + serial_month // 12
+            candidate_month = serial_month % 12 + 1
+            try:
+                candidates.append(_date(candidate_year, candidate_month, day))
+            except ValueError:
+                continue
+        if not_before is not None:
+            candidates = [candidate for candidate in candidates
+                          if candidate >= not_before]
+        return min(candidates) if candidates else None
 
     def _stn_tz(iata):
         # Fallback Europe/Berlin: Discover-Basen sind FRA/MUC.
@@ -53599,8 +53619,12 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         # start_utc = für DTEND-Berechnung und als Fallback
         start = start_local.astimezone(_tzu.utc).replace(tzinfo=None)
         end = _utc(arr_d or dep_d, t2, to)
-        if arr_d is None and end <= start:
-            # Closer ohne eigene Datumszeile: Ankunft am Folgetag.
+        if end <= start:
+            # Closer ohne eigene Datumszeile ODER unplausibles explizites
+            # Tagesdatum: Eine Flugankunft darf nie vor dem Abflug landen.
+            # Flug-Legs dauern weniger als einen Kalendertag; deshalb ist der
+            # Folgetag die sichere, minimale Korrektur.  So bleibt selbst ein
+            # künftig unbekannter PDF-Seitenumbruch frei von Negativzeiten.
             end = _utc(dep_d + _td(days=1), t2, to)
         n = num.lstrip('0') or '0'
         base = f'{carrier}{n} {frm} - {to}'
@@ -53650,7 +53674,7 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         rest = line
         dm = _CREWACCESS_DAY_RE.match(line)
         if dm:
-            nd = day_date(dm.group(1))
+            nd = day_date(dm.group(1), not_before=cur_day)
             if nd is None:
                 continue
             cur_day = nd
