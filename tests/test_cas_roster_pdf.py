@@ -175,6 +175,21 @@ def test_multi_pdf_endpoint_resolves_revision_and_preserves_active_feed():
         'airline': 'Lufthansa',
         'calendar_feed': {'events': [current_event]},
     })
+    protected_briefings = {
+        '2026-07-31': {
+            'ical_summary': 'Protected edge day',
+            'ical_location': 'FRA',
+            'sentinel': 'keep-exactly',
+        },
+        '2026-08-01': {
+            'ical_summary': 'LH100 FRA - MUC',
+            'ical_location': 'FRA - MUC',
+            'ical_start_iso': '2026-08-01T10:00:00+00:00',
+            'ical_end_iso': '2026-08-01T11:00:00+00:00',
+            'sentinel': 'keep-exactly',
+        },
+    }
+    assert backend._ical_briefings_save(token, protected_briefings)
 
     client = backend.app.test_client()
     valid = backend._TokenValidationResult(
@@ -205,3 +220,34 @@ def test_multi_pdf_endpoint_resolves_revision_and_preserves_active_feed():
             or full.get('calendar_feed') or {})
     summaries = {event.get('summary') for event in feed.get('events') or []}
     assert summaries == {'Off Day', 'LH400 FRA - JFK', 'LH100 FRA - MUC'}
+    saved_briefings = backend._ical_briefings_load(token) or {}
+    for day, expected in protected_briefings.items():
+        assert saved_briefings[day]['ical_summary'] == expected['ical_summary']
+        assert saved_briefings[day]['sentinel'] == 'keep-exactly'
+
+
+def test_roster_queue_reuses_pending_identical_pdf():
+    import app as backend
+
+    class _Pending:
+        data = [{'id': 123}]
+
+    class _Query:
+        def select(self, *_args): return self
+        def eq(self, *_args): return self
+        def limit(self, *_args): return self
+        def execute(self): return _Pending()
+
+    class _Sb:
+        def table(self, name):
+            assert name == 'ax_logbook_upload'
+            return _Query()
+
+    with patch.object(backend, 'SB_AVAILABLE', True), \
+            patch.object(backend, 'sb', _Sb()), \
+            patch.object(backend, '_supabase_execute_with_timeout',
+                         side_effect=lambda _name, fn: (fn(), False)), \
+            patch.object(backend, '_logbook_upload_store') as store:
+        assert backend._roster_pdf_upload_store(
+            'AT-TEST-QUEUE', 'same.pdf', b'%PDF-same') is True
+    store.assert_not_called()

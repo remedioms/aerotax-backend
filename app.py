@@ -53234,7 +53234,16 @@ def import_calendar_feed(token):
         # NICHT reconcilen — die merged Liste ist dann unvollständig und das
         # Fenster-Räumen würde die Tage des kaputten Links löschen (Duty-Tage
         # bei totem Duty-Link bzw. Off-Tage bei totem Off-Days-Link).
-        if err_1 or err_2:
+        if _archive_direct:
+            # A PDF archive deliberately omits the protected active-roster
+            # span and carries it forward from durable storage. Reconciling
+            # the combined feed would interpret those omissions as deletions
+            # (real incident: the briefing immediately before the rolling
+            # feed's lower edge disappeared). Archive imports never clear an
+            # existing day; a normal feed refresh keeps the old behavior.
+            _reconcile_dbg = {'skipped': 'pdf_archive_preserve_existing',
+                              'feed_dates': 0, 'cleared': 0, 'window': None}
+        elif err_1 or err_2:
             _reconcile_dbg = {'skipped': 'partial_feed_failure',
                               'feed_dates': 0, 'cleared': 0, 'window': None}
         else:
@@ -53251,6 +53260,15 @@ def import_calendar_feed(token):
         # Vortag) — nach _attach_sectors, damit „hat der Neuaufbau Sektoren?"
         # eine beantwortbare Frage ist.
         _preserve_past_flown_days(briefings, existing)
+        _preserve_from = str(body.get('archive_preserve_from') or '')[:10]
+        _preserve_to = str(body.get('archive_preserve_to') or '')[:10]
+        if (_archive_direct
+                and re.fullmatch(r'\d{4}-\d{2}-\d{2}', _preserve_from)
+                and re.fullmatch(r'\d{4}-\d{2}-\d{2}', _preserve_to)):
+            for _day, _briefing in existing.items():
+                if (_preserve_from <= str(_day)[:10] <= _preserve_to
+                        and isinstance(_briefing, dict)):
+                    briefings[_day] = dict(_briefing)
         if not _ical_briefings_save(token, briefings):
             _persist_err = 'briefings_persist_failed'
     except Exception as e:
@@ -54100,7 +54118,30 @@ def _roster_pdf_upload_store(token, filename, blob):
     import hashlib as _hl
     safe_name = re.sub(r'[^A-Za-z0-9._ ()-]', '_', filename or 'roster.pdf')
     safe_name = safe_name[-120:].strip() or 'roster.pdf'
-    sha = _hl.sha256(blob).hexdigest()[:16]
+    full_sha = _hl.sha256(blob).hexdigest()
+    sha = full_sha[:16]
+    # Public ingress may fail over a long-running multipart request to the
+    # second origin while the first origin is still finishing. Both requests
+    # are data-idempotent, but without this durable check they retain two
+    # identical private queue rows per PDF. A verified/processed upload may be
+    # queued again later; only an already pending copy suppresses the insert.
+    try:
+        if SB_AVAILABLE:
+            def _find_pending():
+                return (sb.table('ax_logbook_upload').select('id')
+                        .eq('token', token).eq('sha256', full_sha)
+                        .eq('note', _ROSTER_PDF_QUEUE_NOTE)
+                        .eq('processed', False).limit(1).execute())
+            pending, failed = _supabase_execute_with_timeout(
+                'roster_pdf_queue_dedupe', _find_pending)
+            if not failed and (getattr(pending, 'data', None) or []):
+                app.logger.info(
+                    f'[roster-pdf] queue-store-existing tok={token[:8]} '
+                    f'sha={sha} bytes={len(blob)}')
+                return True
+    except Exception:
+        # Monitoring durability wins over dedupe when the read path degrades.
+        pass
     stored = _logbook_upload_store(
         token, safe_name, blob, _ROSTER_PDF_QUEUE_NOTE)
     level = app.logger.info if stored else app.logger.warning
@@ -54252,7 +54293,9 @@ def import_roster_pdf(token):
     # `source` explizit — hier ist es WIRKLICH ein PDF (s. _DIRECT_ICS_SOURCES).
     archive = len(files) > 1 or merge_existing
     with app.test_request_context(json={
-            'ics_text': ics, 'source': 'pdf', 'archive': archive}):
+            'ics_text': ics, 'source': 'pdf', 'archive': archive,
+            'archive_preserve_from': existing_bounds[0],
+            'archive_preserve_to': existing_bounds[1]}):
         rv = import_calendar_feed(token)
     resp_obj, status = (rv if isinstance(rv, tuple) else (rv, 200))
     try:
