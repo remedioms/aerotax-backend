@@ -187,6 +187,73 @@ def test_day_markers_and_continuation_lines():
     assert 'OFF Days' not in ics
 
 
+# Echtes Discover-Tabellen-Shape aus den Jun-/Aug-2026-Belegen, anonymisiert.
+# Insbesondere wichtig: Fortsetzungszeilen am selben Datum tragen KEIN neues
+# Datum; `cur_day` muss deshalb über alle Schulungsblöcke erhalten bleiben.
+_GROUND_DUTY_FIXTURE = """\
+Roster
+Period: August 2026
+Crew member: TST, Test, Ground
+Rank: CM Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+04 Tue BRS FRA 10:00 17:00 7:00 12:00
+18 Tue CM HOS FRA 09:00 16:00 7:00 12:00
+19 Wed CM SEP320 FRA 09:30 12:00 2:30
+CM FA FRA 12:00 14:30 2:30
+CM SEP330 FRA 14:30 16:45 2:15 15:15
+20 Thu CM SEP330 FRA 09:30 12:00 2:30
+CM CRM FRA 12:00 14:00 2:00
+CM SEC FRA 14:00 16:00 2:00
+CM SEP320 FRA 16:00 18:10 2:10 15:20
+21 Fri BOT
+Created 21Jul2026 09:58 (UTC) by TST 1 ( 1)
+"""
+
+
+def test_discover_ground_duties_are_not_dropped():
+    """Alle zeitgebundenen Discover-Bodendienste werden als eigene Events
+    übernommen; unbekannte künftige Activity-Codes brauchen keine Whitelist."""
+    ics, err = backend._discover_roster_text_to_ics(_GROUND_DUTY_FIXTURE)
+    assert err is None, err
+    for summary in (
+            'BRS FRA', 'HOS FRA', 'SEP320 FRA', 'FA FRA', 'SEP330 FRA',
+            'CRM FRA', 'SEC FRA'):
+        assert f'SUMMARY:{summary}' in ics
+    # August = CEST: 10:00 FRA lokal → 08:00Z; 18:10 → 16:10Z.
+    assert 'DTSTART:20260804T080000Z' in ics
+    assert 'DTEND:20260804T150000Z' in ics
+    assert 'DTEND:20260820T161000Z' in ics
+    # Ganztägiges BOT bleibt als Rohcode erhalten und wird im Client als Dienst
+    # klassifiziert (keine erfundene Uhrzeit).
+    assert 'DTSTART;VALUE=DATE:20260821' in ics
+    assert 'SUMMARY:BOT' in ics
+
+
+def test_multiple_discover_ground_duties_merge_on_the_correct_day():
+    ics, err = backend._discover_roster_text_to_ics(_GROUND_DUTY_FIXTURE)
+    assert err is None, err
+    events = backend._parse_ics_to_events(ics)
+    briefings, _ = backend._ics_events_to_briefings(events, existing={})
+
+    aug19 = briefings['2026-08-19']
+    assert aug19['ical_summary'] == 'SEP320 FRA · FA FRA · SEP330 FRA'
+    assert aug19['ical_start_iso'] == '2026-08-19T07:30:00Z'
+    assert aug19['ical_end_iso'] == '2026-08-19T14:45:00Z'
+
+    aug20 = briefings['2026-08-20']
+    assert aug20['ical_summary'] == 'SEP330 FRA · CRM FRA · SEC FRA · SEP320 FRA'
+    assert aug20['ical_start_iso'] == '2026-08-20T07:30:00Z'
+    assert aug20['ical_end_iso'] == '2026-08-20T16:10:00Z'
+
+
+def test_discover_ground_codes_are_backend_duty_evidence():
+    for marker in ('BRS FRA', 'BOT', 'HOS FRA', 'SEP320 FRA', 'SEP330 FRA',
+                   'FA FRA', 'CRM FRA', 'SEC FRA'):
+        assert backend._summary_has_ground_duty(marker), marker
+    assert backend._summary_has_ground_duty('OFF DAY · BOT')
+
+
 def test_pipeline_roundtrip_sectors_and_briefings():
     ics, err = backend._discover_roster_text_to_ics(SYN_TEXT)
     assert err is None

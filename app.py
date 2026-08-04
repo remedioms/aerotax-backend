@@ -16148,7 +16148,13 @@ def _summary_has_ground_duty(summary_upper):
     _duty = ('TRAINING', 'SCHULUNG', 'RECURRENT', 'SIMULATOR', 'BRIEFING',
              'MEDICAL', 'SEMINAR', 'COURSE', 'CHECK', 'PICKUP', 'PICK UP',
              'STANDBY', 'STBY', 'RISERVA', 'OFFICE', 'BÜRO', 'BUERO', 'GROUND')
-    _duty_codes = {'EM', 'SIM', 'OPC', 'LPC', 'CBT', 'TRG', 'GST', 'SEP'}
+    _duty_codes = {
+        'EM', 'SIM', 'OPC', 'LPC', 'CBT', 'TRG', 'GST', 'SEP',
+        # Discover CrewAccess (echte Jun/Aug-2026-Roster): Betriebsrat,
+        # all-day Betriebsrat und Schulungs-/Admin-Dienste. Diese Codes werden
+        # als SUMMARY unverändert zum iOS-Client durchgereicht.
+        'BRS', 'BOT', 'HOS', 'SEP320', 'SEP330', 'FA', 'CRM', 'SEC',
+    }
     # LH-Bürodienst-Hauscodes B1…B9 (Marker-Vertrag mit iOS; nur das nackte
     # „B" ist ausgenommen — das ist Betriebsunfall/Abwesenheit). Sie werden
     # VOR dem _offish-`continue` geprüft, weil genau
@@ -51801,7 +51807,19 @@ _DISCOVER_LEG_RE = re.compile(
     r'(?:^|\s)[A-Z]{2,3}\s+(\d{1,4}[A-Z]?)\s+([A-Z]{3})(?:\s+([A-Z]{3}))?\s+'
     r'(\d{1,2}:\d{2})(?:\s+(\d{1,2}:\d{2}))?(?=\s|$)')
 _DISCOVER_GROUND_RE = re.compile(
-    r'(?:^|\s)(SBY[A-Z0-9]*|PREP)\s+([A-Z]{3})\s+'
+    # Discover führt vor der Activity optional die Crew-Position (z.B. CM).
+    # Danach folgt bei JEDEM zeitgebundenen Bodendienst dasselbe stabile Shape:
+    # Activity + Station + Start + Ende. Die frühere SBY/PREP-Whitelist ließ
+    # dadurch echte BRS-/HOS-/SEP-/CRM-/SEC-Tage komplett verschwinden.
+    # Activity beginnt absichtlich mit einem Buchstaben: numerische Flugnummern
+    # können so nicht als Bodendienst fehlgelesen werden.
+    # Am Zeilenanfang verankern. Sonst würde eine Flugzeile ab ihrem
+    # Routing-Teil „FRA PHL 13:21 15:47" wie Activity=FRA/Station=PHL wirken.
+    # Bis zu zwei Report-/Release-Zeiten und der optionale FDP-ext.-Text sind
+    # echte Spalten vor Pos/Activity und dürfen übersprungen werden.
+    r'^(?:(?:\d{1,2}:\d{2})\s+){0,2}(?:FDP\s+ext\.\s+)?'
+    r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
+    r'([A-Z][A-Z0-9]{1,15})\s+([A-Z]{3})\s+'
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
 # Report-Zeit: erstes HH:MM-Token am Anfang der „rest"-Zeile eines Duty-Tages.
 # Gilt NUR für dated-Zeilen (d.h. wenn _CREWACCESS_DAY_RE matcht), nicht für
