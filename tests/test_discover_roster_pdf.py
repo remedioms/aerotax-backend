@@ -331,7 +331,8 @@ Created 04Aug2026 11:33 (UTC) by TST 1 ( 1)
 
 def test_discover_ground_codes_are_backend_duty_evidence():
     for marker in ('BRS FRA', 'BOT', 'HOS FRA', 'SEP320 FRA', 'SEP330 FRA',
-                   'FA FRA', 'CRM FRA', 'SEC FRA', 'PRVT FRA - MUC',
+                   'FA FRA', 'CRM FRA', 'SEC FRA', 'SIM320 FRA',
+                   'PRVT FRA - MUC',
                    'RESERVE'):
         assert backend._summary_has_ground_duty(marker), marker
     assert backend._summary_has_ground_duty('OFF DAY · BOT')

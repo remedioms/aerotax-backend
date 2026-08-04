@@ -16602,7 +16602,9 @@ def _summary_has_ground_duty(summary_upper):
         if any(t in s for t in _duty):
             return True
         tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', s))
-        if tokens & _duty_codes:
+        if (tokens & _duty_codes
+                or any(re.fullmatch(r'SIM\d{2,3}[A-Z]?', tok)
+                       for tok in tokens)):
             return True
         # Getimtes Dienst-Segment: zwei Uhrzeiten (HH:MM oder HHMM)
         if re.search(r'(\d{1,2}:\d{2}|\b\d{4}\b).*(\d{1,2}:\d{2}|\b\d{4}\b)', s):
