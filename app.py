@@ -16560,6 +16560,8 @@ def _summary_has_ground_duty(summary_upper):
         # all-day Betriebsrat und Schulungs-/Admin-Dienste. Diese Codes werden
         # als SUMMARY unverändert zum iOS-Client durchgereicht.
         'BRS', 'BOT', 'HOS', 'SEP320', 'SEP330', 'FA', 'CRM', 'SEC',
+        # Discover: private Bodentransfers und Reserve ohne Stationsspalte.
+        'PRVT', 'RES', 'RESERVE',
     }
     # LH-Bürodienst-Hauscodes B1…B9 (Marker-Vertrag mit iOS; nur das nackte
     # „B" ist ausgenommen — das ist Betriebsunfall/Abwesenheit). Sie werden
@@ -53396,6 +53398,18 @@ _DISCOVER_HEADER = 'Date Report Release Tags Pos Activity From To Start End'
 _DISCOVER_LEG_RE = re.compile(
     r'(?:^|\s)[A-Z]{2,3}\s+(\d{1,4}[A-Z]?)\s+([A-Z]{3})(?:\s+([A-Z]{3}))?\s+'
     r'(\d{1,2}:\d{2})(?:\s+(\d{1,2}:\d{2}))?(?=\s|$)')
+_DISCOVER_DEADHEAD_RE = re.compile(
+    r'^(?:(?:\d{1,2}:\d{2})\s+){0,2}'
+    r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
+    r'DH\s+([A-Z0-9]{2,8})\s+([A-Z]{3})\s+([A-Z]{3})\s+'
+    r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
+_DISCOVER_GROUND_ROUTE_RE = re.compile(
+    # Bodentransfer mit eigener Route, z.B. „PRVT FRA MUC 10:15 11:10".
+    # Flugzeilen kollidieren nicht: deren Activity beginnt mit einer Zahl.
+    r'^(?:(?:\d{1,2}:\d{2})\s+){0,2}(?:FDP\s+ext\.\s+)?'
+    r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
+    r'([A-Z][A-Z0-9]{1,15})\s+([A-Z]{3})\s+([A-Z]{3})\s+'
+    r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
 _DISCOVER_GROUND_RE = re.compile(
     # Discover führt vor der Activity optional die Crew-Position (z.B. CM).
     # Danach folgt bei JEDEM zeitgebundenen Bodendienst dasselbe stabile Shape:
@@ -53411,6 +53425,13 @@ _DISCOVER_GROUND_RE = re.compile(
     r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
     r'([A-Z][A-Z0-9]{1,15})\s+([A-Z]{3})\s+'
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
+_DISCOVER_GROUND_NO_STN_RE = re.compile(
+    # Reserve wird im Discover-Roster ohne Stationsspalte ausgegeben:
+    # „RES 02:00 22:00". Basis aus dem Dokumentkopf verwenden.
+    r'^(?:(?:\d{1,2}:\d{2})\s+){0,2}(?:FDP\s+ext\.\s+)?'
+    r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
+    r'([A-Z][A-Z0-9]{1,15})\s+'
+    r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
 # Report-Zeit: erstes HH:MM-Token am Anfang der „rest"-Zeile eines Duty-Tages.
 # Gilt NUR für dated-Zeilen (d.h. wenn _CREWACCESS_DAY_RE matcht), nicht für
 # Fortsetzungszeilen (Closer/Zweitzele). FDP-ext.-Zeilen tragen diese Zeit als
@@ -53425,13 +53446,20 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
     NICHTS wird erfunden: unbekannte Tages-Marker (OT/BOT/AU/…) reisen als
     Roh-Summary mit; unschließbare Übernacht-Opener werden verworfen."""
     t = text or ''
-    if 'Roster' not in t[:200] or _DISCOVER_HEADER not in t:
+    # Jeppesen schreibt den Titel je nach Export als „Roster" oder
+    # „Released roster" (kleines r). Das Tabellenformat und „All times local"
+    # bleiben identisch; case-sensitive Titelprüfung lehnte den echten
+    # Released-Export aus Open Bugs fälschlich ab.
+    if (not re.search(r'(?im)^\s*(?:Released\s+)?Roster\s*$', t[:300])
+            or _DISCOVER_HEADER not in t):
         return None, 'unsupported_pdf_format'
     mp = re.search(r'Period:\s*([A-Za-z]+)\s+(\d{4})', t)
     month = _CREWACCESS_MONTHS.get((mp.group(1).lower() if mp else ''), 0)
     if not mp or not month:
         return None, 'no_planning_period'
     year = int(mp.group(2))
+    bm = re.search(r'\bBase:\s*([A-Z]{3})\b', t[:1000])
+    roster_base = bm.group(1) if bm else 'FRA'
 
     from datetime import date as _date, timedelta as _td, timezone as _tzu
     from zoneinfo import ZoneInfo as _ZI
@@ -53469,6 +53497,19 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         if end <= start:
             end += _td(days=1)
         events.append((f'tim-{len(events)}', start, end, summary, False))
+
+    def add_route_timed(d, t1, t2, frm, to, summary):
+        """Stationslokaler Transfer/Deadhead mit Route und echter Ziel-TZ."""
+        h, m = (int(x) for x in t1.split(':'))
+        dep_tz = _stn_tz(frm)
+        start_local = datetime(d.year, d.month, d.day, h, m, tzinfo=dep_tz)
+        start_utc = start_local.astimezone(_tzu.utc).replace(tzinfo=None)
+        end_utc = _utc(d, t2, to)
+        if end_utc <= start_utc:
+            end_utc = _utc(d + _td(days=1), t2, to)
+        dep_tzid = getattr(dep_tz, 'key', None)
+        events.append((f'route-{len(events)}', start_local.replace(tzinfo=None),
+                       end_utc, summary, False, dep_tzid))
 
     def add_leg(dep_d, num, frm, to, t1, t2, arr_d=None, briefing=None):
         h, m = (int(x) for x in t1.split(':'))
@@ -53568,11 +53609,32 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         if ml:
             add_all_day(cur_day, f'Layover {ml.group(1)}')
             continue
+        dh = _DISCOVER_DEADHEAD_RE.search(rest)
+        if dh:
+            flight, frm, to, t1, t2 = dh.groups()
+            add_route_timed(cur_day, t1, t2, frm, to,
+                            f'DH {flight} {frm} - {to}')
+            continue
+        # Erst das häufigere Activity+Station-Shape prüfen. Würde der
+        # Route-Parser zuerst laufen, könnte er „CM CRM FRA 12:00 14:00" als
+        # Code=CM, From=CRM, To=FRA fehlinterpretieren.
         gm = _DISCOVER_GROUND_RE.search(rest)
         if gm:
             code, stn = gm.group(1), gm.group(2)
             label = f'Standby {stn}' if code.startswith('SBY') else f'{code} {stn}'
             add_timed(cur_day, gm.group(3), gm.group(4), stn, label)
+            continue
+        gr = _DISCOVER_GROUND_ROUTE_RE.search(rest)
+        if gr:
+            code, frm, to, t1, t2 = gr.groups()
+            add_route_timed(cur_day, t1, t2, frm, to,
+                            f'{code} {frm} - {to}')
+            continue
+        gn = _DISCOVER_GROUND_NO_STN_RE.search(rest)
+        if gn:
+            code = gn.group(1)
+            label = 'Reserve' if code.startswith('RES') else code
+            add_timed(cur_day, gn.group(2), gn.group(3), roster_base, label)
             continue
         lm = _DISCOVER_LEG_RE.search(rest)
         if not lm:
@@ -53608,6 +53670,42 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
                               prodid='AeroX Discover Roster PDF Import'), None
 
 
+_IOS_PDF_CID_RE = re.compile(r'\(cid:(\d{1,5})\)')
+
+
+def _repair_ios_reprinted_roster_text(text):
+    """Repariert Discover-PDFs, die über iOS „Drucken → Als PDF sichern"
+    entstanden sind.
+
+    iOS 26 schreibt bei diesem Jeppesen/NotoSans-Dokument eine defekte
+    ToUnicode-CMap. pdfplumber liefert deshalb ausschließlich Tokens wie
+    ``(cid:53)(cid:82)…`` statt „Roster". Die eingebetteten CIDs entsprechen
+    bei genau diesem Export stabil ``Unicode-Codepoint - 29``. Wir wenden die
+    Abbildung nur bei vielen CID-Tokens an und übernehmen das Ergebnis nur,
+    wenn danach alle drei Discover-Strukturmarker vorhanden sind. Fremde PDFs
+    oder vereinzelte legitime CID-Tokens bleiben unverändert.
+    """
+    raw = text or ''
+    matches = list(_IOS_PDF_CID_RE.finditer(raw))
+    if len(matches) < 20:
+        return raw
+
+    def _decode(match):
+        codepoint = int(match.group(1)) + 29
+        try:
+            return chr(codepoint)
+        except (TypeError, ValueError):
+            return match.group(0)
+
+    candidate = _IOS_PDF_CID_RE.sub(_decode, raw)
+    is_discover = (
+        re.search(r'(?im)^\s*(?:Released\s+)?Roster\s*$', candidate[:300])
+        and re.search(r'(?im)^\s*Period:\s*[A-Za-z]+\s+\d{4}\s*$', candidate)
+        and _DISCOVER_HEADER in candidate
+    )
+    return candidate if is_discover else raw
+
+
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
 def import_roster_pdf(token):
     """Roster-PDF-Upload (Lufthansa City/Discover — kein iCal-Export).
@@ -53630,7 +53728,7 @@ def import_roster_pdf(token):
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             for pg in pdf.pages[:20]:
                 pages.append(pg.extract_text() or '')
-        text = '\n'.join(pages)
+        text = _repair_ios_reprinted_roster_text('\n'.join(pages))
     except Exception as e:
         app.logger.warning(f'[roster-pdf] extract-fail: {type(e).__name__}: {str(e)[:160]}')
         return jsonify({'ok': False, 'error': 'pdf_extract_failed'}), 422

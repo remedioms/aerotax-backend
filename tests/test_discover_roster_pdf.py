@@ -249,9 +249,67 @@ def test_multiple_discover_ground_duties_merge_on_the_correct_day():
 
 def test_discover_ground_codes_are_backend_duty_evidence():
     for marker in ('BRS FRA', 'BOT', 'HOS FRA', 'SEP320 FRA', 'SEP330 FRA',
-                   'FA FRA', 'CRM FRA', 'SEC FRA'):
+                   'FA FRA', 'CRM FRA', 'SEC FRA', 'PRVT FRA - MUC',
+                   'RESERVE'):
         assert backend._summary_has_ground_duty(marker), marker
     assert backend._summary_has_ground_duty('OFF DAY · BOT')
+
+
+_OPEN_BUGS_DISCOVER_VARIANTS = """\
+Released roster
+Period: July 2026
+Crew member: TST, Test, Variants
+Rank: RCM Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+05 Wed 10:15 RCM PRVT FRA MUC 10:15 11:10 05351
+13:25 RCM 1272 MUC JTR 14:40 18:20 32A 2:40
+08 Sat 09:05 RCM 442 MUC IBZ 10:20 12:45 32A 2:25
+DH LH115 MUC FRA 18:00 19:00 9:55 12:00
+13 Thu RES 02:00 22:00
+Created 04Aug2026 09:39 (UTC) by TST 1 ( 1)
+"""
+
+
+def test_released_roster_lowercase_header_and_open_bugs_duties():
+    """Echte Open-Bugs-Varianten: kleingeschriebener Released-Header,
+    PRVT-Transfer, Airline-fremder Deadhead und Reserve ohne Station."""
+    ics, err = backend._discover_roster_text_to_ics(
+        _OPEN_BUGS_DISCOVER_VARIANTS)
+    assert err is None, err
+    assert 'SUMMARY:PRVT FRA - MUC' in ics
+    assert 'SUMMARY:DH LH115 MUC - FRA' in ics
+    assert 'SUMMARY:Reserve' in ics
+    # Juli = CEST: 02:00-22:00 FRA lokal → 00:00-20:00 UTC.
+    assert 'DTSTART:20260713T000000Z' in ics
+    assert 'DTEND:20260713T200000Z' in ics
+    # Normaler Flug bleibt trotz vorgelagertem PRVT erhalten.
+    assert '4Y1272 MUC - JTR' in ics
+
+
+def test_ios_reprinted_discover_cid_text_is_repaired_before_parsing():
+    """iOS-„Drucken → PDF" verliert die ToUnicode-CMap und pdfplumber gibt
+    `(cid:N)` aus. Der echte NotoSans-Offset wird streng format-geprüft
+    repariert; anschließend läuft der normale Discover-Parser."""
+    plain = _OPEN_BUGS_DISCOVER_VARIANTS.replace('Released roster', 'Roster')
+
+    def cid_encode(value):
+        return ''.join(
+            ch if ch == '\n' else f'(cid:{ord(ch) - 29})'
+            for ch in value
+        )
+
+    repaired = backend._repair_ios_reprinted_roster_text(cid_encode(plain))
+    assert repaired == plain
+    ics, err = backend._discover_roster_text_to_ics(repaired)
+    assert err is None, err
+    assert 'SUMMARY:PRVT FRA - MUC' in ics
+    assert 'SUMMARY:Reserve' in ics
+
+
+def test_cid_repair_never_mutates_foreign_pdf_text():
+    foreign = ''.join(f'(cid:{n})' for n in range(20, 45))
+    assert backend._repair_ios_reprinted_roster_text(foreign) == foreign
 
 
 def test_pipeline_roundtrip_sectors_and_briefings():
