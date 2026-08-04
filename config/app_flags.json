@@ -1,0 +1,4 @@
+{
+  "_comment": "Remote-Kill-Switches für die iOS-App (GET /api/app-config). Flag-Änderung = Commit + Deploy (Minuten). Notfall ohne Code: Env AEROX_FLAGS_JSON als JSON-Objekt überlagert diese Defaults. Jedes Flag hat in der App einen kompilierten Safe-Default — diese Datei muss also nur ABWEICHUNGEN vom gewünschten Normalverhalten tragen.",
+  "layover_roster_wins": true
+}

@@ -16,6 +16,8 @@ GET so the cost is negligible (one round-trip per provider per 30s).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 from typing import Any, Dict, Tuple
@@ -208,3 +210,69 @@ def status_dependencies():
         "cached_for_sec": _CACHE_TTL_SEC,
         "ts": int(time.time()),
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Remote-Config / Kill-Switches (Owner 2026-08-04, nach dem BLR-Layover-
+#  Vorfall: „kann man nicht einbauen, dass so Code direkt geändert werden
+#  kann?"). Kein nachgeladener Code (Apple 2.5.2) — sondern Flags, die die
+#  App holt und mit kompilierten Safe-Defaults überblendet.
+#
+#  Quellen-Kaskade (spätere gewinnt):
+#    1. config/app_flags.json  (Repo-Defaults — Flag-Flip = Commit + Deploy)
+#    2. Env AEROX_FLAGS_JSON   (JSON-Objekt — Container-Restart genügt,
+#                               Notfall-Hebel ganz ohne Code-Änderung)
+#  Fehlertoleranz: kaputte Datei/Env wird STILL ignoriert (Defaults gewinnen,
+#  die App hat ohnehin kompilierte Fallbacks). Öffentlich lesbar; es dürfen
+#  hier deshalb NIE Secrets oder personenbezogene Werte liegen.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FLAGS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "app_flags.json")
+_FLAGS_CACHE: Dict[str, Any] = {}          # {"exp": float, "flags": dict, "rev": str}
+_FLAGS_CACHE_TTL_SEC = 60
+
+
+def _load_app_flags() -> Dict[str, Any]:
+    """Effektive Flags: Datei-Defaults + Env-Overlay. Nie raisen."""
+    flags: Dict[str, Any] = {}
+    try:
+        with open(_FLAGS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            flags.update({k: v for k, v in raw.items() if not k.startswith("_")})
+    except Exception:
+        pass  # fehlende/kaputte Datei ⇒ leere Defaults, App-Fallbacks tragen
+    try:
+        env_raw = os.getenv("AEROX_FLAGS_JSON", "").strip()
+        if env_raw:
+            env_obj = json.loads(env_raw)
+            if isinstance(env_obj, dict):
+                flags.update(env_obj)
+    except Exception:
+        pass  # kaputte Env ⇒ ignorieren, Datei-Stand gilt
+    return flags
+
+
+def _app_flags_cached() -> Tuple[Dict[str, Any], str]:
+    now = time.time()
+    if _FLAGS_CACHE.get("exp", 0) > now:
+        return _FLAGS_CACHE["flags"], _FLAGS_CACHE["rev"]
+    flags = _load_app_flags()
+    rev = hashlib.sha256(
+        json.dumps(flags, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    _FLAGS_CACHE.update({"exp": now + _FLAGS_CACHE_TTL_SEC,
+                         "flags": flags, "rev": rev})
+    return flags, rev
+
+
+@status_bp.route("/api/app-config", methods=["GET"])
+def app_config():
+    """Feature-Flags/Kill-Switches für die iOS-App. Public, klein, cachebar."""
+    flags, rev = _app_flags_cached()
+    resp = jsonify({"ok": True, "rev": rev, "flags": flags})
+    # 5 min Edge-/Client-Cache: ein Flag-Flip erreicht die Flotte in Minuten,
+    # ohne dass jeder App-Start einen ungecachten Origin-Hit erzeugt.
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
