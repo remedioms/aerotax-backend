@@ -5652,6 +5652,44 @@ def _lb_self_get(user_token, key, now=None):
     return e['self_landed']
 
 
+def logbook_cached_self_landing_flags(user_token, candidates, now=None):
+    """Frische, strikt personengebundene Landing-Flags in EINEM Datei-Read.
+
+    Rückgabe: ``{(flight, date, dep): bool}``. Anders als der geteilte
+    Completion-Cache darf diese Funktion ausschließlich mit dem Token des
+    anfragenden Users aufgerufen werden. Dadurch kann das Flugbuch eine von LH
+    bestätigte eigene Landung als PF-Beleg darstellen, ohne Flags zwischen
+    Crew-Mitgliedern zu vermischen oder im GET-Pfad etwas zu persistieren.
+    """
+    if not user_token:
+        return {}
+    ts = time.time() if now is None else float(now)
+    try:
+        own = _lb_json_load(_lb_self_path(user_token))
+    except Exception:
+        return {}
+    out = {}
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        flight = (c.get('flight') or '').upper().replace(' ', '')
+        date = (c.get('date') or '')[:10]
+        dep = (c.get('dep') or '').upper()
+        if not (flight and date and dep):
+            continue
+        row = own.get(_lb_key(flight, date, dep))
+        if not isinstance(row, dict) or not isinstance(
+                row.get('self_landed'), bool):
+            continue
+        try:
+            if ts - float(row.get('ts') or 0) >= _LB_SHARED_TTL_S:
+                continue
+        except (TypeError, ValueError):
+            continue
+        out[(flight, date, dep)] = row['self_landed']
+    return out
+
+
 def _lb_self_put(user_token, key, self_landed, now=None):
     p = _lb_self_path(user_token)
     if not p or not isinstance(self_landed, bool):

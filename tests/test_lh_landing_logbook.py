@@ -224,6 +224,32 @@ def test_self_cache_is_per_user_and_only_bools(monkeypatch, tmp_path):
     assert fo._lb_self_get('AT-CAROL', k) is None
 
 
+def test_cached_self_landing_flags_are_batched_private_and_fresh(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(fo, '_flow_dir', lambda: str(tmp_path))
+    now = 1_800_000_000.0
+    fo._lb_self_put('AT-ALICE', 'LH1|2027-01-14|FRA', True, now=now)
+    fo._lb_self_put('AT-ALICE', 'LH2|2027-01-13|MUC', False, now=now)
+    fo._lb_self_put('AT-BOB', 'LH1|2027-01-14|FRA', False, now=now)
+
+    candidates = [
+        {'flight': 'LH 1', 'date': '2027-01-14', 'dep': 'fra'},
+        {'flight': 'LH2', 'date': '2027-01-13', 'dep': 'MUC'},
+    ]
+    assert fo.logbook_cached_self_landing_flags(
+        'AT-ALICE', candidates, now=now + 60) == {
+            ('LH1', '2027-01-14', 'FRA'): True,
+            ('LH2', '2027-01-13', 'MUC'): False,
+        }
+    assert fo.logbook_cached_self_landing_flags(
+        'AT-BOB', candidates, now=now + 60) == {
+            ('LH1', '2027-01-14', 'FRA'): False,
+        }
+    assert fo.logbook_cached_self_landing_flags(
+        'AT-ALICE', candidates,
+        now=now + fo._LB_SHARED_TTL_S + 1) == {}
+
+
 def test_shared_cache_ttl_expires(monkeypatch, tmp_path):
     monkeypatch.setattr(fo, '_flow_dir', lambda: str(tmp_path))
     now = 1_800_000_000.0

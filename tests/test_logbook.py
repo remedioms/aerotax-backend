@@ -238,6 +238,36 @@ def test_discover_a330_variants_share_one_group_and_landing_implies_pf():
     assert entries['4Y3']['pf'] is None       # ohne Landung nichts erfinden
 
 
+def test_api_confirmed_own_landing_implies_pf_without_landing_overlay(
+        monkeypatch):
+    """Die personengebundene LH-API-Landung ist selbst der PF-Beleg.
+
+    Der frühere App-Pfad wartete auf ldg_day/ldg_night im Overlay. Dadurch
+    zeigte die API-Zeile bereits die LH-Landung, im Flugbuch aber noch kein PF.
+    Explizites PM muss trotzdem autoritativ bleiben.
+    """
+    _seed()
+    import blueprints.lh_flightops as fo
+    monkeypatch.setattr(
+        fo, 'logbook_cached_self_landing_flags',
+        lambda token, candidates: {
+            ('LH400', '2026-05-01', 'FRA'): True,
+            ('LH401', '2026-05-03', 'JFK'): True,
+        })
+
+    # LH401 wurde ausdrücklich als PM gespeichert: API-Beleg darf diesen
+    # Userwert nicht überschreiben.
+    key = backend._logbook_leg_key('2026-05-03', 'LH401', 'JFK', 'FRA')
+    monkeypatch.setattr(backend, '_logbook_overlay_load', lambda token: {
+        key: {'pf': False},
+    })
+
+    entries = {x['flight']: x for x in _get()['entries']}
+    assert entries['LH400']['pf'] is True
+    assert entries['LH401']['pf'] is False
+    assert entries['LH222']['pf'] is None
+
+
 def test_save_and_readback_overlay():
     _seed()
 

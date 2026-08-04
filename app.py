@@ -21747,6 +21747,7 @@ def get_logbook(token):
     _now_dt = _lb_dt.now(_lb_tz.utc)
 
     completion_proofs = {}
+    self_landing_flags = {}
     for _key, _fact in facts_cache.items():
         if isinstance(_fact, dict):
             completion_proofs[_key] = dict(_fact)
@@ -21763,7 +21764,10 @@ def get_logbook(token):
     # gemeinsame Flug-Fakten; das personengebundene `self_landed` bleibt in der
     # FlightOps-Schicht und fließt hier NICHT ein.
     try:
-        from blueprints.lh_flightops import logbook_cached_completion_proofs
+        from blueprints.lh_flightops import (
+            logbook_cached_completion_proofs,
+            logbook_cached_self_landing_flags,
+        )
         _cands = [{'flight': lg.get('flight'), 'date': lg.get('date'),
                    'dep': lg.get('from')}
                   for lg in all_merged if lg.get('source') == 'roster']
@@ -21777,6 +21781,7 @@ def get_logbook(token):
             for _target_key in _proof_targets.get(_tuple_key, []):
                 completion_proofs.setdefault(_target_key, {})[
                     'actual_arr_iso'] = _actual
+        self_landing_flags = logbook_cached_self_landing_flags(token, _cands)
     except Exception:
         pass
 
@@ -21849,10 +21854,19 @@ def get_logbook(token):
         ldg_night = ov.get('ldg_night', iv.get('ldg_night'))
         pf_value = (bool(ov['pf']) if ov.get('pf') is not None
                     else iv.get('pf'))
+        _verified_own_landing = self_landing_flags.get((
+            (lg.get('flight') or '').upper().replace(' ', ''),
+            (lg.get('date') or '')[:10],
+            (lg.get('from') or '').upper(),
+        )) is True
         # Eine belegte eigene Landung bedeutet PF. Alte Flugstunden-Exporte
-        # liefern häufig die Landung, aber keine separate PF-Spalte. Explizite
-        # PF/PM-Werte aus Import oder User-Overlay gewinnen weiterhin.
-        if pf_value is None and (ldg_day or 0) + (ldg_night or 0) > 0:
+        # liefern häufig die Landung, aber keine separate PF-Spalte; der
+        # FlightOps-Pfad liefert denselben Beleg personengebunden aus seinem
+        # eigenen Cache. Explizite PF/PM-Werte aus Import oder User-Overlay
+        # gewinnen weiterhin in beiden Fällen.
+        if pf_value is None and (
+                (ldg_day or 0) + (ldg_night or 0) > 0
+                or _verified_own_landing):
             pf_value = True
         row = {
             'key': key, 'date': lg['date'], 'flight': lg['flight'],
