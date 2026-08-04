@@ -38,6 +38,20 @@ from flask import Blueprint, jsonify, request, redirect
 log = logging.getLogger('aerotax')
 lh_flightops_bp = Blueprint('lh_flightops_bp', __name__)
 
+
+def _roster_v2_lh_enabled():
+    allowed = {
+        value.strip().upper()
+        for value in os.environ.get('AEROX_ROSTER_V2_AIRLINES', '').split(',')
+        if value.strip()
+    }
+    return bool(allowed & {'*', 'LH', 'LUFTHANSA'})
+
+
+def _roster_v2_shadow_enabled():
+    return os.environ.get('AEROX_ROSTER_V2_SHADOW', '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
 # ── LH-Bürodienst-Hauscodes (Owner 2026-07-26: „B4 = Office") ───────────────
 # Im CRS-Handbuch stehen diese Codes NICHT (dort ist Bürodienst DS_F/DS_M/DS_S)
 # — sie sind hausintern.
@@ -3082,6 +3096,46 @@ def duty_events_to_ics(resp, pickups=None, rot_legs=None, enrich=True):
                           f'SUMMARY:{summary}',
                           f'LOCATION:{frm} - {to}'] + _x + ['END:VEVENT']
                 continue
+            # UNVOLLSTÄNDIGER FLUG (Deep Review 2026-08-03): FlightOps kann ein
+            # echtes FLIGHT-Event bereits mit Route/Flugnummer veröffentlichen,
+            # während endTime (seltener startTime) noch null ist. Der alte Code
+            # ließ es in den generischen Marker-Zweig fallen: LOCATION wurde nur
+            # FRA statt FRA-JFK, also verschwand das Leg vollständig. Bekannte
+            # Fakten bleiben jetzt erhalten; unbekannte Zeit wird NICHT erfunden.
+            _is_incomplete_real_flight = (
+                is_flight and len(frm) == 3 and len(to) == 3 and frm != to)
+            if _is_incomplete_real_flight and _roster_v2_shadow_enabled():
+                # Nur ein Zähler, keine Flug-/Crewdaten. Legacy bleibt Output.
+                log.warning('roster_v2_shadow_incomplete_flight_candidate')
+            if _is_incomplete_real_flight and _roster_v2_lh_enabled():
+                import re as _re
+                m = _re.search(r'\b([A-Z]{2}|\d[A-Z])\s?\d{1,4}[A-Z]?\b',
+                               det.upper())
+                flt = (m.group(0).replace(' ', '') if m else '').strip()
+                flt_disp = _re.sub(r'^([A-Z]{2}|\d[A-Z])(?=\d)', r'\g<1> ', flt)
+                is_dh = det.upper().strip().startswith('DH ')
+                summary = ((f'DH {flt_disp}' if is_dh else flt_disp)
+                           + f': {frm}-{to}' if flt else f'{frm}-{to}')
+                incomplete = ('missing_end_time' if st and not en
+                              else 'missing_start_time' if en and not st
+                              else 'missing_times')
+                event_lines = ['BEGIN:VEVENT', f'UID:{uid}']
+                if st:
+                    event_lines.append(f'DTSTART:{st}')
+                    # DTEND bewusst weglassen: DTSTART==DTEND würde dem späteren
+                    # Sektor eine falsche Null-Minuten-Ankunft als Wahrheit geben.
+                else:
+                    day = (d.get('day') or '')[:10].replace('-', '')
+                    if not day:
+                        continue
+                    event_lines += [f'DTSTART;VALUE=DATE:{day}',
+                                    f'DTEND;VALUE=DATE:{_shift(day, 1)}']
+                event_lines += [f'SUMMARY:{summary}',
+                                f'LOCATION:{frm} - {to}',
+                                f'X-AEROX-INCOMPLETE:{incomplete}',
+                                'END:VEVENT']
+                lines += event_lines
+                continue
             # BRIEFING (Miguel/Thomas 2026-07-24 „falsche Briefing-Zeiten seit
             # dem Update"): FlightOps liefert Briefings MIT startTime, aber
             # systematisch OHNE endTime → der alte `st and en`-Zweig griff nie
@@ -5519,6 +5573,52 @@ def _lb_shared_get(key, now=None):
     if (ts - float(e.get('ts') or 0)) >= _LB_SHARED_TTL_S:
         return None
     return {k: e[k] for k in _LB_SHARED_KEYS if e.get(k) is not None}
+
+
+def logbook_cached_completion_proofs(candidates, now=None):
+    """Lokale Landing-Report-Belege für mehrere Roster-Legs in EINEM Read.
+
+    Rückgabe: ``{(flight, date, dep): actual_arrival_iso}``. Ausschließlich
+    unveränderliche gemeinsame Flug-Fakten werden gelesen; das pro User
+    gespeicherte ``self_landed`` ist in dieser Datei konstruktiv nicht enthalten.
+    Abgelaufene, naive oder noch in der Zukunft liegende Zeiten beweisen nichts.
+    """
+    ts = time.time() if now is None else float(now)
+    try:
+        ref = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc)
+        shared = _lb_json_load(_lb_shared_path())
+    except Exception:
+        return {}
+    out = {}
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        flight = (c.get('flight') or '').upper().replace(' ', '')
+        date = (c.get('date') or '')[:10]
+        dep = (c.get('dep') or '').upper()
+        if not (flight and date and dep):
+            continue
+        row = shared.get(_lb_key(flight, date, dep))
+        if not isinstance(row, dict):
+            continue
+        try:
+            if ts - float(row.get('ts') or 0) >= _LB_SHARED_TTL_S:
+                continue
+        except (TypeError, ValueError):
+            continue
+        raw = row.get('arr_iso') or row.get('on_iso')
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            actual = _dt.datetime.fromisoformat(
+                raw.strip().replace('Z', '+00:00'))
+            if actual.tzinfo is None or actual.astimezone(_dt.timezone.utc) > ref:
+                continue
+            out[(flight, date, dep)] = actual.astimezone(
+                _dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return out
 
 
 def _lb_shared_put(key, facts, now=None):

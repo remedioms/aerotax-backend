@@ -3,6 +3,7 @@ Roster-Sektoren + manuelles Overlay (Landungen/PF/Nacht) + Summen pro Muster.
 Rein offline — seedet Sektoren über den manual-briefings-Store, kein Netz."""
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,15 +16,21 @@ DAYS = {
         {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
          'dep_iso': '2026-05-01T10:55:00+02:00',
          'arr_iso': '2026-05-01T13:35:00-04:00',
+         'est_arr_iso': '2026-05-01T13:35:00-04:00',
+         'arr_measured': True,
          'tail': 'D-AIHY', 'type': '346'}]},
     '2026-05-03': {'ical_sectors': [
         {'flight': 'LH401', 'from': 'JFK', 'to': 'FRA',
          'dep_iso': '2026-05-03T18:00:00-04:00',
          'arr_iso': '2026-05-04T07:30:00+02:00',   # Übernacht
+         'est_arr_iso': '2026-05-04T07:30:00+02:00',
+         'arr_measured': True,
          'reg': 'D-AIHY', 'type': '346'},
         {'flight': 'LH222', 'from': 'FRA', 'to': 'MUC',
          'dep_iso': '2026-05-04T09:00:00+02:00',
          'arr_iso': '2026-05-04T10:00:00+02:00',
+         'est_arr_iso': '2026-05-04T10:00:00+02:00',
+         'arr_measured': True,
          'type': '32N'}]},
 }
 
@@ -69,6 +76,119 @@ def test_block_min_from_offset_iso():
         '2026-05-01T10:00:00+02:00', '2026-05-01T09:00:00+02:00') is None  # negativ
 
 
+def test_roster_leg_needs_real_arrival_proof_and_never_accepts_plan_only():
+    now = datetime(2026, 8, 3, 18, 58, tzinfo=timezone.utc)
+    plan_only = {'arr_iso': '2026-08-03T18:45:00Z'}
+    measured_past = {'arr_iso': '2026-08-03T18:45:00Z',
+                     'est_arr_iso': '2026-08-03T18:43:00Z',
+                     'arr_measured': True}
+    measured_future = {'arr_iso': '2026-08-04T00:05:00Z',
+                       'est_arr_iso': '2026-08-04T00:09:00Z',
+                       'arr_measured': True}
+    cancelled = dict(measured_past, cancelled=True)
+    cancelled_text = dict(measured_past, status='Cancelled')
+    prediction_only = {
+        'arr_iso': '2026-08-03T18:45:00Z',
+        'est_arr_iso': '2026-08-03T18:50:00Z',
+        'arr_measured': False,
+    }
+
+    assert backend._logbook_roster_leg_completed(plan_only, now=now) is False
+    assert backend._logbook_roster_leg_completed(measured_past, now=now) is True
+    assert backend._logbook_roster_leg_completed(measured_future, now=now) is False
+    assert backend._logbook_roster_leg_completed(cancelled, now=now) is False
+    assert backend._logbook_roster_leg_completed(cancelled_text, now=now) is False
+    assert backend._logbook_roster_leg_completed(
+        prediction_only, now=now) is False
+    assert backend._logbook_roster_leg_completed(
+        plan_only, now=now,
+        proof={'actual_arr_iso': '2026-08-03T18:44:00Z'}) is True
+    assert backend._logbook_roster_leg_completed(
+        plan_only, now=now,
+        proof={'explicit_user_entry': True}) is True
+    assert backend._logbook_roster_leg_completed(
+        cancelled, now=now,
+        proof={'explicit_user_entry': True}) is True
+    assert backend._logbook_roster_leg_completed(
+        cancelled, now=now,
+        proof={'historical_import': True}) is True
+
+
+def test_measured_arrival_from_facts_rejects_frozen_forecast_and_status_only():
+    good = {
+        'est_arr': '2026-08-03T18:45:00Z', 'arr_status': 'landed',
+        'arr_esti_changed_at': '2026-08-03T18:45:30Z',
+    }
+    frozen = dict(good, arr_esti_changed_at='2026-08-03T17:00:00Z')
+    no_terminal = dict(good, arr_status='expected')
+    no_stamp = {'est_arr': good['est_arr'], 'arr_status': 'landed'}
+    assert backend._logbook_measured_arrival_from_facts(good) == \
+        '2026-08-03T18:45:00Z'
+    assert backend._logbook_measured_arrival_from_facts(frozen) is None
+    assert backend._logbook_measured_arrival_from_facts(no_terminal) is None
+    assert backend._logbook_measured_arrival_from_facts(no_stamp) is None
+
+
+def test_completed_only_merge_hides_future_roster_but_keeps_import(monkeypatch):
+    days = {'2026-08-03': {'ical_sectors': [
+        {'flight': 'LH2129', 'from': 'DRS', 'to': 'MUC',
+         'dep_iso': '2026-08-03T17:50:00Z',
+         'arr_iso': '2026-08-03T18:45:00Z',
+         'est_arr_iso': '2026-08-03T18:44:00Z', 'arr_measured': True},
+        {'flight': 'LH586', 'from': 'MUC', 'to': 'CAI',
+         'dep_iso': '2026-08-03T20:05:00Z',
+         'arr_iso': '2026-08-04T00:05:00Z',
+         'est_arr_iso': '2026-08-04T00:09:00Z', 'arr_measured': True},
+    ]}}
+    imported = {'legs': [{
+        'date': '2027-01-01', 'flight': 'OLD1', 'from': 'FRA', 'to': 'MUC',
+        'dep_iso': '2027-01-01T10:00:00Z',
+        'arr_iso': '2027-01-01T11:00:00Z', 'block_min': 60,
+    }]}
+    monkeypatch.setattr(backend, '_manual_briefings_load', lambda _t: days)
+    monkeypatch.setattr(backend, '_ical_briefings_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_import_load', lambda _t: imported)
+    now = datetime(2026, 8, 3, 18, 58, tzinfo=timezone.utc)
+
+    legs = backend._logbook_merged_legs(
+        TOKEN, completed_roster_only=True, now=now)
+
+    assert [x['flight'] for x in legs] == ['LH2129', 'OLD1']
+
+
+def test_get_logbook_never_materializes_plan_only_month_rows(monkeypatch):
+    now = datetime.now(timezone.utc)
+    day = now.date().isoformat()
+    past = (now - timedelta(minutes=10)).isoformat().replace('+00:00', 'Z')
+    future = (now + timedelta(hours=2)).isoformat().replace('+00:00', 'Z')
+    days = {day: {'ical_sectors': [
+        {'flight': 'LH1', 'from': 'FRA', 'to': 'MUC',
+         'dep_iso': (now - timedelta(hours=2)).isoformat(),
+         'arr_iso': past},                         # nur Plan → unsichtbar
+        {'flight': 'LH2', 'from': 'MUC', 'to': 'FRA',
+         'dep_iso': (now - timedelta(hours=1)).isoformat(),
+         'arr_iso': past, 'est_arr_iso': past, 'arr_measured': True},
+        {'flight': 'LH3', 'from': 'FRA', 'to': 'CAI',
+         'dep_iso': now.isoformat(), 'arr_iso': future,
+         'est_arr_iso': future, 'arr_measured': True},
+    ]}}
+    queued = []
+    monkeypatch.setattr(backend, '_manual_briefings_load', lambda _t: days)
+    monkeypatch.setattr(backend, '_ical_briefings_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_import_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_overlay_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_facts_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_enrich_async',
+                        lambda _t, wanted: queued.extend(wanted))
+
+    with backend.app.test_request_context():
+        response = backend.get_logbook(TOKEN).get_json()
+
+    assert [e['flight'] for e in response['entries']] == ['LH2']
+    assert 'LH1' in [w[1] for w in queued]  # Beleg wird nur im Hintergrund gesucht.
+    assert 'LH3' not in [w[1] for w in queued]  # Zukunft kostet keinen API-Call.
+
+
 def test_logbook_entries_and_totals():
     _seed()
     r = _get()
@@ -90,6 +210,32 @@ def test_by_type_aggregation():
     assert bt['32N']['legs'] == 1 and bt['32N']['block_min'] == 60
     # nach block_min absteigend sortiert
     assert r['by_type'][0]['type'] == '346'
+
+
+def test_discover_a330_variants_share_one_group_and_landing_implies_pf():
+    _seed()
+    discover = {'legs': [
+        {'date': '2023-01-01', 'flight': '4Y1', 'from': 'FRA', 'to': 'CUN',
+         'block_min': 600, 'type': '333', 'ldg_day': 1},
+        {'date': '2023-01-03', 'flight': '4Y2', 'from': 'CUN', 'to': 'FRA',
+         'block_min': 570, 'type': '33Y', 'ldg_night': 1, 'pf': False},
+        {'date': '2023-01-05', 'flight': '4Y3', 'from': 'FRA', 'to': 'PHL',
+         'block_min': 510, 'type': '332'},
+    ]}
+    _seed_import(discover)
+
+    r = _get()
+
+    imported = [x for x in r['entries'] if x.get('source') == 'import']
+    assert [x['type'] for x in imported] == ['333', '33Y', '332']
+    by_type = {x['type']: x for x in r['by_type']}
+    assert by_type['A330'] == {
+        'type': 'A330', 'legs': 3, 'block_min': 1680, 'landings': 2,
+    }
+    entries = {x['flight']: x for x in imported}
+    assert entries['4Y1']['pf'] is True       # aus eigener Landung abgeleitet
+    assert entries['4Y2']['pf'] is False      # explizites PM bleibt erhalten
+    assert entries['4Y3']['pf'] is None       # ohne Landung nichts erfinden
 
 
 def test_save_and_readback_overlay():

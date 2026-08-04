@@ -7128,6 +7128,407 @@ SESSION_HOURS = 24  # Session-Token nur 24h gültig — Datenschutz-First
 import secrets as _secrets
 SESSION_SECRET = os.environ.get('SESSION_SECRET') or _secrets.token_hex(32)
 
+
+# ── Öffentliche User-Referenzen (Security-Review 2026-08-03) ────────────────
+# Ein AT-Token ist historisch gleichzeitig User-Key und Bearer-Credential. Viele
+# Social-Endpunkte lieferten den fremden AT-Wert deshalb als `token`/
+# `friend_token` an den Client aus. Das machte Discovery zu einem Credential-
+# Leak. Eine sofortige Tabellenmigration aller Friend-/DM-/Group-Edges wäre
+# unnötig riskant: intern dürfen die bestehenden Keys unverändert bleiben. An
+# der HTTP-Grenze wird ein FREMDER User stattdessen als deterministische,
+# authentifiziert verschlüsselte AXU-Referenz dargestellt und beim nächsten
+# Request wieder aufgelöst. Swift/Android behandeln die ID schon immer als
+# opaken String; Darstellung und Bedienung bleiben damit unverändert.
+_PUBLIC_USER_REF_PREFIX = 'AXU-'
+_PUBLIC_USER_REF_AAD = b'aerox-public-user-ref-v1'
+_INTERNAL_USER_TOKEN_RE = re.compile(r'AT-[A-Fa-f0-9]{16}')
+_PUBLIC_USER_REF_PATH_PREFIXES = (
+    '/api/user/search',
+    '/api/user/contacts-match',
+    '/api/user/lookup-by-short/',
+    '/api/user/profile/',
+    '/api/user/friends/',
+    '/api/user/friend-requests/',
+    '/api/user/friend-roster/',
+    '/api/user/friend-passport/',
+    '/api/user/friends-today/',
+    '/api/user/friends-homebases/',
+    '/api/user/friend-groups/',
+    '/api/user/friend-compare/',
+    '/api/user/crew-here/',
+    '/api/user/crew-at-destination/',
+    '/api/crew-chat/',
+    '/api/crew-graph/',
+    '/api/crew/flight/',
+    '/api/flight/',
+    '/api/wall/',
+    '/api/forum/',
+    '/api/layover-recs/',
+    '/api/layover-group/',
+    '/api/layover-web/',
+    '/api/lh/flightops/crewlist/',
+    '/api/lh/flightops/sim-crewlist/',
+    '/api/feed-status/',
+    '/api/family-request/',
+    '/api/family-share/',
+    '/api/moderation/',
+    '/api/push/prefs',
+    '/api/ax/punctuality/',
+    '/api/trade/',
+    '/api/ax/smp/',
+)
+_PUBLIC_USER_REF_BODY_KEYS = frozenset((
+    'friend_token', 'target_token', 'sender_token', 'recipient_token',
+    'from_token', 'to_token', 'mentioned_token', 'family_token', 'crew_token',
+))
+_PUBLIC_USER_REF_BODY_LIST_KEYS = frozenset(('member_tokens', 'members'))
+
+
+def _public_user_ref_key():
+    """64-Byte-AES-SIV-Key, stabil über alle Produktionsinstanzen.
+
+    RECOVERY_SECRET ist im Produktionsboot bereits Pflicht und persistent. Der
+    per-Prozess SESSION_SECRET bleibt ausschließlich ein lokaler Test-Fallback.
+    """
+    try:
+        secret = _recovery_pepper()
+    except Exception:
+        secret = ''
+    material = ((secret or SESSION_SECRET) + '|public-user-ref-v1').encode()
+    return _hashlib.sha512(material).digest()
+
+
+_CALENDAR_FEED_URL_PREFIX = 'AXF1-'
+_CALENDAR_FEED_URL_AAD = b'aerox-calendar-feed-url-v1|'
+_CALENDAR_FEED_CONTAINER_KEYS = frozenset(('calendar_feed', 'calendar_feed_2'))
+_CALENDAR_FEED_SECRET_FIELDS = ('url', 'pickup_ical_url')
+
+
+def _calendar_feed_url_key():
+    """Eigener 256-Bit-Schlüsselbereich; stabil, aber getrennt von Public IDs."""
+    try:
+        secret = _recovery_pepper()
+    except Exception:
+        secret = ''
+    material = ((secret or SESSION_SECRET) + '|calendar-feed-url-v1').encode()
+    return _hashlib.sha256(material).digest()
+
+
+def _calendar_feed_encrypt_value(value, field='url'):
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        nonce = os.urandom(12)
+        aad = _CALENDAR_FEED_URL_AAD + str(field).encode('utf-8')
+        blob = nonce + AESGCM(_calendar_feed_url_key()).encrypt(
+            nonce, raw.encode('utf-8'), aad)
+        return (_CALENDAR_FEED_URL_PREFIX
+                + base64.urlsafe_b64encode(blob).decode('ascii').rstrip('='))
+    except Exception:
+        return ''
+
+
+def _calendar_feed_decrypt_value(value, field='url'):
+    enc = str(value or '').strip()
+    if not enc.startswith(_CALENDAR_FEED_URL_PREFIX):
+        return ''
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        token = enc[len(_CALENDAR_FEED_URL_PREFIX):]
+        token += '=' * (-len(token) % 4)
+        blob = base64.urlsafe_b64decode(token.encode('ascii'))
+        if len(blob) < 29:  # 12-byte nonce + at least 1 byte + 16-byte tag
+            return ''
+        nonce, ciphertext = blob[:12], blob[12:]
+        aad = _CALENDAR_FEED_URL_AAD + str(field).encode('utf-8')
+        return AESGCM(_calendar_feed_url_key()).decrypt(
+            nonce, ciphertext, aad).decode('utf-8')
+    except Exception:
+        return ''
+
+
+def _calendar_feed_urls_encrypt_payload(value):
+    """Kopie für Persistenz: Feed-Links raus, AEAD-Ciphertexte rein.
+
+    Bestehender Ciphertext wird wiederverwendet, wenn er zum Klartext passt;
+    dadurch erzeugt ein fachlich unveränderter Profil-Save keinen Zufalls-Diff.
+    """
+    import copy as _copy
+    out = _copy.deepcopy(value)
+
+    def protect_feed(feed):
+        for field in _CALENDAR_FEED_SECRET_FIELDS:
+            enc_field = f'{field}_enc'
+            if field not in feed:
+                continue
+            raw = str(feed.get(field) or '').strip()
+            if not raw:
+                # Leere Werte sind kein Geheimnis, gehören aber zum bisherigen
+                # internen Feed-Vertrag (z. B. direkter PDF/ICS-Import mit
+                # ``url == ''``). Beibehalten verhindert, dass reine
+                # At-rest-Verschlüsselung das geladene Profil semantisch ändert.
+                feed[field] = ''
+                feed.pop(enc_field, None)
+                continue
+            existing = str(feed.get(enc_field) or '')
+            if _calendar_feed_decrypt_value(existing, field) != raw:
+                existing = _calendar_feed_encrypt_value(raw, field)
+            if not existing:
+                raise RuntimeError('calendar_feed_url_encrypt_failed')
+            feed[enc_field] = existing
+            feed.pop(field, None)
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, item in list(obj.items()):
+                if key in _CALENDAR_FEED_CONTAINER_KEYS and isinstance(item, dict):
+                    protect_feed(item)
+                walk(item)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(out)
+    return out
+
+
+def _calendar_feed_urls_decrypt_payload(value):
+    """Kopie für interne Leser; manipulierte Ciphertexte bleiben unbrauchbar."""
+    import copy as _copy
+    out = _copy.deepcopy(value)
+
+    def reveal_feed(feed):
+        for field in _CALENDAR_FEED_SECRET_FIELDS:
+            if str(feed.get(field) or '').strip():
+                continue  # Legacy-Klartext bis zum nächsten regulären Save.
+            raw = _calendar_feed_decrypt_value(feed.get(f'{field}_enc'), field)
+            if raw:
+                feed[field] = raw
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for key, item in list(obj.items()):
+                if key in _CALENDAR_FEED_CONTAINER_KEYS and isinstance(item, dict):
+                    reveal_feed(item)
+                walk(item)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(out)
+    return out
+
+
+def _public_user_ref(token):
+    """Verschlüsselt ein internes AT-Credential zu einer stabilen Public-ID."""
+    value = str(token or '').strip()
+    if not value or value.startswith(_PUBLIC_USER_REF_PREFIX):
+        return value
+    # Reguläre AeroX-User-Credentials sind exakt AT- + 16 Hex-Zeichen. Die
+    # strengere Form ist wichtig: Chat-/Forum-Antworten enthalten absichtlich
+    # gekürzte Anzeigen wie ``AT-B379F`` und Nachrichtentext darf ebenfalls mit
+    # ``AT-`` beginnen. Beides ist keine Identität und muss bytegleich bleiben.
+    if not _INTERNAL_USER_TOKEN_RE.fullmatch(value):
+        return value
+    # Guest-/Family-Scoped-Tokens sind kurzlebige eigene Credentials und keine
+    # Discovery-IDs. Sie werden nie als fremde Crew-ID ausgegeben.
+    if value.startswith(('AT-GUEST-', 'AT-FAM-')):
+        return value
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESSIV
+        blob = AESSIV(_public_user_ref_key()).encrypt(
+            value.encode('utf-8'), [_PUBLIC_USER_REF_AAD])
+        return (_PUBLIC_USER_REF_PREFIX
+                + base64.urlsafe_b64encode(blob).decode('ascii').rstrip('='))
+    except Exception:
+        # Fail-closed: nie das Credential als vermeintlichen Fallback leaken.
+        return ''
+
+
+def _token_from_public_user_ref(value):
+    """Entschlüsselt AXU-Referenz; None bei Manipulation/falschem Key."""
+    ref = str(value or '').strip()
+    if not ref.startswith(_PUBLIC_USER_REF_PREFIX):
+        return None
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESSIV
+        encoded = ref[len(_PUBLIC_USER_REF_PREFIX):]
+        encoded += '=' * (-len(encoded) % 4)
+        raw = base64.urlsafe_b64decode(encoded.encode('ascii'))
+        token = AESSIV(_public_user_ref_key()).decrypt(
+            raw, [_PUBLIC_USER_REF_AAD]).decode('utf-8')
+        if not _INTERNAL_USER_TOKEN_RE.fullmatch(token):
+            return None
+        return token
+    except Exception:
+        return None
+
+
+def _public_legacy_prefix_ref(value):
+    """Nicht reversible ID für historische, bereits gekürzte Token-Anzeigen.
+
+    Bei diesen Altwerten fehlen Teile des Credentials; eine AXU-Rückübersetzung
+    ist mathematisch unmöglich. Ein keyed Digest hält Autor-Gruppierung stabil,
+    ohne die fast vollständige Bearer-Vorlage weiter an Clients zu geben.
+    """
+    raw = str(value or '').strip()
+    if not raw:
+        return raw
+    digest = hmac.new(_public_user_ref_key(), b'legacy-prefix|' + raw.encode(),
+                      _hashlib.sha256).hexdigest()[:24]
+    return 'AXP-' + digest
+
+
+def _public_user_ref_or_legacy_display(value, prefix_len=16):
+    """Produktiv AXU; nicht-produktive Alt-/Fixture-IDs behalten ihre Wire-Form."""
+    raw = str(value or '')
+    public = _public_user_ref(raw)
+    if public != raw:
+        return public
+    return raw[:prefix_len] + ('…' if len(raw) > prefix_len else '')
+
+
+def _resolve_user_reference(value):
+    """AXU → internes AT; Legacy-AT läuft während der Migration unverändert."""
+    raw = str(value or '').strip()
+    if raw.startswith(_PUBLIC_USER_REF_PREFIX):
+        return _token_from_public_user_ref(raw)
+    return raw
+
+
+def _publicize_foreign_user_refs(value, viewer_token=None):
+    """Ersetzt fremde AT-Credentials rekursiv, lässt das eigene Credential stehen."""
+    if isinstance(value, dict):
+        safe = {}
+        for key, nested in value.items():
+            public_key = key
+            if (isinstance(key, str)
+                    and _INTERNAL_USER_TOKEN_RE.fullmatch(key)
+                    and not (viewer_token
+                             and hmac.compare_digest(key, viewer_token))):
+                public_key = _public_user_ref(key)
+            safe[public_key] = _publicize_foreign_user_refs(
+                nested, viewer_token)
+        return safe
+    if isinstance(value, list):
+        return [_publicize_foreign_user_refs(v, viewer_token) for v in value]
+    if isinstance(value, tuple):
+        return [_publicize_foreign_user_refs(v, viewer_token) for v in value]
+    if isinstance(value, str) and _INTERNAL_USER_TOKEN_RE.fullmatch(value):
+        if viewer_token and hmac.compare_digest(value, viewer_token):
+            return value
+        return _public_user_ref(value)
+    return value
+
+
+@app.before_request
+def _resolve_public_user_refs_at_boundary():
+    """Löst Public-IDs nur in TARGET-Feldern, niemals als Owner/Auth-Ersatz auf."""
+    try:
+        # Flask hat das Routing vor before_request abgeschlossen. Der Owner heißt
+        # in allen bestehenden Routen `token` und bleibt absichtlich unberührt;
+        # nur Gegenüber-Argumente werden entschlüsselt.
+        if request.view_args:
+            for key, value in list(request.view_args.items()):
+                # Einzige zulässige AXU-Position im historischen `token`-Slot:
+                # öffentlicher GET eines fremden Profils. Owner-Routen dürfen
+                # AXU niemals als Ersatz für das Bearer-gebundene Pfad-Token
+                # akzeptieren.
+                public_profile_target = (
+                    key == 'token'
+                    and request.endpoint == 'get_user_profile'
+                    and request.method in ('GET', 'HEAD')
+                )
+                if (key == 'token' and not public_profile_target) or not isinstance(value, str):
+                    continue
+                if value.startswith(_PUBLIC_USER_REF_PREFIX):
+                    resolved = _token_from_public_user_ref(value)
+                    if resolved:
+                        request.view_args[key] = resolved
+        # get_json() cached das Dict; In-place-Mutation ist danach für die Route
+        # sichtbar. Nur bekannte Cross-User-Keys anfassen, nie body.token.
+        if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.is_json:
+            body = request.get_json(silent=True)
+            if isinstance(body, dict):
+                for key in _PUBLIC_USER_REF_BODY_KEYS:
+                    value = body.get(key)
+                    if isinstance(value, str) and value.startswith(_PUBLIC_USER_REF_PREFIX):
+                        resolved = _token_from_public_user_ref(value)
+                        if resolved:
+                            body[key] = resolved
+                for key in _PUBLIC_USER_REF_BODY_LIST_KEYS:
+                    values = body.get(key)
+                    if not isinstance(values, list):
+                        continue
+                    for index, value in enumerate(values):
+                        if isinstance(value, str) and value.startswith(
+                                _PUBLIC_USER_REF_PREFIX):
+                            resolved = _token_from_public_user_ref(value)
+                            if resolved:
+                                values[index] = resolved
+                # Crew-Graph-Ingest ist die einzige bestehende verschachtelte
+                # Wire-Form: {crew_list:[{token:<Friend-ID>, ...}]}. Die Root-
+                # `token`-Property bleibt weiterhin tabu (Owner/Auth), nur der
+                # explizite Member-Slot wird rückübersetzt.
+                crew_list = body.get('crew_list')
+                if isinstance(crew_list, list):
+                    for member in crew_list:
+                        if not isinstance(member, dict):
+                            continue
+                        value = member.get('token')
+                        if isinstance(value, str) and value.startswith(
+                                _PUBLIC_USER_REF_PREFIX):
+                            resolved = _token_from_public_user_ref(value)
+                            if resolved:
+                                member['token'] = resolved
+                # Push-Freundpräferenzen sind historisch als
+                # {<friend-token>:{...}} gekeyt. GET publicisiert auch Dict-Keys;
+                # beim POST müssen AXU-Keys zurück auf den internen Edge-Key.
+                friend_prefs = body.get('friend_prefs')
+                if isinstance(friend_prefs, dict):
+                    resolved_prefs = {}
+                    for friend_ref, pref in friend_prefs.items():
+                        internal = (_token_from_public_user_ref(friend_ref)
+                                    if isinstance(friend_ref, str)
+                                    and friend_ref.startswith(
+                                        _PUBLIC_USER_REF_PREFIX)
+                                    else None)
+                        resolved_prefs[internal or friend_ref] = pref
+                    body['friend_prefs'] = resolved_prefs
+    except Exception:
+        # Ungültige/manipulierte Referenzen bleiben opak und scheitern später am
+        # normalen not-found/not-friends-Gate. Niemals auf einen fremden User raten.
+        pass
+
+
+@app.after_request
+def _hide_foreign_user_credentials(response):
+    """Kein fremdes AT-Credential verlässt Social-/Discovery-JSON-Endpunkte."""
+    try:
+        path = request.path or ''
+        if not any(path.startswith(p) for p in _PUBLIC_USER_REF_PATH_PREFIXES):
+            return response
+        if response.direct_passthrough or not response.is_json:
+            return response
+        payload = response.get_json(silent=True)
+        if payload is None:
+            return response
+        viewer = _request_bearer_token()
+        safe = _publicize_foreign_user_refs(payload, viewer_token=viewer)
+        response.set_data(json.dumps(safe, ensure_ascii=False, separators=(',', ':')))
+        response.headers['Content-Type'] = 'application/json; charset=utf-8'
+        response.headers['Content-Length'] = str(len(response.get_data()))
+    except Exception as exc:
+        # Fail-closed für diese Endpunkte: wenn Redaction selbst scheitert, darf
+        # die ursprüngliche Credential-haltige Antwort nicht ausgeliefert werden.
+        app.logger.error('[public-user-ref] response redaction failed: %s',
+                         type(exc).__name__)
+        response = jsonify({'ok': False, 'error': 'public_ref_unavailable'})
+        response.status_code = 503
+    return response
+
 def _make_session_token(job_id):
     """Generiert kurzlebigen Session-Token nach erfolgreicher Auswertung."""
     secret = SESSION_SECRET
@@ -10042,7 +10443,7 @@ def _profile_load_from_supabase(token):
         # „zuletzt aktiv" (last_seen_iso) auf SB-primary-Hosting funktioniert.
         if row.get('updated_at') is not None:
             prof['_updated_at'] = row.get('updated_at')
-        return prof
+        return _calendar_feed_urls_decrypt_payload(prof)
     except Exception as e:
         app.logger.warning(
             f'[profile] sb_load_fail tok={token[:8]} err={type(e).__name__}: {str(e)[:120]}'
@@ -10216,7 +10617,7 @@ def _profile_save_to_supabase(token, profile):
     _avatar_cache_invalidate(token)
     if not SB_AVAILABLE or not token:
         return False
-    profile = profile or {}
+    profile = _calendar_feed_urls_encrypt_payload(profile or {})
     row = {'token': token, 'updated_at': datetime.now(timezone.utc).isoformat()}
     meta = {}
     for k, v in profile.items():
@@ -10285,7 +10686,8 @@ def _profile_load_from_disk(token):
         return {'token': token, 'profile': {}}
     try:
         with open(p) as f:
-            return json.load(f) or {'token': token, 'profile': {}}
+            loaded = json.load(f) or {'token': token, 'profile': {}}
+            return _calendar_feed_urls_decrypt_payload(loaded)
     except FileNotFoundError:
         return {'token': token, 'profile': {}}
     except Exception:
@@ -10605,7 +11007,8 @@ def _profile_save(token, profile, full_disk_payload=None):
             '_updated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
         try:
-            _atomic_write_json(p, payload)
+            _atomic_write_json(
+                p, _calendar_feed_urls_encrypt_payload(payload))
             disk_ok = True
         except Exception as e:
             app.logger.warning(f'[profile] disk_save_fail tok={token[:8]}: {e}')
@@ -15924,7 +16327,10 @@ def get_friends_homebases(token):
         hb = (pr.get('homebase') or '').upper().strip()
         if not hb or len(hb) != 3: hb = '???'
         grouped[hb].append({
-            'token': fr[:16] + '…',  # truncate for privacy
+            # Voll funktionsfähige opake Public-ID. Die frühere 16-Zeichen-
+            # Kürzung ließ bei einem 19-Zeichen-Token nur 3 Hex-Zeichen offen
+            # und war damit in 4096 Versuchen zum Bearer zurückrechenbar.
+            'token': _public_user_ref_or_legacy_display(fr),
             # NAME-FIX (Owner 2026-07-13): kein erfundener 'Friend'-Platzhalter —
             # leerer Name bleibt ehrlich '' (iOS lässt ihn dann weg).
             'name': pr.get('name') or '',
@@ -17622,7 +18028,7 @@ def get_friends_today(token):
             except Exception:
                 crew_state_next = None
         return (_idx, {
-            'token': fr[:16] + '…',
+            'token': _public_user_ref_or_legacy_display(fr),
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔
             # FriendToday hierüber (vorher: truncated token != voller Token aus
             # /friends → CrewMap-Pins fanden ihr Profil nie). Kein Token-Leak.
@@ -20685,7 +21091,7 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
                         f'[feed-refresh] tok={token[:8]} status={r.status}')
             except Exception as e:
                 app.logger.warning(
-                    f'[feed-refresh] tok={token[:8]} fail {type(e).__name__}: {str(e)[:120]}')
+                    f'[feed-refresh] tok={token[:8]} fail {type(e).__name__}')
 
         _req_threading.Thread(target=_do_refresh, daemon=True).start()
     except Exception:
@@ -20823,14 +21229,16 @@ def _logbook_facts_path(token):
 
 
 def _logbook_facts_load(token):
-    """Angereicherte Reg/Typ pro Leg-Key: {key: {reg, type, at}}.
+    """Angereicherte Fakten pro Leg-Key: {key: {reg, type, actual_arr_iso, at}}.
 
     Zweck (2026-07-27): die LH-/Board-Anreicherung aus dem REQUEST-PFAD
     nehmen. Vorher rief `get_logbook` bis zu 60x `_flight_facts_from_obs`
     synchron auf — bei einem Roster mit vielen Legs ohne Reg/Typ waren das
     kalt bis zu 67 s (Florian Zäpernick, 117 Legs ohne Muster), und der Edge
     bricht bei ~20 s mit einer 404-Seite ab. Jetzt liest der Request nur noch
-    diesen Cache; gefüllt wird er vom Hintergrund-Worker."""
+    diesen Cache; gefüllt wird er vom Hintergrund-Worker. `actual_arr_iso`
+    wird nur gesetzt, wenn eine terminale Ankunft UND ein zeitlich plausibler
+    Beobachtungsstempel dieselbe Ankunft belegen — nie aus dem Fahrplan."""
     import os
     try:
         pth = _logbook_facts_path(token)
@@ -20855,8 +21263,46 @@ def _logbook_facts_save(token, facts):
     return False
 
 
+def _logbook_measured_arrival_from_facts(facts):
+    """Gemessene Ankunft aus Board-Fakten oder ``None`` (rein, fail-closed).
+
+    Ein terminaler Text wie ``landed`` genügt nicht: tägliche Flugnummern und
+    eingefrorene Prognosen können einen falschen Status tragen. Die Ankunftszeit
+    muss vorhanden sein und ihr DB-Beobachtungsstempel darf nicht vor der
+    behaupteten Landung liegen (kleine Poll-/Schreib-Toleranz wie im Feed).
+    """
+    if not isinstance(facts, dict) or facts.get('cancelled') is True:
+        return None
+    arrival = facts.get('est_arr')
+    if not isinstance(arrival, str) or not arrival.strip():
+        return None
+    try:
+        if not _arr_status_terminal(facts.get('arr_status')):
+            return None
+    except Exception:
+        return None
+    observed = facts.get('arr_esti_changed_at') or facts.get('arr_obs_at')
+    if not isinstance(observed, str) or not observed.strip():
+        return None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        arr = _dt.fromisoformat(arrival.strip().replace('Z', '+00:00'))
+        obs = _dt.fromisoformat(observed.strip().replace('Z', '+00:00'))
+        if arr.tzinfo is None or obs.tzinfo is None:
+            return None
+        # Ein Poll kann wenige Minuten vor dem echten IN-Instant schreiben;
+        # mehr Spielraum würde wieder eine Prognose als Messung durchlassen.
+        settle_min = float(globals().get('_ARR_OBS_SETTLE_MIN', 3) or 3)
+        if (obs.astimezone(_tz.utc) - arr.astimezone(_tz.utc)).total_seconds() \
+                < -settle_min * 60:
+            return None
+        return arr.astimezone(_tz.utc).isoformat().replace('+00:00', 'Z')
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _logbook_enrich_async(token, wanted):
-    """Fehlende Reg/Typ IM HINTERGRUND nachziehen und persistieren.
+    """Fehlende Reg/Typ/Ankunftsbelege IM HINTERGRUND nachziehen.
 
     `wanted`: Liste (key, flight, date, from, to). Pro Token läuft höchstens
     EIN Worker (sonst feuern parallele App-Aufrufe dieselben LH-Calls, und
@@ -20887,18 +21333,23 @@ def _logbook_enrich_async(token, wanted):
                 except Exception:
                     f = {}
                 reg, actype = f.get('reg'), f.get('type')
+                actual_arr_iso = _logbook_measured_arrival_from_facts(f)
                 # Auch das leere Ergebnis festhalten (mit Zeitstempel): sonst
                 # fragt jeder Folge-Request dieselben unauflösbaren Legs neu
                 # an — das war der eigentliche Dauerbrenner.
-                facts[key] = {'reg': reg or None, 'type': actype or None,
-                              'at': int(_t.time())}
-                if reg or actype:
+                facts[key] = {
+                    'reg': reg or None, 'type': actype or None,
+                    'actual_arr_iso': actual_arr_iso,
+                    'at': int(_t.time()),
+                }
+                if reg or actype or actual_arr_iso:
                     found += 1
             _logbook_facts_save(token, facts)
             app.logger.info(
                 f'[logbook] enrich-bg tok={token[:8]} '
                 f'{len(wanted[:_LOGBOOK_ENRICH_CAP])} Legs geprüft, '
-                f'{found} mit Reg/Typ, {max(0, len(wanted) - _LOGBOOK_ENRICH_CAP)} '
+                f'{found} mit Reg/Typ/Ankunft, '
+                f'{max(0, len(wanted) - _LOGBOOK_ENRICH_CAP)} '
                 f'bleiben für den nächsten Aufruf')
         except Exception as e:
             app.logger.warning(f'[logbook] enrich-bg fail tok={token[:8]} '
@@ -20924,6 +21375,19 @@ def _logbook_block_min(dep_iso, arr_iso):
         return m if 0 < m < 20 * 60 else None
     except Exception:
         return None
+
+
+def _logbook_type_group(raw_type):
+    """Flugzeugmuster für die Flugbuch-Statistik vereinheitlichen.
+
+    Die Discover-CrewAccess-Codes 332/333/33Y bezeichnen Varianten derselben
+    A330-Familie. Pro Leg bleibt der gelieferte Rohcode erhalten; nur die
+    Muster-Summen werden unter dem für Crews verständlichen Namen gruppiert.
+    """
+    t = re.sub(r'[^A-Z0-9]', '', str(raw_type or '').upper())
+    if t in {'332', '333', '33Y', 'A332', 'A333', 'A33Y'}:
+        return 'A330'
+    return t or '—'
 
 
 # ── Flugbuch-Import-Store ───────────────────────────────────────────────────
@@ -21035,7 +21499,56 @@ def _logbook_airport_norm(code):
     return ''
 
 
-def _logbook_merged_legs(token, require_flight=True):
+def _logbook_roster_leg_completed(sec, now=None, proof=None):
+    """True nur mit einem belastbaren Beleg für ein abgeschlossenes Roster-Leg.
+
+    Ein Dienstplan ist zunächst eine Planung, kein Flugnachweis. Für das
+    Cockpit-Flugbuch reicht deshalb ein Datum im aktuellen Monat nicht: die
+    absolute Ankunft muss vorbei sein und ein Storno darf nie materialisiert
+    werden. Ein abgelaufener Fahrplan ist ausdrücklich KEIN Flugnachweis.
+    Zulässig sind nur eine als gemessen markierte Sektor-Ankunft, eine zuvor
+    konservierte Beobachtungs-/Landing-Report-Ankunft oder ein bereits bewusst
+    gespeichertes User-Overlay dieses Legs.
+
+    Historische Import-Legs laufen nicht durch dieses Gate — sie stammen aus
+    einem bewusst eingespielten Alt-Flugbuch und nicht aus dem Roster.
+    """
+    if not isinstance(sec, dict):
+        return False
+    p = proof if isinstance(proof, dict) else {}
+    # Niemals bewusst gespeicherte Nutzer-/Importdaten durch einen späteren
+    # Roster-Status entkernen. Diese Werte sind bereits materialisierte Historie,
+    # nicht die automatische Monatsplan-Vorbelegung, gegen die dieses Gate schützt.
+    if p.get('explicit_user_entry') is True or p.get('historical_import') is True:
+        return True
+    status = str(sec.get('status') or '').strip().lower()
+    if sec.get('cancelled') is True or any(x in status for x in (
+            'cancel', 'annull', 'storn')):
+        return False
+    if sec.get('arr_measured') is True:
+        arrival = sec.get('est_arr_iso')
+    elif p.get('actual_arr_iso'):
+        arrival = p.get('actual_arr_iso')
+    else:
+        return False
+    if not isinstance(arrival, str) or not arrival.strip():
+        return False
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        arr = _dt.fromisoformat(arrival.strip().replace('Z', '+00:00'))
+        if arr.tzinfo is None:
+            return False
+        ref = now or _dt.now(_tz.utc)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=_tz.utc)
+        return arr <= ref
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _logbook_merged_legs(token, require_flight=True,
+                         completed_roster_only=False, now=None,
+                         completion_proofs=None):
     """DIE EINE gemergte Leg-Quelle: Roster-Sektoren + importiertes Alt-Flugbuch.
 
     Geteilt von `get_logbook` UND `_passport_stats_compute` (Owner 2026-07-28:
@@ -21052,6 +21565,8 @@ def _logbook_merged_legs(token, require_flight=True):
       * Dedupe über `_logbook_leg_key`; bei Kollision gewinnt das ROSTER-Leg,
         das Import-Leg hängt als `imp` dran (Landungen/PF/Reg/Typ-Fallback).
       * Ein kaputtes Leg/ein kaputter Tag kippt NIE den Rest (per-Item-Guard).
+      * `completed_roster_only=True` lässt nur belegbar abgeschlossene,
+        nicht stornierte Roster-Legs durch; Import-Historie bleibt vollständig.
     `require_flight` bildet den Flugbuch-Filter ab (Legs ohne Flugnummer
     erscheinen nicht im FCL.050-Buch, zählen im Passport aber als Flug).
 
@@ -21118,6 +21633,11 @@ def _logbook_merged_legs(token, require_flight=True):
                 if not frm or not to or (require_flight and not flight):
                     continue
                 key = _logbook_leg_key(date, flight, frm, to)
+                proof = ((completion_proofs or {}).get(key)
+                         if isinstance(completion_proofs, dict) else None)
+                if completed_roster_only and not _logbook_roster_leg_completed(
+                        s, now=now, proof=proof):
+                    continue
                 seen.add(key)
                 out.append({
                     'key': key, 'date': date, 'flight': flight,
@@ -21165,7 +21685,12 @@ def get_logbook(token):
     # Dedupe über den Leg-Key, Roster gewinnt — aber Landungen/PF/Nacht/Reg/Typ
     # aus dem Import bleiben als Fallback am Roster-Leg erhalten (sonst verlöre
     # ein Überlapp-Leg seine CSV-Landungen).
-    merged = _logbook_merged_legs(token, require_flight=True)
+    #
+    # WICHTIG: zunächst verlustfrei mergen, DANACH anhand echter Belege filtern.
+    # So können auch noch unsichtbare, gerade gelandete Legs im Hintergrund ihre
+    # Ankunfts-Fakten bekommen; ein Fahrplan allein materialisiert niemals eine
+    # Flugbuch-Zeile.
+    all_merged = _logbook_merged_legs(token, require_flight=True)
     try:
         imp = _logbook_import_load(token) or {}
     except Exception:
@@ -21177,7 +21702,89 @@ def get_logbook(token):
     facts_cache = _logbook_facts_load(token)
     import time as _lb_t
     _now_ts = _lb_t.time()
+    from datetime import datetime as _lb_dt, timezone as _lb_tz, timedelta as _lb_td
+    _now_dt = _lb_dt.now(_lb_tz.utc)
+
+    completion_proofs = {}
+    for _key, _fact in facts_cache.items():
+        if isinstance(_fact, dict):
+            completion_proofs[_key] = dict(_fact)
+    for _key, _ov in overlay.items():
+        if isinstance(_ov, dict) and _ov:
+            completion_proofs.setdefault(_key, {})['explicit_user_entry'] = True
+    for _lg in all_merged:
+        if isinstance(_lg.get('imp'), dict) and _lg.get('imp'):
+            completion_proofs.setdefault(_lg.get('key'), {})[
+                'historical_import'] = True
+
+    # Der LH Landing Report ist ein zusätzlicher, bereits gecachter
+    # Abschlussbeleg. Der Read ist lokal/einmalig und enthält ausschließlich
+    # gemeinsame Flug-Fakten; das personengebundene `self_landed` bleibt in der
+    # FlightOps-Schicht und fließt hier NICHT ein.
+    try:
+        from blueprints.lh_flightops import logbook_cached_completion_proofs
+        _cands = [{'flight': lg.get('flight'), 'date': lg.get('date'),
+                   'dep': lg.get('from')}
+                  for lg in all_merged if lg.get('source') == 'roster']
+        _proof_targets = {}
+        for _lg in all_merged:
+            if _lg.get('source') != 'roster':
+                continue
+            _tk = (_lg.get('flight'), _lg.get('date'), _lg.get('from'))
+            _proof_targets.setdefault(_tk, []).append(_lg.get('key'))
+        for _tuple_key, _actual in logbook_cached_completion_proofs(_cands).items():
+            for _target_key in _proof_targets.get(_tuple_key, []):
+                completion_proofs.setdefault(_target_key, {})[
+                    'actual_arr_iso'] = _actual
+    except Exception:
+        pass
+
+    merged = [lg for lg in all_merged
+              if lg.get('source') == 'import'
+              or _logbook_roster_leg_completed(
+                  lg.get('sec'), now=_now_dt,
+                  proof=completion_proofs.get(lg.get('key')))]
+
+    # Aktuellen Monat im Hintergrund beweisbasiert vervollständigen. Mehr als
+    # 35 Tage werden hier bewusst nicht angefasst: historische Karriere-Daten
+    # kommen aus dem expliziten Import, und ein Kaltstart darf keine jahrelange
+    # Board-/FR24-Kaskade lostreten.
     enrich_wanted = []
+    _evidence_cutoff = (_now_dt - _lb_td(days=35)).date()
+    for _lg in all_merged:
+        if _lg.get('source') != 'roster':
+            continue
+        _key = _lg.get('key')
+        _sec = _lg.get('sec') or {}
+        _cached = facts_cache.get(_key)
+        _cached_dict = _cached if isinstance(_cached, dict) else {}
+        _cache_fresh = (bool(_cached_dict)
+                        and (_now_ts - (_cached_dict.get('at') or 0))
+                        < _LOGBOOK_FACTS_TTL_S)
+        _fresh_cached = _cached_dict if _cache_fresh else {}
+        _needs_identity = not (_lg.get('reg') or _fresh_cached.get('reg')) \
+            or not (_lg.get('type') or _fresh_cached.get('type'))
+        _is_completed = _logbook_roster_leg_completed(
+            _sec, now=_now_dt, proof=completion_proofs.get(_key))
+        _needs_completion = not _is_completed
+        try:
+            _leg_day = _lb_dt.strptime(_lg.get('date') or '', '%Y-%m-%d').date()
+        except (TypeError, ValueError):
+            _leg_day = None
+        _recent_due = (_leg_day is not None
+                       and _evidence_cutoff <= _leg_day <= _now_dt.date())
+        _plan_due = False
+        try:
+            _plan_arr = _lb_dt.fromisoformat(
+                str(_sec.get('arr_iso') or '').replace('Z', '+00:00'))
+            _plan_due = (_plan_arr.tzinfo is not None and _plan_arr <= _now_dt)
+        except (TypeError, ValueError):
+            _plan_due = (_leg_day is not None and _leg_day < _now_dt.date())
+        if (not _cache_fresh
+                and ((_is_completed and _needs_identity)
+                     or (_needs_completion and _recent_due and _plan_due))):
+            enrich_wanted.append((_key, _lg.get('flight'), _lg.get('date'),
+                                   _lg.get('from'), _lg.get('to')))
 
     entries = []
     imported_count = 0
@@ -21197,9 +21804,15 @@ def get_logbook(token):
                     (_now_ts - (cached.get('at') or 0)) < _LOGBOOK_FACTS_TTL_S:
                 reg = reg or cached.get('reg')
                 actype = actype or cached.get('type')
-            else:
-                enrich_wanted.append((key, lg['flight'], lg['date'],
-                                      lg['from'], lg['to']))
+        ldg_day = ov.get('ldg_day', iv.get('ldg_day'))
+        ldg_night = ov.get('ldg_night', iv.get('ldg_night'))
+        pf_value = (bool(ov['pf']) if ov.get('pf') is not None
+                    else iv.get('pf'))
+        # Eine belegte eigene Landung bedeutet PF. Alte Flugstunden-Exporte
+        # liefern häufig die Landung, aber keine separate PF-Spalte. Explizite
+        # PF/PM-Werte aus Import oder User-Overlay gewinnen weiterhin.
+        if pf_value is None and (ldg_day or 0) + (ldg_night or 0) > 0:
+            pf_value = True
         row = {
             'key': key, 'date': lg['date'], 'flight': lg['flight'],
             'from': lg['from'], 'to': lg['to'],
@@ -21207,12 +21820,11 @@ def get_logbook(token):
             'block_min': (lg.get('block_min') if is_import
                           else _logbook_block_min(lg['dep_iso'], lg['arr_iso'])),
             'reg': reg or None, 'type': actype or None,
-            'ldg_day': ov.get('ldg_day', iv.get('ldg_day')),
-            'ldg_night': ov.get('ldg_night', iv.get('ldg_night')),
+            'ldg_day': ldg_day,
+            'ldg_night': ldg_night,
             'to_day': ov.get('to_day', iv.get('to_day')),
             'to_night': ov.get('to_night', iv.get('to_night')),
-            'pf': (bool(ov['pf']) if ov.get('pf') is not None
-                   else iv.get('pf')),
+            'pf': pf_value,
             'night_min': ov.get('night_min', iv.get('night_min')),
             'remarks': ov.get('remarks', iv.get('remarks')),
         }
@@ -21275,7 +21887,7 @@ def get_logbook(token):
         tot_block += bt
         tot_ldg += ld
         dates_seen.add(e['date'])
-        t = e.get('type') or '—'
+        t = _logbook_type_group(e.get('type'))
         agg = by_type.setdefault(t, {'type': t, 'legs': 0, 'block_min': 0, 'landings': 0})
         agg['legs'] += 1
         agg['block_min'] += bt
@@ -23148,7 +23760,7 @@ def admin_wipe_calendar():
         deleted['profile.calendar_feed'] = 'cleared'
     except Exception as e:
         deleted['profile.calendar_feed'] = f'error:{type(e).__name__}'
-        app.logger.warning(f'[wipe-cal] profile_feed_fail: {str(e)[:120]}')
+        app.logger.warning(f'[wipe-cal] profile_feed_fail: {type(e).__name__}')
     # 4) Ephemere Disk-Fallback-Dateien sicherheitshalber löschen.
     try:
         for _p in (_ical_briefings_path(token), _briefing_path(token),
@@ -25252,7 +25864,7 @@ def _crew_dm_materialize_initial(row):
     msg = {
         'id': stable_id,
         'channel_id': ch,
-        'author_token': sender[:16] + '…',
+        'author_token': _chat_author_id(sender),
         'author_name': (pr.get('name') or 'Crew')[:60],
         'author_avatar': pr.get('avatar_url'),
         'text': (row.get('message') or '')[:500],
@@ -25279,6 +25891,12 @@ def _resolve_friend_token(my_token, friend_token):
     funktionierenden Voll-Token-Flow brechen."""
     if not friend_token:
         return friend_token
+    # Neue HTTP-Grenze: Social-Antworten tragen nie mehr das fremde Bearer-
+    # Credential, sondern eine reversible AXU-Public-ID. Vor Prefix-/Legacy-
+    # Auflösung zuerst sicher entschlüsseln.
+    if str(friend_token).startswith(_PUBLIC_USER_REF_PREFIX):
+        decoded = _token_from_public_user_ref(friend_token)
+        return decoded or friend_token
     import re
     cleaned = re.sub(r'[^A-Za-z0-9_-]', '', friend_token)
     if not cleaned:
@@ -25294,6 +25912,20 @@ def _resolve_friend_token(my_token, friend_token):
     if len(matches) == 1:
         return matches[0]                   # eindeutige Prefix-Auflösung → voller Token
     return friend_token                     # nicht eindeutig → unverändert lassen
+
+
+def _chat_author_id(token):
+    """Öffentliche, reversible Chat-Autor-ID für neue Nachrichten."""
+    return _public_user_ref(token)
+
+
+def _chat_author_matches(author_id, token):
+    """Neue AXU- und alte gekürzte Chat-IDs demselben internen User zuordnen."""
+    author = str(author_id or '')
+    raw = str(token or '')
+    if not author or not raw:
+        return False
+    return author in (raw, _chat_author_id(raw), raw[:16] + '…')
 
 
 def _group_id_from_channel(channel_id):
@@ -25371,6 +26003,9 @@ def _chat_author_identities(author_tokens):
             rows = [row for row in (r.data or [])
                     if (row.get('token') or '').startswith(prefix)]
             if len(rows) == 1:
+                full_token = (rows[0].get('token') or '').strip()
+                if _INTERNAL_USER_TOKEN_RE.fullmatch(full_token):
+                    ident['_public_id'] = _chat_author_id(full_token)
                 nm = (rows[0].get('name') or '').strip()
                 if nm:
                     ident['name'] = nm[:60]
@@ -25471,11 +26106,10 @@ def get_chat_messages(token, channel_id):
     # `is_mine` explizit mitgeben → iOS muss nicht mehr den GEKÜRZTEN author_token
     # (token[:16]+'…') prefix-vergleichen (fragil bei Token-Prefix-Kollision).
     # Vergleich gegen DIESELBE Kürzung, mit der gesendet wurde.
-    my_trunc = (token or '')[:16] + '…'
     out = []
     for m in msgs[-100:]:
         mm = dict(m)
-        mm['is_mine'] = (m.get('author_token') == my_trunc)
+        mm['is_mine'] = _chat_author_matches(m.get('author_token'), token)
         # iOS-CONTRACT-FIX (DM „Nachricht nicht im Verlauf sichtbar", 2026-06-29):
         # author_token MUSS im Payload bleiben — das iOS-`ChatMessage`-Struct
         # deklariert `author_token` als NICHT-optionales Feld. Der vorige
@@ -25490,8 +26124,14 @@ def get_chat_messages(token, channel_id):
         # (token[:16]+'…') wird ausgeliefert, nie der volle Token — defensiv
         # re-truncaten falls eine Legacy-Zeile doch einen längeren Wert trägt.
         at = m.get('author_token') or ''
-        if at and ('…' not in at) and len(at) > 17:
+        if at.startswith('AT-') and ('…' not in at) and len(at) > 17:
             at = at[:16] + '…'
+        if _chat_author_matches(at, token):
+            at = _chat_author_id(token)
+        elif at.startswith('AT-'):
+            resolved_author = _resolve_friend_token(token, at)
+            if _INTERNAL_USER_TOKEN_RE.fullmatch(str(resolved_author or '')):
+                at = _chat_author_id(resolved_author)
         mm['author_token'] = at
         # Token-Leak-Fix: alte Photo-Messages tragen Legacy-Bild-URLs (mit
         # vollem Token) im Text → auf den opaken Key umschreiben.
@@ -25532,10 +26172,17 @@ def get_chat_messages(token, channel_id):
                 mm.pop('author_avatar', None)
             # ident leer = Autor nicht auflösbar → Stempel bleibt, das ist die
             # ehrlichere Anzeige als gar kein Avatar.
+            if ident.get('_public_id'):
+                mm['author_token'] = ident['_public_id']
     except Exception as e:
         # Namen sind Beiwerk — ein Fehler hier darf den Verlauf nie kosten.
         app.logger.warning(
             f'[chat] author_backfill_fail err={type(e).__name__}: {str(e)[:120]}')
+    # Historische Zeilen ohne eindeutig auflösbares Profil enthalten noch
+    # token[:16] — also nur 4096 mögliche Volltokens. Niemals mehr ausliefern.
+    for mm in out:
+        if str(mm.get('author_token') or '').startswith('AT-'):
+            mm['author_token'] = _public_legacy_prefix_ref(mm['author_token'])
     return jsonify({'channel': channel_id, 'messages': out})
 
 
@@ -25569,11 +26216,11 @@ def send_chat_message(token, channel_id):
     # Retry nach unklarem Transport-Ausgang: dieselbe Client-Operation darf
     # niemals eine zweite Chat-Nachricht und einen zweiten Push erzeugen.
     if client_message_id:
-        my_author = token[:16] + '…'
+        my_author = _chat_author_id(token)
         for existing in reversed(_dm_load_messages(channel_id) or []):
             if (
                 existing.get('client_message_id') == client_message_id
-                and existing.get('author_token') == my_author
+                and _chat_author_matches(existing.get('author_token'), token)
             ):
                 if existing.get('text') != text:
                     return jsonify({
@@ -25590,7 +26237,7 @@ def send_chat_message(token, channel_id):
         msg = {
             'id': str(uuid.uuid4())[:12],
             'channel_id': channel_id,
-            'author_token': token[:16] + '…',
+            'author_token': _chat_author_id(token),
             'text': text,
             'ts': time.time(),
             'iso': datetime.now().isoformat(),
@@ -25669,7 +26316,6 @@ def _soft_delete_chat_message(token, channel_id, message_id):
     import time
     if not message_id:
         return jsonify({'ok': False, 'error': 'message_id_required'}), 400
-    my_trunc = (token or '')[:16] + '…'
     try:
         msgs = _dm_load_messages(channel_id) or []
         found = None
@@ -25680,7 +26326,7 @@ def _soft_delete_chat_message(token, channel_id, message_id):
         if found is None:
             # Schon weg/nie existiert → idempotent ok (Client soll nicht retryen).
             return jsonify({'ok': True, 'already_gone': True})
-        if found.get('author_token') != my_trunc:
+        if not _chat_author_matches(found.get('author_token'), token):
             return jsonify({'ok': False, 'error': 'not_author'}), 403
         if found.get('deleted'):
             return jsonify({'ok': True, 'already_deleted': True})
@@ -26417,7 +27063,6 @@ def get_dm_inbox(token):
     # `token[:16] + "…"`. Beim Vergleich hier muessen wir gegen dieselbe
     # truncated Form pruefen — sonst zaehlt jede eigene Message faelschlich
     # als unread (Bug pre-2026-05-31).
-    my_author_id = (token[:16] + '…') if token else ''
     import time as _t
     now = _t.time()
     for friend_token in friends:
@@ -26441,7 +27086,8 @@ def get_dm_inbox(token):
                 last_msg = chat_msgs[-1]
                 seen_ts = float(last_seen.get(ch) or 0)
                 unread = sum(1 for m in chat_msgs
-                             if m.get('author_token') != my_author_id
+                             if not _chat_author_matches(
+                                 m.get('author_token'), token)
                              and float(m.get('ts') or 0) > seen_ts)
             for m in msgs:
                 if m.get('kind') != 'goodflight':
@@ -26449,7 +27095,7 @@ def get_dm_inbox(token):
                 ts = float(m.get('ts') or 0)
                 if ts <= now - 86400:   # 24h-TTL wie beim Family-Feed-Status
                     continue
-                if m.get('author_token') == my_author_id:
+                if _chat_author_matches(m.get('author_token'), token):
                     if gf_out is None or ts > float(gf_out.get('ts') or 0):
                         gf_out = m
                 else:
@@ -26462,7 +27108,8 @@ def get_dm_inbox(token):
             'channel_id': ch,
             'last_message_at': (last_msg or {}).get('ts'),
             'last_message_preview': ((last_msg or {}).get('text') or '')[:80],
-            'last_message_from_me': (last_msg or {}).get('author_token') == my_author_id,
+            'last_message_from_me': _chat_author_matches(
+                (last_msg or {}).get('author_token'), token),
             'unread_count': unread,
         }
         # Additiv (iOS-Codable-sicher, alte Clients ignorieren die Felder):
@@ -34238,7 +34885,11 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
                 try:
                     kwargs = {
                         'data': {'type': payload_type, 'channel_id': cid,
-                                 'from': author_token},
+                                 # `data` landet 1:1 auf dem fremden Gerät. Der
+                                 # DM-Tap kann AXU über die normale HTTP-Grenze
+                                 # zurückgeben; das Bearer-Credential darf hier
+                                 # dagegen nie den Empfänger erreichen.
+                                 'from': _public_user_ref(author_token)},
                         'thread_id': cid,
                         'badge': 1,
                         'idempotency_key': (f'chat:{message_id}:{rcpt}'
@@ -47744,11 +48395,12 @@ def _crew_punctuality_leaderboard(token, year, month, min_sample=3):
 
 
 def _punct_trunc_token(tok, is_me):
-    """Privacy: rohe Friend-Tokens NIE ausliefern. 'self' für den Aufrufer,
-    'tok:<10>…' (truncated) für alle anderen."""
+    """Privacy: 'self' für den Aufrufer, reversible AXU-ID für alle anderen."""
     if is_me:
         return 'self'
-    return 'tok:' + (str(tok or '')[:10]) + '…'
+    public = _public_user_ref(tok)
+    return (public if public != str(tok or '')
+            else 'tok:' + str(tok or '')[:10] + '…')
 
 
 def _punct_is_stale(cached_p, max_age_h=6):
@@ -48688,7 +49340,598 @@ def _ics_split_escaped(value):
     return parts
 
 
-def _ics_parse_dt(value, params):
+_ICS_WINDOWS_TZ_MAP = {
+    # Häufige Outlook/Exchange-TZIDs. VTIMEZONE hat Vorrang; diese Map ist der
+    # robuste Fallback für Feeds, die nur den Windows-Namen mitsenden.
+    'W. EUROPE STANDARD TIME': 'Europe/Berlin',
+    'CENTRAL EUROPE STANDARD TIME': 'Europe/Budapest',
+    'GMT STANDARD TIME': 'Europe/London',
+    'E. EUROPE STANDARD TIME': 'Europe/Chisinau',
+    'EASTERN STANDARD TIME': 'America/New_York',
+    'CENTRAL STANDARD TIME': 'America/Chicago',
+    'MOUNTAIN STANDARD TIME': 'America/Denver',
+    'PACIFIC STANDARD TIME': 'America/Los_Angeles',
+    'CHINA STANDARD TIME': 'Asia/Shanghai',
+    'TOKYO STANDARD TIME': 'Asia/Tokyo',
+    'SINGAPORE STANDARD TIME': 'Asia/Singapore',
+    'ARABIAN STANDARD TIME': 'Asia/Dubai',
+}
+
+
+def _ics_unquote_param(value):
+    v = str(value or '').strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        return v[1:-1]
+    return v
+
+
+def _ics_parse_dt(value, params, tz_lookup=None):
+    """Parse DTSTART/DTEND-Value zu (utc_dt | None, local_date_str | None,
+    is_date_only, local_hhmm | None). Bucket = LOKAL nach TZID (siehe F1).
+    All-Day → utc_dt=None. `local_hhmm` = Wanduhr-Zeit im Bucket (für die
+    Mitternachts-Exklusiv-Erkennung, SWISS-F2) — None bei DATE-only.
+
+    Akzeptiert: 20260315T140000Z (UTC) · 20260315T140000+0200 (Offset) ·
+    20260315T140000 (floating/TZID) · 20260315 (DATE-only). Quoted TZID,
+    VTIMEZONE-Auflösungen und verbreitete Windows-Zonen werden berücksichtigt.
+    """
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _zi_ok = True
+    except Exception:
+        _ZI = None  # type: ignore
+        _zi_ok = False
+    v = (value or '').strip()
+    if not v:
+        return None, None, False, None
+    # DATE-only (all-day events): "20260315"
+    if len(v) == 8 and v.isdigit():
+        return None, f'{v[0:4]}-{v[4:6]}-{v[6:8]}', True, None
+    # DATETIME: Sekunden sind laut RFC üblich, einige Provider lassen sie weg.
+    # UTC-Z oder numerischer Offset sind beide gültige reale Feed-Varianten.
+    m = re.match(
+        r'^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?'
+        r'(Z|[+-]\d{4})?$', v, flags=re.IGNORECASE)
+    if not m:
+        # Fallback: erstes 8-stellige Datum aus dem String ziehen
+        digits = re.sub(r'\D', '', v)[:8]
+        if len(digits) == 8:
+            return None, f'{digits[0:4]}-{digits[4:6]}-{digits[6:8]}', True, None
+        return None, None, False, None
+    Y, M, D, h, mi, s, zone_suffix = m.groups()
+    s = s or '00'
+    try:
+        naive = datetime(int(Y), int(M), int(D), int(h), int(mi), int(s))
+    except Exception:
+        return None, None, False, None
+    tzid = _ics_unquote_param((params or {}).get('TZID'))
+    if zone_suffix and zone_suffix.upper() == 'Z':
+        # Explicit UTC. Lokaler Bucket = User-TZ; LH-Crew nutzt typischerweise
+        # Berlin/Frankfurt als Operations-TZ, also fallback auf Europe/Berlin.
+        # ACHTUNG (Audit 2026-07-31, Befund 1): für LH-FLUG-Legs ist das die
+        # FALSCHE Tageszuordnung (LH keyed amtlich den UTC-Tag; 22:30Z = 00:30
+        # CEST rollte den Flug auf den Folgetag) — _lh_rebucket_utc_flight_days
+        # korrigiert diese Events nach dem Parsen aufs UTC-Datum. Nicht-Flug-
+        # Events (Boden-Termine, Off-Tage) bleiben bewusst Berlin-gebuckert.
+        if _zi_ok:
+            try:
+                utc_dt = naive.replace(tzinfo=_ZI('UTC'))
+                local = utc_dt.astimezone(_ZI('Europe/Berlin'))
+                return (utc_dt, local.strftime('%Y-%m-%d'), False,
+                        local.strftime('%H:%M'))
+            except Exception:
+                pass
+        return naive, f'{Y}-{M}-{D}', False, naive.strftime('%H:%M')
+    if zone_suffix and re.fullmatch(r'[+-]\d{4}', zone_suffix):
+        try:
+            sign = 1 if zone_suffix[0] == '+' else -1
+            off = timedelta(hours=int(zone_suffix[1:3]),
+                            minutes=int(zone_suffix[3:5])) * sign
+            aware = naive.replace(tzinfo=timezone(off))
+            utc_dt = aware.astimezone(timezone.utc)
+            return (utc_dt, aware.strftime('%Y-%m-%d'), False,
+                    aware.strftime('%H:%M'))
+        except Exception:
+            return None, None, False, None
+    if tzid:
+        try:
+            tzinfo = None
+            if isinstance(tz_lookup, dict):
+                tzinfo = tz_lookup.get(tzid)
+            if tzinfo is None and _zi_ok:
+                mapped = _ICS_WINDOWS_TZ_MAP.get(tzid.upper(), tzid)
+                tzinfo = _ZI(mapped)
+            if tzinfo is None:
+                raise ValueError('timezone unavailable')
+            aware = naive.replace(tzinfo=tzinfo)
+            utc_zone = _ZI('UTC') if _zi_ok else timezone.utc
+            utc_dt = aware.astimezone(utc_zone)
+            # F1: bucket = LOKAL-Datum (aware), nicht UTC-Datum.
+            return (utc_dt, aware.strftime('%Y-%m-%d'), False,
+                    aware.strftime('%H:%M'))
+        except Exception:
+            return naive, f'{Y}-{M}-{D}', False, naive.strftime('%H:%M')
+    # Floating local time: bucket = wie geschrieben.
+    return naive, f'{Y}-{M}-{D}', False, naive.strftime('%H:%M')
+
+
+def _ics_parse_rrule(value):
+    """Parse RRULE-Value zu dict {FREQ, INTERVAL, COUNT, UNTIL, BYDAY, ...}."""
+    rr = {}
+    for part in (value or '').split(';'):
+        if '=' in part:
+            rk, _, rv = part.partition('=')
+            rr[rk.strip().upper()] = rv.strip()
+    return rr
+
+
+def _ics_local_naive_from_value(value):
+    """ICS DATE/DATE-TIME → naive Wanduhrzeit für die Recurrence-Engine."""
+    v = str(value or '').strip()
+    m = re.match(r'^(\d{8})(?:T(\d{2})(\d{2})(\d{2})?)?', v)
+    if not m:
+        return None
+    try:
+        day, hh, mm, ss = m.groups()
+        return datetime.strptime(
+            day + (hh or '00') + (mm or '00') + (ss or '00'),
+            '%Y%m%d%H%M%S')
+    except Exception:
+        return None
+
+
+def _ics_occurrence_value(template, occurrence):
+    """Schreibt eine neue Wanduhrzeit in derselben ICS-Shape wie template."""
+    raw = str(template or '').strip()
+    if len(raw) == 8 and raw.isdigit():
+        return occurrence.strftime('%Y%m%d')
+    suffix = ''
+    if raw.upper().endswith('Z'):
+        suffix = 'Z'
+    else:
+        m = re.search(r'([+-]\d{4})$', raw)
+        if m:
+            suffix = m.group(1)
+    has_seconds = bool(re.match(r'^\d{8}T\d{6}', raw))
+    return occurrence.strftime('%Y%m%dT%H%M%S' if has_seconds
+                               else '%Y%m%dT%H%M') + suffix
+
+
+def _ics_expand_rrule(master, max_per_event=100, tz_lookup=None):
+    """Expandiere RRULE-Master zu Liste von occurrence-event-dicts.
+
+    F4: COUNT=N inkludiert das Master-Event — wir produzieren also N-1
+    zusätzliche Expansions, nicht N.
+
+    dateutil übernimmt RFC-nahe DAILY/WEEKLY/MONTHLY/YEARLY/BY*-Regeln. AeroX
+    begrenzt weiterhin auf 366 Tage und 100 zusätzliche Instanzen pro Master.
+    Absolute start_iso/end_iso werden für JEDE Instanz neu berechnet — ein
+    wiederholter Flug verliert dadurch nicht mehr seinen Sektor.
+    """
+    from itertools import islice
+    try:
+        from dateutil.rrule import rrulestr
+    except Exception:
+        return []
+    raw_rule = master.get('_rrule_raw') or ''
+    start_value = master.get('_dtstart_value') or ''
+    base = _ics_local_naive_from_value(start_value)
+    if not raw_rule or base is None:
+        return []
+    # dateutil verlangt bei naive DTSTART ein ebenfalls naives UNTIL. Für die
+    # reine Wanduhr-Expansion ist das Z nur eine Endgrenze; die echte UTC-
+    # Konvertierung jeder Instanz geschieht danach mit DTSTART-Parametern.
+    local_rule = re.sub(r'(UNTIL=\d{8}T\d{4,6})Z(?=;|$)', r'\1',
+                        raw_rule, flags=re.IGNORECASE)
+    try:
+        rule = rrulestr(local_rule, dtstart=base)
+    except Exception:
+        return []
+    max_dt = base + timedelta(days=366)
+    occurrences = []
+    try:
+        # +2: Master selbst + genug Raum für einen durch Grenzfilter verlorenen
+        # Wert. islice verhindert auch bei einer endlosen Regel CPU-Loops.
+        for occurrence in islice(rule, max_per_event + 2):
+            if occurrence <= base:
+                continue
+            if occurrence > max_dt:
+                break
+            occurrences.append(occurrence)
+            if len(occurrences) >= max_per_event:
+                break
+    except Exception:
+        return []
+
+    out = []
+    base_end = _ics_local_naive_from_value(master.get('_dtend_value'))
+    wall_delta = (base_end - base) if base_end is not None else None
+    for occurrence in occurrences:
+        clone = {k: v for k, v in master.items()
+                 if k not in ('_rrule', '_rrule_raw', 'start_iso', 'end_iso',
+                              'start', 'end', '_multiday_dates')}
+        new_start_value = _ics_occurrence_value(start_value, occurrence)
+        start_dt, start_bucket, start_is_date, start_hhmm = _ics_parse_dt(
+            new_start_value, master.get('_dtstart_params') or {}, tz_lookup)
+        if start_bucket:
+            clone['start'] = start_bucket
+        if start_dt is not None:
+            clone['start_iso'] = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        clone['_is_date_only_start'] = start_is_date
+        clone['_dtstart_value'] = new_start_value
+
+        if base_end is not None and wall_delta is not None:
+            new_end_wall = occurrence + wall_delta
+            new_end_value = _ics_occurrence_value(
+                master.get('_dtend_value'), new_end_wall)
+            end_dt, end_bucket, end_is_date, end_hhmm = _ics_parse_dt(
+                new_end_value, master.get('_dtend_params') or {}, tz_lookup)
+            if end_bucket:
+                clone['end'] = end_bucket
+            if end_dt is not None:
+                clone['end_iso'] = end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            clone['_is_date_only_end'] = end_is_date
+            clone['_end_local_midnight'] = (not end_is_date
+                                             and end_hhmm == '00:00')
+            clone['_dtend_value'] = new_end_value
+        else:
+            clone['end'] = clone.get('start')
+        clone['_recurrence_of'] = master.get('start')
+        clone['_recurrence_local_key'] = occurrence.strftime('%Y-%m-%dT%H:%M:%S')
+        out.append(clone)
+    return out
+
+
+def _ics_multiday_dates(ev):
+    """Liefert die Liste lokaler Datums-Strings, an denen das Event den User
+    beschäftigt. F2: Multi-Day-Tour Jun 25 → Jun 27 → [Jun 25, Jun 26, Jun 27].
+    F3: All-Day DTEND-exclusiv → Jun 15 (DTEND Jun 16) = [Jun 15].
+
+    Bei fehlendem DTEND: nur Start-Tag.
+    """
+    from datetime import timedelta as _td
+    start = ev.get('start')
+    end = ev.get('end')
+    if not start or not re.match(r'^\d{4}-\d{2}-\d{2}$', start):
+        return []
+    try:
+        s_d = datetime.strptime(start, '%Y-%m-%d').date()
+    except Exception:
+        return []
+    if not end or not re.match(r'^\d{4}-\d{2}-\d{2}$', end):
+        return [start]
+    try:
+        e_d = datetime.strptime(end, '%Y-%m-%d').date()
+    except Exception:
+        return [start]
+    # All-Day → DTEND ist exklusiv (RFC 5545 §3.8.2.2).
+    # Timed → DTEND ist der Zeitpunkt, der Tag selbst zählt noch zur Tour.
+    # F2 (SWISS): TIMED-DTEND exakt auf lokal 00:00 = exklusive Schreibweise
+    # („bis 24:00") → der End-Bucket-Tag zählt NICHT (Krank/Ferien war sonst
+    # 1 Tag zu lang — steuerrelevant).
+    inclusive_end = e_d
+    if ev.get('_is_date_only_end') or ev.get('_end_local_midnight'):
+        inclusive_end = e_d - _td(days=1)
+    if inclusive_end < s_d:
+        return [start]
+    days = []
+    cur = s_d
+    safety = 0
+    while cur <= inclusive_end and safety < 32:
+        days.append(cur.strftime('%Y-%m-%d'))
+        cur = cur + _td(days=1)
+        safety += 1
+    return days or [start]
+
+
+def _ics_local_recurrence_key(value):
+    """Normalisierte lokale Instanz-ID für RECURRENCE-ID/EXDATE/Expansion."""
+    naive = _ics_local_naive_from_value(value)
+    if naive is None:
+        return None
+    raw = str(value or '').strip()
+    if len(raw) == 8 and raw.isdigit():
+        return naive.strftime('%Y-%m-%d')
+    return naive.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def _ics_revision_rank(ev):
+    """RFC-Revisionsrang: SEQUENCE, dann LAST-MODIFIED/DTSTAMP, dann Feed-Reihenfolge."""
+    try:
+        sequence = int(ev.get('_sequence') or 0)
+    except (TypeError, ValueError):
+        sequence = 0
+    modified = str(ev.get('_last_modified') or ev.get('_dtstamp') or '')
+    return sequence, modified, int(ev.get('_source_order') or 0)
+
+
+def _ics_resolve_event_revisions(raw_events):
+    """Wählt pro UID+RECURRENCE-ID nur die neueste veröffentlichte Revision."""
+    chosen = {}
+    passthrough = []
+    for index, ev in enumerate(raw_events or []):
+        ev['_source_order'] = index
+        uid = str(ev.get('uid') or '').strip()
+        if not uid:
+            passthrough.append(ev)
+            continue
+        instance = ev.get('_recurrence_local_key') or '__master__'
+        key = (uid, instance)
+        previous = chosen.get(key)
+        if previous is None or _ics_revision_rank(ev) >= _ics_revision_rank(previous):
+            chosen[key] = ev
+    ordered = passthrough + list(chosen.values())
+    ordered.sort(key=lambda ev: int(ev.get('_source_order') or 0))
+    return ordered
+
+
+def _parse_ics_to_events_v2(text):
+    """Parser-Kern (pure function). Liefert Liste von Event-Dicts mit Keys:
+    start (lokal yyyy-mm-dd), end, start_iso (UTC), end_iso (UTC),
+    summary, location, _multiday_dates, _rrule (falls vorhanden).
+
+    Pure, ohne Flask-Context — testbar via tests/fixtures/lh_synthetic.ics.
+    """
+    raw_events = []
+    # dateutil.tzical versteht eingebettete VTIMEZONE-Regeln. Ein kaputtes oder
+    # fehlendes VTIMEZONE darf bekannte IANA-TZIDs nicht beeinträchtigen.
+    tz_lookup = {}
+    try:
+        from dateutil.tz import tzical as _tzical
+        parsed_tz = _tzical(io.StringIO(text or ''))
+        for tz_name in parsed_tz.keys():
+            tz_lookup[tz_name] = parsed_tz.get(tz_name)
+    except Exception:
+        tz_lookup = {}
+    current = None
+    for raw_line in _ics_unfold_lines(text):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == 'BEGIN:VEVENT':
+            current = {'_cancelled': False}
+        elif line == 'END:VEVENT' and current is not None:
+            if current:
+                # Multi-Day-Expansion (F2/F3): Datumsliste merken.
+                current['_multiday_dates'] = _ics_multiday_dates(current)
+                # CANCELLED-Ausnahmen müssen bis zur Recurrence-Auflösung
+                # erhalten bleiben; erst danach werden sie entfernt.
+                raw_events.append(current)
+            current = None
+        elif current is not None and ':' in line:
+            name_part, _, value = line.partition(':')
+            segs = name_part.split(';')
+            k = segs[0].upper()
+            params = {}
+            for seg in segs[1:]:
+                if '=' in seg:
+                    pk, _, pv = seg.partition('=')
+                    params[pk.strip().upper()] = pv.strip()
+            v = value.strip()
+            if k == 'SUMMARY':
+                current['summary'] = v[:120]
+            elif k == 'UID':
+                # RFC-5545-UID (LEON-Zwei-Feed-Merge, AeroWest 2026-07-20):
+                # stabiler Schlüssel fürs Dedupe, wenn Duty- und Off-Days-
+                # Kalender dasselbe VEVENT tragen. Additiv — alle bestehenden
+                # Konsumenten ignorieren unbekannte Event-Keys.
+                current['uid'] = v[:120]
+            elif k == 'SEQUENCE':
+                try:
+                    current['_sequence'] = max(0, int(v.strip()))
+                except (TypeError, ValueError):
+                    current['_sequence'] = 0
+            elif k == 'DTSTAMP':
+                current['_dtstamp'] = v[:40]
+            elif k == 'LAST-MODIFIED':
+                current['_last_modified'] = v[:40]
+            elif k == 'RECURRENCE-ID':
+                current['_recurrence_id_value'] = v[:80]
+                current['_recurrence_id_params'] = dict(params)
+                current['_recurrence_local_key'] = _ics_local_recurrence_key(v)
+                rec_dt, rec_bucket, rec_is_date, _ = _ics_parse_dt(
+                    v, params, tz_lookup)
+                if rec_dt is not None:
+                    current['_recurrence_id_iso'] = rec_dt.strftime(
+                        '%Y-%m-%dT%H:%M:%SZ')
+                elif rec_bucket:
+                    current['_recurrence_id_iso'] = rec_bucket
+            elif k == 'DESCRIPTION':
+                # SWISS trägt hier die EXPLIZITE Report-/Dep-/Arr-Zeit
+                # ("Reporting time: 11:15 (09:15Z)…"). RFC-5545-Zeilenfaltung ist
+                # via _ics_unfold_lines schon entfernt; literale \n bleiben drin.
+                current['description'] = v[:400]
+            elif k == 'LOCATION':
+                current['location'] = v[:80]
+            # ── AeroX-X-Props (Welle 0 „LH-Gratis-Ernte", 2026-07-31) ────────
+            # Der LH-FlightOps-ICS-Builder hängt Fakten an, die in den ohnehin
+            # geholten LH-Antworten liegen und im SUMMARY nichts verloren haben
+            # (der ist iOS-Regex-Kontrakt). Additiv: Feeds ohne diese Props
+            # bleiben byte-identisch, alle bestehenden Konsumenten ignorieren
+            # unbekannte Event-Keys.
+            elif k == 'X-AEROX-DH':
+                if v.strip() in ('1', 'true', 'TRUE', 'True'):
+                    current['ax_dh'] = True
+            elif k == 'X-AEROX-ACCHG':
+                if v.strip() in ('1', 'true', 'TRUE', 'True'):
+                    current['ax_ac_change'] = True
+            elif k == 'X-AEROX-DOS':
+                try:
+                    _dos = int(v.strip())
+                except (TypeError, ValueError):
+                    _dos = None
+                if _dos is not None and 1 <= _dos <= 99:
+                    current['ax_day_of_shift'] = _dos
+            elif k == 'X-AEROX-HOTEL':
+                _hn = v.strip()[:60]
+                if _hn:
+                    current['ax_hotel'] = _hn
+            elif k == 'X-AEROX-INCOMPLETE':
+                _reason = v.strip()[:40]
+                if _reason:
+                    current['ax_incomplete'] = _reason
+            elif k == 'STATUS':
+                if v.upper() == 'CANCELLED':
+                    current['_cancelled'] = True
+            elif k == 'DTSTART':
+                current['_dtstart_value'] = v[:80]
+                current['_dtstart_params'] = dict(params)
+                utc_dt, bucket, is_date, _hhmm = _ics_parse_dt(v, params, tz_lookup)
+                if bucket:
+                    current['start'] = bucket
+                if utc_dt is not None:
+                    current['start_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                current['_is_date_only_start'] = is_date
+                # AUDIT 2026-07-31 Befund 1: explizites UTC ('…Z' OHNE TZID)
+                # markieren — NUR solche Events darf
+                # _lh_rebucket_utc_flight_days aufs UTC-Datum umkeyen. Events
+                # mit TZID sind BEWUSST stations-lokal gebuckert (F1/PDF-Pfad)
+                # und bleiben unangetastet.
+                current['_utc_z_start'] = bool(
+                    not is_date and not (params or {}).get('TZID')
+                    and v.strip().upper().endswith('Z'))
+            elif k == 'DTEND':
+                current['_dtend_value'] = v[:80]
+                current['_dtend_params'] = dict(params)
+                utc_dt, bucket, is_date, _hhmm = _ics_parse_dt(v, params, tz_lookup)
+                if bucket:
+                    current['end'] = bucket
+                if utc_dt is not None:
+                    current['end_iso'] = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                current['_is_date_only_end'] = is_date
+                current['_utc_z_end'] = bool(
+                    not is_date and not (params or {}).get('TZID')
+                    and v.strip().upper().endswith('Z'))
+                # F2 (SWISS Krank/Ferien): ein TIMED-DTEND, das lokal auf
+                # 00:00 fällt (SWISS schreibt „bis 24:00" als Folgetag-Mitter-
+                # nacht, z.B. KRANK DTEND 20260623T220000Z = 24.06 00:00 CEST),
+                # ist faktisch EXKLUSIV — der End-Bucket-Tag gehört NICHT mehr
+                # zum Event. _ics_multiday_dates zieht ihn dann ab.
+                current['_end_local_midnight'] = (not is_date
+                                                  and _hhmm == '00:00')
+            elif k == 'CATEGORIES':
+                # RFC 5545 §3.8.1.2: CATEGORIES ist comma-separated. Escaped
+                # commas (\,) zählen als Literal. Werte werden lowercased +
+                # gestripped damit Downstream-Mapping case-insensitive ist.
+                # Mehrfach-CATEGORIES-Zeilen pro Event sind erlaubt und werden
+                # akkumuliert.
+                cats_raw = _ics_split_escaped(v)
+                cats = [c.strip().lower() for c in cats_raw if c and c.strip()]
+                if cats:
+                    if 'categories' in current and isinstance(current['categories'], list):
+                        # Akkumulieren bei wiederholter CATEGORIES-Zeile (dedupe).
+                        seen = set(current['categories'])
+                        for c in cats:
+                            if c not in seen:
+                                current['categories'].append(c)
+                                seen.add(c)
+                    else:
+                        current['categories'] = cats
+            elif k == 'RRULE':
+                rr = _ics_parse_rrule(v)
+                if rr:
+                    current['_rrule'] = rr
+                    current['_rrule_raw'] = v[:500]
+            elif k == 'EXDATE':
+                keys = current.setdefault('_exdate_keys', set())
+                for excluded in _ics_split_escaped(v):
+                    local_key = _ics_local_recurrence_key(excluded)
+                    if local_key:
+                        keys.add(local_key)
+                    ex_dt, ex_bucket, _is_date, _ = _ics_parse_dt(
+                        excluded, params, tz_lookup)
+                    if ex_dt is not None:
+                        keys.add(ex_dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
+                    elif ex_bucket:
+                        keys.add(ex_bucket)
+
+    # Zuerst Revisionen auflösen. Danach bilden RECURRENCE-ID-Events die
+    # Ausnahmen eines Masters (verschoben oder CANCELLED), nicht eigene Dubletten.
+    parsed_events = _ics_resolve_event_revisions(raw_events)
+    exceptions = {}
+    for ev in parsed_events:
+        uid = ev.get('uid')
+        rec_key = ev.get('_recurrence_local_key')
+        if uid and rec_key:
+            exceptions.setdefault(uid, {})[rec_key] = ev
+
+    events = []
+    handled_exceptions = set()
+    expanded = []
+    total_cap = 1000
+    for ev in parsed_events:
+        if ev.get('_recurrence_local_key'):
+            continue
+        if ev.get('_cancelled'):
+            continue
+        # DTSTART ist selbst die erste Instanz des Recurrence-Sets. EXDATE oder
+        # eine RECURRENCE-ID-Ausnahme darf deshalb auch genau diese Master-
+        # Instanz entfernen/verschieben; sie ungeprüft anzuhängen erzeugte sonst
+        # eine Geisterschicht bzw. ein doppeltes erstes Leg.
+        base_key = _ics_local_recurrence_key(ev.get('_dtstart_value'))
+        exclusion_keys = set(ev.get('_exdate_keys') or ())
+        base_excluded = (
+            base_key in exclusion_keys
+            or ev.get('start_iso') in exclusion_keys
+            or ev.get('start') in exclusion_keys
+        )
+        base_exception = ((exceptions.get(ev.get('uid')) or {}).get(base_key)
+                          if base_key else None)
+        if base_exception is not None:
+            handled_exceptions.add((ev.get('uid'), base_key))
+            if not base_exception.get('_cancelled'):
+                base_exception['_multiday_dates'] = _ics_multiday_dates(
+                    base_exception)
+                events.append(base_exception)
+        elif not base_excluded:
+            events.append(ev)
+        if not ev.get('_rrule'):
+            continue
+        try:
+            new_evs = _ics_expand_rrule(ev, tz_lookup=tz_lookup)
+        except Exception:
+            new_evs = []
+        if not new_evs:
+            continue
+        room = total_cap - len(expanded)
+        if room <= 0:
+            break
+        # Expansions auch durch Multi-Day-Expansion schicken.
+        for ne in new_evs[:room]:
+            local_key = ne.get('_recurrence_local_key')
+            if (local_key in exclusion_keys
+                    or ne.get('start_iso') in exclusion_keys
+                    or ne.get('start') in exclusion_keys):
+                continue
+            exception = (exceptions.get(ev.get('uid')) or {}).get(local_key)
+            if exception is not None:
+                handled_exceptions.add((ev.get('uid'), local_key))
+                if not exception.get('_cancelled'):
+                    exception['_multiday_dates'] = _ics_multiday_dates(exception)
+                    expanded.append(exception)
+                continue
+            ne['_multiday_dates'] = _ics_multiday_dates(ne)
+            expanded.append(ne)
+    # Verschobene RECURRENCE-ID ohne expandierbaren Master nicht verlieren;
+    # CANCELLED-Instanzen bleiben dagegen reine Tombstones.
+    for ev in parsed_events:
+        key = (ev.get('uid'), ev.get('_recurrence_local_key'))
+        if (ev.get('_recurrence_local_key') and key not in handled_exceptions
+                and not ev.get('_cancelled')):
+            events.append(ev)
+    for ev in events:
+        for private_key in ('_rrule', '_rrule_raw', '_cancelled', '_source_order',
+                            '_exdate_keys'):
+            ev.pop(private_key, None)
+    for ev in expanded:
+        for private_key in ('_rrule', '_rrule_raw', '_cancelled', '_source_order',
+                            '_exdate_keys'):
+            ev.pop(private_key, None)
+    events.extend(expanded)
+    return events
+
+
+def _legacy_ics_parse_dt(value, params):
     """Parse DTSTART/DTEND-Value zu (utc_dt | None, local_date_str | None,
     is_date_only, local_hhmm | None). Bucket = LOKAL nach TZID (siehe F1).
     All-Day → utc_dt=None. `local_hhmm` = Wanduhr-Zeit im Bucket (für die
@@ -48753,7 +49996,7 @@ def _ics_parse_dt(value, params):
     return naive, f'{Y}-{M}-{D}', False, naive.strftime('%H:%M')
 
 
-def _ics_parse_rrule(value):
+def _legacy_ics_parse_rrule(value):
     """Parse RRULE-Value zu dict {FREQ, INTERVAL, COUNT, UNTIL, BYDAY, ...}."""
     rr = {}
     for part in (value or '').split(';'):
@@ -48763,7 +50006,7 @@ def _ics_parse_rrule(value):
     return rr
 
 
-def _ics_expand_rrule(master, max_per_event=100):
+def _legacy_ics_expand_rrule(master, max_per_event=100):
     """Expandiere RRULE-Master zu Liste von occurrence-event-dicts.
 
     F4: COUNT=N inkludiert das Master-Event — wir produzieren also N-1
@@ -48863,7 +50106,7 @@ def _ics_expand_rrule(master, max_per_event=100):
     return out
 
 
-def _ics_multiday_dates(ev):
+def _legacy_ics_multiday_dates(ev):
     """Liefert die Liste lokaler Datums-Strings, an denen das Event den User
     beschäftigt. F2: Multi-Day-Tour Jun 25 → Jun 27 → [Jun 25, Jun 26, Jun 27].
     F3: All-Day DTEND-exclusiv → Jun 15 (DTEND Jun 16) = [Jun 15].
@@ -48905,7 +50148,7 @@ def _ics_multiday_dates(ev):
     return days or [start]
 
 
-def _parse_ics_to_events(text):
+def _parse_ics_to_events_legacy(text):
     """Parser-Kern (pure function). Liefert Liste von Event-Dicts mit Keys:
     start (lokal yyyy-mm-dd), end, start_iso (UTC), end_iso (UTC),
     summary, location, _multiday_dates, _rrule (falls vorhanden).
@@ -48924,7 +50167,7 @@ def _parse_ics_to_events(text):
             if current and not current.get('_cancelled'):
                 current.pop('_cancelled', None)
                 # Multi-Day-Expansion (F2/F3): Datumsliste merken.
-                current['_multiday_dates'] = _ics_multiday_dates(current)
+                current['_multiday_dates'] = _legacy_ics_multiday_dates(current)
                 events.append(current)
             current = None
         elif current is not None and ':' in line:
@@ -48979,7 +50222,7 @@ def _parse_ics_to_events(text):
                 if v.upper() == 'CANCELLED':
                     current['_cancelled'] = True
             elif k == 'DTSTART':
-                utc_dt, bucket, is_date, _hhmm = _ics_parse_dt(v, params)
+                utc_dt, bucket, is_date, _hhmm = _legacy_ics_parse_dt(v, params)
                 if bucket:
                     current['start'] = bucket
                 if utc_dt is not None:
@@ -48994,7 +50237,7 @@ def _parse_ics_to_events(text):
                     not is_date and not (params or {}).get('TZID')
                     and v.strip().upper().endswith('Z'))
             elif k == 'DTEND':
-                utc_dt, bucket, is_date, _hhmm = _ics_parse_dt(v, params)
+                utc_dt, bucket, is_date, _hhmm = _legacy_ics_parse_dt(v, params)
                 if bucket:
                     current['end'] = bucket
                 if utc_dt is not None:
@@ -49007,7 +50250,7 @@ def _parse_ics_to_events(text):
                 # 00:00 fällt (SWISS schreibt „bis 24:00" als Folgetag-Mitter-
                 # nacht, z.B. KRANK DTEND 20260623T220000Z = 24.06 00:00 CEST),
                 # ist faktisch EXKLUSIV — der End-Bucket-Tag gehört NICHT mehr
-                # zum Event. _ics_multiday_dates zieht ihn dann ab.
+                # zum Event. _legacy_ics_multiday_dates zieht ihn dann ab.
                 current['_end_local_midnight'] = (not is_date
                                                   and _hhmm == '00:00')
             elif k == 'CATEGORIES':
@@ -49029,7 +50272,7 @@ def _parse_ics_to_events(text):
                     else:
                         current['categories'] = cats
             elif k == 'RRULE':
-                rr = _ics_parse_rrule(v)
+                rr = _legacy_ics_parse_rrule(v)
                 if rr:
                     current['_rrule'] = rr
     # RRULE-Expansion (max 1000 total)
@@ -49039,7 +50282,7 @@ def _parse_ics_to_events(text):
         if not ev.get('_rrule'):
             continue
         try:
-            new_evs = _ics_expand_rrule(ev)
+            new_evs = _legacy_ics_expand_rrule(ev)
         except Exception:
             new_evs = []
         if not new_evs:
@@ -49049,12 +50292,165 @@ def _parse_ics_to_events(text):
             break
         # Expansions auch durch Multi-Day-Expansion schicken.
         for ne in new_evs[:room]:
-            ne['_multiday_dates'] = _ics_multiday_dates(ne)
+            ne['_multiday_dates'] = _legacy_ics_multiday_dates(ne)
         expanded.extend(new_evs[:room])
     for ev in events:
         ev.pop('_rrule', None)
     events.extend(expanded)
     return events
+
+
+
+# ── Roster-V2: observe before flip ──────────────────────────────────────────
+# Der über Jahre gehärtete Parser bleibt die produktive Wahrheit. Der erweiterte
+# RFC-/Recurrence-Pfad kann parallel verglichen und erst danach pro Airline
+# freigeschaltet werden. Ohne Env-Flags ist dieser Block verhaltensneutral.
+_ROSTER_V2_TRUE = ('1', 'true', 'yes', 'on')
+
+
+def _roster_v2_shadow_enabled():
+    return os.environ.get('AEROX_ROSTER_V2_SHADOW', '').strip().lower() in _ROSTER_V2_TRUE
+
+
+def _roster_v2_airline(token):
+    try:
+        profile = ((_profile_load(token) or {}).get('profile') or {})
+        return _canonical_airline_key(profile.get('airline'))
+    except Exception:
+        return ''
+
+
+def _roster_v2_enabled_for(token):
+    """Expliziter, pro-Airline Kill-Switch. Default: niemand."""
+    raw_allowed = [
+        value.strip()
+        for value in os.environ.get('AEROX_ROSTER_V2_AIRLINES', '').split(',')
+        if value.strip()
+    ]
+    if '*' in raw_allowed:
+        return True
+    allowed = {
+        _canonical_airline_key(value)
+        for value in raw_allowed
+    }
+    if not allowed:
+        return False
+    airline = _roster_v2_airline(token) if token else ''
+    return bool(airline and airline in allowed)
+
+
+def _roster_shadow_event_projection(event):
+    """PII-arme Vergleichsprojektion; Texte/UIDs verlassen den Prozess nur als Hash."""
+    event = event if isinstance(event, dict) else {}
+    identity_raw = '|'.join([
+        str(event.get('uid') or ''),
+        str(event.get('_recurrence_local_key') or event.get('_recurrence_id_iso') or ''),
+        str(event.get('summary') or event.get('flight') or ''),
+        str(event.get('location') or
+            f"{event.get('from') or ''}-{event.get('to') or ''}"),
+    ])
+    return {
+        'id': hashlib.sha256(identity_raw.encode('utf-8')).hexdigest()[:16],
+        'start': str(event.get('start') or ''),
+        'end': str(event.get('end') or ''),
+        'start_iso': str(event.get('start_iso') or event.get('dep_iso') or ''),
+        'end_iso': str(event.get('end_iso') or event.get('arr_iso') or ''),
+        'cancelled': bool(event.get('_cancelled')),
+    }
+
+
+def _roster_shadow_record(stage, legacy, candidate, token=None):
+    """Strukturierter Diff ohne Feed-Inhalt. Best-effort; nie request-kritisch."""
+    if not _roster_v2_shadow_enabled():
+        return
+    try:
+        old = [_roster_shadow_event_projection(item) for item in (legacy or [])]
+        new = [_roster_shadow_event_projection(item) for item in (candidate or [])]
+        old_rows = {json.dumps(item, sort_keys=True) for item in old}
+        new_rows = {json.dumps(item, sort_keys=True) for item in new}
+        old_ids = {}
+        new_ids = {}
+        for item in old:
+            old_ids.setdefault(item['id'], []).append(item)
+        for item in new:
+            new_ids.setdefault(item['id'], []).append(item)
+        changed = sum(
+            1 for key in (set(old_ids) & set(new_ids))
+            if old_ids[key] != new_ids[key])
+        duplicate_delta = sum(max(0, len(rows) - 1) for rows in new_ids.values()) - sum(
+            max(0, len(rows) - 1) for rows in old_ids.values())
+        missing = old_rows - new_rows
+        extra = new_rows - old_rows
+        if missing or extra or changed or duplicate_delta:
+            user_ref = hashlib.sha256(str(token or '').encode('utf-8')).hexdigest()[:12]
+            app.logger.warning('roster_v2_shadow_diff %s', json.dumps({
+                'stage': stage,
+                'user_ref': user_ref,
+                'airline': _roster_v2_airline(token) if token else '',
+                'legacy_count': len(old),
+                'candidate_count': len(new),
+                'missing_count': len(missing),
+                'extra_count': len(extra),
+                'changed_identity_count': changed,
+                'duplicate_delta': duplicate_delta,
+                'missing_samples': sorted(
+                    json.loads(row)['id'] for row in missing)[:5],
+                'extra_samples': sorted(
+                    json.loads(row)['id'] for row in extra)[:5],
+            }, sort_keys=True))
+    except Exception as exc:
+        app.logger.debug('roster_v2_shadow_record_failed %s', type(exc).__name__)
+
+
+def _roster_shadow_briefing_record(stage, legacy, candidate, token=None):
+    """Prüft Datenverlust-Invarianten einer Merge-Variante ohne Inhalte zu loggen."""
+    if not _roster_v2_shadow_enabled():
+        return
+    try:
+        legacy = legacy if isinstance(legacy, dict) else {}
+        candidate = candidate if isinstance(candidate, dict) else {}
+        critical = (
+            'ical_summary', 'ical_start_iso', 'ical_end_iso',
+            'ical_location', 'ical_layover_ort', 'pickup_time',
+            'briefing_time', 'hotel', 'ical_sectors',
+        )
+        vanished_days = sorted(set(legacy) - set(candidate))
+        lost_fields = []
+        changed_fields = 0
+        for day in sorted(set(legacy) & set(candidate)):
+            old = legacy.get(day) if isinstance(legacy.get(day), dict) else {}
+            new = candidate.get(day) if isinstance(candidate.get(day), dict) else {}
+            for field in critical:
+                old_value = old.get(field)
+                new_value = new.get(field)
+                if old_value and not new_value:
+                    lost_fields.append(f'{day}:{field}')
+                elif old_value != new_value:
+                    changed_fields += 1
+        if vanished_days or lost_fields or changed_fields:
+            user_ref = hashlib.sha256(str(token or '').encode('utf-8')).hexdigest()[:12]
+            app.logger.warning('roster_v2_shadow_diff %s', json.dumps({
+                'stage': stage,
+                'user_ref': user_ref,
+                'airline': _roster_v2_airline(token) if token else '',
+                'legacy_days': len(legacy),
+                'candidate_days': len(candidate),
+                'vanished_day_count': len(vanished_days),
+                'lost_critical_field_count': len(lost_fields),
+                'changed_critical_field_count': changed_fields,
+                'vanished_day_samples': vanished_days[:5],
+                'lost_field_samples': lost_fields[:8],
+            }, sort_keys=True))
+    except Exception as exc:
+        app.logger.debug(
+            'roster_v2_shadow_briefing_record_failed %s', type(exc).__name__)
+
+
+def _parse_ics_to_events(text, token=None):
+    """Legacy bleibt Default; V2 wird ausschließlich pro Airline freigeschaltet."""
+    if _roster_v2_enabled_for(token):
+        return _parse_ics_to_events_v2(text)
+    return _parse_ics_to_events_legacy(text)
 
 
 def _ics_classify_from_categories(categories):
@@ -50154,6 +51550,16 @@ def _itaify_roster_events(events, token=None):
     return events
 
 
+_FEED_PROCESS_EVENT_CAP = 200
+_FEED_PROCESS_EVENT_CAP_V2 = 2000
+
+
+def _feed_process_event_cap(token):
+    return (_FEED_PROCESS_EVENT_CAP_V2
+            if _roster_v2_enabled_for(token)
+            else _FEED_PROCESS_EVENT_CAP)
+
+
 def _select_relevant_feed_events(events, cap):
     """Relevanz-Auswahl statt blindem `events[:cap]`-Slice.
 
@@ -50161,8 +51567,11 @@ def _select_relevant_feed_events(events, cap):
     (byte-identisches Verhalten). ER-Duty/iCloud-Feeds tragen aber JAHRE an
     Historie in zufälliger Reihenfolge (echter ITA-Feed: 1385 Events seit 2023) —
     ein blinder Prefix-Slice verlöre fast alle AKTUELLEN Dienste. Auswahl:
-    zuerst alle Events ab (heute − 45 Tage) chronologisch (bei Überlauf gewinnt
-    die nähere Zukunft), Rest-Plätze mit der jüngsten Vergangenheit auffüllen."""
+    zuerst alle Events ab (heute − 45 Tage) chronologisch (bei einem reinen
+    Sicherheitsüberlauf gewinnt die nähere Zukunft), Rest-Plätze mit der
+    jüngsten Vergangenheit auffüllen. Der Verarbeitungs-Notdeckel liegt bei
+    2.000 statt früher 200: 200 schnitt bei realistischen Jahres-/EventKit-
+    Feeds bereits veröffentlichte Zukunftsdienste sichtbar ab."""
     try:
         if not events or len(events) <= cap:
             return events
@@ -50483,6 +51892,34 @@ def _ics_events_to_briefings(events, existing=None):
     return briefings, imported
 
 
+def _merge_lower_priority_briefings(existing, candidate):
+    """Additiver Merge für eine frischere/autoritative bestehende Quelle.
+
+    EventKit ist Fallback. Wenn ein direkter URL-/PDF-/FlightOps-Import frisch
+    ist, darf EventKit vorhandene Pickup-, Briefing-, Zeit- oder Sektor-Fakten
+    nicht ersetzen. Es darf nur bislang leere Felder und komplett neue Tage
+    ergänzen. Briefing-Felder sind atomare Facts; ein teilweiser Merge in
+    `ical_sectors` würde erneut Legs aus verschiedenen Revisionen mischen.
+    """
+    merged = {day: dict(value) if isinstance(value, dict) else value
+              for day, value in (existing or {}).items()}
+    for day, incoming in (candidate or {}).items():
+        if day not in merged or not isinstance(merged.get(day), dict):
+            merged[day] = (dict(incoming) if isinstance(incoming, dict)
+                           else incoming)
+            continue
+        if not isinstance(incoming, dict):
+            continue
+        current = dict(merged[day])
+        for key, value in incoming.items():
+            old = current.get(key)
+            old_empty = old is None or old == '' or old == [] or old == {}
+            if old_empty and value not in (None, '', [], {}):
+                current[key] = value
+        merged[day] = current
+    return merged
+
+
 # ── LEON-Dienstplan (leon.aero — z.B. AeroWest, Privatjet Hannover) ──────────
 # Verifiziertes Feed-Format (2026-07-20): SUMMARY `(AWH23E) Flight LBG - OXF`
 # (Callsign in Klammern + Route), LOCATION `LBG - OXF (D-CAWX)` (Route + dem
@@ -50511,7 +51948,7 @@ def _ics_parse_leon_flight(summary_upper, location_upper=''):
     return m.group(1), m.group(2), m.group(3), reg
 
 
-def _build_ical_sectors(events):
+def _build_ical_sectors(events, identity_mode='legacy'):
     """Aus EINZEL-iCal-Events je Tag ein sectors[]-Array bauen (Flugnr + from/to +
     dep/arr-ISO) — die echten Pro-Leg-Flugzeiten, die der Tages-Merge sonst
     verliert. Eingabe: dicts mit summary/location/start_iso/end_iso (so liefern es
@@ -50614,6 +52051,15 @@ def _build_ical_sectors(events):
             'flight': flight, 'from': frm, 'to': to,
             'dep_iso': (ev.get('start_iso') or ''), 'arr_iso': (ev.get('end_iso') or ''),
         }
+        # Nur für das Dedupe unten; vor Persistenz wieder entfernt. UID +
+        # RECURRENCE-ID ist die RFC-Identität. Ohne UID ist der exakte
+        # Abflugzeitpunkt Teil der Identität — zwei reale gleiche Umläufe am
+        # selben Tag dürfen niemals zusammenfallen.
+        if ev.get('uid'):
+            _sec['_event_uid'] = ev.get('uid')
+        if ev.get('_recurrence_local_key') or ev.get('_recurrence_id_iso'):
+            _sec['_event_recurrence'] = (
+                ev.get('_recurrence_local_key') or ev.get('_recurrence_id_iso'))
         # LEON: Roster-deklariertes Kennzeichen als tail — echtes Assignment
         # aus dem Dienstplan (Privatjet), kein Inferenz-Marker (`tail_inferred`
         # bleibt leer → _strip_inferred_tails lässt es stehen).
@@ -50635,22 +52081,36 @@ def _build_ical_sectors(events):
             _sec['ac_change'] = True
         if ev.get('ax_hotel'):
             _sec['hotel'] = str(ev['ax_hotel'])[:60]
+        if ev.get('ax_incomplete'):
+            _sec['incomplete'] = str(ev['ax_incomplete'])[:40]
         sec_by_day.setdefault(d, []).append(_sec)
     for d in sec_by_day:
         sec_by_day[d].sort(key=lambda x: x.get('dep_iso') or '')
-        # DOPPEL-LEG-DEDUPE (Daniel 13.7., LX2158 ZRH-PMI um 08:07 UND 09:30):
-        # dieselbe Flugnummer kann am selben Tag nicht zweimal dieselbe Strecke
-        # fliegen — das Duplikat stammt aus überlappenden iCal-Events (Update-
-        # Event neben dem alten). Erste (früheste) Instanz gewinnt. Echte
-        # Doppel-Umläufe haben unterschiedliche Flugnummern und bleiben.
+        # DOPPEL-LEG-DEDUPE: Legacy bleibt die produktive Wahrheit. Die neue
+        # RFC-/Abflug-Identität läuft erst im Shadow und kann danach pro Airline
+        # freigeschaltet werden; so kommen SWISS-Split-Duplikate nicht unbemerkt
+        # für alle Nutzer zurück.
         _seen_legs = set()
         _dedup = []
         for s in sec_by_day[d]:
-            _k = (s.get('flight') or '', s.get('from') or '', s.get('to') or '')
-            if all(_k) and _k in _seen_legs:
+            if identity_mode == 'v2' and s.get('_event_uid'):
+                _k = ('uid', s.get('_event_uid'),
+                      s.get('_event_recurrence') or s.get('dep_iso') or '')
+            elif identity_mode == 'v2':
+                _k = ('leg', s.get('flight') or '', s.get('from') or '',
+                      s.get('to') or '', s.get('dep_iso') or '')
+            else:
+                _k = ('legacy', s.get('flight') or '', s.get('from') or '',
+                      s.get('to') or '')
+            # Legacy dedupliziert nur vollständige Flugnummer+Route-Keys. Das
+            # erhält exakt das bisherige Verhalten für markerartige Sektoren.
+            _complete_legacy = identity_mode != 'v2' and all(_k[1:])
+            if (identity_mode == 'v2' or _complete_legacy) and _k in _seen_legs:
                 continue
-            if all(_k):
+            if identity_mode == 'v2' or _complete_legacy:
                 _seen_legs.add(_k)
+            s.pop('_event_uid', None)
+            s.pop('_event_recurrence', None)
             _dedup.append(s)
         sec_by_day[d] = _dedup
     return sec_by_day
@@ -50738,7 +52198,7 @@ def _preserve_plan_times(secs, prev_secs, now=None):
     return secs
 
 
-def _attach_sectors(briefings, events, existing=None):
+def _attach_sectors(briefings, events, existing=None, identity_mode='legacy'):
     """Hängt die aus `events` gebauten Pro-Leg-Sektoren an die Tagessätze.
 
     `existing` = die zuvor GESPEICHERTE Briefing-Map (beide Import-Pfade haben
@@ -50747,7 +52207,8 @@ def _attach_sectors(briefings, events, existing=None):
     der alte Tages-Dict inklusive seiner Plan-Zeiten ist an dieser Stelle
     sonst schon weg."""
     try:
-        for d, secs in _build_ical_sectors(events).items():
+        for d, secs in _build_ical_sectors(
+                events, identity_mode=identity_mode).items():
             day = briefings.get(d)
             if not isinstance(day, dict):
                 day = {}
@@ -51067,38 +52528,86 @@ def _normalize_feed_scheme(url):
     return url
 
 
+_CALENDAR_FEED_MAX_BYTES = 1024 * 1024
+_CALENDAR_FEED_MAX_REDIRECTS = 3
+
+
+def _calendar_feed_http_get(url, timeout=20):
+    """GET ohne automatische Redirects; jeder Hop wird im Aufrufer geprüft."""
+    import requests as _requests
+    return _requests.get(
+        url, timeout=timeout, allow_redirects=False, stream=True,
+        headers={'User-Agent': 'AeroTax/1.0',
+                 'Accept': 'text/calendar,text/plain;q=0.9,*/*;q=0.1'})
+
+
 def _fetch_calendar_feed_text(url):
     """Validiert (https-only + SSRF-Block) und lädt EINE Feed-URL (max 1 MB).
     Liefert (text, None) bei Erfolg, sonst (None, error_code) mit error_code in
-    {'bad_url','internal_host_blocked','response_too_large','fetch_failed'}.
+    {'bad_url','internal_host_blocked','response_too_large',
+     'too_many_redirects','fetch_failed'}.
     Aus import_calendar_feed extrahiert (LEON-Zwei-Link, 2026-07-20), damit
     Duty- und Off-Days-Link denselben Pfad nehmen — und Tests den Netz-Teil
-    an EINER Stelle monkeypatchen können."""
-    if not url.startswith('https://'):
-        return None, 'bad_url'
-    # SSRF-Block: Host darf nicht privat/loopback/link-local sein
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        host = parsed.hostname or ''
-        if not host:
+    an EINER Stelle monkeypatchen können.
+
+    Redirect-Sicherheitsvertrag: requests folgt NICHT selbst. Vor jedem Hop
+    werden Scheme und ALLE DNS-Adressen erneut geprüft. Damit kann eine zuerst
+    öffentliche URL nicht per 302 auf localhost/169.254/private Netze springen.
+    """
+    from urllib.parse import urljoin, urlparse
+
+    current = str(url or '').strip()
+    for hop in range(_CALENDAR_FEED_MAX_REDIRECTS + 1):
+        try:
+            parsed = urlparse(current)
+            if parsed.scheme != 'https' or not parsed.hostname:
+                return None, 'bad_url'
+            if _is_private_or_local_ip(parsed.hostname):
+                return None, 'internal_host_blocked'
+        except Exception:
             return None, 'bad_url'
-        if _is_private_or_local_ip(host):
-            return None, 'internal_host_blocked'
-    except Exception:
-        return None, 'bad_url'
-    try:
-        import urllib.request
-        req = urllib.request.Request(url, headers={'User-Agent': 'AeroTax/1.0'})
-        # Max 1 MB · verhindert Memory-Bomb bei riesigen ICS-Files
-        with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read(1024 * 1024 + 1)
-            if len(raw) > 1024 * 1024:
+
+        response = None
+        try:
+            response = _calendar_feed_http_get(current, timeout=20)
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get('Location') or ''
+                if not location:
+                    return None, 'fetch_failed'
+                if hop >= _CALENDAR_FEED_MAX_REDIRECTS:
+                    return None, 'too_many_redirects'
+                current = urljoin(current, location)
+                continue
+            if response.status_code < 200 or response.status_code >= 300:
+                return None, 'fetch_failed'
+            try:
+                declared = int(response.headers.get('Content-Length') or 0)
+            except (TypeError, ValueError):
+                declared = 0
+            if declared > _CALENDAR_FEED_MAX_BYTES:
                 return None, 'response_too_large'
+            chunks = []
+            size = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > _CALENDAR_FEED_MAX_BYTES:
+                    return None, 'response_too_large'
+                chunks.append(chunk)
+            raw = b''.join(chunks)
             return raw.decode('utf-8', errors='replace'), None
-    except Exception as e:
-        print(f'[import_calendar_feed] error: {type(e).__name__}: {str(e)[:300]}')
-        return None, 'fetch_failed'
+        except Exception as e:
+            app.logger.warning(
+                f'[import_calendar_feed] fetch_error: {type(e).__name__}')
+            return None, 'fetch_failed'
+        finally:
+            try:
+                if response is not None:
+                    response.close()
+            except Exception:
+                pass
+    return None, 'too_many_redirects'
 
 
 def _merge_feed_events(primary, secondary):
@@ -51220,6 +52729,7 @@ def import_calendar_feed(token):
         text, ferr = ics_text_direct, None
     else:
         text, ferr = _fetch_calendar_feed_text(url)
+    _shadow_text_1 = text if text is not None else None
     if ferr in ('bad_url', 'internal_host_blocked'):
         # Format-/SSRF-Fehler des Primär-Links bleiben harte 400er (wie bisher) —
         # das ist ein Client-Eingabe-Problem, kein „anderer Link rettet es".
@@ -51238,7 +52748,7 @@ def import_calendar_feed(token):
         # siehe _parse_ics_to_events oberhalb. Erlaubt isolierte Test-Coverage
         # (tests/test_ical_parser.py) ohne Flask-Context.
         try:
-            events_1 = _parse_ics_to_events(text)
+            events_1 = _parse_ics_to_events(text, token=token)
         except Exception as _exc:
             app.logger.warning(f'[ics] parse-fail: {type(_exc).__name__}: {str(_exc)[:200]}')
             # J5-Fix (Sweep 2026-07-10): Parse-Fail NICHT als Erfolg maskieren —
@@ -51251,10 +52761,12 @@ def import_calendar_feed(token):
 
     # ── Link 2 (Off-Days) unabhängig holen + parsen ─────────────────────────
     events_2 = []
+    _shadow_text_2 = None
     if ics_text_2_direct:
         # Geräte-Abruf: der zweite Feed kommt schon als Text mit (kein Fetch).
+        _shadow_text_2 = ics_text_2_direct
         try:
-            events_2 = _parse_ics_to_events(ics_text_2_direct)
+            events_2 = _parse_ics_to_events(ics_text_2_direct, token=token)
         except Exception as _exc2:
             app.logger.warning(f'[ics] parse-fail feed2 (device): {type(_exc2).__name__}: {str(_exc2)[:160]}')
             err_2 = 'ics_parse_failed_2'
@@ -51263,6 +52775,7 @@ def import_calendar_feed(token):
                             'detail': 'device_ics_parse'}), 502
     elif url_2:
         text2, ferr2 = _fetch_calendar_feed_text(url_2)
+        _shadow_text_2 = text2 if text2 is not None else None
         if ferr2:
             err_2 = f'{ferr2}_2'
             if ferr2 == 'fetch_failed':
@@ -51270,7 +52783,7 @@ def import_calendar_feed(token):
                                                     slot='calendar_feed_2')
         else:
             try:
-                events_2 = _parse_ics_to_events(text2)
+                events_2 = _parse_ics_to_events(text2, token=token)
             except Exception as _exc2:
                 app.logger.warning(
                     f'[ics] parse-fail feed2: {type(_exc2).__name__}: {str(_exc2)[:200]}')
@@ -51305,6 +52818,58 @@ def import_calendar_feed(token):
     # Layover-Synthese für Feeds ohne LAYOVER-Events (Condor/offblock/
     # Edelweiss, no-op für LH/SWISS/ITA — siehe Gates im Helper).
     events = _generic_layover_synthesis(events, token=token)
+    # SHADOW: alter und neuer Parser sehen exakt dieselben Rohfeeds und laufen
+    # anschließend durch dieselben Airline-Adapter. Nur der Diff wird geloggt;
+    # die produktive Auswahl oben bleibt unverändert. Fehler im Kandidatenpfad
+    # dürfen den Import niemals beeinflussen.
+    if _roster_v2_shadow_enabled():
+        try:
+            _legacy_1 = (_parse_ics_to_events_legacy(_shadow_text_1)
+                         if _shadow_text_1 is not None else [])
+            _candidate_1 = (_parse_ics_to_events_v2(_shadow_text_1)
+                            if _shadow_text_1 is not None else [])
+            _legacy_2 = (_parse_ics_to_events_legacy(_shadow_text_2)
+                         if _shadow_text_2 is not None else [])
+            _candidate_2 = (_parse_ics_to_events_v2(_shadow_text_2)
+                            if _shadow_text_2 is not None else [])
+            _legacy_normalized = _merge_feed_events(_legacy_1, _legacy_2)
+            _candidate_normalized = _merge_feed_events(
+                _candidate_1, _candidate_2)
+            for _name in ('legacy', 'candidate'):
+                _rows = (_legacy_normalized if _name == 'legacy'
+                         else _candidate_normalized)
+                _rows = _normalize_thirdparty_roster_events(_rows)
+                _rows = _swissify_roster_events(_rows, token=token)
+                _rows = _lh_rebucket_utc_flight_days(_rows)
+                _rows = _itaify_roster_events(_rows, token=token)
+                _rows = _edelweissify_roster_events(_rows, token=token)
+                _rows = _generic_layover_synthesis(_rows, token=token)
+                if _name == 'legacy':
+                    _legacy_normalized = _rows
+                else:
+                    _candidate_normalized = _rows
+            _roster_shadow_record(
+                'airline_normalized_events', _legacy_normalized,
+                _candidate_normalized, token)
+            _legacy_sector_rows = [
+                sector
+                for rows in _build_ical_sectors(
+                    _legacy_normalized, identity_mode='legacy').values()
+                for sector in rows
+            ]
+            _candidate_sector_rows = [
+                sector
+                for rows in _build_ical_sectors(
+                    _candidate_normalized, identity_mode='v2').values()
+                for sector in rows
+            ]
+            _roster_shadow_record(
+                'airline_normalized_sectors', _legacy_sector_rows,
+                _candidate_sector_rows, token)
+        except Exception as _shadow_exc:
+            app.logger.debug(
+                'roster_v2_shadow_pipeline_failed %s',
+                type(_shadow_exc).__name__)
     # RECONCILE-WAHRHEIT VOR JEDER PERFORMANCE-KAPPUNG sichern.
     #
     # Die Briefing-Pipeline verarbeitet aus Speicher-/CPU-Gründen höchstens
@@ -51396,6 +52961,7 @@ def import_calendar_feed(token):
                            'events_count': len(events_2)})
         feed_obj_2.pop('refresh_fail_count', None)
         feed_obj_2.pop('last_refresh_fail_at', None)
+    _feed_profile_persist_ok = True
     try:
         disk_full = dict(_profile_load_from_disk(token) or {})
         disk_full['token'] = token
@@ -51409,9 +52975,10 @@ def import_calendar_feed(token):
             disk_full['calendar_feed_2'] = feed_obj_2
         disk_full['profile'] = profile
         disk_full['_updated_at'] = datetime.now().isoformat()
-        _profile_save(token, profile, full_disk_payload=disk_full)
+        _feed_profile_persist_ok = (
+            _profile_save(token, profile, full_disk_payload=disk_full) is not False)
     except Exception:
-        pass
+        _feed_profile_persist_ok = False
 
     # Roster-Integration · jeden Event via _ics_events_to_briefings auf die
     # Briefing-Map mappen. F2/F3 (Multi-Day) und F5 (Same-Day-Merge) handled
@@ -51424,12 +52991,33 @@ def import_calendar_feed(token):
     # wenn ein hartnäckiger Phantom-Tag auch außerhalb des laufenden Monats klebt.
     _full_clean = (str(request.args.get('full') or '').strip() in ('1', 'true', 'yes')
                    or bool((request.get_json(silent=True) or {}).get('full_clean')))
-    _persist_err = None
+    _persist_err = (None if _feed_profile_persist_ok
+                    else 'feed_profile_persist_failed')
     try:
         existing = dict(_ical_briefings_load(token) or {})
-        # Cap auf 200 Events (Performance) — entspricht ~6 Monate LH-Crew-Plan.
-        # Relevanz-Auswahl statt Prefix-Slice (s.o., ITA-Jahres-Feeds).
-        _ev_sel = _select_relevant_feed_events(events, 200)
+        # Hoher Notdeckel statt des alten 200er-Caps: reguläre Jahresfeeds
+        # vollständig verarbeiten; nur absurde/unbegrenzte Feeds begrenzen.
+        _ev_sel = _select_relevant_feed_events(
+            events, _feed_process_event_cap(token))
+        if _roster_v2_shadow_enabled():
+            _v2_sel = _select_relevant_feed_events(
+                events, _FEED_PROCESS_EVENT_CAP_V2)
+            _roster_shadow_record('normalized_event_cap', _ev_sel, _v2_sel, token)
+            _legacy_sector_rows = [
+                sector
+                for rows in _build_ical_sectors(
+                    _ev_sel, identity_mode='legacy').values()
+                for sector in rows
+            ]
+            _v2_sector_rows = [
+                sector
+                for rows in _build_ical_sectors(
+                    _v2_sel, identity_mode='v2').values()
+                for sector in rows
+            ]
+            _roster_shadow_record(
+                'normalized_sector_identity', _legacy_sector_rows,
+                _v2_sector_rows, token)
         briefings, imported_briefings = _ics_events_to_briefings(
             _ev_sel, existing=existing)
         # RECONCILE (geteilter Helper): Tage im aktuellen Monatsfenster, die der neue
@@ -51448,7 +53036,9 @@ def import_calendar_feed(token):
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
         # `existing` = gespeicherter Stand VOR diesem Import → Plan-Blockzeiten
         # überleben den Replace (s. _preserve_plan_times).
-        _attach_sectors(briefings, _ev_sel, existing=existing)
+        _attach_sectors(
+            briefings, _ev_sel, existing=existing,
+            identity_mode=('v2' if _roster_v2_enabled_for(token) else 'legacy'))
         # Geflogene Vergangenheit gegen sektorlose Neuaufbauten verteidigen
         # (Tibor 2026-08-02: Historien-Import-Fallback-Marker entkernte den
         # Vortag) — nach _attach_sectors, damit „hat der Neuaufbau Sektoren?"
@@ -52094,10 +53684,9 @@ def upload_calendar_events(token):
             'start_iso': str(ev.get('start_iso') or '')[:25],
             'end_iso': str(ev.get('end_iso') or '')[:25],
         })
-    # Profil-Notiz
-    p = _user_profile_path(token)
-    # Lebt der ICS-URL-Zyklus? (für den Reconcile-Skip weiter unten)
+    # Profil-Notiz. Lebt der ICS-URL-Zyklus? (für den Reconcile-Skip weiter unten)
     _url_feed_fresh = False
+    _eventkit_profile_persist_ok = True
     try:
         existing = {}
         try:
@@ -52159,15 +53748,19 @@ def upload_calendar_events(token):
             profile['calendar_feed'] = feed_obj_ios
             disk_full['profile'] = profile
             disk_full['_updated_at'] = datetime.now().isoformat()
-            _profile_save(token, profile, full_disk_payload=disk_full)
+            _eventkit_profile_persist_ok = (
+                _profile_save(token, profile, full_disk_payload=disk_full)
+                is not False)
         except Exception:
-            with open(p, 'w') as f: json.dump(existing, f)
+            _eventkit_profile_persist_ok = False
     except Exception:
-        pass
+        _eventkit_profile_persist_ok = False
     # Briefing-Map befüllen — gleicher Pfad wie ICS-Import.
     # W19: nutzt _ics_events_to_briefings für Multi-Day + Same-Day-Merge.
     # iOS schickt schon ISO-Strings → wir adaptieren auf die ICS-Helper-Inputs.
     imported_briefings = 0
+    _persist_err = (None if _eventkit_profile_persist_ok
+                    else 'feed_profile_persist_failed')
     try:
         existing_briefings = dict(_ical_briefings_load(token) or {})
         adapted = []
@@ -52199,12 +53792,33 @@ def upload_calendar_events(token):
         adapted = _itaify_roster_events(adapted, token=token)
         adapted = _edelweissify_roster_events(adapted, token=token)
         adapted = _generic_layover_synthesis(adapted, token=token)
-        # Wie im URL-/Direkt-ICS-Pfad: das 200er-Limit begrenzt nur den teuren
+        # Wie im URL-/Direkt-ICS-Pfad: der hohe Notdeckel begrenzt nur den teuren
         # Neuaufbau, niemals die autoritative Feed-Abdeckung fürs Reconcile.
         # Sonst kann ein großer EventKit-Kalender echte Dienste hinter dem Cap
         # per Zukunfts-Geist-Prune löschen.
         _reconcile_events = list(adapted)
-        adapted = _select_relevant_feed_events(adapted, 200)
+        adapted = _select_relevant_feed_events(
+            adapted, _feed_process_event_cap(token))
+        if _roster_v2_shadow_enabled():
+            _v2_adapted = _select_relevant_feed_events(
+                _reconcile_events, _FEED_PROCESS_EVENT_CAP_V2)
+            _roster_shadow_record(
+                'eventkit_event_cap', adapted, _v2_adapted, token)
+            _legacy_sector_rows = [
+                sector
+                for rows in _build_ical_sectors(
+                    adapted, identity_mode='legacy').values()
+                for sector in rows
+            ]
+            _v2_sector_rows = [
+                sector
+                for rows in _build_ical_sectors(
+                    _v2_adapted, identity_mode='v2').values()
+                for sector in rows
+            ]
+            _roster_shadow_record(
+                'eventkit_sector_identity', _legacy_sector_rows,
+                _v2_sector_rows, token)
         briefings, imported_briefings = _ics_events_to_briefings(
             adapted, existing=existing_briefings)
         # RECONCILE (FIX User C „Flüge im Kalender die ich nicht habe"): auch der
@@ -52230,13 +53844,29 @@ def upload_calendar_events(token):
                 token, briefings, _reconcile_events, full_clean=_full_clean)
         # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad) —
         # inkl. Plan-Blockzeiten aus dem gespeicherten Stand.
-        _attach_sectors(briefings, adapted, existing=existing_briefings)
+        _attach_sectors(
+            briefings, adapted, existing=existing_briefings,
+            identity_mode=('v2' if _roster_v2_enabled_for(token) else 'legacy'))
         # Gleiche Schutzplanke wie im ICS-URL-Pfad: ein hinterherhängender
         # Gerätekalender darf geflogene Vergangenheit nicht entkernen
         # (identischer Zünder wie der Historien-Import, s. Helper-Doku).
         _preserve_past_flown_days(briefings, existing_briefings)
-        _persist_err = (None if _ical_briefings_save(token, briefings)
-                        else 'briefings_persist_failed')
+        if _url_feed_fresh and not _full_clean:
+            # Reconcile zu überspringen reicht nicht: der Neuaufbau oben hat
+            # berührte Tage bereits ersetzt. Der feldweise Merge ist fachlich
+            # sinnvoll, bleibt nach dem Tirana-Vorfall aber hinter demselben
+            # Shadow/Airline-Schalter wie Parser und Dedup. Legacy bleibt Default.
+            _merged_candidate = _merge_lower_priority_briefings(
+                existing_briefings, briefings)
+            _roster_shadow_briefing_record(
+                'eventkit_field_merge', briefings, _merged_candidate, token)
+            _roster_shadow_briefing_record(
+                'eventkit_field_merge_invariants', existing_briefings,
+                _merged_candidate, token)
+            if _roster_v2_enabled_for(token):
+                briefings = _merged_candidate
+        if not _ical_briefings_save(token, briefings):
+            _persist_err = 'briefings_persist_failed'
     except Exception as e:
         _reconcile_dbg = {'error': 'internal_error'}
         app.logger.warning(f'[ical-briefings] ekevent-persist-fail: {type(e).__name__}: {str(e)[:200]}')

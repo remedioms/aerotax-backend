@@ -144,8 +144,10 @@ def test_get_chat_messages_fuellt_namen_fuer_alte_nachrichten():
     msg = resp.get_json()['messages'][0]
     assert msg['author_name'] == 'Till Becke'
     assert msg['author_avatar'] == 'u/av.jpg'
-    # Der Token bleibt gekürzt — Namen ersetzen keine Privacy.
-    assert msg['author_token'] == TRUNC
+    # Historische Fast-Bearer werden nicht erneut ausgeliefert: stabile,
+    # nicht rückrechenbare Legacy-Referenz statt 16/19 Credential-Zeichen.
+    assert msg['author_token'].startswith('AXP-')
+    assert not msg['author_token'].startswith('AT-')
 
 
 def test_sende_stempel_gewinnt_ueber_nachaufloesung():
@@ -203,7 +205,10 @@ def test_senden_stempelt_den_namen_mit():
     msg = resp.get_json()['message']
     assert msg['author_name'] == 'Till Becke'
     assert msg['author_avatar'] == 'u/av.jpg'
-    assert msg['author_token'] == TRUNC     # Token bleibt gekürzt
+    # Neue Nachrichten tragen eine adressierbare öffentliche Referenz, nie das
+    # Login-Credential oder dessen fast vollständigen Präfix.
+    assert msg['author_token'].startswith('AXU-')
+    assert not msg['author_token'].startswith('AT-')
 
 
 def test_senden_ohne_profilnamen_stempelt_nichts():

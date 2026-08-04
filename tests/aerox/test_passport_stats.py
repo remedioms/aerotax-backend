@@ -24,8 +24,12 @@ TOKEN = "PASSPORT-TEST-TOKEN"
 
 
 def _sector(flight, frm, to, dep_iso, arr_iso):
-    return {"flight": flight, "from": frm, "to": to,
-            "dep_iso": dep_iso, "arr_iso": arr_iso}
+    out = {"flight": flight, "from": frm, "to": to,
+           "dep_iso": dep_iso, "arr_iso": arr_iso}
+    if arr_iso:
+        out["est_arr_iso"] = arr_iso
+        out["arr_measured"] = True
+    return out
 
 
 @pytest.fixture
@@ -243,7 +247,10 @@ def test_passport_teilt_die_leg_quelle_mit_dem_flugbuch(synth_days, monkeypatch)
     pp_keys = {lg["key"] for lg in A._passport_legs(TOKEN)}
     assert lb_keys and lb_keys <= pp_keys
     p = A._passport_stats_compute(TOKEN, "all")
-    assert p["flights"] == len(pp_keys) == lb["totals"]["legs"] + 1  # +MUC-LHR
+    # Passport zählt zusätzlich (a) MUC-LHR ohne Flugnummer und (b) LH401 ohne
+    # belastbare Ankunft. Das Flugbuch darf Letzteres nicht aus einem bloßen
+    # Routentag erfinden; der Passport bleibt die breitere Reisehistorie.
+    assert p["flights"] == len(pp_keys) == lb["totals"]["legs"] + 2
 
 
 def test_compute_empty_state(monkeypatch):

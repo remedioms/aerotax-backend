@@ -28,6 +28,7 @@ venv/
 .wrangler/
 .claude/
 .pytest_cache/
+supabase/.temp/
 
 # raw uncompressed reference DB (only the .gz is committed/deployed)
 data/aerox_reference.sqlite

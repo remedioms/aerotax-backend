@@ -291,13 +291,24 @@ def _internal_secret_ok():
 # 500 Zeilen in 0,23 s) — Fallback auf das breite Select, falls die Syntax mal
 # nicht greift, damit der Sweep nie ganz ausfällt.
 _SELECT_NARROW = ('token,feed_url:metadata->calendar_feed->>url,'
+                  'feed_url_enc:metadata->calendar_feed->>url_enc,'
                   'feed_imported_at:metadata->calendar_feed->>imported_at,'
-                  'feed2_url:metadata->calendar_feed_2->>url')
+                  'feed2_url:metadata->calendar_feed_2->>url,'
+                  'feed2_url_enc:metadata->calendar_feed_2->>url_enc')
 _SELECT_WIDE = 'token,metadata'
 
 
 def _feed_url(obj):
-    return (obj.get('url') or '').strip() if isinstance(obj, dict) else ''
+    if not isinstance(obj, dict):
+        return ''
+    raw = (obj.get('url') or '').strip()
+    if raw:
+        return raw
+    try:
+        import app as _app
+        return _app._calendar_feed_decrypt_value(obj.get('url_enc'), 'url')
+    except Exception:
+        return ''
 
 
 def _row_to_candidate(row):
@@ -313,8 +324,10 @@ def _row_to_candidate(row):
         url_2 = _feed_url(md.get('calendar_feed_2'))
         age_h = _feed_age_h(feed)
     else:
-        url = (row.get('feed_url') or '').strip()
-        url_2 = (row.get('feed2_url') or '').strip()
+        url = _feed_url({'url': row.get('feed_url'),
+                         'url_enc': row.get('feed_url_enc')})
+        url_2 = _feed_url({'url': row.get('feed2_url'),
+                           'url_enc': row.get('feed2_url_enc')})
         age_h = _feed_age_h({'imported_at': row.get('feed_imported_at') or ''})
     if not url:
         return None

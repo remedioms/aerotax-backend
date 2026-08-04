@@ -1022,7 +1022,11 @@ def incoming_interests(token):
         # Muster wie crew-chat author_token-Truncation).
         it = item.pop('interested_token', None)
         if isinstance(it, str) and it:
-            item['interested_token'] = it[:16] + '…'
+            # Nicht kürzen: 16 von 19 Zeichen ließen nur 4096 mögliche Bearer
+            # übrig. Die globale AeroX-HTTP-Grenze ersetzt den vollständigen
+            # internen Wert anschließend deterministisch durch eine AXU-ID und
+            # schlägt bei einem Redaction-Fehler fail-closed fehl.
+            item['interested_token'] = it
         if post:
             item['post_snapshot'] = {
                 'id': post.get('id'),

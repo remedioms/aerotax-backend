@@ -542,6 +542,41 @@ def test_auth_gate_requires_bearer_binding(monkeypatch, tmp_path):
         assert r2.get_json()['error'] == 'token_binding_required'
 
 
+def test_cached_completion_proofs_are_actual_fresh_and_batch_read_once(monkeypatch):
+    now_dt = dtmod.datetime(2026, 8, 3, 22, 0, tzinfo=dtmod.timezone.utc)
+    now = now_dt.timestamp()
+    calls = []
+    shared = {
+        fo._lb_key('LH2129', '2026-08-03', 'DRS'): {
+            'arr_iso': '2026-08-03T20:45:00Z', 'self_landed': True,
+            'ts': now - 10,
+        },
+        fo._lb_key('LH586', '2026-08-03', 'MUC'): {
+            'on_iso': '2026-08-04T00:05:00Z', 'ts': now - 10,
+        },
+        fo._lb_key('LH400', '2026-07-01', 'FRA'): {
+            'arr_iso': '2026-07-01T18:30:00Z',
+            'ts': now - fo._LB_SHARED_TTL_S - 1,
+        },
+    }
+
+    def _load(_path):
+        calls.append(_path)
+        return shared
+
+    monkeypatch.setattr(fo, '_lb_json_load', _load)
+    result = fo.logbook_cached_completion_proofs([
+        {'flight': 'LH2129', 'date': '2026-08-03', 'dep': 'DRS'},
+        {'flight': 'LH586', 'date': '2026-08-03', 'dep': 'MUC'},
+        {'flight': 'LH400', 'date': '2026-07-01', 'dep': 'FRA'},
+    ], now=now)
+
+    assert result == {
+        ('LH2129', '2026-08-03', 'DRS'): '2026-08-03T20:45:00Z',
+    }
+    assert len(calls) == 1
+
+
 def test_auth_gate_rejects_unknown_token(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path, [])
     monkeypatch.setattr(A, '_validate_token',
