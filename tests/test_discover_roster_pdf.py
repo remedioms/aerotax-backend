@@ -296,6 +296,39 @@ def test_multiple_discover_ground_duties_merge_on_the_correct_day():
     assert aug20['ical_end_iso'] == '2026-08-20T16:10:00Z'
 
 
+def test_tagged_discover_simulator_duties_are_not_dropped():
+    """Published Rosters setzen bei Trainings vor Pos noch die Tags-Spalte.
+
+    Das echte Shape „Report Release Tag Pos Activity Station Start End" darf
+    SIM-Tage nicht aus dem Kalender verlieren. Der Fixture bleibt synthetisch
+    und deckt mehrere beobachtete Tag-Codes ab.
+    """
+    text = """\
+Roster
+Period: August 2026
+Crew member: TST, Test, Simulator
+Rank: FO Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+05 Wed 08:00 11:30 CQT FO SIM320 FRA 09:00 11:00 2:00 3:30 12:00
+26 Wed 14:10 19:40 REC FO SIM320 FRA 15:10 19:10 4:00 5:30 12:00
+27 Thu 10:05 15:35 OPC FO SIM320 FRA 11:05 15:05 4:00 5:30 12:00
+Created 04Aug2026 11:33 (UTC) by TST 1 ( 1)
+"""
+    ics, err = backend._discover_roster_text_to_ics(text)
+    assert err is None, err
+    assert ics.count('SUMMARY:SIM320 FRA') == 3
+
+    events = backend._parse_ics_to_events(ics)
+    briefings, imported = backend._ics_events_to_briefings(events, existing={})
+    assert imported == 3
+    assert set(briefings) == {
+        '2026-08-05', '2026-08-26', '2026-08-27',
+    }
+    assert briefings['2026-08-05']['ical_start_iso'] == '2026-08-05T07:00:00Z'
+    assert briefings['2026-08-27']['ical_end_iso'] == '2026-08-27T13:05:00Z'
+
+
 def test_discover_ground_codes_are_backend_duty_evidence():
     for marker in ('BRS FRA', 'BOT', 'HOS FRA', 'SEP320 FRA', 'SEP330 FRA',
                    'FA FRA', 'CRM FRA', 'SEC FRA', 'PRVT FRA - MUC',

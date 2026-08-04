@@ -53507,7 +53507,12 @@ _DISCOVER_GROUND_ROUTE_RE = re.compile(
     # Bodentransfer mit eigener Route, z.B. „PRVT FRA MUC 10:15 11:10".
     # Flugzeilen kollidieren nicht: deren Activity beginnt mit einer Zahl.
     r'^(?:(?:\d{1,2}:\d{2})\s+){0,2}(?:FDP\s+ext\.\s+)?'
-    r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
+    # Die optionale Tags-Spalte steht VOR Pos, z.B. „REC FO PRVT ...".
+    # Nur zusammen mit/kurz vor der bekannten Crew-Position zulassen; das
+    # eigentliche Activity-Token bleibt dadurch unverändert auswertbar.
+    r'(?:(?:[A-Z][A-Z0-9_]{1,15})\s+'
+    r'(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+|'
+    r'(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
     r'([A-Z][A-Z0-9]{1,15})\s+([A-Z]{3})\s+([A-Z]{3})\s+'
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
 _DISCOVER_GROUND_RE = re.compile(
@@ -53520,16 +53525,20 @@ _DISCOVER_GROUND_RE = re.compile(
     # Am Zeilenanfang verankern. Sonst würde eine Flugzeile ab ihrem
     # Routing-Teil „FRA PHL 13:21 15:47" wie Activity=FRA/Station=PHL wirken.
     # Bis zu zwei Report-/Release-Zeiten und der optionale FDP-ext.-Text sind
-    # echte Spalten vor Pos/Activity und dürfen übersprungen werden.
+    # echte Spalten vor Tags/Pos/Activity und dürfen übersprungen werden.
     r'^(?:(?:\d{1,2}:\d{2})\s+){0,2}(?:FDP\s+ext\.\s+)?'
-    r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
+    r'(?:(?:[A-Z][A-Z0-9_]{1,15})\s+'
+    r'(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+|'
+    r'(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
     r'([A-Z][A-Z0-9]{1,15})\s+([A-Z]{3})\s+'
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
 _DISCOVER_GROUND_NO_STN_RE = re.compile(
     # Reserve wird im Discover-Roster ohne Stationsspalte ausgegeben:
     # „RES 02:00 22:00". Basis aus dem Dokumentkopf verwenden.
     r'^(?:(?:\d{1,2}:\d{2})\s+){0,2}(?:FDP\s+ext\.\s+)?'
-    r'(?:(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
+    r'(?:(?:[A-Z][A-Z0-9_]{1,15})\s+'
+    r'(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+|'
+    r'(?:CM|RCM|CCM|SCCM|CP|FO|SFO|PU)\s+)?'
     r'([A-Z][A-Z0-9]{1,15})\s+'
     r'(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})(?=\s|$)')
 # Report-Zeit: erstes HH:MM-Token am Anfang der „rest"-Zeile eines Duty-Tages.
