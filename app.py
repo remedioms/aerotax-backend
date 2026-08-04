@@ -4183,6 +4183,22 @@ def _run_process_async(job_id, form, files):
                 prof = (_profile_load(session_token) or {}).get('profile') or {}
                 if prof.get('share_roster') is not False:
                     _tage = safe.get('_tage_detail') or []
+                    # Auch der Steuer-/CAS-Pfad kann einen noch unvollständig
+                    # geparsten Plan liefern. Derselbe Guard wie beim App-
+                    # Snapshot verhindert, dass er den letzten vollständigen
+                    # Stand für Freunde und Crew-Graph verkürzt.
+                    _old_tage = ((_roster_snapshot_read(session_token) or {})
+                                 .get('tage') or [])
+                    _tage, _missing, _removed = \
+                        _roster_snapshot_merge_degraded(_old_tage, _tage)
+                    if _missing:
+                        app.logger.warning(
+                            f'[share-roster-auto-save] '
+                            f'degraded_import_preserved '
+                            f'missing_days={len(_missing)} '
+                            f'removed_duties={_removed} '
+                            f'old_days={len(_old_tage)} '
+                            f'saved_days={len(_tage)}')
                     # Supabase-first + Disk (multi-instance-sicher).
                     _roster_snapshot_save(session_token, {
                         'taken_at': datetime.now().isoformat(),
@@ -23562,6 +23578,57 @@ def _rc_meaningfully_modified(a, b):
         return False
 
 
+def _roster_degraded_missing_days(old_tage, new_tage):
+    """Return missing old days when the existing mass-removal gate fires.
+
+    The change-list guard historically suppressed the false ``removed`` flood
+    but ``take_roster_snapshot`` still replaced the durable snapshot with the
+    truncated payload.  If no second, complete client upload followed, friends
+    and roster-derived surfaces therefore saw the shortened plan despite the
+    warning.  Keep detection in one helper so notification and persistence use
+    the exact same threshold.
+
+    Returns ``(all_missing_days, removed_duty_count)`` when degraded, otherwise
+    ``([], 0)``.  All missing days are preserved once degradation is proven;
+    an absent off-day is just as much a source gap as an absent duty day.
+    """
+    old_by = {t.get('datum'): t for t in (old_tage or [])
+              if isinstance(t, dict) and t.get('datum')}
+    new_dates = {t.get('datum') for t in (new_tage or [])
+                 if isinstance(t, dict) and t.get('datum')}
+    missing = [t for datum, t in old_by.items() if datum not in new_dates]
+    removed_duty_count = sum(
+        1 for t in missing if _rc_duty_state(t) == 'duty')
+    degraded = (
+        removed_duty_count >= 10
+        or (removed_duty_count >= 5
+            and removed_duty_count >= 0.25 * max(1, len(old_by))))
+    return (missing, removed_duty_count) if degraded else ([], 0)
+
+
+def _roster_snapshot_merge_degraded(old_tage, new_tage):
+    """Merge missing old days into a snapshot only when degradation is proven.
+
+    Returns ``(snapshot_days, missing_days, removed_duty_count)``.  New days
+    always win for dates they actually contain, so enrichment and legitimate
+    updates continue to be persisted normally.
+    """
+    missing, removed_duty_count = _roster_degraded_missing_days(
+        old_tage, new_tage)
+    if not missing:
+        return new_tage, [], 0
+    merged = {t.get('datum'): t for t in missing
+              if isinstance(t, dict) and t.get('datum')}
+    for tag in (new_tage or []):
+        if isinstance(tag, dict) and tag.get('datum'):
+            merged[tag['datum']] = tag
+    # Bei theoretisch >400 kombinierten Tagen die neuesten behalten: sie
+    # enthalten die noch bevorstehenden Dienste, die für App/Graph wichtiger
+    # sind als weit zurückliegende Alttage.
+    snapshot_tage = [merged[k] for k in sorted(merged.keys())][-400:]
+    return snapshot_tage, missing, removed_duty_count
+
+
 def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10,
                          now=None):
     """Returns list of {datum, kind, old, new} where kind ∈ added/removed/modified.
@@ -23677,14 +23744,13 @@ def _compute_roster_diff(old_tage, new_tage, today=None, near_added_days=10,
     #    weitere)" ist genau das, was Crews in Panik versetzt.
     #    Lücke ≠ Fakt → die 'removed' fliegen komplett raus, 'added'/'modified'
     #    desselben Diffs bleiben (die tragen echte neue Information).
-    removed = [c for c in changes if c.get('kind') == 'removed']
-    if removed and (len(removed) >= 10
-                    or (len(removed) >= 5
-                        and len(removed) >= 0.25 * max(1, len(old_by)))):
+    _missing_days, removed_duty_count = _roster_degraded_missing_days(
+        old_tage, new_tage)
+    if removed_duty_count:
         try:
             app.logger.warning(
                 f'[roster-diff] degraded_import_suppressed removed='
-                f'{len(removed)} of old_days={len(old_by)}')
+                f'{removed_duty_count} of old_days={len(old_by)}')
         except Exception:
             pass
         changes = [c for c in changes if c.get('kind') != 'removed']
@@ -23827,20 +23893,33 @@ def take_roster_snapshot(token):
     # WICHTIG: das passiert UNABHÄNGIG vom Diff — auch eine Zeit-Änderung, die
     # keinen Change-Eintrag erzeugt, landet hier in den Daten (Auto-Übernahme).
     # Nur der Änderungs-EINTRAG entfällt, nie die Aktualisierung selbst.
+    # AUSNAHME: Ein als degradiert erkannter Teilimport darf fehlende Alttage
+    # nicht aus dem langlebigen Snapshot wischen. Neue/geänderte Tage gewinnen,
+    # nur vollständig fehlende Tage werden aus dem letzten guten Stand ergänzt.
+    snapshot_tage, _missing_days, _removed_duty_count = \
+        _roster_snapshot_merge_degraded(
+        old_tage, new_tage)
+    if _missing_days:
+        app.logger.warning(
+            f'[roster-snapshot] degraded_import_preserved '
+            f'missing_days={len(_missing_days)} '
+            f'removed_duties={_removed_duty_count} '
+            f'old_days={len(old_tage)} new_days={len(new_tage)} '
+            f'saved_days={len(snapshot_tage)}')
     if not _roster_snapshot_save(token, {
-        'taken_at': datetime.now().isoformat(), 'tage': new_tage,
+        'taken_at': datetime.now().isoformat(), 'tage': snapshot_tage,
     }):
         return jsonify({'ok': False, 'error': 'snapshot_persist_failed'}), 500
     # Crews-on-Flight: Flugnummer-Assignments aus dem neuen Snapshot ingesten
     # (best-effort, wirft nie). Speist /api/crew/flight-Lookup.
-    _crew_flight_ingest(token, new_tage)
+    _crew_flight_ingest(token, snapshot_tage)
     # Crew-Graph: aus dem frisch geschriebenen crew_flight_assignments-Index die
     # Same-Flight-Overlap-Kanten neu berechnen (best-effort, wirft nie,
     # idempotenter SET-Upsert). Erst NACH _crew_flight_ingest, damit die eigenen
     # Assignments schon sichtbar sind.
     try:
         from blueprints.crew_graph_blueprint import rebuild_overlap_edges
-        rebuild_overlap_edges(token, new_tage)
+        rebuild_overlap_edges(token, snapshot_tage)
     except Exception as _cg_e:
         app.logger.warning(f'[crew-graph] snapshot_rebuild_fail {type(_cg_e).__name__}: {str(_cg_e)[:120]}')
     # Append diff to changes log (SB-first + Disk — deploy-persistent seit

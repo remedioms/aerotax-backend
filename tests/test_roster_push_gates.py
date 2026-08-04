@@ -761,6 +761,62 @@ def _post(tmp_path, old, new):
     return r, push, changes_file
 
 
+def _post_capture_snapshot(tmp_path, old, new):
+    """Endpoint-Aufruf, der den tatsächlich persistierten Snapshot einfängt."""
+    saved = {}
+
+    def _save(_token, payload):
+        saved.update(payload)
+        return True
+
+    p1, _p2, p3, p4, p5, p6, p7, push, changes_file = _snapshot_env(
+        tmp_path, old)
+    with p1, patch.object(A, '_roster_snapshot_save', side_effect=_save), \
+            p3, p4, p5, p6, p7:
+        r = A.app.test_client().post(
+            '/api/user/roster-snapshot/testtoken123', json={'tage': new})
+    return r, saved, push, changes_file
+
+
+def test_degradierter_teilimport_behaelt_fehlende_tage_im_snapshot(tmp_path):
+    """Regression: der Diff-Guard allein verhinderte keinen Datenverlust.
+
+    Ein paralleler/noch laufender Client-Import lieferte live nur 94 von 131
+    Tagen. Die 37 vermeintlichen Entfernungen wurden zwar nicht gemeldet, der
+    gekürzte Payload aber trotzdem als neuer Snapshot gespeichert. Fehlende
+    Tage müssen deshalb aus dem letzten guten Stand ergänzt werden; alle vom
+    neuen Payload gelieferten Tage bleiben maßgeblich.
+    """
+    start = _hb_today() + timedelta(days=20)
+    old = [_tag((start + timedelta(days=i)).isoformat()) for i in range(20)]
+    new = [dict(old[i], source='fresh') for i in range(5)]
+
+    r, saved, push, _changes_file = _post_capture_snapshot(
+        tmp_path, old, new)
+
+    assert r.status_code == 200
+    assert r.get_json()['changes_count'] == 0  # Massen-removed bleibt still.
+    assert len(saved['tage']) == 20
+    by_date = {t['datum']: t for t in saved['tage']}
+    assert by_date[new[0]['datum']]['source'] == 'fresh'
+    assert by_date[old[-1]['datum']] == old[-1]
+    assert push.call_count == 0
+
+
+def test_kleine_echte_entfernung_wird_nicht_zurueckgemischt(tmp_path):
+    """Unterhalb des Degradations-Gates bleibt ein normaler Plan-Diff echt."""
+    start = _hb_today() + timedelta(days=20)
+    old = [_tag((start + timedelta(days=i)).isoformat()) for i in range(20)]
+    new = old[:-4]
+
+    r, saved, _push, _changes_file = _post_capture_snapshot(
+        tmp_path, old, new)
+
+    assert r.status_code == 200
+    assert r.get_json()['changes_count'] == 4
+    assert saved['tage'] == new
+
+
 def test_past_modified_landet_im_verlauf_statt_im_pending(tmp_path):
     # GEÄNDERT 2026-07-29 (Phantom-Klasse (a)): bis dahin landete ein
     # 'modified' an einem VERGANGENEN Tag zwar nicht im Push, aber sehr wohl
