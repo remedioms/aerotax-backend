@@ -70,8 +70,9 @@ def test_unsichtbare_zeichen_im_link_verstecken_den_host_nicht():
     'api.lufthansa.com.',
     'api.lufthansa.com.evil.tld',      # Täusch-Host: LH-Labels drin
     'lufthansa.com.mirror.example',
+    'crewaccess.cms.discover.aero',
 ])
-def test_lufthansa_hosts_sind_blockiert(host):
+def test_bekannte_gesperrte_hosts_sind_blockiert(host):
     assert cs.host_is_blocked(host) is True
 
 
@@ -85,7 +86,6 @@ def test_lufthansa_hosts_sind_blockiert(host):
     'outlook.office365.com',
     'offblock.de',
     'flybase.eurowings.com',
-    'crewaccess.cms.discover.aero',
     'p160-caldav.icloud.com',
     'ecrew.germanairways.com',
     'apps.apple.com',
@@ -161,6 +161,7 @@ def test_harmlose_urls_werden_vom_ziel_scan_nicht_getroffen():
     ('webcal://schedule.swiss.com/r.ics', True),
     ('https://notlufthansa.com/r.ics', True),
     ('https://api.lufthansa.com.evil.tld/r.ics', False),
+    ('https://crewaccess.cms.discover.aero/roster', False),
     ('kaputt', False),
 ])
 def test_sweep_allows_url(url, allowed):

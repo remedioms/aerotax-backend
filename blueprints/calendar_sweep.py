@@ -26,12 +26,14 @@
 #    Datenquelle des Produkts gefährden. Er ist deshalb VERBOTEN.
 #    ⇒ Dieser Lauf fasst AUSSCHLIESSLICH Nicht-LH-Hosts an. Gegen die
 #      Prod-Daten gemessen (30.07., dieser Filter): 1183 gespeicherte Links →
-#      216 erlaubt, 967 gesperrt. Erlaubt sind cube.aero 129+3 ·
+#      212 erlaubt, 971 gesperrt. Erlaubt sind cube.aero 129+3 ·
 #      schedule.swiss.com 42 · outlook.office365.com 16 · offblock.de 4 ·
-#      flybase.eurowings.com 4 · crewaccess.cms.discover.aero 4 ·
-#      apps.apple.com 4 · icloud-caldav 5 · ecrew.germanairways.com 2 · Rest 3.
+#      flybase.eurowings.com 4 · apps.apple.com 4 · icloud-caldav 5 ·
+#      ecrew.germanairways.com 2 · Rest 3.
 #      Gesperrt: api.lufthansa.com 959 · api-test.lufthansa.com 2 ·
 #      ebase2go.lufthansa.com 1 · www.ui-deref.de 4 · supr.sh 1.
+#      Zusaetzlich: crewaccess.cms.discover.aero 4 — dieses Portal liefert
+#      nachweislich Login-HTML statt iCal und verlangt den PDF-Import.
 #
 #  FILTER = AUSSCHLUSS-LISTE, keine Erlaubnis-Liste (`host_is_blocked`):
 #    Eine Whitelist würde jeden NEUEN Anbieter still hinten runterfallen
@@ -96,10 +98,13 @@ log = logging.getLogger('aerotax')
 calendar_sweep_bp = Blueprint('calendar_sweep', __name__)
 
 # ── Ausschluss-Liste ────────────────────────────────────────────────────────
-# NUR Lufthansa (myTime). Swiss (schedule.swiss.com) und Eurowings
-# (flybase.eurowings.com) sind eigene Portale mit eigenen Freigaben — sie
-# fallen ausdrücklich NICHT unter die LH-Warnung und bleiben erlaubt.
-BLOCKED_HOST_SUFFIXES = ('lufthansa.com',)
+# Lufthansa (myTime) plus bekannte Nicht-Feed-Portale. Swiss
+# (schedule.swiss.com) und Eurowings (flybase.eurowings.com) sind eigene
+# Portale mit echten Freigaben und bleiben erlaubt. Discover CrewAccess ist
+# dagegen Login-HTML; der produktive Import antwortet dort korrekt mit
+# ``discover_needs_pdf`` und darf vom Sweep nicht immer wieder angestossen
+# werden.
+BLOCKED_HOST_SUFFIXES = ('lufthansa.com', 'crewaccess.cms.discover.aero')
 
 # Redirect-/Kürzungsdienste: das Ziel steht NICHT in der URL, der Abruf folgt
 # aber Redirects — es könnte also myTime sein. Da wir das nicht sehen können,

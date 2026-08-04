@@ -21021,6 +21021,22 @@ def _server_ical_refresh_enabled():
     return (os.environ.get('AEROX_SERVER_ICAL_REFRESH', '1').strip() != '0')
 
 
+def _calendar_feed_url_requires_pdf(url):
+    """True fuer bekannte Portal-Links, die niemals einen iCal-Feed liefern.
+
+    Discover CrewAccess ist eine HTML-/Login-Quelle. Der Import-Endpoint weist
+    diese Links bereits ehrlich mit ``discover_needs_pdf`` ab; derselbe Guard
+    muss aber auch VOR dem fire-and-forget Auto-Refresh greifen. Sonst erzeugen
+    alte gespeicherte Portal-Links alle 45 Minuten einen internen 400er, ohne
+    dass daraus jemals ein Dienstplan entstehen kann.
+    """
+    try:
+        cleaned = _normalize_feed_scheme(_sanitize_feed_url(url or ''))
+        return 'crewaccess.cms.discover.aero' in cleaned.lower()
+    except Exception:
+        return False
+
+
 def _maybe_refresh_calendar_feed(token, base_url=None):
     """Stößt (gedrosselt, im Daemon-Thread) einen Re-Import des gespeicherten
     calendar_feed an, wenn der letzte Import älter als 6 h ist. Wirft nie.
@@ -21054,6 +21070,11 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
             return
         url = (feed.get('url') or '').strip()
         if not url.startswith(('https://', 'webcal://', 'webcals://')):
+            return
+        # Discover CrewAccess liefert Login-HTML statt iCal. Der API-Import
+        # antwortet fuer solche Links absichtlich mit ``discover_needs_pdf``;
+        # ein interner Auto-Refresh waere daher garantiert ein 400er.
+        if _calendar_feed_url_requires_pdf(url):
             return
         imported_at = (feed.get('imported_at') or '').strip()
         if imported_at:
@@ -52763,7 +52784,7 @@ def import_calendar_feed(token):
     # iCal (Login-HTML), der Import meldete still "ok" mit 0 Events und der
     # Roster blieb fuer immer leer. Ehrlicher Fehler statt stillem Erfolg;
     # iOS zeigt die Meldung und der PDF-Weg bleibt der richtige.
-    if 'crewaccess.cms.discover.aero' in url:
+    if _calendar_feed_url_requires_pdf(url):
         return jsonify({'ok': False, 'error': 'discover_needs_pdf',
                         'message': 'Discover bietet keinen Kalender-Link. '
                                    'Bitte lade dein Roster-PDF aus CrewAccess '

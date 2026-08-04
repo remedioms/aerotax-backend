@@ -77,3 +77,42 @@ def test_killswitch_disables_server_refresh():
             os.environ.pop('AEROX_SERVER_ICAL_REFRESH', None)
         else:
             os.environ['AEROX_SERVER_ICAL_REFRESH'] = prev
+
+
+def test_discover_portal_link_is_rejected_consistently():
+    url = 'https://crewaccess.cms.discover.aero/portal/roster'
+    assert backend._calendar_feed_url_requires_pdf(url) is True
+    status, payload = _import('AT-DISCOVER-PDF-GUARD', url=url)
+    assert status == 400
+    assert payload['error'] == 'discover_needs_pdf'
+
+
+def test_discover_portal_link_is_never_auto_refreshed(monkeypatch):
+    token = 'AT-DISCOVER-NO-REFRESH'
+    started = []
+
+    monkeypatch.setattr(backend, '_server_ical_refresh_enabled', lambda: True)
+    monkeypatch.setattr(backend, '_flightops_active', lambda _token: False)
+    monkeypatch.setattr(
+        backend, '_profile_load',
+        lambda _token: {
+            'profile': {
+                'calendar_feed': {
+                    'url': 'https://crewaccess.cms.discover.aero/portal',
+                    'imported_at': '2026-01-01T00:00:00',
+                }
+            }
+        })
+
+    class _UnexpectedThread:
+        def __init__(self, *args, **kwargs):
+            started.append((args, kwargs))
+
+        def start(self):
+            started.append('started')
+
+    monkeypatch.setattr(backend._req_threading, 'Thread', _UnexpectedThread)
+    backend._feed_refresh_last_attempt.pop(token, None)
+    with backend.app.test_request_context(base_url='https://api.aerosteuer.de'):
+        backend._maybe_refresh_calendar_feed(token)
+    assert started == []
