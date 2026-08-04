@@ -36,17 +36,22 @@ def main():
                     'where id=%s', (uid,))
         print(f'id {uid} → processed ({cur.rowcount} Zeile)')
         return
+    # The same private inbox also carries roster PDFs.  The exact marker keeps
+    # those rows out of the logbook parser pipeline.
     cur.execute('select id, token, name, airline, homebase, filename, '
                 'sha256, size_bytes, note, created_at '
                 'from public.ax_logbook_upload where not processed '
+                "and coalesce(note, '') <> 'AEROX_ROSTER_PDF_V1' "
                 'order by id')
     rows = cur.fetchall()
     if not rows:
         print('keine unverarbeiteten Uploads')
         return
     for r in rows:
+        token_prefix = (r[1] or '')[:8]
         print(f'#{r[0]} {r[9]:%Y-%m-%d %H:%M}Z  {r[2] or "?"} · {r[3] or "?"}'
-              f' · {r[4] or "?"}  tok={r[1]}  {r[5]} ({r[7] // 1024} KB)'
+              f' · {r[4] or "?"}  tok={token_prefix}...  '
+              f'{r[5]} ({r[7] // 1024} KB)'
               f'  sha256 {r[6][:16]}' + (f'  Notiz: {r[8]}' if r[8] else ''))
     if '--save' in sys.argv:
         os.makedirs(OUT, exist_ok=True)

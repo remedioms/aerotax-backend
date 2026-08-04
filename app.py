@@ -53706,6 +53706,30 @@ def _repair_ios_reprinted_roster_text(text):
     return candidate if is_discover else raw
 
 
+_ROSTER_PDF_QUEUE_NOTE = 'AEROX_ROSTER_PDF_V1'
+
+
+def _roster_pdf_upload_store(token, filename, blob):
+    """Keep every valid roster PDF until the import watcher verified it.
+
+    Reuses the private, service-key-only import inbox that already carries
+    logbook uploads.  The exact note marker gives the two consumers disjoint
+    queues without a production schema change.  The roster fetch helper
+    deletes a row after verified processing, so these sensitive PDFs are not
+    retained indefinitely.
+    """
+    import hashlib as _hl
+    safe_name = re.sub(r'[^A-Za-z0-9._ ()-]', '_', filename or 'roster.pdf')
+    safe_name = safe_name[-120:].strip() or 'roster.pdf'
+    sha = _hl.sha256(blob).hexdigest()[:16]
+    stored = _logbook_upload_store(
+        token, safe_name, blob, _ROSTER_PDF_QUEUE_NOTE)
+    level = app.logger.info if stored else app.logger.warning
+    level(f'[roster-pdf] queue-store-{"ok" if stored else "fail"} '
+          f'tok={token[:8]} sha={sha} bytes={len(blob)}')
+    return stored
+
+
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
 def import_roster_pdf(token):
     """Roster-PDF-Upload (Lufthansa City/Discover — kein iCal-Export).
@@ -53721,6 +53745,12 @@ def import_roster_pdf(token):
         return jsonify({'ok': False, 'error': 'too_large_8mb'}), 413
     if not data[:5] == b'%PDF-':
         return jsonify({'ok': False, 'error': 'invalid_pdf'}), 415
+    import hashlib as _hl
+    _upload_sha = _hl.sha256(data).hexdigest()[:16]
+    # Durable private inbox before parsing: even a parser/extractor failure can
+    # now be reproduced by the import watcher after this request has ended.
+    _monitoring_queued = _roster_pdf_upload_store(
+        token, f.filename or 'roster.pdf', data)
     try:
         import io
         import pdfplumber
@@ -53730,8 +53760,11 @@ def import_roster_pdf(token):
                 pages.append(pg.extract_text() or '')
         text = _repair_ios_reprinted_roster_text('\n'.join(pages))
     except Exception as e:
-        app.logger.warning(f'[roster-pdf] extract-fail: {type(e).__name__}: {str(e)[:160]}')
-        return jsonify({'ok': False, 'error': 'pdf_extract_failed'}), 422
+        app.logger.warning(
+            f'[roster-pdf] extract-fail tok={token[:8]} sha={_upload_sha} '
+            f'err={type(e).__name__}: {str(e)[:160]}')
+        return jsonify({'ok': False, 'error': 'pdf_extract_failed',
+                        'monitoring_queued': _monitoring_queued}), 422
     carrier = _crewaccess_carrier_for(request.form.get('airline'), token)
     ics, perr = _crewaccess_text_to_ics(text, carrier=carrier)
     if perr == 'unsupported_pdf_format':
@@ -53739,7 +53772,11 @@ def import_roster_pdf(token):
         # Quelle impliziert den Carrier: 4Y, unabhängig vom Client-Hint.
         ics, perr = _discover_roster_text_to_ics(text, carrier='4Y')
     if perr:
-        return jsonify({'ok': False, 'error': perr}), 422
+        app.logger.warning(
+            f'[roster-pdf] parse-fail tok={token[:8]} sha={_upload_sha} '
+            f'error={perr}')
+        return jsonify({'ok': False, 'error': perr,
+                        'monitoring_queued': _monitoring_queued}), 422
     # Interner Dispatch in die EINE Feed-Pipeline (wallreply-Muster) — kein
     # Fetch, volles Parse/Merge/Briefings/Reconcile/Sektoren-Verhalten.
     # `source` explizit — hier ist es WIRKLICH ein PDF (s. _DIRECT_ICS_SOURCES).
@@ -53756,6 +53793,16 @@ def import_roster_pdf(token):
               or re.search(r'Period:\s*([A-Za-z]+\s+\d{4})', text))
         if mp:
             payload['period'] = mp.group(1)
+        app.logger.info(
+            f'[roster-pdf] import-ok tok={token[:8]} sha={_upload_sha} '
+            f'events={payload.get("events_count")} '
+            f'briefings={payload.get("briefings_imported")} '
+            f'period={payload.get("period") or "?"}')
+    else:
+        app.logger.warning(
+            f'[roster-pdf] import-fail tok={token[:8]} sha={_upload_sha} '
+            f'status={status} error={payload.get("error") or "unknown"}')
+    payload['monitoring_queued'] = _monitoring_queued
     return jsonify(payload), status
 
 

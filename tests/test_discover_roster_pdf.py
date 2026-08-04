@@ -484,7 +484,9 @@ def test_endpoint_dispatch_via_real_pdf_upload():
     valid = backend._TokenValidationResult(
         backend._TokenValidationState.VALID, 'discover-pdf@example.test')
     with patch.object(backend, '_validate_token', return_value=valid), \
-            patch.object(backend, '_BUG004_REQUIRE_TOKEN_BINDING', False):
+            patch.object(backend, '_BUG004_REQUIRE_TOKEN_BINDING', False), \
+            patch.object(backend, '_roster_pdf_upload_store',
+                         return_value=True) as queue_store:
         rv = client.post(f'/api/user/roster-pdf/{token}/import',
                          data={'pdf': (io.BytesIO(pdf_bytes), 'roster.pdf'),
                                'airline': 'Discover'},
@@ -495,6 +497,54 @@ def test_endpoint_dispatch_via_real_pdf_upload():
     assert payload.get('source') == 'pdf'
     assert payload.get('period') == 'May 2026'
     assert payload.get('briefings_imported', 0) >= 5
+    assert payload.get('monitoring_queued') is True
+    queue_store.assert_called_once()
+
+
+def test_endpoint_queues_valid_pdf_before_extraction_failure():
+    """Even a corrupt PDF remains reproducible after the request finishes."""
+    import io
+    from unittest.mock import patch
+
+    token = 'AT-TEST-ROSTER-QUEUE-1'
+    client = backend.app.test_client()
+    valid = backend._TokenValidationResult(
+        backend._TokenValidationState.VALID, 'roster-queue@example.test')
+    with patch.object(backend, '_validate_token', return_value=valid), \
+            patch.object(backend, '_BUG004_REQUIRE_TOKEN_BINDING', False), \
+            patch.object(backend, '_roster_pdf_upload_store',
+                         return_value=True) as queue_store:
+        rv = client.post(
+            f'/api/user/roster-pdf/{token}/import',
+            data={'pdf': (io.BytesIO(b'%PDF-this-is-corrupt'), 'broken.pdf')},
+            content_type='multipart/form-data')
+
+    assert rv.status_code == 422
+    assert rv.get_json() == {
+        'ok': False,
+        'error': 'pdf_extract_failed',
+        'monitoring_queued': True,
+    }
+    queue_store.assert_called_once_with(
+        token, 'broken.pdf', b'%PDF-this-is-corrupt')
+
+
+def test_roster_queue_uses_dedicated_private_inbox_marker(monkeypatch):
+    captured = {}
+
+    def fake_store(token, filename, blob, note):
+        captured.update(token=token, filename=filename, blob=blob, note=note)
+        return True
+
+    monkeypatch.setattr(backend, '_logbook_upload_store', fake_store)
+    assert backend._roster_pdf_upload_store(
+        'AT-QUEUE', '../unsafe\nroster.pdf', b'%PDF-test') is True
+    assert captured == {
+        'token': 'AT-QUEUE',
+        'filename': '.._unsafe_roster.pdf',
+        'blob': b'%PDF-test',
+        'note': backend._ROSTER_PDF_QUEUE_NOTE,
+    }
 
 
 # ── Outstation-Origin Overnight Return — Date-Placement Bug (Panu-Regression) ─
