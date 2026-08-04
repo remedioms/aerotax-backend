@@ -13098,6 +13098,43 @@ def _friends_save_to_supabase(token, data):
         return False
 
 
+# Kurzer, pro Worker geteilter Cache fuer die ANGEREICHERTE Freundesliste.
+#
+# Produktionsbeweis 04.08.2026 (AeroX 2.2.2 / Build 296): derselbe Client rief
+# beim Oeffnen des Kalender-Tabs GET /api/user/friends/<token> neunmal in rund
+# drei Sekunden auf (27-mal in sechs Minuten). Jeder Lauf bezahlte erneut den
+# Friends-Read, den Profil-Bulk-Read und bis zu N Roster-Ort-Reads. Der Client-
+# Fix kann erst mit dem naechsten Binary greifen; dieser Cache beschleunigt auch
+# bereits veroeffentlichte Builds. Fuenf Sekunden sind lang genug, um den
+# Request-Sturm zu kollabieren, aber kurz genug fuer Profil-/Orts-Aenderungen.
+# Friend-Mutationen invalidieren sofort (s. Edge-/Save-Pfade unten).
+_USER_FRIENDS_PAYLOAD_MEMO = {}
+_USER_FRIENDS_PAYLOAD_LOCK = _req_threading.RLock()
+_USER_FRIENDS_PAYLOAD_KEY_LOCKS = {}
+_USER_FRIENDS_PAYLOAD_GENERATION = {}
+_USER_FRIENDS_PAYLOAD_TTL = 5.0
+
+
+def _user_friends_payload_invalidate(*tokens):
+    """Entfernt Friends-Listen-Antworten fuer die genannten Owner sofort."""
+    with _USER_FRIENDS_PAYLOAD_LOCK:
+        for token in tokens:
+            if token:
+                _USER_FRIENDS_PAYLOAD_MEMO.pop(token, None)
+                _USER_FRIENDS_PAYLOAD_GENERATION[token] = (
+                    _USER_FRIENDS_PAYLOAD_GENERATION.get(token, 0) + 1)
+
+
+def _user_friends_payload_key_lock(token):
+    """Ein Lock pro User verhindert einen Cache-Stampede im Gunicorn-Worker."""
+    with _USER_FRIENDS_PAYLOAD_LOCK:
+        lock = _USER_FRIENDS_PAYLOAD_KEY_LOCKS.get(token)
+        if lock is None:
+            lock = _req_threading.Lock()
+            _USER_FRIENDS_PAYLOAD_KEY_LOCKS[token] = lock
+        return lock
+
+
 def _friends_edge_upsert(owner_token, friend_token, status):
     """Atomarer Single-Edge-Upsert auf user_friends (PK owner_token,friend_token).
     Idempotent: gleicher Edge konvergiert statt zu clobbern. True bei Erfolg."""
@@ -13109,6 +13146,7 @@ def _friends_edge_upsert(owner_token, friend_token, status):
         sb.table('user_friends').upsert(
             {'owner_token': owner_token, 'friend_token': friend_token, 'status': status},
             on_conflict='owner_token,friend_token').execute()
+        _user_friends_payload_invalidate(owner_token)
         return True
     except Exception as e:
         app.logger.warning(
@@ -13124,6 +13162,7 @@ def _friends_edge_delete(owner_token, friend_token):
     try:
         (sb.table('user_friends').delete()
          .eq('owner_token', owner_token).eq('friend_token', friend_token).execute())
+        _user_friends_payload_invalidate(owner_token)
         return True
     except Exception as e:
         app.logger.warning(
@@ -13265,6 +13304,7 @@ def _friends_save_disk_only(token, data):
     wieder einführen, den die per-Edge-Writes vermeiden."""
     if not token:
         return False
+    _user_friends_payload_invalidate(token)
     p = _user_friends_path(token)
     if not p:
         return False
@@ -13282,6 +13322,7 @@ def _friends_save(token, data):
     Groups werden separat in user_friend_groups persistiert."""
     if not token:
         return False
+    _user_friends_payload_invalidate(token)
     disk_ok = False
     p = _user_friends_path(token)
     if p:
@@ -13332,9 +13373,8 @@ def _friend_facing_city(prof, roster_city=None):
     return roster_city or None
 
 
-@app.route('/api/user/friends/<token>', methods=['GET'])
-def get_user_friends(token):
-    """Listet alle Friends eines Users mit deren Profile-Daten."""
+def _build_user_friends_payload(token):
+    """Baut die voll angereicherte Friends-Antwort (ohne Cache/Flask-Response)."""
     data = _friends_load(token)
     enriched = []
     # N+1-Fix (2026-07-01): EIN Bulk-Query über alle Friend-Profile statt
@@ -13368,11 +13408,52 @@ def get_user_friends(token):
             'profile': prof,
             'short': friend_token[:8] + '…',
         })
-    return jsonify({
+    return {
         'token': token,
         'friends': enriched,
         'count': len(enriched),
-    })
+    }
+
+
+def _user_friends_payload_cached(token):
+    """Kurzer Success-Cache + Single-Flight fuer identische Friends-Reads."""
+    key_lock = _user_friends_payload_key_lock(token)
+    with key_lock:
+        now = _req_time.monotonic()
+        with _USER_FRIENDS_PAYLOAD_LOCK:
+            hit = _USER_FRIENDS_PAYLOAD_MEMO.get(token)
+            if hit and now - hit[0] < _USER_FRIENDS_PAYLOAD_TTL:
+                return hit[1]
+            generation = _USER_FRIENDS_PAYLOAD_GENERATION.get(token, 0)
+        # Fehler nie cachen: wir speichern erst nach vollstaendig erfolgreichem
+        # Build. Wartende identische Requests laufen danach direkt in den Hit.
+        payload = _build_user_friends_payload(token)
+        with _USER_FRIENDS_PAYLOAD_LOCK:
+            # Wurde waehrend des Builds eine Freundschaft mutiert, darf der
+            # davor gestartete Read seinen alten Snapshot nicht wieder cachen.
+            if _USER_FRIENDS_PAYLOAD_GENERATION.get(token, 0) == generation:
+                _USER_FRIENDS_PAYLOAD_MEMO[token] = (
+                    _req_time.monotonic(), payload)
+            if len(_USER_FRIENDS_PAYLOAD_MEMO) > 5000:
+                cutoff = _req_time.monotonic() - _USER_FRIENDS_PAYLOAD_TTL
+                for key, value in list(_USER_FRIENDS_PAYLOAD_MEMO.items()):
+                    if value[0] < cutoff:
+                        _USER_FRIENDS_PAYLOAD_MEMO.pop(key, None)
+        return payload
+
+
+@app.route('/api/user/friends/<token>', methods=['GET'])
+def get_user_friends(token):
+    """Listet alle Friends eines Users mit deren Profile-Daten."""
+    # Tests monkeypatchen dieselben Tokens/Funktionen zwischen Testfaellen;
+    # deshalb dort wie beim friend-roster-Memo immer den echten Builder nutzen.
+    payload = (_build_user_friends_payload(token) if app.testing
+               else _user_friends_payload_cached(token))
+    response = jsonify(payload)
+    # Personalisierte PII bleibt ausschliesslich im Server-Prozess-Cache; Browser,
+    # CDN oder geteilte Proxies duerfen die Antwort niemals speichern.
+    response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+    return response
 
 
 @app.route('/api/user/friends/<token>/add', methods=['POST'])
