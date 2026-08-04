@@ -2655,9 +2655,77 @@ def upvote_news_debrief(post_id):
 #  Cent-Bereich — bewusst kein neues Persistenz-System).
 # ─────────────────────────────────────────────────────────────────────────────
 
-_REDAKTION_STORE = {}          # art_id -> rewritten item dict (inkl. published_at)
+_REDAKTION_STORE = {}          # Worker-Memo des Datei-Stores (Quelle: _REDAKTION_PATH)
 _REDAKTION_REJECTED = {}      # art_id -> Fehlversuche; ab 2 endgültig aussortiert
 _REDAKTION_REJECT_MAX = 2     # ein Retry mit Rüge, dann Tombstone
+# MEHRPROZESS-REGEL (Prod = gunicorn --workers 3, Live-Befund 05.08.: Antworten
+# flackerten zwischen leerem und vollem Worker-Store): die Wahrheit liegt in
+# EINER Datei auf dem geteilten Container-FS, geschützt per fcntl-Lock. Jeder
+# Worker hält nur ein mtime-validiertes Memo. Worker-Recycling (max-requests
+# 5000) verliert damit nichts mehr; Container-Restart ⇒ bewusster Neuaufbau.
+_REDAKTION_PATH = os.getenv('AEROX_REDAKTION_STORE', '/tmp/aerox_redaktion_store.json')
+_REDAKTION_FILE_MTIME = {'ts': -1.0}
+
+
+def _redaktion_file_load():
+    """Store-Datei lesen (shared lock). Fehlend/kaputt ⇒ leer."""
+    import fcntl
+    try:
+        with open(_REDAKTION_PATH, 'r', encoding='utf-8') as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _redaktion_file_save(store):
+    """Store-Datei atomar schreiben (exklusiver Lock + rename)."""
+    import fcntl
+    tmp = _REDAKTION_PATH + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, _REDAKTION_PATH)
+    except OSError as exc:
+        _log_warn(f'[redaktion] store save failed: {exc!r}')
+
+
+def _redaktion_store_snapshot():
+    """Aktueller Store — Datei-Wahrheit, mtime-memoisiert pro Worker."""
+    try:
+        mtime = os.path.getmtime(_REDAKTION_PATH)
+    except OSError:
+        mtime = 0.0
+    with _REDAKTION_LOCK:
+        if mtime == _REDAKTION_FILE_MTIME['ts'] and (_REDAKTION_STORE or mtime == 0.0):
+            return dict(_REDAKTION_STORE)
+    loaded = _redaktion_file_load()
+    with _REDAKTION_LOCK:
+        _REDAKTION_STORE.clear()
+        _REDAKTION_STORE.update(loaded)
+        _REDAKTION_FILE_MTIME['ts'] = mtime
+        return dict(_REDAKTION_STORE)
+
+
+def _redaktion_store_merge(new_items):
+    """Neue Artikel in die Datei mergen (read-modify-write, Cap anwenden)."""
+    store = _redaktion_file_load()
+    store.update(new_items)
+    if len(store) > _REDAKTION_STORE_MAX:
+        ordered = sorted(store.values(),
+                         key=lambda x: x.get('published_at') or '',
+                         reverse=True)[:_REDAKTION_STORE_MAX]
+        store = {x['id']: x for x in ordered}
+    _redaktion_file_save(store)
+    with _REDAKTION_LOCK:
+        _REDAKTION_STORE.clear()
+        _REDAKTION_STORE.update(store)
+        try:
+            _REDAKTION_FILE_MTIME['ts'] = os.path.getmtime(_REDAKTION_PATH)
+        except OSError:
+            _REDAKTION_FILE_MTIME['ts'] = -1.0
 _REDAKTION_LOCK = threading.Lock()
 _REDAKTION_LAST_BUILD = {'ts': 0.0, 'running': False}
 _REDAKTION_BUILD_TTL = 30 * 60        # höchstens alle 30 min neu bauen
@@ -2908,11 +2976,11 @@ def _redaktion_build():
             _REDAKTION_LAST_BUILD['running'] = False
         return
     base.sort(key=lambda a: a.get('published_at') or '', reverse=True)
-    with _REDAKTION_LOCK:
-        todo = [a for a in base if a.get('id')
-                and a['id'] not in _REDAKTION_STORE
-                and _REDAKTION_REJECTED.get(a['id'], 0) < _REDAKTION_REJECT_MAX]
-        retry_ids = {a['id'] for a in todo if _REDAKTION_REJECTED.get(a['id'])}
+    existing = _redaktion_store_snapshot()
+    todo = [a for a in base if a.get('id')
+            and a['id'] not in existing
+            and _REDAKTION_REJECTED.get(a['id'], 0) < _REDAKTION_REJECT_MAX]
+    retry_ids = {a['id'] for a in todo if _REDAKTION_REJECTED.get(a['id'])}
     todo = todo[:_REDAKTION_MAX_PER_BUILD]
     for a in todo:
         if a['id'] in retry_ids:
@@ -2924,16 +2992,9 @@ def _redaktion_build():
         except Exception as exc:
             _log_warn(f'[redaktion] rewrite batch failed: {exc!r}')
             break  # Rest beim nächsten Lauf — kein Hämmern auf kaputten Provider
-        with _REDAKTION_LOCK:
-            _REDAKTION_STORE.update(rewritten)
+        if rewritten:
+            _redaktion_store_merge(rewritten)
     with _REDAKTION_LOCK:
-        # Cap: älteste (nach published_at) rausrotieren.
-        if len(_REDAKTION_STORE) > _REDAKTION_STORE_MAX:
-            ordered = sorted(_REDAKTION_STORE.values(),
-                             key=lambda x: x.get('published_at') or '',
-                             reverse=True)[:_REDAKTION_STORE_MAX]
-            _REDAKTION_STORE.clear()
-            _REDAKTION_STORE.update({x['id']: x for x in ordered})
         _REDAKTION_LAST_BUILD['ts'] = time.time()
         _REDAKTION_LAST_BUILD['running'] = False
 
@@ -2965,10 +3026,11 @@ def get_news_redaktion():
         limit = 40
     limit = max(1, min(limit, 100))
     building = _redaktion_kick_build_if_stale()
+    snapshot = _redaktion_store_snapshot()
+    items = sorted(snapshot.values(),
+                   key=lambda x: x.get('published_at') or '',
+                   reverse=True)[:limit]
     with _REDAKTION_LOCK:
-        items = sorted(_REDAKTION_STORE.values(),
-                       key=lambda x: x.get('published_at') or '',
-                       reverse=True)[:limit]
         running = _REDAKTION_LAST_BUILD['running']
     return jsonify({
         'ok': True,

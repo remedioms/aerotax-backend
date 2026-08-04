@@ -35,13 +35,16 @@ def _art(i, **over):
 
 
 @pytest.fixture(autouse=True)
-def _clean_store():
+def _clean_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(nb, '_REDAKTION_PATH', str(tmp_path / 'store.json'))
     with nb._REDAKTION_LOCK:
         nb._REDAKTION_STORE.clear()
+        nb._REDAKTION_FILE_MTIME['ts'] = -1.0
         nb._REDAKTION_LAST_BUILD.update({'ts': 0.0, 'running': False})
     yield
     with nb._REDAKTION_LOCK:
         nb._REDAKTION_STORE.clear()
+        nb._REDAKTION_FILE_MTIME['ts'] = -1.0
         nb._REDAKTION_LAST_BUILD.update({'ts': 0.0, 'running': False})
 
 
@@ -165,13 +168,12 @@ def test_endpoint_serves_store_and_warming(monkeypatch):
     assert r.status_code == 200 and body['ok'] is True
     assert body['items'] == [] and body['warming'] is True
 
-    with nb._REDAKTION_LOCK:
-        nb._REDAKTION_STORE['x'] = {
-            'id': 'x', 'headline': 'H' * 20, 'body': 'B' * 60,
-            'category': 'industry', 'source_name': 'Q',
-            'source_url': 'https://q.example', 'published_at': '2026-08-05',
-            'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
-        }
+    nb._redaktion_store_merge({'x': {
+        'id': 'x', 'headline': 'H' * 20, 'body': 'B' * 60,
+        'category': 'industry', 'source_name': 'Q',
+        'source_url': 'https://q.example', 'published_at': '2026-08-05',
+        'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
+    }})
     r2 = client.get('/api/news/redaktion?limit=5')
     body2 = r2.get_json()
     assert body2['count'] == 1 and body2['warming'] is False
@@ -234,3 +236,32 @@ def test_guard_retry_then_tombstone(monkeypatch):
     nb._redaktion_build()          # Versuch 3: tombstoned, kein Call mehr
     assert calls == [[False], [True]]
     nb._REDAKTION_REJECTED.clear()
+
+
+def test_store_survives_worker_memo_loss(monkeypatch):
+    """Mehrprozess-Vertrag: ein 'frischer Worker' (leeres Memo) liest die
+    Artikel aus der Store-DATEI — genau das fehlte in Prod (3 Gunicorn-
+    Worker, Antworten flackerten zwischen 3 und 0 Artikeln)."""
+    nb._redaktion_store_merge({'a': {
+        'id': 'a', 'headline': 'H' * 20, 'body': 'B' * 60,
+        'category': 'industry', 'source_name': 'Q',
+        'source_url': 'https://q.example', 'published_at': '2026-08-05',
+        'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
+    }})
+    # Frischer Worker: Memo weg, Datei bleibt.
+    with nb._REDAKTION_LOCK:
+        nb._REDAKTION_STORE.clear()
+        nb._REDAKTION_FILE_MTIME['ts'] = -1.0
+    snap = nb._redaktion_store_snapshot()
+    assert 'a' in snap and snap['a']['headline'] == 'H' * 20
+
+
+def test_store_cap_applies_in_file(monkeypatch):
+    many = {f'id{i:03d}': {
+        'id': f'id{i:03d}', 'headline': 'H' * 20, 'body': 'B' * 60,
+        'category': 'industry', 'source_name': 'Q', 'source_url': 'u',
+        'published_at': f'2026-08-05T{i % 24:02d}:{i % 60:02d}:00+00:00',
+        'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
+    } for i in range(nb._REDAKTION_STORE_MAX + 30)}
+    nb._redaktion_store_merge(many)
+    assert len(nb._redaktion_file_load()) == nb._REDAKTION_STORE_MAX
