@@ -3,7 +3,7 @@
 Drei Bausteine, alle hier abgesichert:
   1. TAGES-Deckel im Key-Gate (der Key hat neben 1.000/h auch 6.000/Tag).
   2. LAZY ROTATION: der Ein-Refresher rotiert nur noch bei Bedarf (Demand)
-     oder Keepalive (>20 h) statt ~32×/Tag pro Grant.
+     oder Keepalive (>18 h) statt ~32×/Tag pro Grant.
   3. ADAPTIVE SYNC-KADENZ im 2-h-Cron: 3,5 h bei Dienst in Sicht, sonst 11,5 h.
 
 Die Grant-Burn-Schutzarchitektur ist bewusst NICHT Gegenstand dieser Diät:
@@ -126,12 +126,12 @@ def test_lazy_demand_makes_due():
     assert fo._refresher_due(scan, now=now, demand={'AT-A'}) == ['AT-A']
 
 
-def test_lazy_keepalive_after_20h():
-    """RT-Hygiene: jeder gesunde Grant rotiert mindestens ~1×/20 h, auch ohne
+def test_lazy_keepalive_after_18h():
+    """RT-Hygiene: jeder gesunde Grant rotiert mindestens ~1×/18 h, auch ohne
     jeden Bedarf (der Refresh-Token darf nicht idle sterben)."""
     now = 1000000.0
-    scan = [('AT-YOUNG', _grant(now, age_h=19.0)),
-            ('AT-OLD', _grant(now, age_h=21.0))]
+    scan = [('AT-YOUNG', _grant(now, age_h=17.0)),
+            ('AT-OLD', _grant(now, age_h=19.0))]
     assert fo._refresher_due(scan, now=now, demand=set()) == ['AT-OLD']
 
 

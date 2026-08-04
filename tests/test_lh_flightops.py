@@ -3039,7 +3039,7 @@ def test_refresher_due_selection_orders_by_expiry():
 
     POLICY-UPDATE 2026-07-28 (Quota-Diät, Lazy Rotation): »läuft bald ab« ist
     nur noch die NOTWENDIGE Bedingung — rotiert wird bei Bedarf (Demand) oder
-    Keepalive (>20 h ohne Rotation). Deshalb wird hier Demand für die beiden
+    Keepalive (>18 h ohne Rotation). Deshalb wird hier Demand für die beiden
     fälligen Grants gesetzt; die geprüfte Zusage dieses Tests (Auswahl +
     Reihenfolge) ist unverändert. Die Lazy-Regel selbst prüft
     tests/test_lhfo_quota_diet.py."""

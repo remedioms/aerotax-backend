@@ -15,7 +15,7 @@ Dieser Test sichert die Gegenmaßnahmen ab:
   3. Zwei Leitplanken, die NICHT verhandelbar sind:
        · frische Nachfrage kommt durch, sobald der AT wirklich abgelaufen ist
          (der Nutzer wartet nie länger als einen Tick),
-       · der Keepalive (20 h) kann durch die Bremse NIE ausfallen — der
+       · der Keepalive (18 h) kann durch die Bremse NIE ausfallen — der
          Rückzugs-Deckel liegt bei 1 h.
   4. Verteilungs-Zähler pro Grant und Tag (vorher gab es dafür KEINE Messung).
 """
@@ -145,7 +145,7 @@ def test_claim_and_save_states_do_not_trigger_backoff():
 # ── 3. DER KEEPALIVE BLEIBT HEILIG ──────────────────────────────────────────
 def test_backoff_can_never_starve_the_keepalive():
     """Der Refresh-Token darf nie idle sterben. Der Rückzugs-Deckel (1 h) liegt
-    um den Faktor 20 unter dem Keepalive-Fenster (20 h) — ein Grant im
+    deutlich unter dem Keepalive-Fenster (18 h) — ein Grant im
     tiefsten Rückzug ist also lange vor Ablauf des Fensters wieder dran."""
     assert fo._ROT_BACKOFF_MAX_S < fo._REFRESHER_KEEPALIVE_S / 10
     now = 1_000_000.0

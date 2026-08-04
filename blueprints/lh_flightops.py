@@ -7277,7 +7277,7 @@ def _refresher_scan():
 # einmal in diesem Fenster, auch ohne jeden Bedarf — der LH-Refresh-Token darf
 # nicht idle sterben (Lebensdauer LH-seitig UNDOKUMENTIERT, deshalb bewusst
 # konservativ deutlich unter 24 h).
-_REFRESHER_KEEPALIVE_S = 20 * 3600
+_REFRESHER_KEEPALIVE_S = 18 * 3600
 # Angenommene AT-Lebensdauer für die Rückrechnung des letzten Rotations-
 # Zeitpunkts (s. _refresher_due). LH liefert expires_in=3600, _token_request
 # speichert expires_at = now + (expires_in − 60).
@@ -7292,7 +7292,7 @@ _REFRESHER_DEMAND_RETRY_STATES = frozenset((
 # ── ROTATIONS-BREMSE (Verstärkungs-Audit 2026-07-29) ────────────────────────
 # MESSUNG 29.07.: 4.057 oauth_refresh bei 601 gesunden Grants = 6,75 Rotationen
 # pro Grant und Tag. Rechnerisch erklärbar ist davon nur ein Teil:
-#   · Keepalive           601 × 24/20 h            ≈  721/Tag
+#   · Keepalive           601 × 24/18 h            ≈  801/Tag
 #   · Sync-Kadenz (Demand-Vorlauf des 2-h-Crons; AT lebt 59 min < 3,5-h-Takt,
 #     also kostet JEDER Sync-Lauf genau eine Rotation) ≤ 6/Grant/Tag
 # Der Rest kommt aus einer RÜCKKOPPLUNG, die im Code stand:
@@ -7315,7 +7315,7 @@ _REFRESHER_DEMAND_RETRY_STATES = frozenset((
 #       120 s · 2^(n−1), gedeckelt bei 1 h. Ein dauerhaft scheiternder Grant
 #       macht damit ~26 statt 1.440 Versuche/Tag (Faktor ~55).
 # HEILIG BLEIBT: der Keepalive. Der Deckel (1 h) liegt um Größenordnungen
-# unter _REFRESHER_KEEPALIVE_S (20 h) — ein Refresh-Token kann durch die
+# unter _REFRESHER_KEEPALIVE_S (18 h) — ein Refresh-Token kann durch die
 # Bremse NIE idle sterben. Und die Bremse macht nichts auf, sie macht nur zu:
 # Claim-RPC, Choke-Point-Gate und der Asymmetrie-Vertrag in _tokens_save sind
 # unberührt.
@@ -7423,7 +7423,7 @@ def _refresher_due(scan, now=None, demand=None, out=None):
       a) DEMAND — jemand braucht den Grant JETZT (User-Import auf abgelaufenem
          AT bzw. Demand-Vorlauf des Sync-Laufs, s. _refresher_demand).
       b) KEEPALIVE — die letzte Rotation ist länger als _REFRESHER_KEEPALIVE_S
-         her. Damit rotiert jeder gesunde Grant garantiert ~1×/20 h und der RT
+         her. Damit rotiert jeder gesunde Grant garantiert ~1×/18 h und der RT
          kann nicht idle ablaufen.
 
     EHRLICHE ABLEITUNG von `last_rotated`: es gibt KEINEN rotated_at-Stempel im
