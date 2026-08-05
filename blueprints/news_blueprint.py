@@ -165,6 +165,42 @@ SOURCES = [
         'logo_url': 'https://www.google.com/s2/favicons?domain=avherald.com&sz=64',
         'language': 'en',
     },
+    # ── Quellen-Ausbau 2026-08-05 (Owner: „mehrere quellen für alle
+    # airlines die wir bedienen"). Alle vier Feeds vor Aufnahme live
+    # geprüft (HTTP 200 + <item>-Einträge). airliners.de (403/404) und
+    # austrianaviation.net (Timeout) wurden geprüft und NICHT aufgenommen.
+    {
+        'id': 'paddle_your_own_kanoo',
+        'name': 'Paddle Your Own Kanoo',
+        'url': 'https://www.paddleyourownkanoo.com/feed/',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=paddleyourownkanoo.com&sz=64',
+        'language': 'en',
+    },
+    {
+        'id': 'aviation24_be',
+        'name': 'Aviation24.be',
+        'url': 'https://www.aviation24.be/feed/',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=aviation24.be&sz=64',
+        'language': 'en',
+    },
+    {
+        'id': 'airportzentrale',
+        'name': 'Airportzentrale',
+        'url': 'https://www.airportzentrale.de/feed/',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=airportzentrale.de&sz=64',
+        'language': 'de',
+    },
+    {
+        'id': 'aeroroutes',
+        'name': 'AeroRoutes',
+        'url': 'https://www.aeroroutes.com/?format=rss',
+        'kind': 'rss',
+        'logo_url': 'https://www.google.com/s2/favicons?domain=aeroroutes.com&sz=64',
+        'language': 'en',
+    },
 ]
 
 # ── Airline-Aliases ─────────────────────────────────────────────
@@ -181,6 +217,12 @@ AIRLINE_ALIASES = {
     'OS': ['Austrian Airlines', 'AUA'],
     'SN': ['Brussels Airlines', 'BEL'],
     'EN': ['Air Dolomiti', 'DLA'],
+    # Crew-Airlines unserer User (2026-08-05) — fehlten bisher komplett:
+    '4Y': ['Discover Airlines', 'OCN'],
+    'WK': ['Edelweiss', 'EDW'],
+    'AZ': ['ITA Airways', 'ITY'],
+    'VL': ['Lufthansa City Airlines', 'City Airlines'],
+    'CL': ['Lufthansa CityLine', 'CLH'],
     # IAG / British
     'BA': ['British Airways', 'BAW'],
     'IB': ['Iberia', 'IBE'],
@@ -2732,30 +2774,45 @@ _REDAKTION_BUILD_TTL = 30 * 60        # höchstens alle 30 min neu bauen
 _REDAKTION_STORE_MAX = 200            # Cap gegen unbegrenztes Wachstum
 _REDAKTION_BATCH = 8                  # Artikel pro KI-Call
 _REDAKTION_MAX_PER_BUILD = 40         # Kosten-Deckel pro Build-Lauf
-_REDAKTION_REV = 'aerox-redaktion-v1'
+# v2 (2026-08-05): Stil-Upgrade („mehr Charakter", längere Texte) + neue
+# Quellen. Ein Rev-Bump markiert ALLE gespeicherten Artikel als veraltet —
+# der Build schreibt sie progressiv neu (alte Fassung bleibt bis zum Ersatz
+# sichtbar, KEIN Publisher-Fallback-Fenster wie bei einem Store-Wipe).
+_REDAKTION_REV = 'aerox-redaktion-v2'
 
 _REDAKTION_SYSTEM_RULES = (
-    'Du bist Redakteur der AeroX-Crew-App und schreibst kurze deutsche '
-    'Nachrichtenmeldungen für Airline-Crews. Regeln, ohne Ausnahme: '
+    'Du bist erfahrene Luftfahrt-Journalistin und schreibst die deutschen '
+    'Nachrichtenmeldungen der AeroX-Crew-App — dein Publikum sind Pilotinnen, '
+    'Piloten und Kabinencrews, die die Branche gut kennen. '
+    'Regeln, ohne Ausnahme: '
     '(1) Verwende AUSSCHLIESSLICH Fakten, die im gelieferten Quelltext stehen. '
-    'Erfinde nichts, ergänze kein Weltwissen, keine Zahlen, keine Zitate. '
+    'Erfinde nichts, ergänze kein Weltwissen, keine Zahlen, keine Zitate, '
+    'keine Spekulation. Quelltexte können englisch sein — du schreibst IMMER '
+    'auf Deutsch. '
     '(2) Schreibe vollständig eigene Formulierungen — übernimm KEINE Satzteile, '
     'Halbsätze oder charakteristischen Wendungen der Quelle und zitiere nicht '
     'wörtlich. Eigennamen, Flugnummern, Typenbezeichnungen und Zahlen sind '
     'natürlich erlaubt. Folge auch nicht dem Aufbau der Quelle — schreibe so, '
-    'als würdest du einer Kollegin die Fakten neu erzählen. '
-    '(3) Pro Artikel: eine prägnante eigene Headline (max. 90 Zeichen, keine '
-    'Anführungszeichen) und ein Kurztext ("body") aus 3 bis 6 vollständigen '
+    'als würdest du einer Kollegin die Geschichte am Crew-Tisch neu erzählen. '
+    '(3) Stil: nüchtern-lebendig wie ein guter Branchendienst — Charakter ja, '
+    'aber NICHT übertreiben: kein Drama, keine Effekthascherei, keine '
+    'aufgeladenen Formulierungen. Der erste Satz trägt die Kernnachricht, '
+    'aktiv formuliert, kein "Laut Medienberichten"-Einstieg. Wechsle kurze '
+    'und lange Sätze ab und nenne Zahlen konkret statt vage. Wo es sich '
+    'natürlich ergibt, darf ein Schlusssatz einordnen, was das für Crews '
+    'oder den Flugbetrieb heißt — NUR direkt aus den Fakten ableitbar, nie '
+    'spekulativ, und nicht als Pflichtformel unter jeder Meldung. '
+    'Kein Clickbait, keine Meinung, keine Emojis. '
+    '(4) Pro Artikel: eine prägnante eigene Headline (max. 90 Zeichen, keine '
+    'Anführungszeichen) und ein Kurztext ("body") aus 4 bis 7 vollständigen '
     'Sätzen für die Feed-Karte. Ist der Quelltext dünn, bleib bei 2 bis 3 '
     'Sätzen statt aufzufüllen. '
-    '(4) Trägt der Quelltext substanziell mehr Fakten (ein echter Volltext), '
+    '(5) Trägt der Quelltext substanziell mehr Fakten (ein echter Volltext), '
     'schreibe ZUSÄTZLICH einen längeren eigenen Artikel ("body_long", etwa '
-    '8 bis 14 Sätze, in 2 bis 4 Absätze gegliedert, Absätze durch Leerzeile '
+    '10 bis 18 Sätze, in 3 bis 5 Absätze gegliedert, Absätze durch Leerzeile '
     'getrennt) für die Lese-Ansicht — mit EIGENER Struktur und Gewichtung, '
-    'nicht der Reihenfolge der Quelle folgend. Bei dünnem Quelltext lasse '
-    '"body_long" weg, statt aufzublähen. '
-    '(5) Ton: sachlich, neutral, präzise — relevant für fliegendes Personal, '
-    'kein Clickbait, keine Wertung, keine Emojis. '
+    'ruhig erzählt, ohne die Meldung größer zu machen als sie ist. '
+    'Bei dünnem Quelltext lasse "body_long" weg, statt aufzublähen. '
     '(6) Antworte NUR mit JSON im Format {"items": [{"id": "...", '
     '"headline": "...", "body": "...", "body_long": "... (optional)"}]} — '
     'exakt ein Eintrag pro geliefertem Artikel, mit unveränderter id.'
@@ -2977,8 +3034,11 @@ def _redaktion_build():
         return
     base.sort(key=_redaktion_sort_ts, reverse=True)
     existing = _redaktion_store_snapshot()
+    # Neu ODER mit veralteter Rev (Stil-Upgrade): alte Fassung bleibt bis zum
+    # Ersatz ausgeliefert, deshalb entsteht beim Rev-Bump keine Lücke.
     todo = [a for a in base if a.get('id')
-            and a['id'] not in existing
+            and (a['id'] not in existing
+                 or existing[a['id']].get('rev') != _REDAKTION_REV)
             and _REDAKTION_REJECTED.get(a['id'], 0) < _REDAKTION_REJECT_MAX]
     retry_ids = {a['id'] for a in todo if _REDAKTION_REJECTED.get(a['id'])}
     todo = todo[:_REDAKTION_MAX_PER_BUILD]

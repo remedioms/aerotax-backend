@@ -154,6 +154,47 @@ def test_build_dedupes_already_rewritten(monkeypatch):
     assert len(seen_batches) == 1
 
 
+def test_build_rewrites_items_with_stale_rev(monkeypatch):
+    """Rev-Bump-Vertrag (Stil-Upgrade 05.08.): Artikel mit alter rev werden
+    beim nächsten Build NEU geschrieben (progressiver Ersatz), Artikel mit
+    aktueller rev bleiben unangetastet — und die alte Fassung bleibt bis zum
+    Ersatz im Store (kein Publisher-Fallback-Fenster)."""
+    seen_batches = []
+
+    def fake_batch(articles):
+        seen_batches.append(sorted(a['id'] for a in articles))
+        return {a['id']: {'id': a['id'], 'headline': 'Neu ' + 'H' * 20,
+                          'body': 'B' * 60, 'category': 'industry',
+                          'source_name': a['source_name'],
+                          'source_url': a['article_url'],
+                          'published_at': a['published_at'],
+                          'mentioned_airlines': [], 'rev': nb._REDAKTION_REV}
+                for a in articles}
+
+    arts = [_art(i) for i in range(1, 4)]
+    monkeypatch.setattr(nb, '_redaktion_base_articles', lambda: list(arts))
+    monkeypatch.setattr(nb, '_redaktion_rewrite_batch', fake_batch)
+    # Vorbelegung: art0001 alte Rev, art0002 aktuelle Rev, art0003 fehlt.
+    nb._redaktion_store_merge({
+        'art0001': {'id': 'art0001', 'headline': 'Alt ' + 'H' * 20,
+                    'body': 'B' * 60, 'category': 'industry',
+                    'source_name': 'Q', 'source_url': 'u',
+                    'published_at': '2026-08-05', 'mentioned_airlines': [],
+                    'rev': 'aerox-redaktion-v1'},
+        'art0002': {'id': 'art0002', 'headline': 'Aktuell ' + 'H' * 20,
+                    'body': 'B' * 60, 'category': 'industry',
+                    'source_name': 'Q', 'source_url': 'u',
+                    'published_at': '2026-08-05', 'mentioned_airlines': [],
+                    'rev': nb._REDAKTION_REV},
+    })
+    nb._redaktion_build()
+    assert seen_batches == [['art0001', 'art0003']]
+    snap = nb._redaktion_store_snapshot()
+    assert snap['art0001']['headline'].startswith('Neu ')      # ersetzt
+    assert snap['art0002']['headline'].startswith('Aktuell ')  # unangetastet
+    assert snap['art0003']['rev'] == nb._REDAKTION_REV
+
+
 def test_endpoint_serves_store_and_warming(monkeypatch):
     from flask import Flask
     app = Flask(__name__)
