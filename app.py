@@ -21860,6 +21860,13 @@ def _logbook_airport_norm(code):
     return ''
 
 
+# Beweis-Horizont des Flugbuchs: nur innerhalb dieses Fensters sammelt der
+# Enrich-Backfill überhaupt Ankunfts-Belege (Board/Landing-Report/FR24) —
+# ältere Tage werden bewusst nie angefasst (kein Kaltstart-Kaskaden-Risiko).
+# Dieselbe Zahl gatet deshalb BEIDE Seiten: Belege sammeln UND Belege fordern.
+_LOGBOOK_EVIDENCE_WINDOW_DAYS = 35
+
+
 def _logbook_roster_leg_completed(sec, now=None, proof=None):
     """True nur mit einem belastbaren Beleg für ein abgeschlossenes Roster-Leg.
 
@@ -21870,6 +21877,16 @@ def _logbook_roster_leg_completed(sec, now=None, proof=None):
     Zulässig sind nur eine als gemessen markierte Sektor-Ankunft, eine zuvor
     konservierte Beobachtungs-/Landing-Report-Ankunft oder ein bereits bewusst
     gespeichertes User-Overlay dieses Legs.
+
+    AUSNAHME Historie (Paula/Florian 2026-08-05, Regression aus d05e779):
+    Jenseits des Beweis-Fensters (`_LOGBOOK_EVIDENCE_WINDOW_DAYS`) existiert
+    für Roster-Legs prinzipbedingt NIE ein Beleg — der Enrich-Backfill fasst
+    ältere Tage bewusst nicht an, Landing-Report/Facts-Cache reichen nicht so
+    weit zurück. Dort IST der konservierte Roster die Historie (FlightOps
+    liefert für geflogene Vergangenheit die gemeldeten Zeiten); ohne diese
+    Regel verschwanden ganze Monate aus Flugbuch und Passport (Mai/Juni bei
+    Florian, „nur noch August" bei Paula). Im Fenster bleibt das Gate streng
+    beweisbasiert.
 
     Historische Import-Legs laufen nicht durch dieses Gate — sie stammen aus
     einem bewusst eingespielten Alt-Flugbuch und nicht aus dem Roster.
@@ -21886,6 +21903,23 @@ def _logbook_roster_leg_completed(sec, now=None, proof=None):
     if sec.get('cancelled') is True or any(x in status for x in (
             'cancel', 'annull', 'storn')):
         return False
+    # Historien-Regel: Plan-Ankunft älter als das Beweis-Fenster → geflogen.
+    # (Stornos sind oben bereits raus; LH entfernt gestrichene Legs zudem aus
+    # dem konservierten Roster-Bestand.)
+    _hist_arr = sec.get('arr_iso') or sec.get('dep_iso')
+    if isinstance(_hist_arr, str) and _hist_arr.strip():
+        try:
+            from datetime import (datetime as _hdt, timedelta as _htd,
+                                  timezone as _htz)
+            _arr = _hdt.fromisoformat(_hist_arr.strip().replace('Z', '+00:00'))
+            _ref = now or _hdt.now(_htz.utc)
+            if _ref.tzinfo is None:
+                _ref = _ref.replace(tzinfo=_htz.utc)
+            if _arr.tzinfo is not None and _arr <= _ref - _htd(
+                    days=_LOGBOOK_EVIDENCE_WINDOW_DAYS):
+                return True
+        except (TypeError, ValueError, OverflowError):
+            pass
     if sec.get('arr_measured') is True:
         arrival = sec.get('est_arr_iso')
     elif p.get('actual_arr_iso'):
@@ -22116,7 +22150,8 @@ def get_logbook(token):
     # kommen aus dem expliziten Import, und ein Kaltstart darf keine jahrelange
     # Board-/FR24-Kaskade lostreten.
     enrich_wanted = []
-    _evidence_cutoff = (_now_dt - _lb_td(days=35)).date()
+    _evidence_cutoff = (_now_dt
+                        - _lb_td(days=_LOGBOOK_EVIDENCE_WINDOW_DAYS)).date()
     for _lg in all_merged:
         if _lg.get('source') != 'roster':
             continue

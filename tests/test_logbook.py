@@ -114,6 +114,34 @@ def test_roster_leg_needs_real_arrival_proof_and_never_accepts_plan_only():
         proof={'historical_import': True}) is True
 
 
+def test_roster_history_beyond_evidence_window_needs_no_proof():
+    """Regression Paula/Florian 2026-08-05 (aus d05e779): Für Legs jenseits
+    des Beweis-Fensters gibt es prinzipbedingt nie einen Beleg (Backfill
+    fasst >35 Tage nicht an) — der konservierte Roster IST dort die Historie.
+    Ohne die Altersregel verschwanden ganze Monate aus Flugbuch+Passport
+    (Florian: Mai/Juni komplett, Juli teilweise; Paula: „nur noch August")."""
+    now = datetime(2026, 8, 5, 8, 0, tzinfo=timezone.utc)
+    # Florians echtes Mai-Leg (LH1800 MUC-MAD, Alt-Format: nur Plan-Felder).
+    old_plan = {'arr_iso': '2026-05-03T09:08:00Z'}
+    old_dep_only = {'dep_iso': '2026-05-03T06:29:00Z'}
+    old_cancelled = {'arr_iso': '2026-05-03T09:08:00Z', 'cancelled': True}
+    old_cancelled_text = {'arr_iso': '2026-05-03T09:08:00Z',
+                          'status': 'Cancelled'}
+    # Im Fenster (< 35 Tage) bleibt das Gate streng beweisbasiert.
+    recent_plan = {'arr_iso': '2026-07-15T09:00:00Z'}
+    boundary_out = {'arr_iso': '2026-07-01T07:59:00Z'}   # now-35d = 07-01 08:00
+    boundary_in = {'arr_iso': '2026-07-01T08:01:00Z'}
+
+    assert backend._logbook_roster_leg_completed(old_plan, now=now) is True
+    assert backend._logbook_roster_leg_completed(old_dep_only, now=now) is True
+    assert backend._logbook_roster_leg_completed(old_cancelled, now=now) is False
+    assert backend._logbook_roster_leg_completed(
+        old_cancelled_text, now=now) is False
+    assert backend._logbook_roster_leg_completed(recent_plan, now=now) is False
+    assert backend._logbook_roster_leg_completed(boundary_out, now=now) is True
+    assert backend._logbook_roster_leg_completed(boundary_in, now=now) is False
+
+
 def test_measured_arrival_from_facts_rejects_frozen_forecast_and_status_only():
     good = {
         'est_arr': '2026-08-03T18:45:00Z', 'arr_status': 'landed',
