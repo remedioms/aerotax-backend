@@ -456,3 +456,16 @@ def test_endpoint_hides_offtopic_leftovers(monkeypatch):
     r = backend.app.test_client().get('/api/news/redaktion?limit=100')
     ids = [i['id'] for i in r.get_json()['items']]
     assert 'ok1' in ids and 'off1' not in ids
+
+
+def test_offtopic_stopcodes_never_count_as_airline_proof():
+    """Live-Fall 05.08.: gespeicherte Erwähnungen ['EI']/['AM'] stammen aus
+    Whole-Word-Treffern auf Funktionswörter (dt. „am", .de-Domains, engl.
+    „AI") und dürfen einen Off-Topic-Artikel nicht schützen."""
+    for code in ('EI', 'AM', 'DE', 'AI'):
+        assert nb._redaktion_offtopic(
+            'SpaceX-Rakete könnte auf dem Mond einschlagen', 'Raumfahrt.',
+            mentioned=[code]), code
+    assert not nb._redaktion_offtopic(
+        'SpaceX-Rakete könnte auf dem Mond einschlagen', 'Raumfahrt.',
+        mentioned=['LH'])

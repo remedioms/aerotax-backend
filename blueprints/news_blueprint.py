@@ -2814,6 +2814,10 @@ _REDAKTION_SOURCE_CAP = 8
 _REDAKTION_MENTION_STOPCODES = frozenset({
     'AM', 'AN', 'AB', 'AS', 'AT', 'BE', 'BY', 'DO', 'IF', 'IN', 'IS',
     'IT', 'ON', 'OR', 'SO', 'TO', 'US',
+    # Zweite Welle (live 05.08.): 'EI' (Aer Lingus) traf deutsche Texte,
+    # 'DE' (Condor) matcht jede .de-Domain im Summary, 'AI' (Air India)
+    # jedes englische "AI". Alle bleiben über ihre Namen erkennbar.
+    'AI', 'DE', 'EI', 'GO', 'HE', 'LA', 'ME', 'NO', 'OK', 'WE',
 })
 
 
