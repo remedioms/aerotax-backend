@@ -247,10 +247,13 @@ def test_passport_teilt_die_leg_quelle_mit_dem_flugbuch(synth_days, monkeypatch)
     pp_keys = {lg["key"] for lg in A._passport_legs(TOKEN)}
     assert lb_keys and lb_keys <= pp_keys
     p = A._passport_stats_compute(TOKEN, "all")
-    # Passport zählt zusätzlich (a) MUC-LHR ohne Flugnummer und (b) LH401 ohne
-    # belastbare Ankunft. Das Flugbuch darf Letzteres nicht aus einem bloßen
-    # Routentag erfinden; der Passport bleibt die breitere Reisehistorie.
-    assert p["flights"] == len(pp_keys) == lb["totals"]["legs"] + 2
+    # Passport zählt zusätzlich NUR das MUC-LHR-Leg ohne Flugnummer (fällt im
+    # FCL.050-Buch durch require_flight). LH401 ohne arr_iso ist seit der
+    # Altersregel (Owner 2026-08-05, Paula/Florian-Regression) im Flugbuch
+    # enthalten: alle Fixture-Legs liegen jenseits des Beweis-Fensters, dort
+    # IST der Roster die Historie — ein fehlendes arr_iso versteckt keinen
+    # geflogenen Leg mehr.
+    assert p["flights"] == len(pp_keys) == lb["totals"]["legs"] + 1
 
 
 def test_compute_empty_state(monkeypatch):

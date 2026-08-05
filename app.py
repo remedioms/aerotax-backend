@@ -21864,7 +21864,11 @@ def _logbook_airport_norm(code):
 # Enrich-Backfill überhaupt Ankunfts-Belege (Board/Landing-Report/FR24) —
 # ältere Tage werden bewusst nie angefasst (kein Kaltstart-Kaskaden-Risiko).
 # Dieselbe Zahl gatet deshalb BEIDE Seiten: Belege sammeln UND Belege fordern.
-_LOGBOOK_EVIDENCE_WINDOW_DAYS = 35
+# Owner-Entscheid 2026-08-05: 7 Tage statt 35 — Stornos/Zukunft fängt das
+# Fenster weiterhin, aber unbeweisbare Legs (Beweis-Caches sind bis zum
+# Volume-Mount deploy-flüchtig, Board/FR24 reichen nur Tage zurück) bleiben
+# höchstens eine Woche unsichtbar statt fünf.
+_LOGBOOK_EVIDENCE_WINDOW_DAYS = 7
 
 
 def _logbook_roster_leg_completed(sec, now=None, proof=None):
@@ -22145,10 +22149,10 @@ def get_logbook(token):
                   lg.get('sec'), now=_now_dt,
                   proof=completion_proofs.get(lg.get('key')))]
 
-    # Aktuellen Monat im Hintergrund beweisbasiert vervollständigen. Mehr als
-    # 35 Tage werden hier bewusst nicht angefasst: historische Karriere-Daten
-    # kommen aus dem expliziten Import, und ein Kaltstart darf keine jahrelange
-    # Board-/FR24-Kaskade lostreten.
+    # Frische Legs im Hintergrund beweisbasiert vervollständigen. Jenseits von
+    # _LOGBOOK_EVIDENCE_WINDOW_DAYS wird bewusst nichts angefasst: dort greift
+    # die Altersregel des Gates (Roster = Historie), und ein Kaltstart darf
+    # keine jahrelange Board-/FR24-Kaskade lostreten.
     enrich_wanted = []
     _evidence_cutoff = (_now_dt
                         - _lb_td(days=_LOGBOOK_EVIDENCE_WINDOW_DAYS)).date()
