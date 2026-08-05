@@ -32,9 +32,10 @@ from legkeys import dedupe_keys
 
 RE_HEADER = re.compile(r"für Monat\s+(\d{2})\s*/\s*(\d{4})")
 RE_DATE = re.compile(r"^(\d{2})\.(\d{2})\.$")
-RE_FLIGHT = re.compile(r"^([A-Z]{2})(\d{3,4})$")
+RE_FLIGHT = re.compile(r"^([A-Z]{2})(\d{3,4})(?:/\d{1,2})?$")
 RE_CLOCKS = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$")
-RE_SIM_DEVICE = re.compile(r"^[A-Z]{3}[A-Z0-9]{3}$")
+RE_SIM_DEVICE = re.compile(r"^(?:[A-Z]{3}[A-Z0-9]{3}|FT\d{2})$")
+RE_LEGACY_CABIN = re.compile(r"Funktion\s+FB\s*/\s*KABINE", re.IGNORECASE)
 CONTROL_ROUNDING_TOLERANCE_MIN = 2
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -82,6 +83,15 @@ def control_minutes_match(parsed_minutes, summary_minutes):
         <= CONTROL_ROUNDING_TOLERANCE_MIN
 
 
+def effective_summary_minutes(value, source_rows):
+    """Resolve an omitted SAP effective-time total for a genuine zero month."""
+    if value is not None:
+        return value
+    if source_rows == 0:
+        return 0
+    raise ValueError("Effektive Flugzeit fehlt in der Summenzeile")
+
+
 def normalized_flight(value):
     """SAP-Padding: LH0046 → LH046, LH0982 → LH982; sonst unverändert."""
     match = RE_FLIGHT.fullmatch((value or "").strip().upper())
@@ -99,6 +109,14 @@ def normalized_registration(value):
     if re.fullmatch(r"D[A-Z0-9]{4}", value):
         return "D-" + value[1:]
     return value or None
+
+
+def legacy_cabin_traffic_code(value):
+    """Old cabin overview: TC 01 is a credited deadhead, TC 00 operating."""
+    value = (value or "").strip()
+    if value not in ("00", "01"):
+        raise ValueError(f"unbekannter Kabinen-Traffic-Code: {value!r}")
+    return value == "01"
 
 
 def _solar_elevation(instant, lat, lon):
@@ -174,11 +192,10 @@ def _summary(page, month):
     landings = _one(row, 160, 190, r"\d+")
     effective = _one(row, 190, 225, r"\d+[,]\d{2}")
     deadhead = _one(row, 310, 345, r"\d+[,]\d{2}")
-    if not effective:
-        raise ValueError("Effektive Flugzeit fehlt in der Summenzeile")
     return {
         "landings": int(landings or 0),
-        "effective_min": decimal_hours_minutes(effective),
+        "effective_min": (decimal_hours_minutes(effective)
+                          if effective is not None else None),
         "deadhead_min": decimal_hours_minutes(deadhead),
     }
 
@@ -190,6 +207,7 @@ def parse_pdf(path):
         if not header:
             raise ValueError(f"kein LH-Flugstundenübersicht-Kopf: {path}")
         month, year = map(int, header.groups())
+        legacy_cabin = RE_LEGACY_CABIN.search(text) is not None
         summary = _summary(pdf.pages[-1], month)
         legs, sims, deadheads = [], [], []
         source_rows = landing_marks = 0
@@ -201,7 +219,9 @@ def parse_pdf(path):
                     [w for w in words if abs(w["top"] - date_word["top"]) < 2.5],
                     key=lambda w: w["x0"],
                 )
-                raw_flight = _one(row, 78, 125, r"[A-Z]{2}\d{3,4}")
+                raw_flight = _one(
+                    row, 78, 125, r"[A-Z]{2}\d{3,4}(?:/\d{1,2})?"
+                )
                 clocks = _one(row, 174, 225, r"\d{2}:\d{2}-\d{2}:\d{2}")
                 if not raw_flight or not clocks:
                     continue
@@ -209,15 +229,16 @@ def parse_pdf(path):
                 day, printed_month = map(int, RE_DATE.fullmatch(date_word["text"]).groups())
                 if printed_month != month:
                     raise ValueError(f"Zeilenmonat {printed_month:02d} != Kopf {month:02d}")
-                frm = _one(row, 145, 174, r"[A-Z]{3}")
-                to = _one(row, 225, 258, r"[A-Z]{3}")
+                frm = _one(row, 145, 190, r"[A-Z]{3}")
+                to = _one(row, 225, 300, r"[A-Z]{3}")
                 if not frm or not to:
                     raise ValueError(f"Route fehlt: {date_word['text']} {raw_flight}")
                 dep, arr = _clock_instants(year, month, day, clocks)
-                landing = "L" in _row_values(row, 300, 315)
+                landing = not legacy_cabin and "L" in _row_values(row, 300, 315)
                 landing_marks += int(landing)
 
-                aircraft = "".join(_row_values(row, 468, 560)).split("/")
+                aircraft = ([] if legacy_cabin else
+                            "".join(_row_values(row, 468, 560)).split("/"))
                 raw_reg = aircraft[0].strip() if aircraft else ""
                 actype = aircraft[1].strip() if len(aircraft) > 1 else ""
                 is_sim = (frm == to and RE_SIM_DEVICE.fullmatch(raw_reg) is not None)
@@ -233,7 +254,18 @@ def parse_pdf(path):
                     })
                     continue
 
-                dh_value = _one(row, 380, 405, r"\d+[,]\d{2}")
+                if legacy_cabin:
+                    traffic_code = _one(row, 280, 305, r"\d{2}")
+                    is_deadhead = legacy_cabin_traffic_code(traffic_code)
+                    dh_value = (_one(row, 415, 445, r"\d+[,]\d{2}")
+                                if is_deadhead else None)
+                    if is_deadhead and dh_value is None:
+                        raise ValueError(
+                            f"Kabinen-Deadhead-Zeit fehlt: {date_word['text']} "
+                            f"{raw_flight}"
+                        )
+                else:
+                    dh_value = _one(row, 380, 405, r"\d+[,]\d{2}")
                 if dh_value:
                     deadheads.append({
                         "date": dep.date().isoformat(),
@@ -244,8 +276,11 @@ def parse_pdf(path):
                     })
                     continue
 
-                fact = _one(row, 315, 343, r"\d+")
-                if not fact or int(fact) <= 0:
+                fact = (_one(row, 315, 350, r"\d+[,]\d{2}")
+                        if legacy_cabin else _one(row, 315, 343, r"\d+"))
+                block_min = (decimal_hours_minutes(fact) if legacy_cabin
+                             else int(fact or 0))
+                if not fact or block_min <= 0:
                     raise ValueError(
                         f"FAKT-Minuten fehlen: {date_word['text']} {raw_flight}"
                     )
@@ -256,12 +291,13 @@ def parse_pdf(path):
                     "to": to,
                     "dep_iso": dep.isoformat().replace("+00:00", "Z"),
                     "arr_iso": arr.isoformat().replace("+00:00", "Z"),
-                    "block_min": int(fact),
+                    "block_min": block_min,
                     "reg": normalized_registration(raw_reg),
                     "type": actype or None,
-                    "role": "FO",
+                    "role": "FB" if legacy_cabin else "FO",
                     "remarks": (f"LH-Flugstundenübersicht {month:02d}/{year}; "
-                                "FAKT-Minuten, OUT/IN UTC"),
+                                + ("BLOCK-Zeit, OUT/IN UTC" if legacy_cabin
+                                   else "FAKT-Minuten, OUT/IN UTC")),
                 }
                 if landing:
                     night = is_civil_night(arr, to)
@@ -273,9 +309,12 @@ def parse_pdf(path):
             + sum(s["duration_min"] for s in sims)
         deadhead_min = sum(d["duration_min"] for d in deadheads)
         errors = []
-        if not control_minutes_match(effective_min, summary["effective_min"]):
+        summary_effective_min = effective_summary_minutes(
+            summary["effective_min"], source_rows
+        )
+        if not control_minutes_match(effective_min, summary_effective_min):
             errors.append(
-                f"Effektiv {effective_min} != PDF {summary['effective_min']} min"
+                f"Effektiv {effective_min} != PDF {summary_effective_min} min"
             )
         # SAP druckt jede Zeile UND die Monatssumme nur zweistellig. Das
         # Runden der Einzelzeilen kann deshalb gegenüber dem Runden der Summe

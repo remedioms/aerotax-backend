@@ -53871,6 +53871,243 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
                               prodid='AeroX CrewAccess PDF Import'), None
 
 
+# Lufthansa Jeppesen/PRT „Acknowledged Roster" (confirmedYearPlan). Anders
+# als CrewAccess enthaelt ein PDF mehrere Monate und druckt Report in LT,
+# Flug-Start/Ende aber explizit in UTC. Bei Datumsabweichungen steht der echte
+# UTC-Tag direkt als „(16)" vor der Zeit. Diese Marker sind autoritativ; wir
+# leiten keine Zeitzone aus dem Seitentag ab.
+_ACK_ROSTER_HEADER = (
+    'Date (LT) Trip ID Report (LT) Pos Activity From To Start (UTC) End (UTC)'
+)
+_ACK_POSITIONS = r'(?:CP|AC|FO|SF)'
+_ACK_FULL_LEG_RE = re.compile(
+    r'^(?:(?P<trip>\d{5,}(?:_\d+)?)\s+)?'
+    r'(?:(?P<report>\d{1,2}:\d{2})\s+)?'
+    r'(?P<pos>' + _ACK_POSITIONS + r')\s+'
+    r'(?P<num>\d{1,4}[A-Z]?)\s+(?P<frm>[A-Z]{3})\s+(?P<to>[A-Z]{3})\s+'
+    r'(?:(?P<start_day>\(\d{1,2}\))\s+)?'
+    r'(?P<start>\d{1,2}:\d{2})\s+'
+    r'(?:(?P<end_day>\(\d{1,2}\))\s+)?'
+    r'(?P<end>\d{1,2}:\d{2})\b')
+_ACK_SPLIT_LEG_RE = re.compile(
+    r'^(?:(?P<trip>\d{5,}(?:_\d+)?)\s+)?'
+    r'(?:(?P<report>\d{1,2}:\d{2})\s+)?'
+    r'(?P<pos>' + _ACK_POSITIONS + r')\s+'
+    r'(?P<num>\d{1,4}[A-Z]?)\s+(?P<station>[A-Z]{3})\s+'
+    r'(?:(?P<utc_day>\(\d{1,2}\))\s+)?'
+    r'(?P<clock>\d{1,2}:\d{2})\s+(?:78S|78Q|789)\b')
+_ACK_GROUND_RE = re.compile(
+    r'^(?:(?P<trip>[A-Z0-9_]{5,})\s+)?'
+    r'(?:(?P<report>\d{1,2}:\d{2})\s+)?'
+    r'(?:(?P<pos>' + _ACK_POSITIONS + r')\s+)?'
+    r'(?P<activity>[A-Z][A-Z0-9_/.\-]*)\s+(?P<station>[A-Z]{3})\s+'
+    r'(?:(?P<utc_day>\(\d{1,2}\))\s+)?'
+    r'(?P<start>\d{1,2}:\d{2})\s+(?P<end>\d{1,2}:\d{2})\b')
+
+
+def _acknowledged_roster_text_to_ics(text, carrier='LH'):
+    """Multi-month Lufthansa Acknowledged Roster -> synthetic UTC ICS.
+
+    Pure/testbar. Unknown marker days are retained verbatim as all-day
+    events. An unmatched split flight or a contradictory printed weekday is
+    rejected instead of being silently guessed.
+    """
+    t = text or ''
+    if (not re.search(r'(?im)^\s*Acknowledged Roster\s*$', t[:500])
+            or _ACK_ROSTER_HEADER not in t
+            or not re.search(r'Company Name:\s*LH\b', t[:1500])):
+        return None, 'unsupported_pdf_format'
+
+    from datetime import date as _date, timedelta as _td
+
+    events = []
+    period = None
+    in_table = False
+    cur_day = None
+    last_day = None
+    pending = None  # (num, frm, start, start_day, report)
+
+    def _month_shift(year, month, offset):
+        serial = year * 12 + month - 1 + offset
+        return serial // 12, serial % 12 + 1
+
+    def _printed_day(dom, weekday):
+        if not period:
+            return None
+        candidates = []
+        for offset in (-1, 0, 1):
+            y, m = _month_shift(period[0], period[1], offset)
+            try:
+                value = _date(y, m, int(dom))
+            except ValueError:
+                continue
+            if value.strftime('%a') == weekday:
+                candidates.append(value)
+        if not candidates:
+            return None
+        # A new monthly block normally belongs to its named month. A previous
+        # month candidate is allowed only for the explicitly printed carry-in
+        # row (e.g. „31 Sun" at the start of June 2026).
+        current = [d for d in candidates if d.month == period[1]
+                   and d.year == period[0]]
+        if current:
+            return current[0]
+        return min(candidates, key=lambda d: abs((d - _date(
+            period[0], period[1], 1)).days))
+
+    def _utc_marker_day(reference, marker):
+        if not marker:
+            return reference
+        dom = int(marker.strip('()'))
+        candidates = []
+        for offset in (-1, 0, 1):
+            y, m = _month_shift(reference.year, reference.month, offset)
+            try:
+                candidates.append(_date(y, m, dom))
+            except ValueError:
+                pass
+        if not candidates:
+            raise ValueError('acknowledged_roster_bad_utc_day')
+        return min(candidates, key=lambda d: abs((d - reference).days))
+
+    def _instant(day, hhmm):
+        hour, minute = (int(value) for value in hhmm.split(':'))
+        if hour > 23 or minute > 59:
+            raise ValueError('acknowledged_roster_bad_time')
+        return datetime(day.year, day.month, day.day, hour, minute)
+
+    def _all_day(day, summary):
+        events.append((f'day-{len(events)}', day, day + _td(days=1),
+                       summary, True))
+
+    def _timed(day, start, end, summary):
+        start_dt, end_dt = _instant(day, start), _instant(day, end)
+        # Equal timestamps in this format are zero-duration accounting
+        # markers (REP/RPX), not invented 24-hour duties.
+        if end_dt == start_dt:
+            _all_day(day, summary)
+            return
+        if end_dt < start_dt:
+            end_dt += _td(days=1)
+        events.append((f'tim-{len(events)}', start_dt, end_dt, summary, False))
+
+    def _leg(num, frm, to, start_day, start, end_day, end, report=None):
+        start_dt, end_dt = _instant(start_day, start), _instant(end_day, end)
+        if end_dt <= start_dt:
+            end_dt += _td(days=1)
+        number = num.lstrip('0') or '0'
+        base = f'{carrier}{number} {frm} - {to}'
+        summary = (f'{report} LT Briefing {frm} · {base}' if report else base)
+        events.append((f'leg-{len(events)}', start_dt, end_dt, summary, False))
+
+    for raw in t.splitlines():
+        line = raw.strip()
+        month_match = re.match(r'^Month:\s*([A-Za-z]+)\s+(\d{4})$', line)
+        if month_match:
+            month = _CREWACCESS_MONTHS.get(month_match.group(1).lower())
+            if not month:
+                return None, 'no_planning_period'
+            new_period = (int(month_match.group(2)), month)
+            if new_period != period:
+                period = new_period
+                last_day = None
+                cur_day = None
+            in_table = False
+            continue
+        if line.startswith(_ACK_ROSTER_HEADER):
+            in_table = True
+            continue
+        if line.startswith('Created '):
+            in_table = False
+            continue
+        if not in_table or not line:
+            continue
+        if line.startswith(('Difference ', 'Max ', 'Min ', '[duty]')):
+            continue
+
+        day_match = re.match(
+            r'^(\d{2})\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b\s*(.*)$', line)
+        rest = line
+        if day_match:
+            resolved = _printed_day(day_match.group(1), day_match.group(2))
+            if resolved is None:
+                return None, 'invalid_roster_day'
+            if last_day and resolved < last_day - _td(days=1):
+                return None, 'non_monotonic_roster_day'
+            cur_day = resolved
+            last_day = resolved
+            rest = (day_match.group(3) or '').strip()
+            if not rest:
+                continue
+        if cur_day is None or rest == 'ORTSTAG':
+            continue
+
+        full = _ACK_FULL_LEG_RE.match(rest)
+        if full:
+            if pending:
+                return None, 'unclosed_split_leg'
+            start_day = _utc_marker_day(cur_day, full.group('start_day'))
+            end_day = _utc_marker_day(cur_day, full.group('end_day'))
+            if start_day > end_day:
+                end_day = start_day
+            if (start_day == end_day
+                    and full.group('end') <= full.group('start')):
+                end_day += _td(days=1)
+            _leg(full.group('num'), full.group('frm'), full.group('to'),
+                 start_day, full.group('start'), end_day, full.group('end'),
+                 full.group('report'))
+            continue
+
+        split = _ACK_SPLIT_LEG_RE.match(rest)
+        if split:
+            num = split.group('num')
+            clock_day = _utc_marker_day(cur_day, split.group('utc_day'))
+            if pending:
+                if pending[0] != num:
+                    return None, 'split_leg_number_mismatch'
+                p_num, p_from, p_start, p_day, p_report = pending
+                _leg(p_num, p_from, split.group('station'), p_day, p_start,
+                     clock_day, split.group('clock'), p_report)
+                pending = None
+            else:
+                pending = (num, split.group('station'), split.group('clock'),
+                           clock_day, split.group('report'))
+            continue
+
+        ground = _ACK_GROUND_RE.match(rest)
+        if ground:
+            day = _utc_marker_day(cur_day, ground.group('utc_day'))
+            label = f"{ground.group('activity')} {ground.group('station')}"
+            _timed(day, ground.group('start'), ground.group('end'), label)
+            continue
+
+        layover = re.match(r'^Layover:?\s+([A-Z]{3})\b', rest)
+        if layover:
+            _all_day(cur_day, f'Layover {layover.group(1)}')
+            continue
+
+        # Marker ohne eindeutig beidseitige UTC-Zeit: als all-day bewahren.
+        marker = rest.split()[0]
+        if re.fullmatch(r'[A-Z][A-Z0-9_/.\-]*', marker):
+            if marker in ('FREE', 'OFF', 'OFF_2'):
+                marker = 'Off Day'
+            elif marker == 'U':
+                marker = 'Urlaub'
+            _all_day(cur_day, marker)
+
+    if pending:
+        return None, 'unclosed_split_leg'
+    if not events:
+        return None, 'no_roster_days'
+    first = min(events, key=lambda event: (
+        event[1].year, event[1].month, event[1].day,
+        getattr(event[1], 'hour', 0), getattr(event[1], 'minute', 0),
+    ))[1]
+    return _pdf_events_to_ics(
+        events, first.year, first.month,
+        prodid='AeroX Lufthansa Acknowledged Roster PDF Import'), None
+
+
 def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
     """Synthetische Event-Tupel (uid_suffix, start, end, summary, all_day[, dep_tzid])
     → ICS-String. Geteilt von CrewAccess- und Discover-Roster-Parser.
@@ -54528,6 +54765,11 @@ def import_roster_pdf(token):
             # Native Discover „Roster" format implies carrier 4Y.
             ics, perr = _discover_roster_text_to_ics(text, carrier='4Y')
         if perr == 'unsupported_pdf_format':
+            # Lufthansa Jeppesen „Acknowledged Roster" / confirmedYearPlan
+            # can carry several months in one PDF. Start/end columns are UTC,
+            # report is explicitly LT; its dedicated parser preserves both.
+            ics, perr = _acknowledged_roster_text_to_ics(text, carrier='LH')
+        if perr == 'unsupported_pdf_format':
             # Lufthansa's older CAS „Persönlicher Einsatzplan" uses UTC rows
             # and coordinate layout. It must parse from the original PDF,
             # never from guessed plain-text columns.
@@ -54548,6 +54790,9 @@ def import_roster_pdf(token):
                   or re.search(r'Period:\s*([A-Za-z]+\s+\d{4})', text))
             if mp:
                 periods.append(mp.group(1))
+            elif re.search(r'(?im)^\s*Acknowledged Roster\s*$', text[:500]):
+                periods.extend(re.findall(
+                    r'(?m)^Month:\s*([A-Za-z]+\s+\d{4})\s*$', text))
         if perr:
             app.logger.warning(
                 f'[roster-pdf] parse-fail tok={token[:8]} sha={upload_sha} '

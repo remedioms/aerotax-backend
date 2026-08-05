@@ -183,6 +183,14 @@ def main():
                     sim['code'] = B['std_type'].strip().upper()
                 sims.append({k: v for k, v in sim.items() if v is not None})
 
+            # pdfplumber cached words, edges and layout objects on every Page.
+            # A long FCL export can contain >200 pages; retaining all caches
+            # until the document context closes consumed gigabytes and made
+            # otherwise valid production uploads effectively unparseable.
+            # All facts needed from this A/B pair are materialized above.
+            pa.close()
+            pb.close()
+
     legs.sort(key=lambda x: (x['date'], x.get('dep_iso') or ''))
     sims.sort(key=lambda x: x['date'])
 

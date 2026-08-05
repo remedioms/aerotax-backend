@@ -46,3 +46,18 @@ def test_midnight_arrival_is_not_treated_as_zero_duration_marker():
         _row(**{"Departure time": "23:30", "Arrival time": "00:00",
                 "Total time": "00:30"})
     )
+
+
+def test_fstd_device_with_same_station_is_a_simulator():
+    assert PARSER.fstd_row_is_sim("DE-1A-040", "FRA", "FRA", "MCC 3")
+
+
+def test_fstd_field_does_not_erase_confirmed_operating_leg():
+    assert not PARSER.fstd_row_is_sim(
+        "DE-1A-079", "MUC", "GRU", "LH504"
+    )
+
+
+def test_fstd_code_is_never_persisted_as_aircraft_registration():
+    source = open(os.path.join(TOOLS, "parse_duties_v8.py"), encoding="utf-8").read()
+    assert "not RE_FSTD.fullmatch(reg_raw)" in source

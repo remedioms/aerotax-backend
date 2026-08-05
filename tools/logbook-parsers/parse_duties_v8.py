@@ -59,11 +59,12 @@ NEU gegenüber v5 — alles generisch, greift bei Alt-Exporten nicht:
    v5 hat blind Whitespace gefressen und ab `/` abgeschnitten — das ist NUR
    für echte Flugnummern richtig (Tages-Suffix „DE 2199 /14").
 3. **SIM-als-Flug** (Regel schon in v4, in v5 verloren): Zeilen mit
-   Type=Flug, deren „Kennzeichen" eine EASA-FSTD-Gerätenummer ist
-   (`DE-1A-040` = LH Aviation Training A320-FFS), sind Simulator-Sessions
-   und wandern nach `sim[]`. Sonst landen bei Martin 104 h FFS-Zeit und
-   59 Sim-„Landungen" in der Flug-Blockzeit → Invariante 5 (FCL.050 trennt
-   FSTD-Zeit) wäre gebrochen. `--keep-sim-as-flight` schaltet es ab.
+   Type=Flug und EASA-FSTD-Gerätenummer werden als Simulator behandelt, wenn
+   sie keine echte Flugnummer+Strecke tragen oder Start=Ziel ist. Die Nummer
+   allein reicht nicht: ein verifizierter OffBlock/FCL-Doppel-Export enthielt
+   acht echte Langstrecken-Legs mit realer Flugnummer und Route, aber einem
+   FSTD-Code als fehlbelegtem Kennzeichen. `--keep-sim-as-flight` schaltet
+   die Erkennung ab.
 4. **Noch nicht geflogene (geplante) Zeilen** werden ab `--cutoff`
    (Default: heute) übersprungen. OffBlock zieht den kommenden Dienstplan
    als Vorbelegung in den Export: keine Klassenzeit (pic/single/multi/dual
@@ -126,6 +127,26 @@ FILL_FIELDS = ('reg', 'type', 'pic_name', 'remarks', 'night_min',
 def s(row, key):
     """Feld sicher als getrimmter String (CSV liefert None bei Kurzzeilen)."""
     return (row.get(key) or '').strip()
+
+
+def fstd_row_is_sim(registration, departure, arrival, flight_number):
+    """True only when an FSTD registration is corroborated as a session.
+
+    OffBlock can put an FSTD device code into the registration field of an
+    otherwise independently confirmed operating flight. A real airline
+    flight number plus a non-local route wins over that one bad field.
+    """
+    registration = re.sub(r'\s+', '', (registration or '').upper())
+    departure = (departure or '').strip().upper()
+    arrival = (arrival or '').strip().upper()
+    flight_number = norm_flight(flight_number)
+    if not RE_FSTD.fullmatch(registration):
+        return False
+    has_operating_evidence = (
+        departure and arrival and departure != arrival
+        and RE_FLIGHT.fullmatch(flight_number or '') is not None
+    )
+    return not has_operating_evidence
 
 
 def hhmm_to_min(txt):
@@ -410,8 +431,13 @@ def main():
         # ── Simulator ────────────────────────────────────────────────────
         # entweder Type=Simulator ODER als „Flug" verbuchte FFS-Session
         # (Kennzeichen ist eine EASA-FSTD-Gerätenummer)
-        is_fstd_row = (typ_l in TYPE_FLIGHT and RE_FSTD.match(reg_raw)
-                       and not keep_sim_as_flight)
+        is_fstd_row = (
+            typ_l in TYPE_FLIGHT
+            and fstd_row_is_sim(
+                reg_raw, s(r, 'Departure place'), s(r, 'Arrival place'),
+                s(r, 'Flight number'))
+            and not keep_sim_as_flight
+        )
         if typ_l in TYPE_SIM or is_fstd_row:
             code = (norm_sim_code(s(r, 'Flight number'))
                     or s(r, 'Aircraft ICAO') or s(r, 'Notes')[:40] or None)
@@ -475,8 +501,9 @@ def main():
         # Reg säubern: Leerzeichen raus („D- AIZI"), Platzhalter verwerfen.
         # G-ENERIC ist KEIN Kennzeichen, sondern der Dummy des Exports —
         # Leg bleibt, nur das Feld fällt weg (Raten wäre Erfinden).
-        if reg_raw and reg_raw not in ('G-ENERIC', 'GENERIC', 'UNKNOWN',
-                                       'N/A', '-'):
+        if (reg_raw and not RE_FSTD.fullmatch(reg_raw)
+                and reg_raw not in ('G-ENERIC', 'GENERIC', 'UNKNOWN',
+                                    'N/A', '-')):
             leg['reg'] = reg_raw
         icao = s(r, 'Aircraft ICAO').upper()
         if icao:

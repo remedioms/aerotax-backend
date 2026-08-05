@@ -32,11 +32,37 @@ def test_sap_flight_padding_matches_existing_import_convention():
     assert PARSER.normalized_flight("LH0046") == "LH046"
     assert PARSER.normalized_flight("LH0982") == "LH982"
     assert PARSER.normalized_flight("LH1670") == "LH1670"
+    assert PARSER.normalized_flight("LH1788/23") == "LH1788"
+
+
+def test_sap_short_ft_device_is_a_simulator():
+    assert PARSER.RE_SIM_DEVICE.fullmatch("FT51")
+
+
+def test_empty_sap_month_accepts_omitted_effective_total_only_without_rows():
+    assert PARSER.effective_summary_minutes(None, 0) == 0
+    try:
+        PARSER.effective_summary_minutes(None, 1)
+    except ValueError as exc:
+        assert "Effektive Flugzeit fehlt" in str(exc)
+    else:
+        raise AssertionError("missing effective total with source rows must fail")
 
 
 def test_german_registration_gets_display_hyphen():
     assert PARSER.normalized_registration("DAIUL") == "D-AIUL"
     assert PARSER.normalized_registration("MUC327") == "MUC327"
+
+
+def test_legacy_cabin_traffic_code_distinguishes_deadhead():
+    assert not PARSER.legacy_cabin_traffic_code("00")
+    assert PARSER.legacy_cabin_traffic_code("01")
+    try:
+        PARSER.legacy_cabin_traffic_code("02")
+    except ValueError as exc:
+        assert "Traffic-Code" in str(exc)
+    else:
+        raise AssertionError("unknown cabin traffic code must fail")
 
 
 def test_civil_night_split_matches_verified_florian_reference_landings():
