@@ -31,6 +31,11 @@ _PERIOD_RE = re.compile(
 )
 _MONTH_RANGE_RE = re.compile(
     r'\b([A-ZÄÖÜ]{3})\s*-\s*([A-ZÄÖÜ]{3})\s+(20\d{2})\b', re.I)
+_DATED_MONTH_RANGE_RE = re.compile(
+    r'\b([A-ZÄÖÜ]{3})\s+(20\d{2})\s*[-–—]\s*'
+    r'([A-ZÄÖÜ]{3})\s+(20\d{2})\b',
+    re.I,
+)
 _MONTH_YEAR_RE = re.compile(r'\b([A-ZÄÖÜ]{3})\s+(20\d{2})\b', re.I)
 _PRINT_RE = re.compile(
     r'\bDruckdatum\s*:?\s*(\d{1,2})\s+([A-ZÄÖÜ]{3})\s+(20\d{2})\s+'
@@ -70,6 +75,17 @@ _MARKER_LABELS = {
 }
 
 
+def _is_following_month_placeholder(rest: str) -> bool:
+    """Return true for CAS's out-of-period ``H`` filler rows.
+
+    Change rosters can append every day of the following month as ``H`` after
+    the actual planning month and the final real duty.  Those rows are a
+    layout placeholder (the PDF also says that no further duties are
+    planned), not roster events or revision coverage.
+    """
+    return (rest or '').strip().upper() == 'H'
+
+
 def _month_after(year: int, month: int) -> Tuple[int, int]:
     return (year + 1, 1) if month == 12 else (year, month + 1)
 
@@ -80,6 +96,26 @@ def _month_before(year: int, month: int) -> Tuple[int, int]:
 
 def _parse_period(rows: Sequence[Tuple[int, str]]) -> Optional[Dict[str, Any]]:
     joined = ' '.join(line for _, line in rows[:20])
+    dated_range = _DATED_MONTH_RANGE_RE.search(joined)
+    if dated_range:
+        start_name = dated_range.group(1).upper()
+        end_name = dated_range.group(3).upper()
+        start_month = _MONTHS.get(start_name)
+        end_month = _MONTHS.get(end_name)
+        if not start_month or not end_month:
+            return None
+        start_year = int(dated_range.group(2))
+        end_year = int(dated_range.group(4))
+        if (end_year, end_month) < (start_year, start_month):
+            return None
+        return {
+            'start_year': start_year,
+            'start_month': start_month,
+            'end_year': end_year,
+            'end_month': end_month,
+            'label': f'{start_name} {start_year}-{end_name} {end_year}',
+        }
+
     match = _PERIOD_RE.search(joined) or _MONTH_RANGE_RE.search(joined)
     if match:
         start_name = match.group(1).upper()
@@ -302,6 +338,10 @@ def rows_to_calendar_events(
         return None, 'no_planning_period'
 
     candidates = _candidate_dates(period)
+    period_last = date(
+        period['end_year'], period['end_month'],
+        calendar.monthrange(period['end_year'], period['end_month'])[1],
+    )
     days: List[Dict[str, Any]] = []
     by_date: Dict[date, Dict[str, Any]] = {}
     previous: Optional[date] = None
@@ -315,16 +355,25 @@ def rows_to_calendar_events(
             continue
         day_match = _DAY_RE.match(line)
         if day_match:
+            rest = (day_match.group(3) or '').strip()
             resolved = _resolve_day(
                 day_match.group(1), int(day_match.group(2)), candidates, previous)
             if resolved is None:
+                if (_is_following_month_placeholder(rest)
+                        and previous is not None and previous >= period_last):
+                    current = None
+                    continue
                 warnings.append('unresolved_day')
+                current = None
+                continue
+            if (resolved > period_last
+                    and _is_following_month_placeholder(rest)):
                 current = None
                 continue
             previous = resolved
             current = {
                 'date': resolved,
-                'rest': (day_match.group(3) or '').strip(),
+                'rest': rest,
                 'lines': [line],
                 'legs': [],
                 'briefing': None,

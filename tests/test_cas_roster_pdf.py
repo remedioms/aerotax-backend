@@ -55,6 +55,37 @@ def test_two_month_change_plan_keeps_first_month_tail_in_first_month():
                for event in result['events'])
 
 
+def test_cross_year_range_with_year_on_both_months_keeps_january_tail():
+    result, error = cas.rows_to_calendar_events(_rows(
+        'Mi 31 X',
+        'Do 01 X',
+        'Do 15 OFF',
+        period='DEC 2025-JAN 2026',
+        printed='29 DEC 2025 12:51',
+    ))
+    assert error is None
+    assert result['period_start'] == '2025-12'
+    assert result['period_end'] == '2026-01'
+    assert result['coverage_dates'] == [
+        '2025-12-31', '2026-01-01', '2026-01-15']
+    assert result['warnings'] == []
+
+
+def test_single_month_ignores_following_month_h_placeholder_tail():
+    result, error = cas.rows_to_calendar_events(_rows(
+        'Sa 28 OFF',
+        'So 01 H',
+        'Mo 02 H',
+        'Mi 11 H',
+        period='FEB 2026',
+        printed='02 FEB 2026 16:07',
+    ))
+    assert error is None
+    assert result['coverage_dates'] == ['2026-02-28']
+    assert [event[3] for event in result['events']] == ['Off Day']
+    assert result['warnings'] == []
+
+
 def test_overnight_departure_closes_on_undated_followup_row():
     result, error = cas.rows_to_calendar_events(_rows(
         'So 01 89705 FB',
