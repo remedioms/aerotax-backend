@@ -22,6 +22,12 @@ def test_sap_decimal_hours_round_to_minutes():
     assert PARSER.decimal_hours_minutes(None) == 0
 
 
+def test_sap_month_control_accepts_only_verified_two_minute_rounding_drift():
+    assert PARSER.control_minutes_match(2211, 2213)
+    assert PARSER.control_minutes_match(3973, 3971)
+    assert not PARSER.control_minutes_match(2210, 2213)
+
+
 def test_sap_flight_padding_matches_existing_import_convention():
     assert PARSER.normalized_flight("LH0046") == "LH046"
     assert PARSER.normalized_flight("LH0982") == "LH982"

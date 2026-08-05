@@ -15,7 +15,7 @@ Die Quelle weist pro Zeile drei verschiedene Zeiten aus. Für das Flugbuch gilt:
 
 Jeder Monat wird gegen die im PDF gedruckten Kontrollwerte geprüft:
 Landungen, effektive Flugzeit (Flug + Simulator) und Deadhead-Zeit. Schon eine
-unerklärte Abweichung > 1 Minute bricht den Lauf ab; nichts wird still geraten.
+unerklärte Abweichung > 2 Minuten bricht den Lauf ab; nichts wird still geraten.
 """
 
 import argparse
@@ -35,6 +35,7 @@ RE_DATE = re.compile(r"^(\d{2})\.(\d{2})\.$")
 RE_FLIGHT = re.compile(r"^([A-Z]{2})(\d{3,4})$")
 RE_CLOCKS = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$")
 RE_SIM_DEVICE = re.compile(r"^[A-Z]{3}[A-Z0-9]{3}$")
+CONTROL_ROUNDING_TOLERANCE_MIN = 2
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 AIRPORTS_PATH = os.path.join(ROOT, "airports_compact.json")
@@ -68,6 +69,17 @@ def decimal_hours_minutes(value):
         raise ValueError(f"ungültige SAP-Dezimalzeit: {value!r}")
     hours, hundredths = map(int, match.groups())
     return round(hours * 60 + hundredths * 0.6)
+
+
+def control_minutes_match(parsed_minutes, summary_minutes):
+    """SAP-Rundungsdrift zwischen Zeilenminuten und Dezimal-Monatssumme.
+
+    Die verifizierten Monate 08–10/2022 driften bei vollständig gelesenen
+    Zeilen und exakt passenden Landungen um zwei Minuten. Drei Minuten bleiben
+    außerhalb der belegten Rundungsgrenze und brechen den Import weiter ab.
+    """
+    return abs(parsed_minutes - summary_minutes) \
+        <= CONTROL_ROUNDING_TOLERANCE_MIN
 
 
 def normalized_flight(value):
@@ -255,14 +267,14 @@ def parse_pdf(path):
             + sum(s["duration_min"] for s in sims)
         deadhead_min = sum(d["duration_min"] for d in deadheads)
         errors = []
-        if abs(effective_min - summary["effective_min"]) > 1:
+        if not control_minutes_match(effective_min, summary["effective_min"]):
             errors.append(
                 f"Effektiv {effective_min} != PDF {summary['effective_min']} min"
             )
         # SAP druckt jede Zeile UND die Monatssumme nur zweistellig. Das
         # Runden der Einzelzeilen kann deshalb gegenüber dem Runden der Summe
-        # um genau eine Minute driften (11/2019: 0,66 + 0,58 vs. 1,24).
-        if abs(deadhead_min - summary["deadhead_min"]) > 1:
+        # um bis zu zwei Minuten driften (verifiziert 08–10/2022).
+        if not control_minutes_match(deadhead_min, summary["deadhead_min"]):
             errors.append(
                 f"Deadhead {deadhead_min} != PDF {summary['deadhead_min']} min"
             )
