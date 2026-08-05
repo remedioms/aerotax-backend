@@ -7313,9 +7313,14 @@ def _refresher_scan():
 
 # Keepalive-Abstand der Lazy-Rotation: JEDER gesunde Grant rotiert mindestens
 # einmal in diesem Fenster, auch ohne jeden Bedarf — der LH-Refresh-Token darf
-# nicht idle sterben (Lebensdauer LH-seitig UNDOKUMENTIERT, deshalb bewusst
-# konservativ deutlich unter 24 h).
-_REFRESHER_KEEPALIVE_S = 18 * 3600
+# nicht idle sterben. Laut Gateway-Betreiber (Mail Alex 05.08.2026) beträgt
+# die RT-Lebensdauer 14 h; enforced wurde das bisher beobachtbar NICHT
+# (Grants überlebten tagelanges Ruhen), aber ab September 2026 zieht Mashery
+# die Enforcement-Schrauben an (AT 1 h → 15 min). Deshalb 12 h: selbst mit
+# maximalem Fehler-Backoff (1 h, s. Bremse unten) bleibt die späteste
+# Rotation bei ~13 h < 14 h. LH rotiert den RT bei jedem Refresh — jede
+# Keepalive-Rotation verlängert die Familie also um volle 14 h.
+_REFRESHER_KEEPALIVE_S = 12 * 3600
 # Angenommene AT-Lebensdauer für die Rückrechnung des letzten Rotations-
 # Zeitpunkts (s. _refresher_due). LH liefert expires_in=3600, _token_request
 # speichert expires_at = now + (expires_in − 60).
@@ -7353,7 +7358,7 @@ _REFRESHER_DEMAND_RETRY_STATES = frozenset((
 #       120 s · 2^(n−1), gedeckelt bei 1 h. Ein dauerhaft scheiternder Grant
 #       macht damit ~26 statt 1.440 Versuche/Tag (Faktor ~55).
 # HEILIG BLEIBT: der Keepalive. Der Deckel (1 h) liegt um Größenordnungen
-# unter _REFRESHER_KEEPALIVE_S (18 h) — ein Refresh-Token kann durch die
+# unter _REFRESHER_KEEPALIVE_S (12 h) — ein Refresh-Token kann durch die
 # Bremse NIE idle sterben. Und die Bremse macht nichts auf, sie macht nur zu:
 # Claim-RPC, Choke-Point-Gate und der Asymmetrie-Vertrag in _tokens_save sind
 # unberührt.

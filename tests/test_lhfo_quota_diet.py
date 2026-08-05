@@ -126,13 +126,17 @@ def test_lazy_demand_makes_due():
     assert fo._refresher_due(scan, now=now, demand={'AT-A'}) == ['AT-A']
 
 
-def test_lazy_keepalive_after_18h():
-    """RT-Hygiene: jeder gesunde Grant rotiert mindestens ~1×/18 h, auch ohne
-    jeden Bedarf (der Refresh-Token darf nicht idle sterben)."""
+def test_lazy_keepalive_after_12h():
+    """RT-Hygiene: jeder gesunde Grant rotiert mindestens ~1×/12 h, auch ohne
+    jeden Bedarf (RT-Lebensdauer laut Gateway 14 h; 12 h + max. 1 h Backoff
+    bleibt sicher darunter — Mashery-Enforcement ab September 2026)."""
     now = 1000000.0
-    scan = [('AT-YOUNG', _grant(now, age_h=17.0)),
-            ('AT-OLD', _grant(now, age_h=19.0))]
+    scan = [('AT-YOUNG', _grant(now, age_h=11.0)),
+            ('AT-OLD', _grant(now, age_h=13.0))]
     assert fo._refresher_due(scan, now=now, demand=set()) == ['AT-OLD']
+    # Invariante: Keepalive + maximaler Fehler-Backoff müssen unter der
+    # RT-Lebensdauer von 14 h liegen, sonst können idle Grants sterben.
+    assert fo._REFRESHER_KEEPALIVE_S + fo._ROT_BACKOFF_MAX_S < 14 * 3600
 
 
 def test_lazy_never_touches_dead_or_rtless_grants():
