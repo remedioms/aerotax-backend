@@ -69,13 +69,18 @@ def _patch_persistence(monkeypatch):
 def _spy_reconcile(monkeypatch):
     seen = {}
 
-    def spy(_token, _briefings, feed_events, full_clean=False):
+    # Signatur spiegelt die ECHTE (inkl. prev_feed_min/-_at der Edge-Jump-
+    # Erkennung) — ein veralteter Mock wäre ein Test-Infra-Bug.
+    def spy(_token, _briefings, feed_events, full_clean=False,
+            prev_feed_min=None, prev_feed_min_at=None):
         seen['events'] = list(feed_events)
         seen['full_clean'] = full_clean
+        seen['prev_feed_min'] = prev_feed_min
+        seen['prev_feed_min_at'] = prev_feed_min_at
         dates = sorted(
             d for ev in feed_events
             for d in (ev.get('_multiday_dates') or [ev.get('start')]) if d)
-        return {'feed_dates': len(set(dates)), 'cleared': 0,
+        return {'feed_dates': len(set(dates)), 'cleared': 0, 'removed_dates': [],
                 'window': f'{dates[0]}..{dates[-1]}' if dates else None}
 
     monkeypatch.setattr(backend, '_reconcile_month_briefings', spy)

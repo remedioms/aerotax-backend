@@ -16964,8 +16964,14 @@ def get_friend_roster(token, friend_token):
             _hit = _FRIEND_ROSTER_MEMO.get(_memo_key)
             if _hit and _now_mono - _hit[0] < _FRIEND_ROSTER_MEMO_TTL:
                 return jsonify(_hit[1])
+    # Phasen-Timing (Owner 2026-08-05: „Profil laden dauert sehr lange" —
+    # Log zeigt 8–12 s p-hoch für AXU-Refs; das 60s-Memo deckt nur Wieder-
+    # holungen. Diese Marker zeigen auf Live-Traffic, WELCHE Phase den
+    # Erst-Aufbau frisst: friends/refresh/roster/build.)
+    _ph_t0 = _req_time.monotonic()
     # Friend-Check
     me = _friends_load(token)
+    _ph_friends_ms = int((_req_time.monotonic() - _ph_t0) * 1000)
     if friend_token not in (me.get('friends') or []):
         return jsonify({'ok': False, 'shared': False,
                         'error': 'not_friends', 'days': []}), 403
@@ -16976,6 +16982,7 @@ def get_friend_roster(token, friend_token):
     # Auch der FREUND-Roster soll frisch sein (Pickup-Events kommen erst ~1 Tag
     # vorher in den Feed) — gedrosselter Re-Sync seines calendar_feed.
     _maybe_refresh_calendar_feed(friend_token)
+    _ph_t1 = _req_time.monotonic()
     # Friend roster: 1) aus _store (in-memory, frisch wenn Friend gerade aktiv),
     # 2) Fallback auf persistenten roster_snapshot — überlebt Container-Restart.
     # Vorher: nur _store → bei Render-Sleep waren alle Friend-Rosters leer.
@@ -16983,6 +16990,8 @@ def get_friend_roster(token, friend_token):
     tage = (sess.get('result_data') or {}).get('_tage_detail') or []
     if not tage:
         tage = (_roster_snapshot_read(friend_token) or {}).get('tage') or []
+    _ph_roster_ms = int((_req_time.monotonic() - _ph_t1) * 1000)
+    _ph_t2 = _req_time.monotonic()
     today = _date.today()
     cutoff = today + _td(days=days_limit)
     out = []
@@ -17316,6 +17325,18 @@ def get_friend_roster(token, friend_token):
             _cut = _req_time.monotonic() - _FRIEND_ROSTER_MEMO_TTL
             for _k in [k for k, v in _FRIEND_ROSTER_MEMO.items() if v[0] < _cut]:
                 _FRIEND_ROSTER_MEMO.pop(_k, None)
+    # Nur langsame Erst-Aufbauten loggen — die Phase mit dem größten Anteil
+    # ist der Ansatzpunkt für den nächsten Perf-Fix (siehe Docstring-Memo).
+    try:
+        _ph_total_ms = int((_req_time.monotonic() - _ph_t0) * 1000)
+        if _ph_total_ms > 1500:
+            app.logger.info(
+                f'[friend-roster] slow-build total={_ph_total_ms}ms '
+                f'friends={_ph_friends_ms}ms roster={_ph_roster_ms}ms '
+                f'build={int((_req_time.monotonic() - _ph_t2) * 1000)}ms '
+                f'tage={len(out)} ref={friend_token[:10]}…')
+    except Exception:
+        pass
     return jsonify(_payload)
 
 
@@ -31302,6 +31323,18 @@ def _canonical_airline_key(airline):
     # fielen z.B. „Air ItaXY"-Fantasienamen mit hinein).
     if 'ita airways' in v or 'alitalia' in v or v in ('az', 'ita', 'ity'):
         return 'ITA AIRWAYS'
+    # Aerologic (3V/BOX, 2026-08-05, Anfrage Aerologic-Crew Philipp): EIGENER
+    # Bucket — trotz der Lufthansa-Beteiligung (Cargo-Joint-Venture DHL/LH) ist
+    # es ein eigener Arbeitgeber mit eigener Basis (Leipzig LEJ) und eigenen
+    # Crewhotels. Der Name enthält kein „Lufthansa", die Substring-Zweige oben
+    # greifen also von sich aus nicht — wie bei AeroWest genügt der Fall-Through.
+    # Die KURZFORMEN werden trotzdem explizit gemappt (gleiche Mechanik wie ITA
+    # Airways): sonst zerfiele das Freitext-Profilfeld in drei Buckets
+    # ('AEROLOGIC'/'3V'/'BOX') und dieselbe Crew fände sich im Hotel-Verzeichnis
+    # und in der Hangout-Zielgruppe „nur meine Airline" nicht wieder. Kurz-Codes
+    # nur EXAKT (kein Substring — 'box' ist ein zu gewöhnliches Wort).
+    if 'aerologic' in v or 'aero logic' in v or v in ('3v', 'box'):
+        return 'AEROLOGIC'
     # AeroWest (LEON-Privatjet, Hannover, 2026-07-20): BEWUSST kein Sonderfall —
     # „AeroWest" matcht keinen der Substring-Zweige oben und landet damit als
     # eigener Bucket 'AEROWEST' (crowdsource-gefüllt), genau wie gewünscht.
@@ -31315,6 +31348,8 @@ _CANONICAL_AIRLINE_LABELS = {
     'LUFTHANSA CITY': 'Lufthansa City',
     'SWISS': 'SWISS',
     'ITA AIRWAYS': 'ITA Airways',
+    # Damit „3V"/„BOX" als „Aerologic" benannt werden statt als roher Code.
+    'AEROLOGIC': 'Aerologic',
 }
 
 
@@ -52768,7 +52803,7 @@ def _attach_sectors(briefings, events, existing=None, identity_mode='legacy'):
         app.logger.warning(f'[ical-briefings] sectors-attach-fail: {str(e)[:160]}')
 
 
-def _preserve_past_flown_days(briefings, existing):
+def _preserve_past_flown_days(briefings, existing, skip_dates=None):
     """SCHUTZPLANKE (Tibor-Vorfall 2026-08-02, „Tirana fehlt"): Ein Import darf
     einen VERGANGENEN Tag, der gespeicherte Flug-Sektoren trägt, nicht durch
     einen sektorlosen Neuaufbau entkernen.
@@ -52788,12 +52823,23 @@ def _preserve_past_flown_days(briefings, existing):
     Neuaufbau). Zukunftstage bleiben bewusst REPLACE-Semantik (Streichungen
     müssen verschwinden — Owner-Regel „golden truth"). Läuft NACH
     `_attach_sectors`, VOR dem Save; in-place, gibt die Zahl der bewahrten
-    Tage zurück, wirft nie."""
+    Tage zurück, wirft nie.
+
+    `skip_dates` (Dominik Ift 2026-08-05): die Tage, die das Reconcile in
+    DIESEM Lauf gerade als storniert geräumt hat (`removed_dates` aus dem
+    Debug-Dict). Ohne diese Liste restauriert die Planke einen frisch
+    geräumten Vergangenheits-Tag SOFORT wieder aus `existing` — der
+    Krankmeldungs-Ghost wäre zurück, bevor der Save ihn los ist. Das
+    Reconcile hat für genau diese Tage bereits entschieden, dass der Feed
+    (die Autorität) sie nicht mehr kennt; die Planke hält sich raus."""
     kept = 0
     try:
         today = datetime.now().strftime('%Y-%m-%d')
+        _skip = {str(d)[:10] for d in (skip_dates or [])}
         for d, old in (existing or {}).items():
             if not isinstance(old, dict) or d >= today:
+                continue
+            if d in _skip:
                 continue
             if not (old.get('ical_sectors') or []):
                 continue
@@ -52810,7 +52856,65 @@ def _preserve_past_flown_days(briefings, existing):
     return kept
 
 
-def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
+def _feed_covered_dates(feed_events, iso_fallback=False):
+    """Alle Kalendertage, die der Feed tatsächlich ABDECKT (Set 'YYYY-MM-DD').
+
+    Leere Events (kein Summary/Location/Start) „decken" keinen Tag ab — sonst
+    markiert eine Feed-Lücke den Tag fälschlich als belegt und ein veralteter
+    Eintrag wird nie geräumt.
+
+    `iso_fallback=True` erlaubt zusätzlich Roh-Events, die NUR `start_iso`
+    tragen (der iOS-EKEventStore-Push, bevor die Adapter `start`/
+    `_multiday_dates` ergänzen). Das Reconcile selbst nutzt den Fallback
+    bewusst NICHT — dort bleibt die Abdeckungs-Semantik unverändert."""
+    dates = set()
+    for ev in (feed_events or []):
+        if not isinstance(ev, dict):
+            continue
+        if not (ev.get('summary') or '').strip() \
+           and not (ev.get('location') or '').strip() \
+           and not (ev.get('start_iso') or '').strip():
+            continue
+        ds = ev.get('_multiday_dates') or ([ev.get('start')] if ev.get('start') else [])
+        if not ds and iso_fallback:
+            _si = str(ev.get('start_iso') or '')[:10]
+            ds = [_si] if _si else []
+        for d in ds:
+            if isinstance(d, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', d.strip()):
+                dates.add(d.strip())
+    return dates
+
+
+def _calendar_feed_stamp_feed_min(feed_obj, feed_events, iso_fallback=False):
+    """Schreibt den UNTERRAND des Feeds (`feed_min`) und den Zeitpunkt, SEIT DEM
+    er dort steht (`feed_min_at`), ins calendar_feed-Objekt (in-place).
+
+    Warum (Dominik Ift 2026-08-05, Condor-Krankmeldung): monatsverankerte Feeds
+    (Condor) BLANKEN bei einer Krankmeldung die führenden Monatstage komplett.
+    Der Feed-Unterrand springt dadurch schlagartig nach vorn (01.08. → 06.08.) —
+    und genau die geblankten Tage fallen damit UNTER das Reconcile-Fenster und
+    werden nie geräumt (Ghost-Blockminuten in FTL/Fatigue). Nur wer den ALTEN
+    Rand kennt, kann diesen Sprung von einem normal ROLLENDEN Feed (LH: ≤1 Tag
+    pro Tag) unterscheiden.
+
+    `feed_min_at` wird NUR neu gestempelt, wenn sich der Rand ÄNDERT — der Wert
+    beantwortet „seit wann steht der Rand hier?", nicht „wann war der letzte
+    Import?". Wirft nie."""
+    try:
+        dates = _feed_covered_dates(feed_events, iso_fallback=iso_fallback)
+        if not dates:
+            return
+        new_min = min(dates)
+        if (str(feed_obj.get('feed_min') or '').strip() != new_min
+                or not str(feed_obj.get('feed_min_at') or '').strip()):
+            feed_obj['feed_min_at'] = datetime.now().isoformat()
+        feed_obj['feed_min'] = new_min
+    except Exception:
+        pass
+
+
+def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False,
+                               prev_feed_min=None, prev_feed_min_at=None):
     """RECONCILE: säubert veraltete/stornierte iCal-Tage aus `briefings` (in-place)
     UND aus der manuellen Briefing-Map + Supabase, sodass ein RE-IMPORT den Monat
     WIRKLICH ERSETZT (Tage, die der neue Feed nicht mehr enthält, verschwinden).
@@ -52827,39 +52931,83 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
     einen Umlauf rückwirkend entfernen. Bliebe er gespeichert, würde der
     Flight-Fanout weiter Meldungen zu diesem nicht mehr aktuellen Umlauf senden.
     `full_clean=True` zieht den Anfang nicht auf den Vormonat hoch, sondern räumt
-    das GANZE vom Feed abgedeckte Fenster (min(feed_dates)..max).
+    das GANZE vom Feed abgedeckte Fenster (min(feed_dates)..max) — mindestens
+    aber ab Monatsanfang(heute): „der Feed ist Autorität für den ganzen
+    laufenden Monat" (sonst kann ein hochgesprungener Unterrand auch per
+    Force-Clean nicht mehr abgeräumt werden).
 
-    Gibt ein Debug-Dict zurück (feed_dates/cleared/window/...). Wirft nie.
+    `prev_feed_min`/`prev_feed_min_at` (Dominik Ift 2026-08-05): der zuletzt
+    gespeicherte Feed-Unterrand + seit wann er dort steht (s.
+    `_calendar_feed_stamp_feed_min`). Springt der Unterrand SCHNELLER nach vorn
+    als ein rollender Feed wandern kann, ist das kein Horizont-Rollen, sondern
+    ein GEBLANKTER Monatsanfang (Condor-Krankmeldung) → das Fenster wird auf den
+    alten Rand zurückgesenkt, damit die gestrichenen Tage überhaupt im
+    Räumfenster liegen.
+
+    Gibt ein Debug-Dict zurück (feed_dates/cleared/window/removed_dates/...).
+    Wirft nie.
     """
-    dbg = {'feed_dates': 0, 'cleared': 0, 'window': None}
+    dbg = {'feed_dates': 0, 'cleared': 0, 'window': None, 'removed_dates': []}
     try:
-        feed_dates = set()
-        for ev in (feed_events or []):
-            # Leere Events (kein Summary/Location/Start) „decken" keinen Tag ab —
-            # sonst markiert eine Feed-Lücke den Tag fälschlich als belegt und ein
-            # veralteter Eintrag wird nie geräumt.
-            if not (ev.get('summary') or '').strip() \
-               and not (ev.get('location') or '').strip() \
-               and not (ev.get('start_iso') or '').strip():
-                continue
-            ds = ev.get('_multiday_dates') or ([ev.get('start')] if ev.get('start') else [])
-            for d in ds:
-                if isinstance(d, str) and re.match(r'^\d{4}-\d{2}-\d{2}$', d.strip()):
-                    feed_dates.add(d.strip())
+        feed_dates = _feed_covered_dates(feed_events)
         dbg['feed_dates'] = len(feed_dates)
         removed_dates = set()
         if feed_dates:
             fmin, fmax = min(feed_dates), max(feed_dates)
+            _feed_min_raw = fmin
+            _this_month = datetime.now().replace(day=1)
+            _previous_month_start = (
+                _this_month - timedelta(days=1)).replace(day=1).strftime('%Y-%m-%d')
             # AKTUELLEN + VORHERIGEN MONAT neu schreiben, ältere Historie
             # einfrieren. Planänderungen kommen auch kurz nach dem Monatswechsel
             # rückwirkend rein. Nur der aktuelle Monat ließ den entfernten
             # Vormonats-Umlauf als Sektoren-Zombie im Push-Fanout stehen.
-            if not full_clean:
-                _this_month = datetime.now().replace(day=1)
-                _previous_month_start = (
-                    _this_month - timedelta(days=1)).replace(day=1).strftime('%Y-%m-%d')
-                if fmin < _previous_month_start:
-                    fmin = _previous_month_start
+            if not full_clean and fmin < _previous_month_start:
+                fmin = _previous_month_start
+            # EDGE-JUMP (Dominik Ift 2026-08-05, Condor-FA krankgemeldet:
+            # „Plan aktualisiert sich nicht mehr, Flug steht als abgeflogen
+            # drin"): Condor-Feeds sind MONATSVERANKERT — eine Krankmeldung
+            # blankt die führenden Monatstage, der Unterrand sprang von 01.08.
+            # auf 06.08. Der gestrichene Flugtag 03.08. lag damit UNTER fmin und
+            # wurde NIE geräumt (575 Ghost-Blockminuten in FTL/Fatigue). Der
+            # Vormonats-Clamp hebt fmin nur AN, er senkt nie.
+            # Test: wandert der Rand SCHNELLER als die Zeit vergeht (mehr Tage
+            # Sprung als verstrichene Tage + 1 Tag Sync-Slack), ist er GESPRUNGEN,
+            # nicht gerollt. Rollende Feeds (LH: ≤1 Tag pro Tag) fallen nie
+            # darunter und bleiben exakt unverändert.
+            _prev_edge = str(prev_feed_min or '').strip()
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', _prev_edge) and _prev_edge < _feed_min_raw:
+                _elapsed_days = None
+                try:
+                    _elapsed_days = max(0.0, (
+                        datetime.now()
+                        - datetime.fromisoformat(str(prev_feed_min_at or ''))
+                    ).total_seconds() / 86400.0)
+                except Exception:
+                    _elapsed_days = None      # ohne Zeitstempel kein Urteil → nichts senken
+                if _elapsed_days is not None:
+                    _jump_days = (datetime.strptime(_feed_min_raw, '%Y-%m-%d')
+                                  - datetime.strptime(_prev_edge, '%Y-%m-%d')).days
+                    if _jump_days > int(_elapsed_days) + 1:
+                        # Der Vormonats-Clamp bleibt HART: nie älter als
+                        # Vormonatsanfang räumen (Flugbuch-Beweisgate-Regression
+                        # 2026-08-05 — Historie >35d darf nicht verschwinden).
+                        _lowered = max(_prev_edge, _previous_month_start)
+                        if _lowered < fmin:
+                            app.logger.info(
+                                f'[ical-reconcile] edge-jump: {_prev_edge}..'
+                                f'{_feed_min_raw} fenster-gesenkt-auf={_lowered}')
+                            fmin = _lowered
+                            dbg['edge_jump'] = f'{_prev_edge}..{_feed_min_raw}'
+            # FULL-CLEAN-VENTIL: der explizite Force-Clean erklärt den Feed zur
+            # Autorität für den GANZEN laufenden Monat — auch ohne bekannten
+            # Vorrand (Alt-Profile ohne feed_min, iOS-Geräte-Pfad). Ohne das
+            # Ventil konnte ein hochgesprungener Unterrand nicht einmal manuell
+            # abgeräumt werden.
+            if full_clean:
+                _month_start_today = _this_month.strftime('%Y-%m-%d')
+                if _month_start_today < fmin:
+                    fmin = _month_start_today
             dbg['window'] = f'{fmin}..{fmax}'
             # ZUKUNFTS-GEIST-PRUNE (Jennifer Orhan 2026-07-18: stornierter SFO-Trip
             # 31.07–01.08 überlebte, weil er HINTER dem geschrumpften Feed-Horizont
@@ -52964,6 +53112,11 @@ def _reconcile_month_briefings(token, briefings, feed_events, full_clean=False):
                     dbg['sb_deleted'] = len(dl)
                 except Exception as _de:
                     dbg['sb_delete_error'] = str(_de)[:100]
+            # Die TATSÄCHLICH geräumten Tage nach außen geben: der nachlaufende
+            # `_preserve_past_flown_days`-Guard muss sie überspringen, sonst
+            # restauriert er einen gerade gestrichenen Vergangenheits-Tag sofort
+            # wieder aus `existing` (Dominik Ift 2026-08-05).
+            dbg['removed_dates'] = sorted(removed_dates)
     except Exception as _re:
         dbg['error'] = str(_re)[:120]
         app.logger.warning(f'[ical-reconcile] {str(_re)[:150]}')
@@ -53447,6 +53600,16 @@ def import_calendar_feed(token):
     # liest weiterhin ausschließlich `url` — der Geräte-Abruf bleibt also der
     # alleinige Roster-Weg, kein neues Server-„Bot"-Muster).
     _prev_feed_url = str(feed_obj.get('url') or '').strip()
+    # EDGE-JUMP-BASIS (Dominik Ift 2026-08-05): den GESPEICHERTEN Feed-Unterrand
+    # lesen BEVOR wir ihn überschreiben — das Reconcile weiter unten braucht ihn,
+    # um einen geblankten Monatsanfang von einem rollenden Horizont zu trennen.
+    _prev_feed_min = str(feed_obj.get('feed_min') or '').strip()
+    _prev_feed_min_at = str(feed_obj.get('feed_min_at') or '').strip()
+    # Den Rand NUR fortschreiben, wenn dieser Lauf auch wirklich reconciled:
+    # ein PDF-Archiv-Import deckt bewusst ein ALTES Fenster ab und ein partieller
+    # Feed-Fehler eine unvollständige Liste — beide würden `feed_min` vergiften
+    # und beim NÄCHSTEN Import einen Phantom-Sprung vortäuschen.
+    _feed_min_trackable = not (err_1 or err_2 or _archive_direct)
     if not err_1:
         # Der Primär-Slot trägt die MERGED Event-Liste (Duty + Off-Days) — alle
         # bestehenden Reader (Friend-Roster-Fallback, get_briefings-Pfade) sehen
@@ -53463,6 +53626,11 @@ def import_calendar_feed(token):
         # _calendar_feed_note_refresh_failure / _maybe_refresh_calendar_feed).
         feed_obj.pop('refresh_fail_count', None)
         feed_obj.pop('last_refresh_fail_at', None)
+        # Feed-Unterrand fortschreiben (Basis der Edge-Jump-Erkennung beim
+        # NÄCHSTEN Import). `_reconcile_events` ist die ungekappte Wahrheit —
+        # dieselbe Liste, die auch das Reconcile unten sieht.
+        if _feed_min_trackable:
+            _calendar_feed_stamp_feed_min(feed_obj, _reconcile_events)
         if ics_text_direct:
             # Direkt-ICS: kein URL-Zyklus (der Server-Auto-Refresh hat nichts
             # zu holen) — Quelle ehrlich markieren, damit Diagnose/UI sie
@@ -53512,7 +53680,8 @@ def import_calendar_feed(token):
     # die Helper. SB primary + Disk best-effort, sonst Wipe-pro-Redeploy.
     imported_briefings = 0
     briefings = {}
-    _reconcile_dbg = {'feed_dates': 0, 'cleared': 0, 'window': None}
+    _reconcile_dbg = {'feed_dates': 0, 'cleared': 0, 'window': None,
+                      'removed_dates': []}
     # Optionaler Voll-Clean: ?full=1 (oder Body {"full_clean":true}) räumt das GANZE
     # Feed-Fenster statt nur ab Monatsanfang — „force full re-import/clean" pro User,
     # wenn ein hartnäckiger Phantom-Tag auch außerhalb des laufenden Monats klebt.
@@ -53564,13 +53733,17 @@ def import_calendar_feed(token):
             # feed's lower edge disappeared). Archive imports never clear an
             # existing day; a normal feed refresh keeps the old behavior.
             _reconcile_dbg = {'skipped': 'pdf_archive_preserve_existing',
-                              'feed_dates': 0, 'cleared': 0, 'window': None}
+                              'feed_dates': 0, 'cleared': 0, 'window': None,
+                              'removed_dates': []}
         elif err_1 or err_2:
             _reconcile_dbg = {'skipped': 'partial_feed_failure',
-                              'feed_dates': 0, 'cleared': 0, 'window': None}
+                              'feed_dates': 0, 'cleared': 0, 'window': None,
+                              'removed_dates': []}
         else:
             _reconcile_dbg = _reconcile_month_briefings(
-                token, briefings, _reconcile_events, full_clean=_full_clean)
+                token, briefings, _reconcile_events, full_clean=_full_clean,
+                prev_feed_min=_prev_feed_min,
+                prev_feed_min_at=_prev_feed_min_at)
         # Pro-Leg-Sektoren auch im ICS-URL-Pfad bewahren (gleich wie EKEvent-Upload).
         # `existing` = gespeicherter Stand VOR diesem Import → Plan-Blockzeiten
         # überleben den Replace (s. _preserve_plan_times).
@@ -53580,8 +53753,11 @@ def import_calendar_feed(token):
         # Geflogene Vergangenheit gegen sektorlose Neuaufbauten verteidigen
         # (Tibor 2026-08-02: Historien-Import-Fallback-Marker entkernte den
         # Vortag) — nach _attach_sectors, damit „hat der Neuaufbau Sektoren?"
-        # eine beantwortbare Frage ist.
-        _preserve_past_flown_days(briefings, existing)
+        # eine beantwortbare Frage ist. Gerade GERÄUMTE Tage sind vom Guard
+        # ausgenommen — sonst holt er den stornierten Tag aus `existing` zurück.
+        _preserve_past_flown_days(
+            briefings, existing,
+            skip_dates=(_reconcile_dbg.get('removed_dates') or []))
         _preserve_from = str(body.get('archive_preserve_from') or '')[:10]
         _preserve_to = str(body.get('archive_preserve_to') or '')[:10]
         if (_archive_direct
@@ -54370,6 +54546,16 @@ _DISCOVER_GROUND_NO_STN_RE = re.compile(
 # zweiten Token nach dem eigentlichen „HH:MM Release FDP ext." — aber da
 # Release immer das ZWEITE Token ist, bleibt das erste = Report. ✓
 _DISCOVER_REPORT_RE = re.compile(r'^(\d{1,2}:\d{2})\b')
+# Der gedruckte Wochentag der Datumszeile. `_CREWACCESS_DAY_RE` prüft ihn nur,
+# ohne ihn zu greifen (Gruppen-Indizes dort gehören dem CrewAccess-Parser).
+# Für die Vormonats-Auflösung ist er die einzige harte Evidenz im Dokument.
+_DISCOVER_WEEKDAY_RE = re.compile(
+    r'^\d{1,2}\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b')
+_DISCOVER_WEEKDAY_INDEX = {
+    'Mon': 0, 'Tue': 1, 'Wed': 2, 'Thu': 3, 'Fri': 4, 'Sat': 5, 'Sun': 6,
+}
+# Trip-ID-/Tag-Umbruchzeile („0_200", „_006", „14:00 _270") — kein Inhalt.
+_DISCOVER_CONT_RE = re.compile(r'(?:\d{1,2}:\d{2}\s+)?[\dA-Za-z_]+')
 
 
 def _discover_roster_text_to_ics(text, carrier='4Y'):
@@ -54421,6 +54607,76 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
             candidates = [candidate for candidate in candidates
                           if candidate >= not_before]
         return min(candidates) if candidates else None
+
+    # Vormonat der Periode (Januar → Dezember des Vorjahres).
+    _prev_serial = (month - 1) - 1
+    prev_year = year + _prev_serial // 12
+    prev_month = _prev_serial % 12 + 1
+
+    def prev_month_date(dom):
+        """Tag-im-Monat im VORMONAT der Periode auflösen."""
+        try:
+            return _date(prev_year, prev_month, int(dom))
+        except (TypeError, ValueError):
+            return None
+
+    # ── Pre-Scan: führender Vormonats-Spillover ─────────────────────────────
+    # Discover druckt nur den Tag-im-Monat. Ein August-PDF kann mit der Zeile
+    # des 31. JULI beginnen (Übernacht-Abflug am Vortag, dessen Closer erst
+    # am „01" steht). `day_date` kennt nur Offsets ab dem Periodenmonat und
+    # las diese Zeile als 31. AUGUST — Phantom-Tour am Monatsende mit einer
+    # Ankunft VOR dem Abflug, und der echte Monatserste blieb leer.
+    # Deterministische Regel: Kandidat sind NUR die FÜHRENDEN,
+    # aufeinanderfolgenden Datumszeilen mit Tag >= 25, auf die später eine
+    # Zeile mit Tag < 25 folgt. In den Vormonat verschoben wird eine solche
+    # Zeile aber erst, wenn der im PDF GEDRUCKTE Wochentag den Vormonat
+    # bestätigt und den Periodenmonat ausschließt (bzw. der Tag im
+    # Periodenmonat gar nicht existiert). Ohne diese Evidenz bleibt alles wie
+    # bisher — ein echter Monatsschluss („31" der Periode, Closer am „01" des
+    # Folgemonats) wird dadurch nicht angetastet.
+    scan_in_table = False
+    day_rows = []          # [(day_of_month, weekday_index|None), …]
+    for scan_raw in t.splitlines():
+        scan_line = ' '.join(tok for tok in scan_raw.split() if tok != '*')
+        if not scan_line:
+            continue
+        if scan_line.startswith('Date Report'):
+            scan_in_table = True
+            continue
+        if scan_line.startswith('Created ') or scan_line.startswith('Monthly'):
+            scan_in_table = False
+            continue
+        if not scan_in_table:
+            continue
+        if '_' in scan_line and _DISCOVER_CONT_RE.fullmatch(scan_line):
+            continue
+        scan_dm = _CREWACCESS_DAY_RE.match(scan_line)
+        if not scan_dm:
+            continue
+        scan_wd = _DISCOVER_WEEKDAY_RE.match(scan_line)
+        day_rows.append((
+            int(scan_dm.group(1)),
+            _DISCOVER_WEEKDAY_INDEX.get(scan_wd.group(1)) if scan_wd else None,
+        ))
+
+    lead_len = 0
+    while lead_len < len(day_rows) and day_rows[lead_len][0] >= 25:
+        lead_len += 1
+    spillover_rows = 0
+    if lead_len and any(dom < 25 for dom, _ in day_rows[lead_len:]):
+        for dom, weekday_index in day_rows[:lead_len]:
+            if weekday_index is None:
+                break
+            prev_candidate = prev_month_date(dom)
+            if prev_candidate is None or prev_candidate.weekday() != weekday_index:
+                break
+            try:
+                own_candidate = _date(year, month, dom)
+            except ValueError:
+                own_candidate = None
+            if own_candidate is not None and own_candidate.weekday() == weekday_index:
+                break   # Der Periodenmonat passt genauso gut → nicht raten.
+            spillover_rows += 1
 
     def _stn_tz(iata):
         # Fallback Europe/Berlin: Discover-Basen sind FRA/MUC.
@@ -54506,6 +54762,7 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
     pending = None          # offener Übernacht-Leg: (num, frm, start_hhmm, dep_date, briefing)
     cur_day_report = None   # Report-Zeit (HH:MM) des aktuellen Duty-Tages
     cur_day_first_flight_done = False  # True sobald erster Flug-Leg dieses Tages emittiert
+    dated_row_index = 0     # laufender Index der Datumszeilen (Pre-Scan-Sync)
     for raw in t.splitlines():
         # Bid-Sterne („granted Bid") sind reine Marker-Tokens.
         line = ' '.join(tok for tok in raw.split() if tok != '*')
@@ -54520,14 +54777,16 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         if not in_table:
             continue
         # Umbruch-Fortsetzung (Trip-ID/Tag): „0_200", „_006", „14:00 _270".
-        if '_' in line and re.fullmatch(
-                r'(?:\d{1,2}:\d{2}\s+)?[\dA-Za-z_]+', line):
+        if '_' in line and _DISCOVER_CONT_RE.fullmatch(line):
             continue
         dated = False
         rest = line
         dm = _CREWACCESS_DAY_RE.match(line)
         if dm:
-            nd = day_date(dm.group(1), not_before=cur_day)
+            is_spillover = dated_row_index < spillover_rows
+            dated_row_index += 1
+            nd = (prev_month_date(dm.group(1)) if is_spillover
+                  else day_date(dm.group(1), not_before=cur_day))
             if nd is None:
                 continue
             cur_day = nd
@@ -54565,35 +54824,61 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
         if ml:
             add_all_day(cur_day, f'Layover {ml.group(1)}')
             continue
-        dh = _DISCOVER_DEADHEAD_RE.search(rest)
-        if dh:
-            flight, frm, to, t1, t2 = dh.groups()
-            add_route_timed(cur_day, t1, t2, frm, to,
-                            f'DH {flight} {frm} - {to}')
-            continue
-        # Erst das häufigere Activity+Station-Shape prüfen. Würde der
-        # Route-Parser zuerst laufen, könnte er „CM CRM FRA 12:00 14:00" als
-        # Code=CM, From=CRM, To=FRA fehlinterpretieren.
-        gm = _DISCOVER_GROUND_RE.search(rest)
-        if gm:
-            code, stn = gm.group(1), gm.group(2)
-            label = f'Standby {stn}' if code.startswith('SBY') else f'{code} {stn}'
-            add_timed(cur_day, gm.group(3), gm.group(4), stn, label)
-            continue
-        gr = _DISCOVER_GROUND_ROUTE_RE.search(rest)
-        if gr:
-            code, frm, to, t1, t2 = gr.groups()
-            add_route_timed(cur_day, t1, t2, frm, to,
-                            f'{code} {frm} - {to}')
-            continue
-        gn = _DISCOVER_GROUND_NO_STN_RE.search(rest)
-        if gn:
-            code = gn.group(1)
-            label = 'Reserve' if code.startswith('RES') else code
-            add_timed(cur_day, gn.group(2), gn.group(3), roster_base, label)
+        # Zweiter Versuch auf der GROSSSCHREIBUNG: Discover mischt in seltenen
+        # Exporten Prosa in die Activity-Spalte („Proceeding FRA MUC 18:00
+        # 20:00"). Die ALL-CAPS-Regexes greifen dort nicht — und die Zeile
+        # (samt ihres Tages) verschwand komplett. Die Flug-LEG-Regex bleibt
+        # bewusst case-sensitiv: eine falsch erkannte Flugnummer wäre teurer
+        # als ein roher Text.
+        variants = [rest]
+        if rest.upper() != rest:
+            variants.append(rest.upper())
+        ground_hit = False
+        for variant in variants:
+            dh = _DISCOVER_DEADHEAD_RE.search(variant)
+            if dh:
+                flight, frm, to, t1, t2 = dh.groups()
+                add_route_timed(cur_day, t1, t2, frm, to,
+                                f'DH {flight} {frm} - {to}')
+                ground_hit = True
+                break
+            # Erst das häufigere Activity+Station-Shape prüfen. Würde der
+            # Route-Parser zuerst laufen, könnte er „CM CRM FRA 12:00 14:00"
+            # als Code=CM, From=CRM, To=FRA fehlinterpretieren.
+            gm = _DISCOVER_GROUND_RE.search(variant)
+            if gm:
+                code, stn = gm.group(1), gm.group(2)
+                label = (f'Standby {stn}' if code.startswith('SBY')
+                         else f'{code} {stn}')
+                add_timed(cur_day, gm.group(3), gm.group(4), stn, label)
+                ground_hit = True
+                break
+            gr = _DISCOVER_GROUND_ROUTE_RE.search(variant)
+            if gr:
+                code, frm, to, t1, t2 = gr.groups()
+                add_route_timed(cur_day, t1, t2, frm, to,
+                                f'{code} {frm} - {to}')
+                ground_hit = True
+                break
+            gn = _DISCOVER_GROUND_NO_STN_RE.search(variant)
+            if gn:
+                code = gn.group(1)
+                label = 'Reserve' if code.startswith('RES') else code
+                add_timed(cur_day, gn.group(2), gn.group(3), roster_base, label)
+                ground_hit = True
+                break
+        if ground_hit:
             continue
         lm = _DISCOVER_LEG_RE.search(rest)
         if not lm:
+            # Owner-Regel „Keine Fake-Werte": ein DATIERTER Tag darf nie still
+            # verschwinden (echter Vorfall: ein Proceeding-Tag fehlte komplett
+            # im Kalender). Trifft kein Muster, reist der Rohtext 1:1 als
+            # All-Day-Marker mit — lieber roher Text als verlorener Tag.
+            # Undatierte Fortsetzungszeilen bleiben bewusst ohne Fallback:
+            # sie hätten kein eigenes Datum und würden fremde Tage zumüllen.
+            if dated and rest:
+                add_all_day(cur_day, rest[:60])
             continue
         num, a1, a2, t1, t2 = lm.groups()
         if a2 and t2:
@@ -54920,8 +55205,15 @@ def upload_calendar_events(token):
             'start_iso': str(ev.get('start_iso') or '')[:25],
             'end_iso': str(ev.get('end_iso') or '')[:25],
         })
+    # Voll-Clean-Flag früh auflösen: es entscheidet nicht nur über das
+    # Räumfenster, sondern auch darüber, ob DIESER Lauf überhaupt reconciled —
+    # und nur ein reconcilender Lauf darf den Feed-Unterrand fortschreiben.
+    _full_clean = (str(request.args.get('full') or '').strip() in ('1', 'true', 'yes')
+                   or bool(body.get('full_clean')))
     # Profil-Notiz. Lebt der ICS-URL-Zyklus? (für den Reconcile-Skip weiter unten)
     _url_feed_fresh = False
+    _prev_feed_min = ''
+    _prev_feed_min_at = ''
     _eventkit_profile_persist_ok = True
     try:
         existing = {}
@@ -54965,11 +55257,21 @@ def upload_calendar_events(token):
                     _url_feed_fresh = _imp_age_s < 35 * 86400
         except Exception:
             pass
+        # EDGE-JUMP-BASIS (Dominik Ift 2026-08-05): gespeicherten Feed-Unterrand
+        # lesen, BEVOR er überschrieben wird.
+        _prev_feed_min = str(feed_obj_ios.get('feed_min') or '').strip()
+        _prev_feed_min_at = str(feed_obj_ios.get('feed_min_at') or '').strip()
         _stamp = datetime.now().isoformat()
         feed_obj_ios.update({
             'source': 'ios_ekeventstore', 'events': events[:300],
             'ek_imported_at': _stamp,
         })
+        # Den Rand NUR fortschreiben, wenn DIESER Lauf auch reconciled — sonst
+        # trüge der Slot abwechselnd das Fenster des URL-Feeds und das des
+        # Gerätekalenders und täuschte Sprünge vor. (Roh-Events tragen nur
+        # `start_iso`; die Adapter laufen erst weiter unten → iso_fallback.)
+        if not _url_feed_fresh or _full_clean:
+            _calendar_feed_stamp_feed_min(feed_obj_ios, events, iso_fallback=True)
         # imported_at gehört dem ICS-URL-Zyklus (6h-Throttle des Server-
         # Refresh): nur setzen wenn KEIN URL-Feed aktiv ist — sonst würde
         # jeder EK-Push den serverseitigen ICS-Refresh dauerhaft verschieben.
@@ -55062,8 +55364,8 @@ def upload_calendar_events(token):
         # eine Phantom-SFO-Tour), die der neue Push nicht mehr enthält, im aktuellen
         # Monatsfenster räumen. Vorher lief das nur im ICS-URL-Pfad → Phantom-Touren
         # über den iOS-Push überlebten dauerhaft. ?full=1 → ganzes Feed-Fenster.
-        _full_clean = (str(request.args.get('full') or '').strip() in ('1', 'true', 'yes')
-                       or bool(body.get('full_clean')))
+        # (`_full_clean` steht schon oben fest — es entscheidet mit über den
+        # Feed-Unterrand-Stempel.)
         # Doppel-Import-Wettlauf-Fix (Review 2026-07-10): hängt der Geräte-
         # Kalender dem LH-Feed hinterher (Pickup ~1 Tag vorher nachgetragen,
         # EK-Subscription lahmt) oder deckt er ein schmaleres Fenster ab, würde
@@ -55074,10 +55376,13 @@ def upload_calendar_events(token):
         # Explizites ?full=1 bleibt als bewusster Force-Clean-Override wirksam.
         if _url_feed_fresh and not _full_clean:
             _reconcile_dbg = {'feed_dates': 0, 'cleared': 0, 'window': None,
+                              'removed_dates': [],
                               'skipped': 'url_feed_fresher'}
         else:
             _reconcile_dbg = _reconcile_month_briefings(
-                token, briefings, _reconcile_events, full_clean=_full_clean)
+                token, briefings, _reconcile_events, full_clean=_full_clean,
+                prev_feed_min=_prev_feed_min,
+                prev_feed_min_at=_prev_feed_min_at)
         # Pro-Leg-Sektoren bewahren (geteilte Logik mit dem ICS-URL-Pfad) —
         # inkl. Plan-Blockzeiten aus dem gespeicherten Stand.
         _attach_sectors(
@@ -55085,8 +55390,12 @@ def upload_calendar_events(token):
             identity_mode=('v2' if _roster_v2_enabled_for(token) else 'legacy'))
         # Gleiche Schutzplanke wie im ICS-URL-Pfad: ein hinterherhängender
         # Gerätekalender darf geflogene Vergangenheit nicht entkernen
-        # (identischer Zünder wie der Historien-Import, s. Helper-Doku).
-        _preserve_past_flown_days(briefings, existing_briefings)
+        # (identischer Zünder wie der Historien-Import, s. Helper-Doku). Gerade
+        # GERÄUMTE Tage sind ausgenommen — sonst kommt der stornierte Tag sofort
+        # aus `existing_briefings` zurück.
+        _preserve_past_flown_days(
+            briefings, existing_briefings,
+            skip_dates=(_reconcile_dbg.get('removed_dates') or []))
         if _url_feed_fresh and not _full_clean:
             # Reconcile zu überspringen reicht nicht: der Neuaufbau oben hat
             # berührte Tage bereits ersetzt. Der feldweise Merge ist fachlich

@@ -223,6 +223,14 @@ AIRLINE_ALIASES = {
     'AZ': ['ITA Airways', 'ITY'],
     'VL': ['Lufthansa City Airlines', 'City Airlines'],
     'CL': ['Lufthansa CityLine', 'CLH'],
+    # Aerologic (Cargo-Joint-Venture DHL/Lufthansa, Basis Leipzig LEJ) —
+    # Anfrage Aerologic-Crew Philipp, 2026-08-05.
+    # BEWUSST ohne ICAO 'BOX': als Whole-Word-Alias taggte er die Schlagzeile
+    # „Ermittler werten die black box aus" als Aerologic (Agent-Befund
+    # 2026-08-05, konkret verifiziert). Im Profil-Matching
+    # (_canonical_airline_key) bleibt 'box' erlaubt — dort ist es exakt-Match
+    # auf ein Airline-Feld, keine Volltextsuche.
+    '3V': ['AeroLogic', 'Aerologic'],
     # IAG / British
     'BA': ['British Airways', 'BAW'],
     'IB': ['Iberia', 'IBE'],

@@ -786,3 +786,144 @@ def test_attach_sectors_backfill_never_overwrites_parsed_flight():
     backend._attach_sectors(briefings, events)
     secs = briefings['2026-07-23']['ical_sectors']
     assert secs[0]['flight'] == '4Y1224'
+
+
+# ── Führender Vormonats-Spillover + kein stiller Tages-Drop ─────────────────
+#
+# Echter Vorfall (Discover PU FRA, August-PDF): Die Tabelle beginnt mit der
+# Zeile des 31. JULI (Übernacht-Abflug, Closer erst am „01"). `day_date`
+# kannte nur Offsets ab dem Periodenmonat und las die Zeile als 31. AUGUST —
+# Phantom-Tour am Monatsende mit Ankunft VOR dem Abflug; der echte 01.08.
+# trug nur noch ein orphanes Zeit-Token.
+# Fixture synthetisch (Struktur wie das echte PDF, keine Personendaten).
+# Wochentage sind bewusst ECHT: 31Jul2026 = Freitag, 01Aug2026 = Samstag —
+# genau daran erkennt der Parser den Vormonat.
+_LEADING_PREV_MONTH_SPILLOVER = """\
+Roster
+Period: August 2026
+Crew member: TST, Test, Spill
+Rank: PU Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+31 Fri 16:35 PU 130 FRA 18:20 333 20260731_13
+0_200
+01 Sat PU 130 ZNZ 03:20 333 8:00
+02 Sun Layover: ZNZ
+03 Mon 11:15 PU 131 ZNZ FRA 13:15 20:05 333 6:50 9:30 12:00
+04 Tue O
+Created 01Aug2026 10:00 (UTC) by TST 1 ( 1)
+"""
+
+
+def _assert_no_negative_durations(ics):
+    """Kein Event darf enden, bevor es beginnt (Prod-Symptom des Bugs)."""
+    for event in backend._parse_ics_to_events(ics):
+        start = event.get('start_iso') or event.get('start')
+        end = event.get('end_iso') or event.get('end')
+        assert start and end, event
+        assert end >= start, f'DTEND vor DTSTART: {event}'
+
+
+def test_leading_prev_month_row_lands_in_previous_month():
+    """Die führende „31"-Zeile eines August-PDFs ist der 31. JULI."""
+    ics, err = backend._discover_roster_text_to_ics(
+        _LEADING_PREV_MONTH_SPILLOVER)
+    assert err is None, err
+    # Abflug am 31. Juli (FRA 18:20 lokal), Ankunft am 01. August.
+    assert 'DTSTART;TZID=Europe/Berlin:20260731T182000' in ics
+    assert 'DTEND:20260801T002000Z' in ics
+    # Keinerlei Event am 31. AUGUST aus dieser Zeile:
+    assert '20260831' not in ics
+    _assert_no_negative_durations(ics)
+
+    events = backend._parse_ics_to_events(ics)
+    secs = backend._build_ical_sectors(events)
+    assert '2026-08-31' not in secs
+    leg = next(s for s in secs['2026-07-31'] if s.get('flight') == '4Y130')
+    assert leg['dep_iso'] == '2026-07-31T16:20:00Z'
+    assert leg['arr_iso'] == '2026-08-01T00:20:00Z'
+    # Der Rückflug am 03.08. bleibt unberührt im Periodenmonat.
+    assert secs['2026-08-03'][0]['flight'] == '4Y131'
+
+
+def test_real_end_of_period_overnight_stays_in_period_month():
+    """Gegenprobe zum Spillover: trägt die führende „31"-Zeile den Wochentag
+    des PERIODENMONATS (31Aug2026 = Montag), bleibt sie im August — der
+    Closer „01" rollt wie bisher in den September."""
+    text = """Roster
+Period: August 2026
+Rank: CM Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+31 Mon 18:20 CM 753 FRA 21:20 333
+01 Tue 07:05 CM 753 HYD 07:05 333
+Created 31Aug2026 10:00 (UTC) by TEST 1 ( 1)
+"""
+    ics, err = backend._discover_roster_text_to_ics(text)
+    assert err is None, err
+    assert 'DTSTART;TZID=Europe/Berlin:20260831T212000' in ics
+    assert 'DTEND:20260901T013500Z' in ics
+    _assert_no_negative_durations(ics)
+
+
+# Prosa in der Activity-Spalte: die ALL-CAPS-Regexes greifen nicht, der Tag
+# verschwand komplett (Christinas 12.08. mit Proceeding FRA→MUC fehlte ganz).
+_DATED_PROSE_ROWS = """\
+Roster
+Period: August 2026
+Crew member: TST, Test, Prosa
+Rank: PU Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+11 Tue O
+12 Wed Proceeding FRA MUC 18:00 20:00
+13 Thu Sonderdienst XY
+Created 01Aug2026 10:00 (UTC) by TST 1 ( 1)
+"""
+
+
+def test_dated_prose_row_is_never_dropped():
+    """„12 Wed Proceeding FRA MUC 18:00 20:00" muss den 12.08. erzeugen —
+    als getimtes Route-Event (Upper-Retry) oder mindestens als Roh-Marker."""
+    ics, err = backend._discover_roster_text_to_ics(_DATED_PROSE_ROWS)
+    assert err is None, err
+    assert '20260812' in ics, 'Tag 12 fehlt komplett im ICS'
+    _assert_no_negative_durations(ics)
+
+    events = backend._parse_ics_to_events(ics)
+    aug12 = [e for e in events if (e.get('start') or '') == '2026-08-12']
+    assert aug12, f'Kein Event am 2026-08-12; events={events}'
+    summary = ' '.join(e.get('summary') or '' for e in aug12)
+    assert 'FRA' in summary and 'MUC' in summary, summary
+    # Über den Upper-Retry wird daraus ein echter Transfer mit Zeiten:
+    assert 'SUMMARY:PROCEEDING FRA - MUC' in ics
+    assert 'DTSTART;TZID=Europe/Berlin:20260812T180000' in ics
+
+
+def test_dated_unknown_multi_token_row_travels_as_raw_all_day():
+    """Unbekannter Mehr-Token-Inhalt: lieber roher Text als verlorener Tag
+    (Owner-Regel „Keine Fake-Werte" — es wird KEINE Uhrzeit erfunden)."""
+    ics, err = backend._discover_roster_text_to_ics(_DATED_PROSE_ROWS)
+    assert err is None, err
+    assert 'DTSTART;VALUE=DATE:20260813' in ics
+    assert 'SUMMARY:Sonderdienst XY' in ics
+
+
+def test_undated_continuation_row_gets_no_raw_fallback():
+    """Fortsetzungszeilen ohne eigenes Datum bekommen KEINEN Roh-Fallback —
+    sie würden sonst fremde Tage zumüllen."""
+    text = """\
+Roster
+Period: August 2026
+Rank: CM Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+04 Tue BRS FRA 10:00 17:00 7:00 12:00
+irgendein unerwarteter Fliesstext ohne Datum
+Created 04Aug2026 10:00 (UTC) by TST 1 ( 1)
+"""
+    ics, err = backend._discover_roster_text_to_ics(text)
+    assert err is None, err
+    assert 'SUMMARY:BRS FRA' in ics
+    assert 'irgendein' not in ics
+    assert ics.count('BEGIN:VEVENT') == 1

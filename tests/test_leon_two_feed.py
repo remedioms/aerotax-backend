@@ -146,8 +146,9 @@ def _patch_persistence(monkeypatch, fetch_map):
     monkeypatch.setattr(backend, '_ical_briefings_save', lambda t, b: saved.update({'briefings': b}) or True)
     monkeypatch.setattr(
         backend, '_reconcile_month_briefings',
-        lambda t, b, e, full_clean=False: {'feed_dates': len(e), 'cleared': 0,
-                                           'window': 'stubbed'})
+        lambda t, b, e, full_clean=False, prev_feed_min=None,
+        prev_feed_min_at=None: {'feed_dates': len(e), 'cleared': 0,
+                                'removed_dates': [], 'window': 'stubbed'})
     return saved
 
 
