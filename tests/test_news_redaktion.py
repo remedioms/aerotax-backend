@@ -180,6 +180,43 @@ def test_endpoint_serves_store_and_warming(monkeypatch):
     assert 'image' not in json.dumps(body2['items'][0])
 
 
+def test_endpoint_published_at_ist_immer_string(monkeypatch):
+    """App-Vertrag (Vorfall 05.08.): RedaktionItem.published_at ist in Swift
+    String? — ein int (Unix-Epoche aus dem Feed-Schema) lässt das GESAMTE
+    Decoding platzen und die App fällt still auf den Publisher-Feed zurück.
+    Der Endpoint muss int-Epochen deshalb als ISO-String ausliefern und
+    gemischte Typen (int + str im selben Store) sortieren können."""
+    from flask import Flask
+    app = Flask(__name__)
+    app.register_blueprint(nb.news_bp)
+    client = app.test_client()
+    monkeypatch.setattr(nb, '_redaktion_kick_build_if_stale', lambda: True)
+
+    nb._redaktion_store_merge({
+        'alt': {'id': 'alt', 'headline': 'H' * 20, 'body': 'B' * 60,
+                'category': 'industry', 'source_name': 'Q', 'source_url': 'u',
+                'published_at': 1785913510,  # Unix-int wie im Prod-Store
+                'mentioned_airlines': [], 'rev': nb._REDAKTION_REV},
+        'neu': {'id': 'neu', 'headline': 'H' * 20, 'body': 'B' * 60,
+                'category': 'industry', 'source_name': 'Q', 'source_url': 'u',
+                'published_at': '2026-08-05T09:00:00+00:00',
+                'mentioned_airlines': [], 'rev': nb._REDAKTION_REV},
+        'leer': {'id': 'leer', 'headline': 'H' * 20, 'body': 'B' * 60,
+                 'category': 'industry', 'source_name': 'Q', 'source_url': 'u',
+                 'published_at': None,
+                 'mentioned_airlines': [], 'rev': nb._REDAKTION_REV},
+    })
+    body = client.get('/api/news/redaktion').get_json()
+    assert body['count'] == 3
+    for it in body['items']:
+        assert it['published_at'] is None or isinstance(it['published_at'], str)
+    by_id = {it['id']: it for it in body['items']}
+    # 1785913510 = 2026-08-05T07:05:10Z — als ISO-String, nicht als Zahl.
+    assert by_id['alt']['published_at'] == '2026-08-05T07:05:10Z'
+    # Neuester zuerst (09:00 > 07:05) trotz gemischter Typen im Store.
+    assert body['items'][0]['id'] == 'neu'
+
+
 def test_copyright_guard_rejects_copied_passages(monkeypatch):
     art = _art(9, fulltext=(
         'Die Lufthansa hat am Montag angekündigt, dass die beschädigte '

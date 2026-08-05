@@ -2975,7 +2975,7 @@ def _redaktion_build():
         with _REDAKTION_LOCK:
             _REDAKTION_LAST_BUILD['running'] = False
         return
-    base.sort(key=lambda a: a.get('published_at') or '', reverse=True)
+    base.sort(key=_redaktion_sort_ts, reverse=True)
     existing = _redaktion_store_snapshot()
     todo = [a for a in base if a.get('id')
             and a['id'] not in existing
@@ -2997,6 +2997,40 @@ def _redaktion_build():
     with _REDAKTION_LOCK:
         _REDAKTION_LAST_BUILD['ts'] = time.time()
         _REDAKTION_LAST_BUILD['running'] = False
+
+
+def _redaktion_published_iso(ts):
+    """published_at → ISO8601-String für die App.
+
+    Der Feed führt published_at als Unix-Sekunden (int); das iOS-Modell
+    (RedaktionItem.published_at: String?) decodiert aber NUR Strings — ein
+    int lässt in Swift das gesamte Response-Decoding platzen, fetchRedaktion
+    wirft, und die App fällt still auf den alten Publisher-Feed zurück
+    (Vorfall 05.08.). Der Endpoint liefert deshalb IMMER String oder null.
+    """
+    if ts is None or ts == '':
+        return None
+    if isinstance(ts, str):
+        return ts
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc) \
+            .isoformat().replace('+00:00', 'Z')
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _redaktion_sort_ts(item):
+    """Sortier-Schlüssel, der int-Epochen UND ISO-Strings verträgt — der
+    Store enthält beides (alte Einträge int, Test-/Alt-Einträge String)."""
+    ts = item.get('published_at')
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str) and ts:
+        try:
+            return datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _redaktion_kick_build_if_stale():
@@ -3028,8 +3062,10 @@ def get_news_redaktion():
     building = _redaktion_kick_build_if_stale()
     snapshot = _redaktion_store_snapshot()
     items = sorted(snapshot.values(),
-                   key=lambda x: x.get('published_at') or '',
+                   key=_redaktion_sort_ts,
                    reverse=True)[:limit]
+    items = [{**it, 'published_at': _redaktion_published_iso(it.get('published_at'))}
+             for it in items]
     with _REDAKTION_LOCK:
         running = _REDAKTION_LAST_BUILD['running']
     return jsonify({
