@@ -233,6 +233,29 @@ def looks_unflown(r):
     return True
 
 
+def is_zero_duration_marker(r):
+    """Historischer OffBlock-Marker ohne ableitbare Flug- oder FSTD-Zeit.
+
+    Einzelne alte Exporte enthalten Type=Flight-Zeilen mit identischer
+    Abflug-/Ankunftszeit am selben Ort, Total time 00:00 und ohne jede
+    Flug-/Muster-/Kennzeichenangabe. Das ist kein Mitternachtsflug: Würde die
+    Zeile wie ein normaler Leg behandelt, machte ``arr <= dep`` daraus einen
+    erfundenen 24-Stunden-Leg ohne Blockzeit.
+    """
+    dep_p, arr_p = s(r, 'Departure place'), s(r, 'Arrival place')
+    dep_t, arr_t = s(r, 'Departure time'), s(r, 'Arrival time')
+    total = hhmm_to_min(s(r, 'Total time'))
+    return (
+        s(r, 'Type').strip().lower() in TYPE_FLIGHT
+        and bool(dep_p) and dep_p.upper() == arr_p.upper()
+        and bool(dep_t) and dep_t == arr_t
+        and total == 0
+        and not s(r, 'Flight number')
+        and not s(r, 'Aircraft registration')
+        and not s(r, 'Aircraft ICAO')
+    )
+
+
 def merge_clusters(legs, window_min, report):
     """Doppelt verbuchte Flüge zusammenlegen (siehe Kopf, Punkt 1).
 
@@ -345,7 +368,7 @@ def main():
 
     legs, sims = [], []
     skipped = {'kein_datum': 0, 'summenzeile': 0, 'platzhalter': 0,
-               'leer': 0, 'geplant': 0}
+               'leer': 0, 'geplant': 0, 'nullzeit_marker': 0}
     planned_rows, unflown_past, sim_as_flight, merged = [], [], [], []
     # unabhängige Kontrollsumme direkt aus der Quelle (ALLE Flug-Zeilen, auch
     # die später zusammengelegten — die Differenz wird getrennt ausgewiesen)
@@ -360,6 +383,10 @@ def main():
         typ_l = typ.strip().lower()
         if typ_l not in TYPE_FLIGHT | TYPE_SIM:
             skipped['summenzeile'] += 1
+            continue
+
+        if is_zero_duration_marker(r):
+            skipped['nullzeit_marker'] += 1
             continue
 
         # ── noch nicht geflogen (Dienstplan-Vorbelegung) ──────────────────
