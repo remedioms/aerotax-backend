@@ -26110,6 +26110,53 @@ def _dm_load_messages(channel_id):
     return []
 
 
+def _dm_load_recent(channel_id, limit=300):
+    """NUR-LESE-Schnellpfad: die letzten `limit` Messages (aufsteigend).
+
+    Owner 06.08. („chats laden super langsam"): Inbox und Chat-Ansicht luden
+    pro Channel `select * limit 2000` aufsteigend — bei langen Channels
+    Sekunden pro Query, in der Inbox N-mal sequenziell. Für Anzeige, Preview,
+    Unread und Goodflight reichen die NEUESTEN Zeilen. Query desc + limit,
+    danach umgedreht; gleiche Rehydration wie der Voll-Loader.
+
+    BEWUSST kein Ersatz für `_dm_load_messages` in MUTATIONS-Pfaden: wer lädt,
+    anhängt und komplett zurückschreibt, würde mit einem Teil-Load ältere
+    Messages verlieren (Bulk-Save cappt auf die letzten 500). Auch die
+    Lazy-Migration Disk→SB lebt nur im Voll-Loader."""
+    if not channel_id:
+        return []
+    if SB_AVAILABLE:
+        try:
+            r = (sb.table('dm_messages').select('*')
+                 .eq('channel_id', channel_id)
+                 .order('ts', desc=True)
+                 .limit(limit).execute())
+            rows = r.data or []
+            out = []
+            for row in rows:
+                m = {}
+                for k in _DM_MSG_KNOWN_COLS:
+                    v = row.get(k)
+                    if v is not None:
+                        m[k] = v
+                if row.get('body') is not None:
+                    m['text'] = row.get('body')
+                md = row.get('metadata') or {}
+                if isinstance(md, dict):
+                    for k, v in md.items():
+                        if k not in m:
+                            m[k] = v
+                out.append(m)
+            if out:
+                out.reverse()
+                return out
+        except Exception as e:
+            app.logger.warning(
+                f'[dm] sb_recent_fail ch={(channel_id or "")[:16]} '
+                f'err={type(e).__name__}: {str(e)[:120]}')
+    return (_dm_load_messages_from_disk(channel_id) or [])[-limit:]
+
+
 def _dm_save_messages(channel_id, messages):
     """SB primary + Disk Read-Cache. Cap auf letzte 500 Messages je Channel."""
     if not channel_id:
@@ -26591,7 +26638,10 @@ def get_chat_messages(token, channel_id):
     _gate = _channel_access_error(token, channel_id)
     if _gate is not None:
         return _gate
-    msgs = _dm_load_messages(channel_id) or []
+    # PERF Owner 06.08. („im chat selber super langsam"): Anzeige-Read über
+    # den Schnellpfad — die letzten 400 reichen für jede Chat-Ansicht; der
+    # Voll-Loader (2000, mit Lazy-Migration) bleibt den Mutationspfaden.
+    msgs = _dm_load_recent(channel_id, 400) or []
     destination_lobby = None
     gid = _group_id_from_channel(channel_id)
     if gid and re.fullmatch(r'destination_[A-Z]{3}', gid):
@@ -27590,25 +27640,30 @@ def get_dm_inbox(token):
         if peer and peer not in friends and _crew_dm_pair_authorized(token, peer):
             friends.append(peer)
     last_seen = _dm_lastseen_load(token) or {}
-    inbox = []
     # send_chat_message speichert author_token PII-truncated als
     # `token[:16] + "…"`. Beim Vergleich hier muessen wir gegen dieselbe
     # truncated Form pruefen — sonst zaehlt jede eigene Message faelschlich
     # als unread (Bug pre-2026-05-31).
     import time as _t
     now = _t.time()
-    for friend_token in friends:
+
+    def _inbox_entry(friend_token):
         ch = _dm_channel(token, friend_token)
-        if not ch: continue
+        if not ch:
+            return None
         last_msg = None
         unread = 0
         gf_in = None   # letzter eingehender „guten Flug"-Wunsch < 24h
         gf_out = None  # letzter eigener „guten Flug"-Wunsch/Antwort < 24h
         try:
-            # _dm_load_messages: SB primary, Disk fallback (P0 2026-06-01).
+            # PERF Owner 06.08. („chats laden super langsam"): Schnellpfad
+            # `_dm_load_recent` (desc + Limit 60) statt `select * limit 2000`
+            # aufsteigend — Preview/Unread/Goodflight brauchen nur die
+            # neuesten Zeilen. Unread ist damit ehrlich bei 60 gedeckelt.
             # Soft-deletete Messages raus, sonst zeigt die Inbox eine geloeschte
             # Nachricht als letzte Preview bzw. zaehlt sie als unread.
-            msgs = [m for m in (_dm_load_messages(ch) or []) if not m.get('deleted')]
+            msgs = [m for m in (_dm_load_recent(ch, 60) or [])
+                    if not m.get('deleted')]
             # Owner 2026-07-19: goodflight-Nachrichten („Wünsche einen guten
             # Flug", Bordkarten-Tap) laufen wie die Family-Nachrichten als
             # 24h-Feed-Glas — sie zaehlen hier NICHT als Chat (kein Preview,
@@ -27652,7 +27707,18 @@ def get_dm_inbox(token):
         if gf_out is not None:
             entry['goodflight_out_text'] = (gf_out.get('text') or '')[:200]
             entry['goodflight_out_at'] = gf_out.get('ts')
-        inbox.append(entry)
+        return entry
+
+    # PERF: die Per-Friend-Reads sind unabhängige SB-Roundtrips — parallel
+    # statt sequenziell (Owner 06.08.: Inbox brauchte Sekunden). SB-Clients
+    # sind thread-local (siehe Boot-Log), dasselbe Muster wie crew-prefetch.
+    from concurrent.futures import ThreadPoolExecutor
+    if len(friends) > 1:
+        with ThreadPoolExecutor(max_workers=min(6, len(friends))) as ex:
+            results = list(ex.map(_inbox_entry, friends))
+    else:
+        results = [_inbox_entry(f) for f in friends]
+    inbox = [e for e in results if e]
     inbox.sort(key=lambda x: -(x.get('last_message_at') or 0))
     return jsonify({'count': len(inbox), 'inbox': inbox})
 

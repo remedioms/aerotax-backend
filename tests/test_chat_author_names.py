@@ -135,7 +135,7 @@ def test_get_chat_messages_fuellt_namen_fuer_alte_nachrichten():
         A.app.test_request_context(method='GET'),
         patch.object(A, '_chat_path', return_value='/tmp/c.json'),
         patch.object(A, '_channel_access_error', return_value=None),
-        patch.object(A, '_dm_load_messages', return_value=[alt]),
+        patch.object(A, '_dm_load_recent', return_value=[alt]),
         patch.object(A, '_chat_author_identities',
                      return_value={TRUNC: {'name': 'Till Becke',
                                            'avatar_url': 'u/av.jpg'}}),
@@ -171,7 +171,7 @@ def test_sende_stempel_gewinnt_ueber_nachaufloesung():
         A.app.test_request_context(method='GET'),
         patch.object(A, '_chat_path', return_value='/tmp/c.json'),
         patch.object(A, '_channel_access_error', return_value=None),
-        patch.object(A, '_dm_load_messages', return_value=[neu]),
+        patch.object(A, '_dm_load_recent', return_value=[neu]),
         # return_value MUSS ein Dict sein — die echte Funktion liefert
         # {token: {'name','avatar_url'}}. Ein nackter MagicMock waere hier
         # wahrheitswertig und landete als Avatar im JSON.
@@ -192,7 +192,7 @@ def test_senden_stempelt_den_namen_mit():
         A.app.test_request_context(method='POST', json={'text': 'Servus'}),
         patch.object(A, '_chat_path', return_value='/tmp/c.json'),
         patch.object(A, '_channel_access_error', return_value=None),
-        patch.object(A, '_dm_load_messages', return_value=[]),
+        patch.object(A, '_dm_load_recent', return_value=[]),
         patch.object(A, '_token_rate_limited', return_value=False),
         patch.object(A, '_chat_push_fanout_async'),
         patch.object(A, '_dm_messages_save_to_supabase', return_value=True),
@@ -217,7 +217,7 @@ def test_senden_ohne_profilnamen_stempelt_nichts():
         A.app.test_request_context(method='POST', json={'text': 'Hi'}),
         patch.object(A, '_chat_path', return_value='/tmp/c.json'),
         patch.object(A, '_channel_access_error', return_value=None),
-        patch.object(A, '_dm_load_messages', return_value=[]),
+        patch.object(A, '_dm_load_recent', return_value=[]),
         patch.object(A, '_token_rate_limited', return_value=False),
         patch.object(A, '_chat_push_fanout_async'),
         patch.object(A, '_dm_messages_save_to_supabase', return_value=True),
@@ -237,7 +237,7 @@ def test_namensfehler_kostet_niemals_den_verlauf():
         A.app.test_request_context(method='GET'),
         patch.object(A, '_chat_path', return_value='/tmp/c.json'),
         patch.object(A, '_channel_access_error', return_value=None),
-        patch.object(A, '_dm_load_messages', return_value=[alt]),
+        patch.object(A, '_dm_load_recent', return_value=[alt]),
         patch.object(A, '_chat_author_identities',
                      side_effect=RuntimeError('boom')),
     ):

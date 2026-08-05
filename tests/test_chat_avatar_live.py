@@ -40,7 +40,7 @@ CHANNEL = 'group__pin_abc123'
 def _hole(msgs, idents):
     with patch.object(A, '_chat_path', return_value='x'), \
          patch.object(A, '_channel_access_error', return_value=None), \
-         patch.object(A, '_dm_load_messages', return_value=msgs), \
+         patch.object(A, '_dm_load_recent', return_value=msgs), \
          patch.object(A, '_chat_author_identities', return_value=idents), \
          A.app.test_request_context(f'/api/crew-chat/{TOKEN}/channel/{CHANNEL}'):
         return A.get_chat_messages(TOKEN, CHANNEL).get_json()['messages']
@@ -96,7 +96,7 @@ def test_fehlender_name_wird_weiter_nachgefuellt():
 def test_leerer_verlauf_ruft_den_resolver_nicht():
     with patch.object(A, '_chat_path', return_value='x'), \
          patch.object(A, '_channel_access_error', return_value=None), \
-         patch.object(A, '_dm_load_messages', return_value=[]), \
+         patch.object(A, '_dm_load_recent', return_value=[]), \
          patch.object(A, '_chat_author_identities') as res, \
          A.app.test_request_context(f'/api/crew-chat/{TOKEN}/channel/{CHANNEL}'):
         out = A.get_chat_messages(TOKEN, CHANNEL).get_json()['messages']
@@ -108,7 +108,7 @@ def test_resolver_fehler_kostet_den_verlauf_nicht():
     msgs = [_msg(author_avatar='/alt.png')]
     with patch.object(A, '_chat_path', return_value='x'), \
          patch.object(A, '_channel_access_error', return_value=None), \
-         patch.object(A, '_dm_load_messages', return_value=msgs), \
+         patch.object(A, '_dm_load_recent', return_value=msgs), \
          patch.object(A, '_chat_author_identities',
                       side_effect=RuntimeError('db weg')), \
          A.app.test_request_context(f'/api/crew-chat/{TOKEN}/channel/{CHANNEL}'):

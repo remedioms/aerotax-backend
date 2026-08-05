@@ -115,7 +115,8 @@ def test_guest_can_join_and_write_into_same_native_group_channel():
         assert stored['kind'] == 'web_guest'
 
         # Der normale native Channel-Read sieht exakt dieselbe persistierte Row.
-        with patch.object(A, '_dm_load_messages', return_value=h.saved_messages), \
+        # (Anzeige-GET nutzt seit 06.08. den Schnellpfad _dm_load_recent.)
+        with patch.object(A, '_dm_load_recent', return_value=h.saved_messages), \
              patch.object(A, '_chat_author_identities', return_value={}):
             native = client.get(
                 f'/api/crew-chat/{OWNER}/channel/group__{GROUP}',

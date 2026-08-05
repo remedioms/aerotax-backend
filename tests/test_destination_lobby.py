@@ -141,7 +141,8 @@ def test_destination_messages_are_limited_to_arrival_and_24_hours():
         patch.object(A, '_channel_access_error', return_value=None),
         patch.object(A, '_destination_lobby_for_token', return_value=lobby),
         patch.object(A, '_destination_lobby_now', return_value=NOW),
-        patch.object(A, '_dm_load_messages', return_value=messages),
+        # Anzeige-GET nutzt seit 06.08. den Schnellpfad _dm_load_recent.
+        patch.object(A, '_dm_load_recent', return_value=messages),
         patch.object(A, '_chat_author_identities', return_value={}),
     ):
         response = A.get_chat_messages(TOKEN, 'group__destination_JFK')
