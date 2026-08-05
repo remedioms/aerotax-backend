@@ -343,3 +343,116 @@ def test_store_cap_applies_in_file(monkeypatch):
     } for i in range(nb._REDAKTION_STORE_MAX + 30)}
     nb._redaktion_store_merge(many)
     assert len(nb._redaktion_file_load()) == nb._REDAKTION_STORE_MAX
+
+
+# ── Off-Topic-Gate + Quellen-Deckel (Owner 05.08.: „wie können so viele
+#    news erscheinen??") ──────────────────────────────────────────────────────
+
+def test_offtopic_helper_blocks_without_airline_and_exempts_with():
+    # Klar fremdes Themenfeld ohne Airline-Bezug → raus.
+    assert nb._redaktion_offtopic(
+        'SpaceX-Rakete könnte auf dem Mond einschlagen', 'Raumfahrt-News.')
+    assert nb._redaktion_offtopic(
+        'US Navy sucht neues Kampfjet-Triebwerk', 'Militärbeschaffung.')
+    assert nb._redaktion_offtopic(
+        'Schifffahrt auf der Donau boomt bei Hitze', 'Tourismus am Fluss.')
+    # Airline-Erwähnung gewinnt IMMER — als Parameter ODER aus dem Text.
+    assert not nb._redaktion_offtopic(
+        'Militärauftrag mit Beteiligung', 'Details.', mentioned=['LH'])
+    assert not nb._redaktion_offtopic(
+        'Lufthansa fliegt Satelliten-Techniker nach Kourou', 'Charter.')
+    # Normale Airline-News bleiben unberührt (kein Blocklist-Treffer).
+    assert not nb._redaktion_offtopic(
+        'Condor startet tägliche Flüge nach Tel Aviv', 'Neue Strecke.')
+
+
+def test_build_skips_offtopic_and_purges_stale_rewrite(monkeypatch):
+    """Off-Topic wird weder umgeschrieben (kein KI-Call) noch weiter
+    ausgeliefert: ein VOR dem Gate umgeschriebener Altbestand fliegt beim
+    nächsten Build aus dem Store."""
+    seen = []
+
+    def fake_batch(articles):
+        seen.extend(a['id'] for a in articles)
+        return {a['id']: {'id': a['id'], 'headline': 'H' * 20,
+                          'body': 'B' * 60, 'category': 'industry',
+                          'source_name': a['source_name'],
+                          'source_url': a['article_url'],
+                          'published_at': a['published_at'],
+                          'mentioned_airlines': [], 'rev': nb._REDAKTION_REV}
+                for a in articles}
+
+    good = _art(1)
+    space = _art(2, title='NASA plant neue Mond-Rakete',
+                 summary='Raumfahrtprogramm.', mentioned_airlines=[])
+    # Altbestand: die Weltraum-Story wurde vor dem Gate schon umgeschrieben.
+    nb._redaktion_store_merge({space['id']: {
+        'id': space['id'], 'headline': 'Alte Weltraum-Headline ' + 'H' * 8,
+        'body': 'B' * 60, 'category': 'general', 'source_name': 'Q',
+        'source_url': 'u', 'published_at': space['published_at'],
+        'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
+    }})
+    monkeypatch.setattr(nb, '_redaktion_base_articles',
+                        lambda: [good, space])
+    monkeypatch.setattr(nb, '_redaktion_rewrite_batch', fake_batch)
+    nb._redaktion_build()
+    assert seen == [good['id']]                      # Off-Topic nie zur KI
+    assert space['id'] not in nb._redaktion_file_load()   # Purge greift
+    assert good['id'] in nb._redaktion_file_load()
+
+
+def test_endpoint_caps_items_per_source(monkeypatch):
+    """Höchstens _REDAKTION_SOURCE_CAP Artikel je Quelle in einer Antwort —
+    eine fleißige Quelle dominiert die Liste nicht mehr; andere Quellen
+    bleiben vollständig sichtbar."""
+    import time as _t
+    import app as backend
+    many = {}
+    for i in range(nb._REDAKTION_SOURCE_CAP + 4):
+        many[f'flut{i:02d}'] = {
+            'id': f'flut{i:02d}', 'headline': 'H' * 20, 'body': 'B' * 60,
+            'category': 'industry', 'source_name': 'Fleissige Quelle',
+            'source_url': 'u',
+            'published_at': f'2026-08-05T{10 + i % 12:02d}:00:00+00:00',
+            'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
+        }
+    many['ruhig01'] = {
+        'id': 'ruhig01', 'headline': 'H' * 20, 'body': 'B' * 60,
+        'category': 'industry', 'source_name': 'Ruhige Quelle',
+        'source_url': 'u', 'published_at': '2026-08-05T00:30:00+00:00',
+        'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
+    }
+    nb._redaktion_store_merge(many)
+    with nb._REDAKTION_LOCK:
+        nb._REDAKTION_LAST_BUILD.update({'ts': _t.time(), 'running': False})
+    r = backend.app.test_client().get('/api/news/redaktion?limit=100')
+    assert r.status_code == 200
+    items = r.get_json()['items']
+    from collections import Counter
+    counts = Counter(i['source_name'] for i in items)
+    assert counts['Fleissige Quelle'] == nb._REDAKTION_SOURCE_CAP
+    assert counts['Ruhige Quelle'] == 1
+
+
+def test_endpoint_hides_offtopic_leftovers(monkeypatch):
+    """Serve-Gate: ein noch im Store liegender Off-Topic-Rewrite ist SOFORT
+    unsichtbar (nicht erst nach dem nächsten Build-Purge)."""
+    import time as _t
+    import app as backend
+    nb._redaktion_store_merge({
+        'ok1': {'id': 'ok1', 'headline': 'Condor erweitert das Streckennetz',
+                'body': 'B' * 60, 'category': 'industry',
+                'source_name': 'Q', 'source_url': 'u',
+                'published_at': '2026-08-05T09:00:00+00:00',
+                'mentioned_airlines': ['DE'], 'rev': nb._REDAKTION_REV},
+        'off1': {'id': 'off1', 'headline': 'SpaceX-Rakete erreicht den Mond',
+                 'body': 'Raumfahrt. ' * 10, 'category': 'general',
+                 'source_name': 'Q', 'source_url': 'u',
+                 'published_at': '2026-08-05T10:00:00+00:00',
+                 'mentioned_airlines': [], 'rev': nb._REDAKTION_REV},
+    })
+    with nb._REDAKTION_LOCK:
+        nb._REDAKTION_LAST_BUILD.update({'ts': _t.time(), 'running': False})
+    r = backend.app.test_client().get('/api/news/redaktion?limit=100')
+    ids = [i['id'] for i in r.get_json()['items']]
+    assert 'ok1' in ids and 'off1' not in ids

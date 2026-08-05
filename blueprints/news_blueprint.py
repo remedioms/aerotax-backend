@@ -2780,6 +2780,83 @@ _REDAKTION_MAX_PER_BUILD = 40         # Kosten-Deckel pro Build-Lauf
 # sichtbar, KEIN Publisher-Fallback-Fenster wie bei einem Store-Wipe).
 _REDAKTION_REV = 'aerox-redaktion-v2'
 
+# Off-Topic-Gate (Owner 2026-08-05 „wie können so viele news erscheinen??"):
+# Die 10 Quellen liefern auch klar fremde Themenfelder (Raumfahrt, Militär-
+# Beschaffung, Schifffahrt, Entertainment). Die Redaktion schreibt NUR
+# Airline-/Luftfahrtbetriebs-Nachrichten um. Eine erkannte Airline-Erwähnung
+# gewinnt IMMER gegen die Blockliste — ein Militärauftrag MIT Lufthansa-Bezug
+# bleibt drin. Deterministisch, keine KI-Entscheidung.
+_REDAKTION_OFFTOPIC_RE = re.compile(
+    r'\b(spacex|nasa|weltraum|raumfahrt|rakete\w*|rocket\w*|mond\w*|'
+    r'moon landing|mars(?:-|\b)|satellit\w*|satellite\w*|orbital\w*|'
+    r'space station|'
+    r'navy|air force|luftwaffe|kampfjet\w*|fighter jet\w*|'
+    r'f-15\w*|f-35\w*|f/a-18\w*|bomber\w*|milit[aä]r\w*|military|'
+    r'verteidigungs\w*|defense (?:contract|program|budget)|missile\w*|'
+    r'pentagon|'
+    r'schifffahrt\w*|kreuzfahrt\w*|cruise (?:ship|line)\w*|f[äa]hre\w*|'
+    r'eisenbahn\w*|'
+    r'netflix|tv-serie\w*|streaming-serie\w*|hollywood|spielfilm\w*)\b',
+    re.IGNORECASE)
+
+# Eine fleißige Quelle darf die Liste nicht dominieren (Aviation.Direct
+# stellte am 05.08. 19 von 90 Artikeln): pro Antwort höchstens N je Quelle,
+# neueste zuerst — der Rest bleibt im Store und rückt nach, wenn die Quelle
+# ruhiger wird.
+_REDAKTION_SOURCE_CAP = 8
+
+
+# IATA-Codes, die zugleich deutsche/englische Funktionswörter sind:
+# `_extract_mentioned_airlines` matcht 2-Letter-Codes als ganze Wörter, und
+# „AM" (Aeroméxico) trifft damit jedes deutsche „am", „TO" jedes englische
+# „to" usw. Für die Off-Topic-AUSNAHME zählt so ein Treffer nicht — die
+# betroffenen Airlines bleiben über ihre Namens-Aliase (>=4 Zeichen) erkennbar.
+_REDAKTION_MENTION_STOPCODES = frozenset({
+    'AM', 'AN', 'AB', 'AS', 'AT', 'BE', 'BY', 'DO', 'IF', 'IN', 'IS',
+    'IT', 'ON', 'OR', 'SO', 'TO', 'US',
+})
+
+
+def _redaktion_offtopic(title, summary, mentioned=None):
+    """True für Artikel aus erkennbar fremden Themenfeldern OHNE Airline-Bezug.
+
+    Reihenfolge bewusst: erst die billige Blockliste (ein Regex-Lauf), nur bei
+    Treffer die teurere Airline-Erkennung (`_extract_mentioned_airlines`,
+    ~60 Alias-Muster). `mentioned` = bereits bekannte Erwähnungen; eine LEERE
+    Liste gilt als „nicht berechnet" (das Artikel-Grundgerüst füllt [] als
+    Platzhalter), dann wird selbst extrahiert. Stopwort-Codes (s. o.) zählen
+    nie als Airline-Beleg."""
+    blob = f'{title or ""}\n{summary or ""}'
+    if not _REDAKTION_OFFTOPIC_RE.search(blob):
+        return False
+    mentions = mentioned or _extract_mentioned_airlines(title, summary)
+    real = [m for m in (mentions or [])
+            if str(m).upper() not in _REDAKTION_MENTION_STOPCODES]
+    return not real
+
+
+def _redaktion_store_drop(ids):
+    """Artikel-IDs aus dem persistierten Store austragen (read-modify-write,
+    gleiche Datei-Disziplin wie `_redaktion_store_merge`). Für den einmaligen
+    Austrag bereits umgeschriebener Off-Topic-Artikel nach dem Gate-Einbau."""
+    if not ids:
+        return
+    store = _redaktion_file_load()
+    changed = False
+    for art_id in ids:
+        if store.pop(art_id, None) is not None:
+            changed = True
+    if not changed:
+        return
+    _redaktion_file_save(store)
+    with _REDAKTION_LOCK:
+        _REDAKTION_STORE.clear()
+        _REDAKTION_STORE.update(store)
+        try:
+            _REDAKTION_FILE_MTIME['ts'] = os.path.getmtime(_REDAKTION_PATH)
+        except OSError:
+            _REDAKTION_FILE_MTIME['ts'] = -1.0
+
 _REDAKTION_SYSTEM_RULES = (
     'Du bist erfahrene Luftfahrt-Journalistin und schreibst die deutschen '
     'Nachrichtenmeldungen der AeroX-Crew-App — dein Publikum sind Pilotinnen, '
@@ -3034,9 +3111,26 @@ def _redaktion_build():
         return
     base.sort(key=_redaktion_sort_ts, reverse=True)
     existing = _redaktion_store_snapshot()
+    # OFF-TOPIC-GATE (Owner 05.08.): fremde Themenfelder werden weder
+    # umgeschrieben (spart den KI-Call) noch weiter ausgeliefert — bereits
+    # vor dem Gate umgeschriebene Altbestände werden hier ausgetragen.
+    # Basis-Titel/-Summary sind die Wahrheit, nicht der Rewrite-Text.
+    off_ids = [a['id'] for a in base
+               if a.get('id') and _redaktion_offtopic(
+                   a.get('title', ''), a.get('summary', ''),
+                   a.get('mentioned_airlines'))]
+    if off_ids:
+        stale = [i for i in off_ids if i in existing]
+        if stale:
+            _log_warn(f'[redaktion] off-topic purge: {len(stale)} Artikel')
+            _redaktion_store_drop(stale)
+            for i in stale:
+                existing.pop(i, None)
+    off_set = set(off_ids)
     # Neu ODER mit veralteter Rev (Stil-Upgrade): alte Fassung bleibt bis zum
     # Ersatz ausgeliefert, deshalb entsteht beim Rev-Bump keine Lücke.
     todo = [a for a in base if a.get('id')
+            and a['id'] not in off_set
             and (a['id'] not in existing
                  or existing[a['id']].get('rev') != _REDAKTION_REV)
             and _REDAKTION_REJECTED.get(a['id'], 0) < _REDAKTION_REJECT_MAX]
@@ -3121,9 +3215,25 @@ def get_news_redaktion():
     limit = max(1, min(limit, 100))
     building = _redaktion_kick_build_if_stale()
     snapshot = _redaktion_store_snapshot()
-    items = sorted(snapshot.values(),
-                   key=_redaktion_sort_ts,
-                   reverse=True)[:limit]
+    # Serve-Gate (Owner 05.08. „wie können so viele news erscheinen??"):
+    # (1) Off-Topic-Reste sofort unsichtbar — der Build-Purge braucht sonst
+    #     bis zum nächsten Lauf; geprüft wird hier der Rewrite-Text, die
+    #     gespeicherte Airline-Erwähnung gewinnt weiterhin.
+    # (2) Höchstens _REDAKTION_SOURCE_CAP Artikel je Quelle, neueste zuerst —
+    #     eine fleißige Quelle dominiert die Liste nicht mehr.
+    items = []
+    per_source = {}
+    for it in sorted(snapshot.values(), key=_redaktion_sort_ts, reverse=True):
+        if _redaktion_offtopic(it.get('headline', ''), it.get('body', ''),
+                               it.get('mentioned_airlines')):
+            continue
+        src = (it.get('source_name') or '?')
+        if per_source.get(src, 0) >= _REDAKTION_SOURCE_CAP:
+            continue
+        per_source[src] = per_source.get(src, 0) + 1
+        items.append(it)
+        if len(items) >= limit:
+            break
     items = [{**it, 'published_at': _redaktion_published_iso(it.get('published_at'))}
              for it in items]
     with _REDAKTION_LOCK:
