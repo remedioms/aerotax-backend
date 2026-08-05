@@ -105,6 +105,77 @@ def read_source(path):
         return fh.read()
 
 
+def geometry_leg_lines_from_words(words, page_width):
+    """Duty-Legs aus der festen dreispaltigen NetLine-Geometrie lesen.
+
+    ``extract_text`` mischt bei dicht gesetzten Zeilen gelegentlich Zeichen
+    aus benachbarten Monatsspalten. ``extract_words`` behält dagegen die
+    Positionen. Wir ordnen deshalb nur leg-förmige Zeilen innerhalb desselben
+    Seitendrittels und hängen den letzten Tagesanker derselben Spalte an.
+
+    Crew-Info-Echos bleiben draußen, weil ihnen der verpflichtende AC-Typ
+    fehlt. Der Rückgabewert besteht bewusst wieder aus Textzeilen, damit die
+    eigentliche Leg-Validierung genau einen gemeinsamen Pfad behält.
+    """
+    if not page_width:
+        return []
+
+    day_words = []
+    for word in words:
+        match = RE_DAY.fullmatch(word.get('text', ''))
+        if match:
+            day_words.append((word, match.group(0)))
+
+    found = []
+    seen = set()
+    col_width = page_width / 3
+    for word in words:
+        if not re.fullmatch(r'[A-Z]{2}', word.get('text', '')):
+            continue
+        col = min(2, max(0, int(word['x0'] / col_width)))
+        left, right = col * col_width, (col + 1) * col_width
+        same_row = sorted(
+            (candidate for candidate in words
+             if left <= candidate['x0'] < right
+             and candidate['x0'] >= word['x0'] - 0.1
+             and abs(candidate['top'] - word['top']) <= 2.5),
+            key=lambda candidate: candidate['x0'],
+        )
+        line = ' '.join(candidate.get('text', '') for candidate in same_row)
+        leg_match = RE_LEG.search(line)
+        if not leg_match:
+            continue
+
+        anchors = [
+            (candidate, token) for candidate, token in day_words
+            if left <= candidate['x0'] < right
+            and candidate['top'] <= word['top'] + 0.1
+        ]
+        if not anchors:
+            continue
+        _, day_token = max(anchors, key=lambda item: item[0]['top'])
+        key = (day_token,) + leg_match.groups()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(f'{day_token} {leg_match.group(0)}')
+    return found
+
+
+def geometry_leg_lines(path):
+    """PDF-Seiten geometrisch linearisieren; bei Textquellen leer."""
+    if not path.lower().endswith('.pdf'):
+        return []
+    import pdfplumber
+    lines = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=2, y_tolerance=2,
+                                       keep_blank_chars=False)
+            lines.extend(geometry_leg_lines_from_words(words, page.width))
+    return lines
+
+
 def parse_period(text):
     """„Period: 01Jul26 - 31Jul26" → (start_date, end_date)."""
     m = RE_PERIOD.search(text)
@@ -204,6 +275,13 @@ def main():
     src, dst = sys.argv[1], sys.argv[2]
     text = read_source(src)
 
+    # Der normale Textstrom bleibt für Kopf, Rang, Kontrollsumme und die
+    # Echo-Diagnostik maßgeblich. PDF-Legs werden jedoch aus den räumlich
+    # getrennten Monatsspalten gelesen, sofern dort valide Kandidaten
+    # existieren. So können Tagesanker nicht aus einer Nachbarspalte stammen.
+    geometry_lines = geometry_leg_lines(src)
+    leg_text = '\n'.join(geometry_lines) if geometry_lines else text
+
     start, end = parse_period(text)
     if not start:
         print('FEHLER: „Period: DDMonYY - DDMonYY" nicht gefunden — ohne '
@@ -218,7 +296,7 @@ def main():
     # ── Tages-Anker einsammeln: Offset im Gesamttext → Datum ─────────────
     anchors = []            # [(offset, datum, token)]
     bad_day_tokens = []
-    for m in RE_DAY.finditer(text):
+    for m in RE_DAY.finditer(leg_text):
         key = (m.group(1), int(m.group(2)))
         d = daymap.get(key)
         if d:
@@ -242,15 +320,12 @@ def main():
 
     # ── Legs parsen ──────────────────────────────────────────────────────
     legs = []
-    strict_spans = []
-    for m in RE_LEG.finditer(text):
+    for m in RE_LEG.finditer(leg_text):
         carrier, num, dep, dep_t, arr_t, arr, ac = m.groups()
         d, tok = day_for(m.start())
         if d is None:
             bad_day_tokens.append(f'{carrier}{num} ohne Tages-Anker')
             continue
-        strict_spans.append(m.start())
-
         dep_m, arr_m = to_min(dep_t), to_min(arr_t)
         dep_dt = d + timedelta(minutes=dep_m)
         arr_dt = d + timedelta(minutes=arr_m)
@@ -286,8 +361,9 @@ def main():
     echo, unknown_cand = [], []
     key_of = {(l['flight'], l['from'], l['to'], l['dep_iso'][11:16])
               for l in legs}
+    source_strict_spans = {m.start() for m in RE_LEG.finditer(text)}
     for m in RE_LEG_LOOSE.finditer(text):
-        if m.start() in strict_spans:
+        if m.start() in source_strict_spans:
             continue
         carrier, num, dep, dep_t, arr_t, arr = m.groups()
         k = (f'{carrier}{num}', dep, arr, f'{dep_t[:2]}:{dep_t[2:]}')
@@ -329,6 +405,9 @@ def main():
     print(f'Rang/Rolle  : {rank} → role={role}   (Quelle: {rank_src})')
     print(f'Legs        : {len(legs)}   Block gesamt '
           f'{block_sum // 60}:{block_sum % 60:02d} ({block_sum} min)')
+    if geometry_lines:
+        print(f'PDF-Geometrie: {len(geometry_lines)} valide Leg-Zeilen aus '
+              'getrennten Monatsspalten')
     print('')
     print('  datum       flug     strecke    dep–arr        block   AC   tag')
     for l in legs:
