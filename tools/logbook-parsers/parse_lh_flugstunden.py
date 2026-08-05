@@ -151,8 +151,14 @@ def _clock_instants(year, month, day, clocks):
     if not match:
         raise ValueError(f"ungültige OFF-ON-Zeit: {clocks!r}")
     off_h, off_m, on_h, on_m = map(int, match.groups())
-    dep = datetime(year, month, day, off_h, off_m, tzinfo=timezone.utc)
-    arr = datetime(year, month, day, on_h, on_m, tzinfo=timezone.utc)
+    if off_h > 24 or on_h > 24 or (off_h == 24 and off_m) or (on_h == 24 and on_m):
+        raise ValueError(f"ungültige OFF-ON-Zeit: {clocks!r}")
+    # SAP prints midnight as 24:00 on some monthly summaries.  Treat that as
+    # the next UTC day rather than rejecting an otherwise valid flight row.
+    dep = datetime(year, month, day, 0 if off_h == 24 else off_h, off_m,
+                   tzinfo=timezone.utc) + timedelta(days=off_h // 24)
+    arr = datetime(year, month, day, 0 if on_h == 24 else on_h, on_m,
+                   tzinfo=timezone.utc) + timedelta(days=on_h // 24)
     if arr <= dep:
         arr += timedelta(days=1)
     return dep, arr

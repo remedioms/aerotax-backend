@@ -54,3 +54,9 @@ def test_arrival_wraps_to_next_utc_day():
     dep, arr = PARSER._clock_instants(2019, 12, 31, "23:40-01:10")
     assert dep.isoformat() == "2019-12-31T23:40:00+00:00"
     assert arr.isoformat() == "2020-01-01T01:10:00+00:00"
+
+
+def test_sap_midnight_2400_is_next_utc_day():
+    dep, arr = PARSER._clock_instants(2026, 5, 7, "20:44-24:00")
+    assert dep.isoformat() == "2026-05-07T20:44:00+00:00"
+    assert arr.isoformat() == "2026-05-08T00:00:00+00:00"
