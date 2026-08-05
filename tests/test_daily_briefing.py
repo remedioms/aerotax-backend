@@ -439,6 +439,63 @@ def test_parenthesis_content_can_be_the_distinguishing_feature():
                           'Mercure Hotel Frankfurt (Airport)')
 
 
+# ── Base-Sicht: PVG-Fall 05.08. (FRA→Amara, MUC→Grand Millennium) ───────────
+PVG_DIRECTORY = [
+    {'iata': 'PVG', 'base': 'FRA', 'hotel': 'Amara Signature Hotel',
+     'transfer_min': 45, 'votes': 1},
+    {'iata': 'PVG', 'base': 'MUC', 'hotel': 'Grand Millennium Shanghai HongQiao',
+     'transfer_min': 40, 'votes': 1},
+    {'iata': 'SIN', 'base': None, 'hotel': 'Shared House Singapore',
+     'transfer_min': 25, 'votes': 1},
+]
+
+
+def test_base_scope_shows_own_base_plus_generic():
+    scoped = db.base_scope(PVG_DIRECTORY, 'MUC')
+    assert [r['hotel'] for r in scoped] == [
+        'Grand Millennium Shanghai HongQiao', 'Shared House Singapore']
+    # Ohne bekannte Base: nur Allgemein-Zeilen — ehrlich N/A statt fremdes
+    # Basen-Haus.
+    assert [r['hotel'] for r in db.base_scope(PVG_DIRECTORY, None)] == [
+        'Shared House Singapore']
+
+
+def test_base_scope_muc_booking_matches_own_house_not_fra():
+    """MUC-Crew mit LH-Buchung 'Grand Millennlum' (LHs eigener Tippfehler,
+    live 05.08.) trifft in der Base-Sicht das eigene Haus → enrich, KEIN
+    contest gegen das FRA-Haus."""
+    scoped = db.base_scope(PVG_DIRECTORY, 'MUC')
+    m = db.transfer_match('PVG', 'Grand Millennium Shanghai HongQiao', scoped)
+    assert m['matched'] is True and m['transfer_min'] == 40
+    # FRA-Sicht: Amara bleibt deren eindeutiges Haus.
+    m2 = db.transfer_match(
+        'PVG', 'Amara Signature Shanghai', db.base_scope(PVG_DIRECTORY, 'FRA'))
+    # Anderes Haus in der eigenen Sicht -> Regel 3 (EIN Eintrag) mit '*'
+    assert m2['row']['hotel'] == 'Amara Signature Hotel'
+
+
+def test_base_scoped_supersede_never_sees_other_bases_row():
+    """Der Flip-Pfad (_apply_lh_hotel_change) arbeitet auf der Base-Sicht:
+    MUC-Evidenz für ein NEUES Haus darf das FRA-Haus weder stilllegen noch
+    reaktivieren — gespiegelt über dieselbe Scope-Logik + supersede_plan."""
+    rows = [
+        {'id': 1, 'iata': 'PVG', 'base': 'FRA', 'hotel': 'Amara Signature Hotel',
+         'status': 'approved', 'active': True, 'transfer_min': 45, 'votes': 1},
+        {'id': 2, 'iata': 'PVG', 'base': 'MUC',
+         'hotel': 'Grand Millennium Shanghai HongQiao',
+         'status': 'approved', 'active': True, 'transfer_min': 40, 'votes': 1},
+    ]
+    b = 'MUC'
+    scoped = [r for r in rows
+              if not str(r.get('base') or '').strip()
+              or (b and str(r.get('base') or '').strip().upper() == b)]
+    plan = db.hotel_supersede_plan(scoped, 'Ganz Neues Haus Shanghai')
+    # Nur das MUC-Haus ist Kandidat fürs Stilllegen — die FRA-Zeile ist
+    # unsichtbar und bleibt unangetastet.
+    assert [r['id'] for r in plan['deactivate']] == [2]
+    assert plan['insert'] is True and plan['resurrect'] is None
+
+
 def test_purely_generic_names_never_match_each_other():
     """Ein Name, der nur aus generischen Wörtern besteht, hat eine LEERE
     Token-Menge. Zwei leere Mengen sind gleich — ohne Riegel matchte 'The Hotel'
@@ -1049,6 +1106,11 @@ class _FakeSB:
                 self.filters.append(('ilike', k, v))
                 return self
 
+            def is_(self, k, v):
+                # Echte supabase-py-API: .is_('base', 'null') für IS NULL.
+                self.filters.append(('is', k, v))
+                return self
+
             def limit(self, n):
                 return self
 
@@ -1409,13 +1471,15 @@ def test_endpoint_enriches_only_lh_sourced_names(client, monkeypatch):
     Name zurückgeschrieben werden (das wäre eine erfundene LH-Bestätigung)."""
     seen = []
     monkeypatch.setattr(db, '_sync_official_name',
-                        lambda tok, stn, name, d, night=None:
-                        seen.append((stn, name, night)))
+                        lambda tok, stn, name, d, night=None, base=None:
+                        seen.append((stn, name, night, base)))
     r = client.get(f'/api/ax/daily-briefing/AT-TEST?date={DATE}')
     assert r.status_code == 200
     assert r.get_json()['briefing']['hotel']['hotel_source'] == 'lh'
-    # night_of = Ankunftsnacht des letzten Legs (Evidenz-Schluessel)
-    assert seen == [('BUD', 'IntercityHotel Budapest', '2026-07-27')]
+    # night_of = Ankunftsnacht des letzten Legs (Evidenz-Schluessel);
+    # base = Homebase der ROTATION (Fixture: FRA) — das Base-Wiring bis zum
+    # Sync-Aufruf wird hier gleich mitgeprüft.
+    assert seen == [('BUD', 'IntercityHotel Budapest', '2026-07-27', 'FRA')]
     # ZAG-Nacht: Name stammt aus dem Verzeichnis → kein Rückschreiben.
     db._cache.clear()
     seen.clear()

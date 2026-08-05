@@ -644,6 +644,30 @@ def _same_house(lh_name, dir_name):
     return True
 
 
+def base_scope(directory, base):
+    """Verzeichnis-Zeilen, die für die Crew EINER Homebase gelten. Pure.
+
+    LH bucht an Stationen mit getrennten Verträgen PRO BASE verschiedene
+    Häuser (PVG-Fall 05.08.: FRA → Amara Signature, MUC → Grand Millennium —
+    beleg: rotation.hotelName eines MUC-Users + Siggis Meldung). Das
+    Verzeichnis trägt dafür die Spalte `base`; die iOS-Auflösung
+    (CrewHotelDirectory.lookup) ist längst base-bewusst. Serverseitig
+    (Briefing-Karte, Anreicherung, Hotelwechsel-Evidenz) muss dieselbe
+    Sicht gelten, sonst matcht eine MUC-Crew gegen das FRA-Haus und die
+    Evidenz-Pipeline überschreibt die Basen gegenseitig.
+
+    Sichtbar: Zeilen OHNE base (Allgemein-Haus der Station) plus Zeilen der
+    EIGENEN Base. Ohne bekannte Base (leer/None) nur die Allgemein-Zeilen —
+    ehrlich N/A statt fremdes Basen-Haus."""
+    b = str(base or '').strip().upper()
+    out = []
+    for r in (directory or []):
+        rb = str(r.get('base') or '').strip().upper()
+        if not rb or (b and rb == b):
+            out.append(r)
+    return out
+
+
 def transfer_match(iata, lh_name, directory):
     """Florians vier Zuordnungsregeln, 1:1:
       1. passendes Hotel → dessen Zeit (LHs Klarname ist der primäre Schlüssel)
@@ -782,7 +806,10 @@ def hotel_block(shift, legs_today, all_legs, directory, hotel_event_days):
         m = re.search(r'(\d{1,2}):(\d{2})', str(ret['pickup_lt']).split('T')[-1])
         if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
             pickup_lt = f"{int(m.group(1)):02d}:{m.group(2)}"
-    tm = transfer_match(station, lh_name, directory)
+    # Base-Sicht der Rotation (nicht des Profils): an Stationen mit
+    # basegetrennten Häusern (PVG) darf weder die Transferzeit noch der
+    # Regel-3-Rückfallname vom Haus der ANDEREN Base kommen.
+    tm = transfer_match(station, lh_name, base_scope(directory, hb_station))
     display_name = lh_name or ((tm['row'] or {}).get('hotel') if tm['reason'] in (
         'destination_general', 'destination_general_no_time',
         'no_time_recorded') else None)
@@ -791,6 +818,9 @@ def hotel_block(shift, legs_today, all_legs, directory, hotel_event_days):
     pu_txt = f"PU @ {pickup_lt}lcl" if pickup_lt else 'PU n/a'
     return {
         'station': station, 'hotel': display_name,
+        # Homebase der ROTATION (LHs eigene Aussage) — Basis-Schlüssel für die
+        # base-bewusste Verzeichnis-Anreicherung (_sync_official_name).
+        'homebase': hb_station,
         'hotel_source': ('lh' if lh_name else ('directory' if display_name else None)),
         'transfer_min': tm['transfer_min'], 'transfer_marker': tm['marker'],
         'transfer_reason': tm['reason'],
@@ -1027,7 +1057,8 @@ _LHFO_AIRLINE_BUCKETS = ('LUFTHANSA', 'LUFTHANSA CITY')
 _SUGGESTED_BY_MACHINE = 'lh_flightops:auto'
 
 
-def _sync_official_name(token, station, lh_name, directory, night=None):
+def _sync_official_name(token, station, lh_name, directory, night=None,
+                        base=None):
     """Best-effort-Anreicherung nach einem gebauten Hotel-Block. Wirft nie und
     blockiert das Briefing nie. Airline fail-closed über das Profil des Tokens
     (dieselbe Linie wie _crew_hotel_dir_serve; _filter_crew_hotels der
@@ -1036,9 +1067,15 @@ def _sync_official_name(token, station, lh_name, directory, night=None):
     `night` = ISO-Datum der Layover-Nacht. Es ist der EVIDENZ-Schlüssel des
     Hotelwechsel-Pfads: gezählt werden Nächte, nicht Payloads — acht Crews
     derselben Rotation sind EIN Ereignis. Ohne `night` wird keine Evidenz
-    gesammelt (der Konflikt wird dann nur wie früher gemeldet)."""
+    gesammelt (der Konflikt wird dann nur wie früher gemeldet).
+
+    `base` = Homebase der ROTATION (rot.homebase, LHs eigene Aussage — NICHT
+    das selbstgesetzte Profilfeld). Matching, Evidenz und Wechsel laufen in
+    der Base-Sicht (`base_scope`): eine MUC-Buchung darf nie das FRA-Haus
+    derselben Station anfechten oder überschreiben (PVG-Fall 05.08.)."""
     try:
-        match = transfer_match(station, lh_name, directory)
+        base_val = str(base or '').strip().upper() or None
+        match = transfer_match(station, lh_name, base_scope(directory, base_val))
         action, conflict = official_name_action(lh_name, match)
         if not action:
             return None
@@ -1065,7 +1102,7 @@ def _sync_official_name(token, station, lh_name, directory, night=None):
         # zweite Layover-Nacht verschluckt, die kurz nach Mitternacht auf die
         # erste folgt — und genau die Nächte sind die Evidenz.
         mk = (airline, (station or '').upper(), clean.lower(), action,
-              str(night or '')[:10])
+              str(night or '')[:10], base_val or '')
         now = time.time()
         if (now - _dir_sync_memo.get(mk, 0)) < _DIR_SYNC_TTL_S:
             return None
@@ -1090,16 +1127,22 @@ def _sync_official_name(token, station, lh_name, directory, night=None):
                 return 'reported'    # ohne Nacht kein Evidenz-Schlüssel
             return _record_lh_hotel_evidence(sbc, airline,
                                              (station or '').upper(), clean,
-                                             str(night)[:10], now_iso)
+                                             str(night)[:10], now_iso,
+                                             base=base_val)
         if action == 'enrich':
             crowd = str((match['row'] or {}).get('hotel_crowd')
                         or (match['row'] or {}).get('hotel') or '').strip()
-            rows = (sbc.table('crew_hotel_directory')
-                    .select('id,official_name,hotel')
-                    .eq('airline', airline).eq('iata', (station or '').upper())
-                    .eq('hotel', crowd).eq('status', 'approved')
-                    .eq('active', True)
-                    .limit(2).execute().data) or []
+            # Adressiert wird die Zeile in IHRER Base-Ausprägung — an einer
+            # Station mit gleichnamigem Haus unter zwei Basen darf die
+            # Anreicherung nicht die fremde Zeile treffen.
+            mrow_base = str((match['row'] or {}).get('base') or '').strip().upper()
+            q = (sbc.table('crew_hotel_directory')
+                 .select('id,official_name,hotel')
+                 .eq('airline', airline).eq('iata', (station or '').upper())
+                 .eq('hotel', crowd).eq('status', 'approved')
+                 .eq('active', True))
+            q = q.eq('base', mrow_base) if mrow_base else q.is_('base', 'null')
+            rows = (q.limit(2).execute().data) or []
             if len(rows) != 1:
                 return None      # nicht eindeutig adressierbar → nicht anfassen
             if (rows[0].get('official_name') or '').strip() == clean:
@@ -1125,6 +1168,10 @@ def _sync_official_name(token, station, lh_name, directory, night=None):
             if ex:
                 return None      # kein doppelter Vorschlag
         sbc.table('crew_hotel_directory').insert({
+            # An einer LEEREN Station gibt es keinen Divergenz-Beleg — der
+            # Vorschlag bleibt bewusst basenlos (Ein-Haus-Annahme wie bisher).
+            # Base-Zeilen entstehen nur dort, wo die Basen nachweislich
+            # verschiedene Häuser haben (Contest-/Flip-Pfad bzw. Datenpflege).
             'airline': airline, 'iata': (station or '').upper(), 'base': None,
             'hotel': clean, 'transfer_min': 0, 'status': 'suggested',
             # Herkunft EHRLICH: die Maschine hat geschrieben, nicht ein Mensch.
@@ -1148,9 +1195,14 @@ def _sync_official_name(token, station, lh_name, directory, night=None):
 _DIR_TABLE = 'crew_hotel_directory'
 
 
-def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso):
+def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso,
+                              base=None):
     """Eine Layover-Nacht als Evidenz für „LH bucht hier ein anderes Haus"
     festhalten und — sobald die Schwelle steht — den Wechsel vollziehen.
+
+    `base` = Homebase der liefernden Rotation. Evidenz wird PRO BASE gezählt
+    und der spätere Wechsel bleibt in der Base-Sicht — MUC-Nächte können nie
+    das FRA-Haus kippen (PVG-Fall 05.08.).
 
     SPEICHERORT ist bewusst `crew_hotel_directory` selbst, mit dem eigenen
     Status `lh_contested`: keine neue Tabelle, also kein Migrations-Schritt
@@ -1168,11 +1220,13 @@ def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso):
         # bereits erreichter Schwelle — und würde eine vom Owner
         # zurückgenommene Entscheidung sofort wieder überstimmen
         # (adversarialer Review 27.07.).
-        rows = (sbc.table(_DIR_TABLE)
-                .select('id,official_name_source,votes')
-                .eq('airline', airline).eq('iata', station)
-                .eq('status', _LH_CONTEST_STATUS).eq('active', True)
-                .ilike('hotel', clean).limit(5).execute().data) or []
+        q = (sbc.table(_DIR_TABLE)
+             .select('id,official_name_source,votes')
+             .eq('airline', airline).eq('iata', station)
+             .eq('status', _LH_CONTEST_STATUS).eq('active', True)
+             .ilike('hotel', clean))
+        q = q.eq('base', base) if base else q.is_('base', 'null')
+        rows = (q.limit(5).execute().data) or []
     except Exception as e:
         log.warning('[daily_briefing] hotel-evidence read: %s', type(e).__name__)
         return 'reported'
@@ -1195,7 +1249,7 @@ def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso):
     try:
         if row is None:
             sbc.table(_DIR_TABLE).insert(dict(payload, **{
-                'airline': airline, 'iata': station, 'base': None,
+                'airline': airline, 'iata': station, 'base': base,
                 'hotel': clean, 'official_name': clean, 'transfer_min': 0,
                 'status': _LH_CONTEST_STATUS,
                 'suggested_by': _SUGGESTED_BY_MACHINE, 'active': True,
@@ -1214,11 +1268,11 @@ def _record_lh_hotel_evidence(sbc, airline, station, clean, night, now_iso):
     if not flip:
         return 'evidence_recorded'
     return _apply_lh_hotel_change(sbc, airline, station, clean, kept,
-                                  (row or {}).get('id'), now_iso)
+                                  (row or {}).get('id'), now_iso, base=base)
 
 
 def _apply_lh_hotel_change(sbc, airline, station, clean, nights, evidence_id,
-                           now_iso):
+                           now_iso, base=None):
     """Den Wechsel vollziehen: LHs Haus wird der aktuelle Eintrag, das bisherige
     wird STILLGELEGT (active=False) — nie gelöscht, nie umgeschrieben.
     `transfer_min`, `votes` und `status` der alten Zeile bleiben unangetastet,
@@ -1229,13 +1283,26 @@ def _apply_lh_hotel_change(sbc, airline, station, clean, nights, evidence_id,
     (→ N/A bzw. Regel 3). Wirft nie."""
     try:
         rows = (sbc.table(_DIR_TABLE)
-                .select('id,hotel,official_name,status,active,transfer_min,votes')
+                .select('id,hotel,official_name,status,active,transfer_min,'
+                        'votes,base')
                 .eq('airline', airline).eq('iata', station)
                 .limit(200).execute().data) or []
     except Exception as e:
         log.warning('[daily_briefing] hotel-change read: %s', type(e).__name__)
         return 'evidence_recorded'
-    plan = hotel_supersede_plan(rows, clean)
+    # BASE-SICHT (PVG-Fall 05.08.): der Wechsel operiert nur auf Zeilen der
+    # eigenen Base plus den basenlosen Allgemein-Zeilen. Das FRA-Haus einer
+    # basegetrennten Station ist für MUC-Evidenz unsichtbar — weder Kandidat
+    # fürs Stilllegen noch fürs Reaktivieren. `station_tagged` entscheidet,
+    # ob eine NEUE Zeile die Base trägt: an einer bereits basegetrennten
+    # Station ja, an einer Ein-Haus-Station bleibt es beim basenlosen
+    # Verhalten (ein echter Hotelwechsel gilt dort für alle).
+    b = str(base or '').strip().upper() or None
+    station_tagged = any(str(r.get('base') or '').strip() for r in rows)
+    scoped = [r for r in rows
+              if not str(r.get('base') or '').strip()
+              or (b and str(r.get('base') or '').strip().upper() == b)]
+    plan = hotel_supersede_plan(scoped, clean)
     if not (plan['resurrect'] or plan['insert'] or plan['deactivate']):
         log.warning('[daily_briefing] hotel-change %s/%s "%s": kein Plan (%s)',
                     airline, station, clean, plan['reason'])
@@ -1248,14 +1315,21 @@ def _apply_lh_hotel_change(sbc, airline, station, clean, nights, evidence_id,
                 {'active': False, 'updated_at': now_iso}
             ).eq('id', old['id']).execute()
         if plan['resurrect'] is not None:
-            sbc.table(_DIR_TABLE).update({
+            resurrect_payload = {
                 'status': 'approved', 'active': True,
                 'official_name': clean, 'official_name_source': 'lh_flightops',
                 'official_name_at': now_iso, 'updated_at': now_iso,
-            }).eq('id', plan['resurrect']['id']).execute()
+            }
+            if station_tagged and b:
+                # An einer basegetrennten Station gehört das zurückkehrende
+                # Haus der Base, deren Evidenz es zurückholt.
+                resurrect_payload['base'] = b
+            sbc.table(_DIR_TABLE).update(
+                resurrect_payload).eq('id', plan['resurrect']['id']).execute()
         elif plan['insert']:
             sbc.table(_DIR_TABLE).insert({
-                'airline': airline, 'iata': station, 'base': None,
+                'airline': airline, 'iata': station,
+                'base': (b if station_tagged else None),
                 'hotel': clean, 'transfer_min': 0, 'status': 'approved',
                 'suggested_by': _SUGGESTED_BY_MACHINE, 'votes': len(nights),
                 'active': True, 'official_name': clean,
@@ -1782,7 +1856,8 @@ def ax_daily_briefing(token):
     hb = briefing.get('hotel') or {}
     if hb.get('hotel') and hb.get('hotel_source') == 'lh':
         _sync_official_name(token, hb.get('station'), hb.get('hotel'),
-                            directory, night=hb.get('night_of'))
+                            directory, night=hb.get('night_of'),
+                            base=hb.get('homebase'))
 
     out = {'ok': True, 'available': True, 'briefing': briefing,
            'complete': not errors, 'errors': errors, 'lh_calls': calls}
