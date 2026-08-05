@@ -54344,6 +54344,47 @@ def _roster_join_ics(calendars, prodid='AeroX Combined Roster PDF Import'):
     return '\r\n'.join(lines)
 
 
+def _roster_ics_excluding_date_span(calendar_text, start_date, end_date):
+    """Drop synthetic PDF events inside an authoritative active-feed span.
+
+    The PDF parsers above emit one unfolded ``DTSTART`` per VEVENT.  Filtering
+    the original blocks preserves timezone/value parameters and avoids a
+    lossy parse/re-serialize cycle.  Unknown/malformed blocks remain visible;
+    the normal calendar parser will validate them later instead of this merge
+    helper silently deleting data.
+    """
+    if not (re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(start_date or ''))
+            and re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(end_date or ''))):
+        return calendar_text
+
+    output = []
+    event = None
+    for raw in (calendar_text or '').replace('\r\n', '\n').split('\n'):
+        line = raw.rstrip('\r')
+        if line == 'BEGIN:VEVENT':
+            event = [line]
+            continue
+        if event is not None:
+            event.append(line)
+            if line != 'END:VEVENT':
+                continue
+            event_day = None
+            for event_line in event:
+                match = re.match(r'^DTSTART(?:;[^:]*)?:(\d{8})', event_line)
+                if match:
+                    raw_day = match.group(1)
+                    event_day = f'{raw_day[:4]}-{raw_day[4:6]}-{raw_day[6:8]}'
+                    break
+            if not (event_day and start_date <= event_day <= end_date):
+                output.extend(event)
+            event = None
+            continue
+        output.append(line)
+    if event is not None:
+        output.extend(event)
+    return '\r\n'.join(output)
+
+
 def _roster_ics_text(value):
     """RFC-5545 text escaping for stored-event archive reconstruction."""
     return (str(value or '').replace('\\', '\\\\').replace('\r', '')
@@ -55115,6 +55156,11 @@ def import_roster_pdf(token):
             # The active feed is authoritative for its complete covered span.
             # A missing day inside that span is meaningful and must not be
             # resurrected from an older monthly PDF.
+            standard_calendars = [
+                _roster_ics_excluding_date_span(
+                    calendar_text, existing_bounds[0], existing_bounds[1])
+                for calendar_text in standard_calendars
+            ]
             cas_events = [
                 event for event in cas_events
                 if not (existing_bounds[0]
