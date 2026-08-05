@@ -2634,3 +2634,408 @@ def upvote_news_debrief(post_id):
 
     upvotes, did_upvote = result
     return jsonify({'ok': True, 'upvotes': upvotes, 'did_upvote': did_upvote}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  AeroX News-Redaktion (Owner 2026-08-05, Urheberrechts-Risiko):
+#  KI-umgeschriebene EIGENE Kurzartikel aus den FAKTEN der Quellen —
+#  eigene deutsche Headline + 3–6-Satz-Text, keine Verlags-Formulierungen,
+#  keine Verlags-Fotos (die App nutzt ihre freie Foto-Pipeline), Quelle nur
+#  als Name+Link-Attribution.
+#
+#  Provider: OpenAI/ChatGPT bevorzugt (Owner: „er schreibt es besser auf
+#  Deutsch") sobald OPENAI_API_KEY gesetzt ist; sonst Anthropic/Claude als
+#  sofort funktionierender Fallback (Key liegt bereits in Prod). Beide Wege
+#  laufen über `requests` (kein neues SDK, requirements bleibt unberührt).
+#
+#  Rechtliche Leitplanken im Prompt: NUR Fakten aus dem gelieferten
+#  Quelltext, nichts erfinden, keine Nah-Paraphrase einzelner Sätze, bei
+#  dünner Quelle kurz bleiben. Ein Artikel wird genau EINMAL umgeschrieben
+#  (In-Memory-Store, Cap; Container-Restart ⇒ einmalige Neu-Erzeugung im
+#  Cent-Bereich — bewusst kein neues Persistenz-System).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REDAKTION_STORE = {}          # Worker-Memo des Datei-Stores (Quelle: _REDAKTION_PATH)
+_REDAKTION_REJECTED = {}      # art_id -> Fehlversuche; ab 2 endgültig aussortiert
+_REDAKTION_REJECT_MAX = 2     # ein Retry mit Rüge, dann Tombstone
+# MEHRPROZESS-REGEL (Prod = gunicorn --workers 3, Live-Befund 05.08.: Antworten
+# flackerten zwischen leerem und vollem Worker-Store): die Wahrheit liegt in
+# EINER Datei auf dem geteilten Container-FS, geschützt per fcntl-Lock. Jeder
+# Worker hält nur ein mtime-validiertes Memo. Worker-Recycling (max-requests
+# 5000) verliert damit nichts mehr; Container-Restart ⇒ bewusster Neuaufbau.
+_REDAKTION_PATH = os.getenv('AEROX_REDAKTION_STORE', '/tmp/aerox_redaktion_store.json')
+_REDAKTION_FILE_MTIME = {'ts': -1.0}
+
+
+def _redaktion_file_load():
+    """Store-Datei lesen (shared lock). Fehlend/kaputt ⇒ leer."""
+    import fcntl
+    try:
+        with open(_REDAKTION_PATH, 'r', encoding='utf-8') as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _redaktion_file_save(store):
+    """Store-Datei atomar schreiben (exklusiver Lock + rename)."""
+    import fcntl
+    tmp = _REDAKTION_PATH + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, _REDAKTION_PATH)
+    except OSError as exc:
+        _log_warn(f'[redaktion] store save failed: {exc!r}')
+
+
+def _redaktion_store_snapshot():
+    """Aktueller Store — Datei-Wahrheit, mtime-memoisiert pro Worker."""
+    try:
+        mtime = os.path.getmtime(_REDAKTION_PATH)
+    except OSError:
+        mtime = 0.0
+    with _REDAKTION_LOCK:
+        if mtime == _REDAKTION_FILE_MTIME['ts'] and (_REDAKTION_STORE or mtime == 0.0):
+            return dict(_REDAKTION_STORE)
+    loaded = _redaktion_file_load()
+    with _REDAKTION_LOCK:
+        _REDAKTION_STORE.clear()
+        _REDAKTION_STORE.update(loaded)
+        _REDAKTION_FILE_MTIME['ts'] = mtime
+        return dict(_REDAKTION_STORE)
+
+
+def _redaktion_store_merge(new_items):
+    """Neue Artikel in die Datei mergen (read-modify-write, Cap anwenden)."""
+    store = _redaktion_file_load()
+    store.update(new_items)
+    if len(store) > _REDAKTION_STORE_MAX:
+        ordered = sorted(store.values(),
+                         key=lambda x: x.get('published_at') or '',
+                         reverse=True)[:_REDAKTION_STORE_MAX]
+        store = {x['id']: x for x in ordered}
+    _redaktion_file_save(store)
+    with _REDAKTION_LOCK:
+        _REDAKTION_STORE.clear()
+        _REDAKTION_STORE.update(store)
+        try:
+            _REDAKTION_FILE_MTIME['ts'] = os.path.getmtime(_REDAKTION_PATH)
+        except OSError:
+            _REDAKTION_FILE_MTIME['ts'] = -1.0
+_REDAKTION_LOCK = threading.Lock()
+_REDAKTION_LAST_BUILD = {'ts': 0.0, 'running': False}
+_REDAKTION_BUILD_TTL = 30 * 60        # höchstens alle 30 min neu bauen
+_REDAKTION_STORE_MAX = 200            # Cap gegen unbegrenztes Wachstum
+_REDAKTION_BATCH = 8                  # Artikel pro KI-Call
+_REDAKTION_MAX_PER_BUILD = 40         # Kosten-Deckel pro Build-Lauf
+_REDAKTION_REV = 'aerox-redaktion-v1'
+
+_REDAKTION_SYSTEM_RULES = (
+    'Du bist Redakteur der AeroX-Crew-App und schreibst kurze deutsche '
+    'Nachrichtenmeldungen für Airline-Crews. Regeln, ohne Ausnahme: '
+    '(1) Verwende AUSSCHLIESSLICH Fakten, die im gelieferten Quelltext stehen. '
+    'Erfinde nichts, ergänze kein Weltwissen, keine Zahlen, keine Zitate. '
+    '(2) Schreibe vollständig eigene Formulierungen — übernimm KEINE Satzteile, '
+    'Halbsätze oder charakteristischen Wendungen der Quelle und zitiere nicht '
+    'wörtlich. Eigennamen, Flugnummern, Typenbezeichnungen und Zahlen sind '
+    'natürlich erlaubt. Folge auch nicht dem Aufbau der Quelle — schreibe so, '
+    'als würdest du einer Kollegin die Fakten neu erzählen. '
+    '(3) Pro Artikel: eine prägnante eigene Headline (max. 90 Zeichen, keine '
+    'Anführungszeichen) und ein Kurztext ("body") aus 3 bis 6 vollständigen '
+    'Sätzen für die Feed-Karte. Ist der Quelltext dünn, bleib bei 2 bis 3 '
+    'Sätzen statt aufzufüllen. '
+    '(4) Trägt der Quelltext substanziell mehr Fakten (ein echter Volltext), '
+    'schreibe ZUSÄTZLICH einen längeren eigenen Artikel ("body_long", etwa '
+    '8 bis 14 Sätze, in 2 bis 4 Absätze gegliedert, Absätze durch Leerzeile '
+    'getrennt) für die Lese-Ansicht — mit EIGENER Struktur und Gewichtung, '
+    'nicht der Reihenfolge der Quelle folgend. Bei dünnem Quelltext lasse '
+    '"body_long" weg, statt aufzublähen. '
+    '(5) Ton: sachlich, neutral, präzise — relevant für fliegendes Personal, '
+    'kein Clickbait, keine Wertung, keine Emojis. '
+    '(6) Antworte NUR mit JSON im Format {"items": [{"id": "...", '
+    '"headline": "...", "body": "...", "body_long": "... (optional)"}]} — '
+    'exakt ein Eintrag pro geliefertem Artikel, mit unveränderter id.'
+)
+
+
+_REDAKTION_MAX_SHARED_RUN = 6   # erlaubte identische Wortfolge (Eigennamen/Typen)
+
+
+def _redaktion_longest_shared_run(source_text, out_text):
+    """Längste identische zusammenhängende Wortfolge (case-/satzzeichen-blind).
+
+    Deterministischer Urheberrechts-Guard: dem Modell wird NICHT geglaubt,
+    dass es paraphrasiert hat — übernommene Passagen werden mechanisch
+    erkannt. Eigennamen/Typen ("Boeing 787-9 Dreamliner") erzeugen legitime
+    kurze Überschneidungen, deshalb greift der Guard erst oberhalb von
+    _REDAKTION_MAX_SHARED_RUN Wörtern.
+    """
+    def toks(t):
+        return re.findall(r"[a-zA-ZäöüÄÖÜß0-9']+", (t or '').lower())
+    a, b = toks(source_text), toks(out_text)
+    if not a or not b:
+        return 0
+    positions = {}
+    for i, w in enumerate(a):
+        positions.setdefault(w, []).append(i)
+    best = 0
+    for j, w in enumerate(b):
+        for i in positions.get(w, ()):  # Startpunkte im Quelltext
+            k = 0
+            while (i + k < len(a) and j + k < len(b) and a[i + k] == b[j + k]):
+                k += 1
+            if k > best:
+                best = k
+    return best
+
+
+def _redaktion_copyright_ok(art, headline, body, body_long):
+    """True nur, wenn KEIN Output-Teil eine übernommene Quell-Passage trägt."""
+    source = ' '.join(filter(None, [art.get('title'), art.get('summary'),
+                                    art.get('fulltext')]))
+    for out in (headline, body, body_long):
+        if out and _redaktion_longest_shared_run(source, out) > _REDAKTION_MAX_SHARED_RUN:
+            return False
+    return True
+
+
+def _redaktion_source_block(art, retry=False):
+    """Faktenblock einer Quelle für den Prompt — Volltext bevorzugt."""
+    body = (art.get('fulltext') or '').strip() or (art.get('summary') or '').strip()
+    if retry:
+        return {
+            'id': art.get('id'),
+            'quelle': art.get('source_name') or art.get('source') or '',
+            'datum': art.get('published_at') or '',
+            'originaltitel': (art.get('title') or '')[:300],
+            'quelltext': body[:6000],
+            'hinweis': ('Dein vorheriger Versuch hat eine Passage wörtlich aus '
+                        'der Quelle übernommen. Formuliere diesmal JEDEN Satz '
+                        'vollständig neu und folge nicht dem Satzbau der Quelle.'),
+        }
+    return {
+        'id': art.get('id'),
+        'quelle': art.get('source_name') or art.get('source') or '',
+        'datum': art.get('published_at') or '',
+        'originaltitel': (art.get('title') or '')[:300],
+        'quelltext': body[:6000],
+    }
+
+
+def _redaktion_parse_json(raw_text):
+    """Tolerant gegen Codefences/Präambeln — extrahiert das items-JSON."""
+    txt = (raw_text or '').strip()
+    if txt.startswith('```'):
+        txt = re.sub(r'^```[a-zA-Z]*\s*', '', txt)
+        txt = re.sub(r'\s*```$', '', txt)
+    start = txt.find('{')
+    end = txt.rfind('}')
+    if start < 0 or end <= start:
+        return []
+    try:
+        obj = json.loads(txt[start:end + 1])
+    except ValueError:
+        return []
+    items = obj.get('items') if isinstance(obj, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _redaktion_call_openai(blocks):
+    key = (os.getenv('OPENAI_API_KEY') or '').strip()
+    if not key:
+        return None  # Provider nicht verfügbar → Caller probiert Anthropic
+    model = os.getenv('AEROX_NEWS_MODEL_OPENAI', 'gpt-4o-mini')
+    resp = requests.post(
+        'https://api.openai.com/v1/chat/completions',
+        headers={'Authorization': f'Bearer {key}',
+                 'Content-Type': 'application/json'},
+        json={
+            'model': model,
+            'temperature': 0.4,
+            'response_format': {'type': 'json_object'},
+            'messages': [
+                {'role': 'system', 'content': _REDAKTION_SYSTEM_RULES},
+                {'role': 'user', 'content':
+                    'Schreibe für jeden der folgenden Artikel eine eigene '
+                    'Meldung nach den Regeln. Antworte als JSON.\n'
+                    + json.dumps(blocks, ensure_ascii=False)},
+            ],
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    content = (resp.json().get('choices') or [{}])[0].get('message', {}).get('content', '')
+    return _redaktion_parse_json(content)
+
+
+def _redaktion_call_anthropic(blocks):
+    key = (os.getenv('ANTHROPIC_API_KEY') or '').strip()
+    if not key:
+        return None
+    model = os.getenv('AEROX_NEWS_MODEL_ANTHROPIC', 'claude-haiku-4-5')
+    resp = requests.post(
+        'https://api.anthropic.com/v1/messages',
+        headers={'x-api-key': key,
+                 'anthropic-version': '2023-06-01',
+                 'Content-Type': 'application/json'},
+        json={
+            'model': model,
+            'max_tokens': 4000,
+            'system': _REDAKTION_SYSTEM_RULES,
+            'messages': [{'role': 'user', 'content':
+                'Schreibe für jeden der folgenden Artikel eine eigene '
+                'Meldung nach den Regeln. Antworte als JSON.\n'
+                + json.dumps(blocks, ensure_ascii=False)}],
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    parts = resp.json().get('content') or []
+    text = ''.join(p.get('text', '') for p in parts if p.get('type') == 'text')
+    return _redaktion_parse_json(text)
+
+
+def _redaktion_rewrite_batch(articles):
+    """Ein KI-Call für bis zu _REDAKTION_BATCH Artikel. Liefert dict id->item.
+
+    Provider-Kaskade: OpenAI (falls Key da) → Anthropic. Ein Fehler wirft —
+    der Build-Loop fängt und lässt die Artikel für den nächsten Lauf übrig
+    (nichts wird halb gespeichert).
+    """
+    blocks = [_redaktion_source_block(a, retry=a.get('_redaktion_retry', False))
+              for a in articles]
+    items = _redaktion_call_openai(blocks)
+    if items is None:
+        items = _redaktion_call_anthropic(blocks)
+    if items is None:
+        raise RuntimeError('redaktion: kein KI-Provider konfiguriert '
+                           '(weder OPENAI_API_KEY noch ANTHROPIC_API_KEY)')
+    by_id = {a['id']: a for a in articles}
+    out = {}
+    for it in items:
+        art = by_id.get(str(it.get('id') or ''))
+        headline = (it.get('headline') or '').strip()
+        body = (it.get('body') or '').strip()
+        # Validierung: nur vollständige, plausible Ergebnisse übernehmen.
+        if not art or len(headline) < 8 or len(body) < 40:
+            continue
+        body_long_probe = (it.get('body_long') or '').strip()
+        if not _redaktion_copyright_ok(art, headline, body, body_long_probe):
+            fails = _REDAKTION_REJECTED.get(art['id'], 0) + 1
+            _REDAKTION_REJECTED[art['id']] = fails
+            _log_warn(f"[redaktion] copyright-guard verwirft {art['id']} "
+                      f"(übernommene Passage erkannt, Versuch {fails})")
+            continue
+        body_long = (it.get('body_long') or '').strip()
+        # Langfassung nur übernehmen, wenn sie substanziell ist — sonst hat
+        # das Modell die Dünn-Quelle-Regel befolgt und es gibt nur den Teaser.
+        if len(body_long) < 300:
+            body_long = ''
+        out[art['id']] = {
+            'id': art['id'],
+            'headline': headline[:160],
+            'body': body[:1500],
+            'body_long': body_long[:6000] or None,
+            'category': art.get('category') or _DEFAULT_CATEGORY,
+            'source_name': art.get('source_name') or '',
+            'source_url': art.get('article_url') or '',
+            'published_at': art.get('published_at') or '',
+            'mentioned_airlines': art.get('mentioned_airlines') or [],
+            'rev': _REDAKTION_REV,
+        }
+    return out
+
+
+def _redaktion_base_articles():
+    """Faktenbasis: warmer Feed-Cache wenn vorhanden, sonst frisch aggregieren."""
+    cached = _cache_get('*:*')
+    if cached and cached.get('articles'):
+        return list(cached['articles'])
+    aggregated, _status = _aggregate_all_sources()
+    for art in aggregated:
+        art['category'] = _classify_category(art.get('title', ''),
+                                             art.get('summary', ''))
+    try:
+        _attach_stored_fulltexts(aggregated)
+    except Exception as exc:  # Volltext ist nice-to-have, kein Muss
+        _log_warn(f'[redaktion] fulltext attach failed: {exc!r}')
+    return aggregated
+
+
+def _redaktion_build():
+    """Ein Build-Lauf: neue Artikel umschreiben, Store aktualisieren."""
+    try:
+        base = _redaktion_base_articles()
+    except Exception as exc:
+        _log_warn(f'[redaktion] base aggregation failed: {exc!r}')
+        with _REDAKTION_LOCK:
+            _REDAKTION_LAST_BUILD['running'] = False
+        return
+    base.sort(key=lambda a: a.get('published_at') or '', reverse=True)
+    existing = _redaktion_store_snapshot()
+    todo = [a for a in base if a.get('id')
+            and a['id'] not in existing
+            and _REDAKTION_REJECTED.get(a['id'], 0) < _REDAKTION_REJECT_MAX]
+    retry_ids = {a['id'] for a in todo if _REDAKTION_REJECTED.get(a['id'])}
+    todo = todo[:_REDAKTION_MAX_PER_BUILD]
+    for a in todo:
+        if a['id'] in retry_ids:
+            a['_redaktion_retry'] = True
+    for i in range(0, len(todo), _REDAKTION_BATCH):
+        chunk = todo[i:i + _REDAKTION_BATCH]
+        try:
+            rewritten = _redaktion_rewrite_batch(chunk)
+        except Exception as exc:
+            _log_warn(f'[redaktion] rewrite batch failed: {exc!r}')
+            break  # Rest beim nächsten Lauf — kein Hämmern auf kaputten Provider
+        if rewritten:
+            _redaktion_store_merge(rewritten)
+    with _REDAKTION_LOCK:
+        _REDAKTION_LAST_BUILD['ts'] = time.time()
+        _REDAKTION_LAST_BUILD['running'] = False
+
+
+def _redaktion_kick_build_if_stale():
+    with _REDAKTION_LOCK:
+        stale = (time.time() - _REDAKTION_LAST_BUILD['ts']) > _REDAKTION_BUILD_TTL
+        if not stale or _REDAKTION_LAST_BUILD['running']:
+            return False
+        _REDAKTION_LAST_BUILD['running'] = True
+    threading.Thread(target=_redaktion_build, name='news-redaktion',
+                     daemon=True).start()
+    return True
+
+
+@news_bp.route('/api/news/redaktion', methods=['GET'])
+def get_news_redaktion():
+    """AeroX-eigene, KI-umgeschriebene Kurzartikel (deutsch, faktenbasiert).
+
+    Antwort: {ok, items:[{id, headline, body, category, source_name,
+    source_url, published_at, mentioned_airlines, rev}], count, warming,
+    generated_at}. Bewusst OHNE Bild-Felder und OHNE Original-Wortlaut.
+    `warming=true` = Store noch leer und ein Build läuft — App zeigt dann
+    weiter ihre bisherige Quelle statt einer leeren Sektion.
+    """
+    try:
+        limit = int(request.args.get('limit') or '40')
+    except (TypeError, ValueError):
+        limit = 40
+    limit = max(1, min(limit, 100))
+    building = _redaktion_kick_build_if_stale()
+    snapshot = _redaktion_store_snapshot()
+    items = sorted(snapshot.values(),
+                   key=lambda x: x.get('published_at') or '',
+                   reverse=True)[:limit]
+    with _REDAKTION_LOCK:
+        running = _REDAKTION_LAST_BUILD['running']
+    return jsonify({
+        'ok': True,
+        'items': items,
+        'count': len(items),
+        'warming': (not items) and (building or running),
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+    })

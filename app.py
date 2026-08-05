@@ -637,6 +637,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/family-request/', # /<crew_token>/pending → Requester-PII (Name/Avatar)
     '/api/family-watch/',   # /<family_token>/feed → Crew-Status (AT-FAM-Gate greift)
     '/api/crew-chat/',      # alle DM/Inbox/Channel-Reads
+    '/api/destination-lobby/',  # eigener aktueller Aufenthalts-Chat aus dem Roster
     '/api/moderation/',     # block/mute-Listen
     '/api/lufthansa/status/',
     # ── Security-Audit 2026-07-01: weitere owner-scoped PII-GETs ──
@@ -14557,6 +14558,244 @@ def _crew_roster_days(token):
     return out
 
 
+# ── Destination Lobby (stiller, roster-gesteuerter Stations-Chat) ────────
+# Die Lobby ist absichtlich KEINE persistente Gruppe mit Mitgliederliste:
+# Zugriff ist nur waehrend des eigenen, mindestens achtstuendigen Aufenthalts
+# moeglich. So gibt es weder Telefonnummern/Einladungen noch veraltete
+# Mitgliedschaften. Der Stations-Channel bleibt stabil, die session_id dagegen
+# ist pro Aufenthalt neu und trennt den lokalen iOS-Cache sauber.
+_DESTINATION_LOBBY_MIN_STAY_SECONDS = 8 * 60 * 60
+_DESTINATION_LOBBY_MAX_STAY_SECONDS = 14 * 24 * 60 * 60
+_DESTINATION_LOBBY_MESSAGE_TTL_SECONDS = 24 * 60 * 60
+_DESTINATION_LOBBY_MEMO_TTL_SECONDS = 30.0
+_DESTINATION_LOBBY_MEMO = {}
+_DESTINATION_LOBBY_MEMO_LOCK = _req_threading.RLock()
+_DESTINATION_LOBBY_PRESENCE_RPC = 'touch_destination_lobby_presence'
+_DESTINATION_LOBBY_PRESENCE_RPC_DISABLED = False
+
+
+def _destination_lobby_invalidate(token):
+    if not token:
+        return
+    with _DESTINATION_LOBBY_MEMO_LOCK:
+        _DESTINATION_LOBBY_MEMO.pop(token, None)
+
+
+def _destination_lobby_now():
+    """Separater Clock-Hook, damit Grenzfaelle ohne Systemzeit-Patches testbar sind."""
+    return datetime.now(timezone.utc)
+
+
+def _destination_lobby_parse_iso(value):
+    try:
+        dt = datetime.fromisoformat(str(value or '').strip().replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _destination_lobby_effective_time(sector, planned_key, live_keys):
+    """Live-/Ist-Zeit nur verwenden, wenn sie plausibel zum Soll-Leg gehoert."""
+    planned = _destination_lobby_parse_iso((sector or {}).get(planned_key))
+    if planned is None:
+        return None
+    for key in live_keys:
+        live = _destination_lobby_parse_iso((sector or {}).get(key))
+        if live is not None and abs((live - planned).total_seconds()) <= 12 * 60 * 60:
+            return live
+    return planned
+
+
+def _destination_lobby_compute(token, now=None):
+    """Aktive Lobby oder None. Fehlende/unklare Rosterdaten fallen geschlossen aus."""
+    now = now or _destination_lobby_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    days = _crew_roster_days(token)
+    sectors = []
+    seen = set()
+    for datum in sorted(days):
+        day = days.get(datum) or {}
+        for sector in (day.get('ical_sectors') or []):
+            if not _is_real_flight_sector(sector):
+                continue
+            key = tuple(str(sector.get(k) or '') for k in (
+                'flight', 'from', 'to', 'dep_iso', 'arr_iso'))
+            if key in seen:
+                continue
+            seen.add(key)
+            dep = _destination_lobby_parse_iso(sector.get('dep_iso'))
+            arr = _destination_lobby_parse_iso(sector.get('arr_iso'))
+            if dep is not None and arr is not None and arr > dep:
+                sectors.append((dep, arr, sector))
+    sectors.sort(key=lambda item: item[0])
+    homebase = str(_profile_homebase_cached(token) or '').strip().upper()
+    active = []
+    for idx in range(len(sectors) - 1):
+        _in_dep, scheduled_arrival, inbound = sectors[idx]
+        scheduled_departure, _out_arr, outbound = sectors[idx + 1]
+        iata = str(inbound.get('to') or '').strip().upper()
+        if iata != str(outbound.get('from') or '').strip().upper():
+            continue
+        if len(iata) != 3 or not iata.isalpha() or iata == homebase:
+            continue
+        arrival = _destination_lobby_effective_time(
+            inbound, 'arr_iso', ('actual_arr_iso', 'est_arr_iso'))
+        departure = _destination_lobby_effective_time(
+            outbound, 'dep_iso', ('actual_dep_iso', 'est_dep_iso'))
+        if arrival is None or departure is None:
+            continue
+        ground_seconds = (departure - arrival).total_seconds()
+        if not (_DESTINATION_LOBBY_MIN_STAY_SECONDS <= ground_seconds
+                <= _DESTINATION_LOBBY_MAX_STAY_SECONDS):
+            continue
+        if arrival <= now < departure:
+            session_epoch = int(scheduled_arrival.timestamp())
+            active.append((arrival, {
+                'session_id': f'destination_{iata}_{session_epoch}',
+                'channel_id': f'group__destination_{iata}',
+                'iata': iata,
+                'title': f'Destination Lobby · {iata}',
+                'available_since': arrival.isoformat().replace('+00:00', 'Z'),
+                'expires_at': departure.isoformat().replace('+00:00', 'Z'),
+                'minimum_stay_hours': 8,
+                'message_ttl_hours': 24,
+            }))
+    return max(active, key=lambda item: item[0])[1] if active else None
+
+
+def _destination_lobby_for_token(token):
+    """Kurzer Success/None-Cache; Tests umgehen ihn fuer deterministische Fixtures."""
+    now = _destination_lobby_now()
+    if app.testing:
+        return _destination_lobby_compute(token, now=now)
+    monotonic_now = _req_time.monotonic()
+    with _DESTINATION_LOBBY_MEMO_LOCK:
+        hit = _DESTINATION_LOBBY_MEMO.get(token)
+        if hit and monotonic_now - hit[0] < _DESTINATION_LOBBY_MEMO_TTL_SECONDS:
+            lobby = hit[1]
+            expiry = _destination_lobby_parse_iso((lobby or {}).get('expires_at'))
+            return lobby if lobby is None or (expiry is not None and now < expiry) else None
+    lobby = _destination_lobby_compute(token, now=now)
+    with _DESTINATION_LOBBY_MEMO_LOCK:
+        _DESTINATION_LOBBY_MEMO[token] = (monotonic_now, lobby)
+        if len(_DESTINATION_LOBBY_MEMO) > 5000:
+            cutoff = monotonic_now - _DESTINATION_LOBBY_MEMO_TTL_SECONDS
+            for key, value in list(_DESTINATION_LOBBY_MEMO.items()):
+                if value[0] < cutoff:
+                    _DESTINATION_LOBBY_MEMO.pop(key, None)
+    return lobby
+
+
+def _destination_lobby_presence_touch_count(token, lobby):
+    """Registriert den anonymisierten Lobby-Beitritt und liefert nur die Zahl.
+
+    Der Client bekommt weder Tokens noch Namen/Avatare. Auch die Presence-
+    Tabelle speichert neben dem SHA-256-Hash nur eine verschluesselte AXU-
+    Referenz. Sie wird ausschliesslich serverseitig fuer Nachrichten-Pushes an
+    bereits beigetretene, noch anwesende User aufgeloest. Fehlt die additive
+    Migration oder ist Supabase gestoert, bleibt der Chat voll funktionsfaehig
+    und der Zaehler wird weggelassen, statt eine falsche 0 zu zeigen.
+    """
+    global _DESTINATION_LOBBY_PRESENCE_RPC_DISABLED
+    if (not token or not isinstance(lobby, dict) or not SB_AVAILABLE
+            or sb is None or _DESTINATION_LOBBY_PRESENCE_RPC_DISABLED):
+        return None
+    user_ref = _public_user_ref(token)
+    if not str(user_ref or '').startswith(_PUBLIC_USER_REF_PREFIX):
+        return None
+    params = {
+        'p_member_hash': _hashlib.sha256(token.encode()).hexdigest(),
+        'p_user_ref': user_ref,
+        'p_session_id': str(lobby.get('session_id') or ''),
+        'p_channel_id': str(lobby.get('channel_id') or ''),
+        'p_available_since': str(lobby.get('available_since') or ''),
+        'p_expires_at': str(lobby.get('expires_at') or ''),
+    }
+    if not all(params.values()):
+        return None
+    try:
+        def _do():
+            return sb.rpc(_DESTINATION_LOBBY_PRESENCE_RPC, params).execute()
+        result, timed_out = _supabase_execute_with_timeout(
+            'destination_lobby_presence', _do)
+        if timed_out:
+            return None
+        value = getattr(result, 'data', None)
+        if isinstance(value, list) and value:
+            value = value[0]
+        if isinstance(value, dict):
+            value = (value.get(_DESTINATION_LOBBY_PRESENCE_RPC)
+                     if _DESTINATION_LOBBY_PRESENCE_RPC in value
+                     else value.get('member_count'))
+        count = int(value)
+        return count if 1 <= count <= 100000 else None
+    except Exception as e:
+        msg = str(e)
+        if ('PGRST202' in msg or 'PGRST205' in msg
+                or 'Could not find the function' in msg
+                or 'does not exist' in msg or 'schema cache' in msg.lower()):
+            _DESTINATION_LOBBY_PRESENCE_RPC_DISABLED = True
+            app.logger.warning(
+                '[destination-lobby] presence migration missing; '
+                'anonymous member count disabled')
+        else:
+            app.logger.warning(
+                f'[destination-lobby] presence_count_fail '
+                f'err={type(e).__name__}: {msg[:120]}')
+        return None
+
+
+def _destination_lobby_push_recipients(channel_id, author_token=None):
+    """Aktive Lobby-Empfaenger intern aufloesen; keine Identitaet verlaesst den Server.
+
+    `None` bedeutet Lookup-Ausfall (Outbox soll retryen), `[]` bedeutet ehrlich
+    keine weiteren beigetretenen Personen. Abgelaufene Aufenthalte werden durch
+    den DB-Filter auch dann ausgeschlossen, wenn alte Presence-Rows noch liegen.
+    """
+    cid = str(channel_id or '')
+    if (not re.fullmatch(r'group__destination_[A-Z]{3}', cid)
+            or not SB_AVAILABLE or sb is None):
+        return None
+    now_iso = _destination_lobby_now().isoformat().replace('+00:00', 'Z')
+    try:
+        result = (sb.table('destination_lobby_presence')
+                  .select('user_ref')
+                  .eq('channel_id', cid)
+                  .lte('available_since', now_iso)
+                  .gt('expires_at', now_iso)
+                  .limit(500).execute())
+        recipients = []
+        seen = set()
+        for row in (result.data or []):
+            token = _token_from_public_user_ref((row or {}).get('user_ref'))
+            if (token and token != author_token and token not in seen):
+                seen.add(token)
+                recipients.append(token)
+        return recipients
+    except Exception as e:
+        app.logger.warning(
+            f'[destination-lobby] push_recipients_fail ch={cid[-3:]} '
+            f'err={type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
+@app.route('/api/destination-lobby/<token>', methods=['GET'])
+def get_destination_lobby(token):
+    lobby = _destination_lobby_for_token(token)
+    if lobby is not None:
+        # Nicht in den 30-s-Roster-Memo schreiben: die Zahl soll bei jedem
+        # stillen Refresh frisch sein und niemals eine Identitaetsliste tragen.
+        lobby = dict(lobby)
+        lobby['member_count'] = _destination_lobby_presence_touch_count(token, lobby)
+    response = jsonify({'ok': True, 'lobby': lobby})
+    response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+    return response
+
+
 def _crew_day_place(day):
     """Aufenthalts-/Übernachtungs-IATA EINES Roster-Tags ('' wenn unbekannt).
     Dieselbe Ableitung wie Feed/Overlap (_feed_nightstop_ort) — NICHT blind
@@ -23135,6 +23374,7 @@ def _sb_roster_snapshot_load(token):
 
 def _roster_snapshot_save(token, payload):
     """Schreibt Snapshot nach Supabase UND Disk. True wenn mind. eines klappt."""
+    _destination_lobby_invalidate(token)
     sb_ok = _sb_roster_snapshot_upsert(token, payload)
     disk_ok = False
     sp = _roster_snapshot_path(token)
@@ -26247,7 +26487,6 @@ def _channel_access_error(token, channel_id):
     - Unbekanntes Format → 400 invalid_channel (kein still-erlaubter Catch-all)."""
     cid = channel_id or ''
     if cid.startswith('dm__'):
-        import re
         safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
         parts = cid[len('dm__'):].split('__')
         if safe and len(parts) == 2 and safe in parts:
@@ -26263,6 +26502,13 @@ def _channel_access_error(token, channel_id):
         return jsonify({'error': 'not_a_member'}), 403
     gid = _group_id_from_channel(cid)
     if gid is not None:
+        # Reservierter Stations-Channel: die ID ist hier KEINE Capability.
+        # Nur der aktuell roster-berechtigte User darf lesen/schreiben/loeschen.
+        if re.fullmatch(r'destination_[A-Z]{3}', gid):
+            lobby = _destination_lobby_for_token(token)
+            if lobby and lobby.get('channel_id') == cid:
+                return None
+            return jsonify({'error': 'destination_lobby_unavailable'}), 403
         # CAPABILITY-Modell: die Gruppen-ID ist das Geheimnis (nur per Invite-Code/
         # QR bekannt). Wer sie hat, ist eingeladen — Crew ODER Nicht-Crew. KEIN
         # Owner-Mitgliederlisten-Check: der sperrte per-Code-Beigetretene mit 403 aus
@@ -26286,6 +26532,33 @@ def get_chat_messages(token, channel_id):
     if _gate is not None:
         return _gate
     msgs = _dm_load_messages(channel_id) or []
+    destination_lobby = None
+    gid = _group_id_from_channel(channel_id)
+    if gid and re.fullmatch(r'destination_[A-Z]{3}', gid):
+        destination_lobby = _destination_lobby_for_token(token)
+        now_ts = _destination_lobby_now().timestamp()
+        global_cutoff = now_ts - _DESTINATION_LOBBY_MESSAGE_TTL_SECONDS
+        visible_since = max(
+            global_cutoff,
+            (_destination_lobby_parse_iso(
+                (destination_lobby or {}).get('available_since')) or
+             datetime.fromtimestamp(now_ts, tz=timezone.utc)).timestamp())
+        # Global nur >24h alte Zeilen entfernen. Aufenthaltsbeginn ist dagegen
+        # ein per-Viewer-Filter, damit eine spaeter angekommene Crew nicht den
+        # fuer andere noch sichtbaren Verlauf physisch loescht.
+        stale = [m for m in msgs if float(m.get('ts') or 0) < global_cutoff]
+        if stale:
+            if SB_AVAILABLE:
+                try:
+                    (sb.table('dm_messages').delete().eq('channel_id', channel_id)
+                     .lt('ts', global_cutoff).execute())
+                except Exception as e:
+                    app.logger.warning(
+                        f'[destination-lobby] ttl_prune_fail '
+                        f'err={type(e).__name__}: {str(e)[:120]}')
+            msgs = [m for m in msgs if float(m.get('ts') or 0) >= global_cutoff]
+            _dm_save_messages_disk(channel_id, msgs)
+        msgs = [m for m in msgs if float(m.get('ts') or 0) >= visible_since]
     # Soft-Delete-Gate: vom Autor geloeschte Messages (deleted==True, gesetzt vom
     # DELETE-Endpoint) werden NIE ausgeliefert. Ohne dieses Filter taucht eine
     # geloeschte Nachricht beim naechsten Poll/Reload (oder auf einem neuen Geraet)
@@ -34975,6 +35248,8 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
     - Group (`group__gid`/`grp__gid`): Owner + members aus user_friend_groups
       (best-effort — per-Code-Beigetretene ohne Members-Eintrag sind nicht
       adressierbar, Capability-Modell hat keine vollständige Mitgliederliste).
+    - Destination (`group__destination_IATA`): aktive Presence-Referenzen; damit
+      Push erst AB dem Beitritt und nur bis zum Abflug, niemals beim Beitritt.
     - NIE an den Autor selbst; Block-/Mute-Listen des Empfängers respektiert.
     The request path first persists one lightweight fanout job. The outbox
     worker resolves recipients and atomically/idempotently enqueues one child
@@ -35008,6 +35283,14 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
             if cid.startswith('dm__'):
                 parts = cid[len('dm__'):].split('__')
                 recipients = [p for p in parts if p and p != author_token]
+            elif cid.startswith('group__destination_'):
+                resolved = _destination_lobby_push_recipients(
+                    cid, author_token=author_token)
+                if resolved is None:
+                    recipient_lookup_failed = True
+                else:
+                    recipients = resolved
+                    group_name = f'Destination Lobby · {cid[-3:]}'
             else:
                 gid = _group_id_from_channel(cid)
                 if gid and SB_AVAILABLE:
