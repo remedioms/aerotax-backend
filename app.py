@@ -21312,29 +21312,60 @@ def _corrected_briefing_start_iso(date_str, summary, current_start_iso,
         designator = (m.group(2) or '').strip().upper()
         if designator in ('UTC', 'Z'):
             # Explizit UTC deklarierte Zeit → keine TZ-Rätselei.
-            utc_dt = datetime(Y, M, D, hh, mm, tzinfo=_ZI('UTC'))
-            return utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-        # „LT" (oder kein Designator) = Lokalzeit an der STATION des Dienstes.
-        tzname = None
-        station = _briefing_lt_station(s, day_briefing, prev_day_briefing)
-        if station:
-            tzname = airport_tz(station)
-        if not tzname and token:
-            # Fallback: Homebase-TZ aus dem Profil (lazy — nur wenn die
-            # Station des Tages nicht bestimmbar war). Pro Token gecacht.
-            cached = _BRIEFING_HB_TZ_CACHE.get(token)
-            if cached is not None and (time.time() - cached[1]) < 600:
-                tzname = cached[0]
-            else:
+            cand = datetime(Y, M, D, hh, mm, tzinfo=_ZI('UTC'))
+        else:
+            # „LT" (oder kein Designator) = Lokalzeit an der STATION des Dienstes.
+            tzname = None
+            station = _briefing_lt_station(s, day_briefing, prev_day_briefing)
+            if station:
+                tzname = airport_tz(station)
+            if not tzname and token:
+                # Fallback: Homebase-TZ aus dem Profil (lazy — nur wenn die
+                # Station des Tages nicht bestimmbar war). Pro Token gecacht.
+                cached = _BRIEFING_HB_TZ_CACHE.get(token)
+                if cached is not None and (time.time() - cached[1]) < 600:
+                    tzname = cached[0]
+                else:
+                    try:
+                        pr = (_profile_load(token) or {}).get('profile', {}) or {}
+                        hb = str(pr.get('homebase') or '').strip().upper()
+                        tzname = airport_tz(hb) if hb else None
+                    except Exception:
+                        tzname = None
+                    _BRIEFING_HB_TZ_CACHE[token] = (tzname, time.time())
+            cand = datetime(Y, M, D, hh, mm,
+                            tzinfo=_ZI(tzname or 'Europe/Berlin')
+                            ).astimezone(_ZI('UTC'))
+        # CROSS-DATE-ANKER (Condor cube.aero, SEA-Red-Eye 2026-08-06): die
+        # Tages-Buckets sind Homebase-datiert (Pickup 15:35 SEA = 00:35 Berlin
+        # → Bucket am Folgetag), die „LT"-Zeit gehört an Weit-West-Stationen
+        # aber zum lokalen VORTAG. Stur aufs Bucket-Datum geankert lag der
+        # Report 22 h NACH dem Abflug (08-08T23:25Z vs. dep 01:00Z). Ein
+        # Report liegt nie nach dem ersten Abflug seines Tages → auf den
+        # Vortag ankern. Nur wenn das Ergebnis in ein echtes Report-Fenster
+        # fällt (≤ 8 h vor dem Abflug): ein Abend-Briefing für den FOLGE-Tag,
+        # das mit einem Morgen-Sektor im selben Bucket gemerged wurde, bleibt
+        # so unangetastet (Status quo statt −24 h-Rutsch).
+        first_dep = None
+        for sc in ((day_briefing or {}).get('ical_sectors') or []):
+            for fld in ('sched_dep_iso', 'dep_iso'):
+                v = str((sc or {}).get(fld) or '').strip()
+                if not v:
+                    continue
                 try:
-                    pr = (_profile_load(token) or {}).get('profile', {}) or {}
-                    hb = str(pr.get('homebase') or '').strip().upper()
-                    tzname = airport_tz(hb) if hb else None
+                    dt = datetime.fromisoformat(v.replace('Z', '+00:00'))
                 except Exception:
-                    tzname = None
-                _BRIEFING_HB_TZ_CACHE[token] = (tzname, time.time())
-        local = datetime(Y, M, D, hh, mm, tzinfo=_ZI(tzname or 'Europe/Berlin'))
-        return local.astimezone(_ZI('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_ZI('UTC'))
+                if first_dep is None or dt < first_dep:
+                    first_dep = dt
+                break
+        if first_dep is not None and cand >= first_dep:
+            shifted = cand - timedelta(days=1)
+            if timedelta(0) < (first_dep - shifted) <= timedelta(hours=8):
+                cand = shifted
+        return cand.strftime('%Y-%m-%dT%H:%M:%SZ')
     except Exception:
         return current_start_iso
 
@@ -45141,6 +45172,45 @@ def ax_transit():
         return jsonify(out)
     except Exception as e:
         app.logger.warning(f'[ax_transit] fail {type(e).__name__}: {str(e)[:400]}')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 200
+
+
+@app.route('/api/ax/shuttle-options/<token>', methods=['GET'])
+def ax_shuttle_options(token):
+    """Shuttler-Verbindungen: alle Flüge einer Strecke an einem Tag (für
+    Pendler, die mit dem Flieger zur Base kommen). Quelle: LH Open API
+    flightstatus/route (12-h-Cache pro Strecke+Datum in lh_open_api —
+    alle Shuttler derselben Strecke teilen sich EINEN Call).
+
+    Bewusst DUMM gehalten: reine Fahrplan-Liste mit Offset-ISO-Zeiten
+    (Instants!), KEIN arrive_by-Filter hier — die Puffer (Airport/Deboarding/
+    Fußweg) sind in der App sichtbar einstellbar und werden DORT gerechnet.
+    Keine Load-/Mitflieg-Aussagen (Owner 07.08.: Seatmap-Schätzung geparkt).
+
+    Query: ?from=LIS&to=FRA&date=YYYY-MM-DD.
+    Antwort-Ehrlichkeit: `answered=False` (Budget-Gate/LH-Ausfall) ist von
+    „leere Liste" (echtes 404 = keine Flüge) UNTERSCHIEDEN — die App darf aus
+    einer Lücke nie „keine Flüge" machen. Wirft nie (try/except-Hülle)."""
+    if not token or not _validate_token_exists(token):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 404
+    if _token_rate_limited(token, 'ax_shuttle', limit=60, window_sec=3600):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    try:
+        frm = (request.args.get('from') or '').strip().upper()
+        to = (request.args.get('to') or '').strip().upper()
+        d = (request.args.get('date') or '').strip()[:10]
+        if (not re.match(r'^[A-Z]{3}$', frm) or not re.match(r'^[A-Z]{3}$', to)
+                or not re.match(r'^\d{4}-\d{2}-\d{2}$', d) or frm == to):
+            return jsonify({'ok': False, 'error': 'bad_params'}), 400
+        from blueprints.lh_open_api import route_flights, lh_open_configured
+        if not lh_open_configured():
+            return jsonify({'ok': True, 'answered': False, 'flights': []})
+        flights, answered = route_flights(frm, to, d, caller='shuttle_user')
+        return jsonify({'ok': True, 'answered': bool(answered),
+                        'from': frm, 'to': to, 'date': d,
+                        'flights': flights})
+    except Exception as e:
+        app.logger.warning(f'[ax_shuttle] fail {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 200
 
 

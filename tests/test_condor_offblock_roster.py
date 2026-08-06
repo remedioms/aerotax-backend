@@ -119,6 +119,66 @@ def test_generic_synthesis_skips_lh_and_edelweiss():
     assert any(e.get('summary') == 'LAY' for e in out)
 
 
+def test_condor_westcoast_redeye_briefing_anchors_previous_day():
+    """Echte-User-Regression (Condor-FA, SEA-Rotation, 2026-08-06): cube.aero
+    bucketet Events nach BERLIN-Datum — Pickup 15:35 SEA (= 00:35 Berlin) landet
+    im Bucket des FOLGE-Tags. Die „16:25 LT Briefing SEA"-Ankerung ans
+    Bucket-Datum ergab 2026-08-08T23:25Z — 22 h NACH dem Abflug des Tagesflugs
+    (dep 01:00Z). Ein Report liegt nie nach dem ersten Abflug seines Tages →
+    Vortags-Anker: 2026-08-07T23:25Z (1:35 h vor dep)."""
+    day = {
+        'ical_summary': 'Pickup 15:35 · 16:25 LT Briefing SEA · DE2033 SEA-FRA',
+        'ical_start_iso': '2026-08-07T22:35:00Z',
+        'ical_end_iso': '2026-08-08T11:00:00Z',
+        'ical_sectors': [{'flight': 'DE2033', 'from': 'SEA', 'to': 'FRA',
+                          'dep_iso': '2026-08-08T01:00:00Z',
+                          'arr_iso': '2026-08-08T11:00:00Z'}],
+    }
+    fixed = backend._corrected_briefing_start_iso(
+        '2026-08-08', day['ical_summary'], day['ical_start_iso'],
+        day['ical_end_iso'], day_briefing=day)
+    assert fixed == '2026-08-07T23:25:00Z'
+
+
+def test_condor_homebase_briefing_stays_on_bucket_day():
+    """Gegenprobe: normaler FRA-Abflugtag (Briefing VOR dem ersten Abflug)
+    bleibt exakt auf dem Bucket-Datum geankert — der Cross-Date-Anker greift
+    nur, wenn der Report NACH dem ersten Abflug läge."""
+    day = {
+        'ical_summary': '12:45 LT Briefing FRA · DE2032 FRA-SEA · SB90',
+        'ical_start_iso': '2026-08-06T03:00:00Z',
+        'ical_end_iso': '2026-08-06T23:00:00Z',
+        'ical_sectors': [{'flight': 'DE2032', 'from': 'FRA', 'to': 'SEA',
+                          'dep_iso': '2026-08-06T12:35:00Z',
+                          'arr_iso': '2026-08-06T23:00:00Z'}],
+    }
+    fixed = backend._corrected_briefing_start_iso(
+        '2026-08-06', day['ical_summary'], day['ical_start_iso'],
+        day['ical_end_iso'], day_briefing=day)
+    # 12:45 LT FRA (CEST) = 10:45Z, vor dep 12:35Z → unverändert geankert.
+    assert fixed == '2026-08-06T10:45:00Z'
+
+
+def test_evening_briefing_for_next_day_not_shifted():
+    """Schutzplanke: Abend-Briefing (für den Folgetag) im selben Bucket wie ein
+    MORGEN-Sektor darf NICHT um −24 h rutschen — das Report-Fenster (≤ 8 h vor
+    dep) lehnt den Vortags-Anker ab, Status quo bleibt."""
+    day = {
+        'ical_summary': 'LH 401: JFK-FRA · 21:00 LT Briefing FRA',
+        'ical_start_iso': '2026-08-08T04:00:00Z',
+        'ical_end_iso': '2026-08-08T20:00:00Z',
+        'ical_sectors': [{'flight': 'LH401', 'from': 'JFK', 'to': 'FRA',
+                          'dep_iso': '2026-08-08T04:00:00Z',
+                          'arr_iso': '2026-08-08T11:30:00Z'}],
+    }
+    fixed = backend._corrected_briefing_start_iso(
+        '2026-08-08', day['ical_summary'], day['ical_start_iso'],
+        day['ical_end_iso'], day_briefing=day)
+    # 21:00 LT FRA = 19:00Z — nach dep 04:00Z, aber Vortags-Anker läge 33 h
+    # vor dep (> 8 h) → kein Shift.
+    assert fixed == '2026-08-08T19:00:00Z'
+
+
 def test_pdf_import_protected_from_ek_reconcile(monkeypatch, tmp_path):
     """Discover/City-PDF (source='pdf', url='') gilt 35 Tage als frischer Feed —
     der EKEvent-Push darf die PDF-Tage nicht mehr wegräumen (Echte-User-Befund
