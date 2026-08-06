@@ -809,6 +809,49 @@ def _request_bearer_matches(path_token):
 
 
 @app.before_request
+def _normalize_modern_session_bearer():
+    """Resolve a short-lived AXA bearer to the legacy account principal.
+
+    Existing handlers intentionally keep receiving the established ``AT-…``
+    account key during the staged migration.  Rewriting the request header in
+    one place means every legacy handler/blueprint gets the same principal and
+    no route accidentally treats the opaque access token as a storage key.
+
+    Old app builds still send ``Bearer AT-…`` and pass through unchanged.  New
+    builds send ``Bearer AXA-…``; expired/revoked sessions fail before any
+    handler runs.  This hook is registered before the BUG-004 binding gate, so
+    that gate continues to compare the normalized principal with the URL key.
+    """
+    bearer = _request_bearer_token()
+    if not bearer:
+        return None
+    if bearer.startswith('AT-'):
+        if not _AUTH_ACCEPT_LEGACY_BEARER:
+            return jsonify({
+                'ok': False,
+                'error': 'legacy_token_retired',
+                'message': 'Bitte AeroX aktualisieren und erneut anmelden.',
+            }), 401
+        return None
+    if not bearer.startswith('AXA-'):
+        return None
+    state, principal = _auth_session_access_principal(bearer)
+    if state == 'valid' and principal:
+        try:
+            from flask import g as _g
+            _g.aerox_access_token_hash = _auth_session_hash(bearer)
+            _g.aerox_auth_kind = 'session'
+        except Exception:
+            pass
+        request.environ['HTTP_AUTHORIZATION'] = f'Bearer {principal}'
+        return None
+    if state == 'unavailable':
+        return _auth_store_unavailable_response()
+    error = 'token_expired' if state == 'expired' else 'invalid_token'
+    return jsonify({'ok': False, 'error': error}), 401
+
+
+@app.before_request
 def _bug004_token_auth_gate():
     """Reject Requests mit gefakeden AT-...-Tokens die nicht in auth_users
     existieren.
@@ -24387,7 +24430,13 @@ def take_roster_snapshot(token):
         # Tagen < heute — u.a. ein 24.07.-Eintrag und ein 13.07. mit
         # IDENTISCHEN Sektoren. Der Nutzer kann daran nichts mehr entscheiden.
         # Der Eintrag entfällt nicht, er landet direkt im VERLAUF (nachlesbar,
-        # aber ohne „bitte bestätigen"-Wirkung).
+        # aber ohne „bitte bestätigen"-Wirkung). Das gilt fuer ALLE Arten:
+        # Antje Sommer bekam am 06.08. eine lokale „9 Änderungen"-Notification,
+        # obwohl nur neun alte Juli-Dienste aus einem kurzzeitig verkuerzten
+        # Snapshot verschwunden waren. Der Server-Push war bereits still, aber
+        # `removed` blieb pending; der iOS-BG-Poll sah den Pending-Sprung und
+        # erzeugte daraus selbst die Notification. Vergangenheit ist deshalb
+        # auch bei added/removed Verlauf statt offene Kenntnisnahme.
         # `now_hhmm=None` ist Absicht: damit wertet `_roster_change_is_past`
         # AUSSCHLIESSLICH den Datums-Vergleich `datum < heute` aus. Der
         # zusätzliche „heute, aber Dienst schon beendet"-Zweig bleibt dem PUSH
@@ -24396,8 +24445,7 @@ def take_roster_snapshot(token):
         # Dienst in der Vergangenheit ist steuerlich/logbuchseitig relevant).
         for ch in diff:
             ch['detected_at'] = datetime.now().isoformat()
-            if (ch.get('kind') == 'modified'
-                    and _roster_change_is_past(ch, _today_ymd, None)):
+            if _roster_change_is_past(ch, _today_ymd, None):
                 ch['status'] = 'past_auto'
                 history.append(ch)
             else:
@@ -24413,7 +24461,7 @@ def take_roster_snapshot(token):
         # sonst heilte nur, wer ohnehin gerade eine Änderung hat.
         _kept, _aged = [], 0
         for ch in pending:
-            if (isinstance(ch, dict) and ch.get('kind') == 'modified'
+            if (isinstance(ch, dict)
                     and _roster_change_is_past(ch, _today_ymd, None)):
                 ch['status'] = 'past_auto'
                 history.append(ch)
@@ -35696,6 +35744,265 @@ def clear_user_history(token):
 
 # ── Auth-System (email/password optional auf Token-Flow) ──────────────
 
+# Modern session credentials are additive. ``auth_users.token`` remains the
+# account/storage key while deployed legacy clients still depend on it. New
+# clients authenticate with a short-lived AXA token and rotate an AXR refresh
+# token; only SHA-256 hashes are persisted in ``auth_sessions``.
+_AUTH_ACCESS_TTL_SECONDS = max(
+    900, int(os.environ.get('AEROX_ACCESS_TOKEN_TTL_SECONDS', '86400')))
+_AUTH_REFRESH_TTL_SECONDS = max(
+    86400, int(os.environ.get('AEROX_REFRESH_TOKEN_TTL_SECONDS', '7776000')))
+_AUTH_ACCEPT_LEGACY_BEARER = str(
+    os.environ.get('AEROX_ACCEPT_LEGACY_BEARER', '1')
+).strip().lower() not in {'0', 'false', 'no', 'off'}
+_AUTH_SESSION_ACCESS_CACHE = {}
+_AUTH_SESSION_ACCESS_CACHE_TTL = 60.0
+
+
+def _auth_session_hash(value):
+    return hashlib.sha256(str(value or '').encode('utf-8')).hexdigest()
+
+
+def _auth_session_token(prefix):
+    import secrets
+    return prefix + secrets.token_urlsafe(32)
+
+
+def _auth_utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _auth_iso(value):
+    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _auth_parse_time(value):
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or '').strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _auth_session_client_label():
+    try:
+        explicit = (request.headers.get('X-AeroX-Client') or '').strip()
+        if explicit:
+            return explicit[:120]
+        return (request.headers.get('User-Agent') or '')[:120] or None
+    except Exception:
+        return None
+
+
+def _auth_session_access_principal(access_token):
+    """Return (state, legacy_user_token) for an opaque AXA credential.
+
+    ``state`` is valid/invalid/expired/unavailable. A short positive cache keeps
+    normal API traffic from turning into one Supabase read per request. Expiry
+    is re-checked on every cache hit; revocation propagates within at most 60 s.
+    """
+    if not isinstance(access_token, str) or not access_token.startswith('AXA-'):
+        return ('invalid', None)
+    digest = _auth_session_hash(access_token)
+    now = _auth_utcnow()
+    cached = _AUTH_SESSION_ACCESS_CACHE.get(digest)
+    if cached and cached.get('cache_until', 0) > time.time():
+        expires = _auth_parse_time(cached.get('access_expires_at'))
+        if not expires or expires <= now:
+            return ('expired', None)
+        return ('valid', cached.get('user_token'))
+    if not SB_AVAILABLE or sb is None:
+        return ('unavailable', None)
+    try:
+        result = (sb.table('auth_sessions').select(
+            'user_token,access_expires_at,revoked_at')
+            .eq('access_hash', digest).limit(1).execute())
+        rows = result.data or []
+    except Exception as exc:
+        app.logger.warning(
+            f'[auth-session] access lookup failed: {type(exc).__name__}: {str(exc)[:120]}')
+        return ('unavailable', None)
+    if not rows:
+        return ('invalid', None)
+    row = rows[0] or {}
+    if row.get('revoked_at'):
+        return ('invalid', None)
+    expires = _auth_parse_time(row.get('access_expires_at'))
+    if not expires or expires <= now:
+        return ('expired', None)
+    principal = row.get('user_token')
+    if not principal:
+        return ('invalid', None)
+    _AUTH_SESSION_ACCESS_CACHE[digest] = {
+        'user_token': principal,
+        'access_expires_at': row.get('access_expires_at'),
+        'cache_until': time.time() + _AUTH_SESSION_ACCESS_CACHE_TTL,
+    }
+    return ('valid', principal)
+
+
+def _auth_session_issue(user_token, user_id=None, client=None):
+    """Create a modern session, or return None without breaking legacy login."""
+    if not SB_AVAILABLE or sb is None or not user_token:
+        return None
+    access_token = _auth_session_token('AXA-')
+    refresh_token = _auth_session_token('AXR-')
+    now = _auth_utcnow()
+    access_expires = now + timedelta(seconds=_AUTH_ACCESS_TTL_SECONDS)
+    refresh_expires = now + timedelta(seconds=_AUTH_REFRESH_TTL_SECONDS)
+    row = {
+        'access_hash': _auth_session_hash(access_token),
+        'refresh_hash': _auth_session_hash(refresh_token),
+        'user_token': user_token,
+        'user_id': user_id,
+        'access_expires_at': _auth_iso(access_expires),
+        'refresh_expires_at': _auth_iso(refresh_expires),
+        'created_at': _auth_iso(now),
+        'client': (client or '')[:120] or None,
+    }
+    try:
+        sb.table('auth_sessions').insert(row).execute()
+    except Exception as exc:
+        # Migration may not be deployed yet. Login remains fully compatible and
+        # the new client falls back to the legacy bearer until the next launch.
+        app.logger.warning(
+            f'[auth-session] issue failed, legacy continues: '
+            f'{type(exc).__name__}: {str(exc)[:160]}')
+        return None
+    return {
+        'access_token': access_token,
+        'refresh_token': refresh_token,
+        'access_expires_at': _auth_iso(access_expires),
+        'refresh_expires_at': _auth_iso(refresh_expires),
+        'token_type': 'Bearer',
+    }
+
+
+def _auth_session_refresh(refresh_token):
+    if (not isinstance(refresh_token, str)
+            or not refresh_token.startswith('AXR-')):
+        return ('invalid', None)
+    if not SB_AVAILABLE or sb is None:
+        return ('unavailable', None)
+    digest = _auth_session_hash(refresh_token)
+    try:
+        result = (sb.table('auth_sessions').select('*')
+                  .eq('refresh_hash', digest).limit(1).execute())
+        rows = result.data or []
+    except Exception as exc:
+        app.logger.warning(
+            f'[auth-session] refresh lookup failed: {type(exc).__name__}: {str(exc)[:120]}')
+        return ('unavailable', None)
+    if not rows:
+        return ('invalid', None)
+    row = rows[0] or {}
+    if row.get('revoked_at') or row.get('rotated_at'):
+        return ('invalid', None)
+    expires = _auth_parse_time(row.get('refresh_expires_at'))
+    if not expires or expires <= _auth_utcnow():
+        return ('expired', None)
+    now_s = _auth_iso(_auth_utcnow())
+    try:
+        rotation = sb.rpc('consume_auth_refresh_token', {
+            'p_refresh_hash': digest,
+            'p_now': now_s,
+        }).execute()
+    except Exception as exc:
+        app.logger.warning(
+            f'[auth-session] refresh rotation failed: {type(exc).__name__}: {str(exc)[:120]}')
+        return ('unavailable', None)
+    consumed = rotation.data or []
+    if not consumed:
+        # Another request consumed the rotating token after our lookup. Only
+        # the atomic DB update may win; a replay never receives credentials.
+        return ('invalid', None)
+    principal = consumed[0] or {}
+    _AUTH_SESSION_ACCESS_CACHE.pop(principal.get('access_hash'), None)
+    issued = _auth_session_issue(
+        principal.get('user_token'), user_id=principal.get('user_id'),
+        client=_auth_session_client_label())
+    if issued:
+        issued['_user_token'] = principal.get('user_token')
+        issued['_user_id'] = principal.get('user_id')
+    return ('valid', issued) if issued else ('unavailable', None)
+
+
+def _auth_session_revoke(access_hash=None, refresh_token=None):
+    if not SB_AVAILABLE or sb is None:
+        return False
+    now_s = _auth_iso(_auth_utcnow())
+    try:
+        if access_hash:
+            (sb.table('auth_sessions').update({'revoked_at': now_s})
+             .eq('access_hash', access_hash).execute())
+            _AUTH_SESSION_ACCESS_CACHE.pop(access_hash, None)
+            return True
+        if refresh_token:
+            digest = _auth_session_hash(refresh_token)
+            (sb.table('auth_sessions').update({'revoked_at': now_s})
+             .eq('refresh_hash', digest).execute())
+            return True
+    except Exception as exc:
+        app.logger.warning(
+            f'[auth-session] revoke failed: {type(exc).__name__}: {str(exc)[:120]}')
+    return False
+
+
+def _auth_session_revoke_all(user_token):
+    """Best-effort account-wide revocation after password reset/deletion."""
+    if not SB_AVAILABLE or sb is None or not user_token:
+        return False
+    now_s = _auth_iso(_auth_utcnow())
+    try:
+        (sb.table('auth_sessions').update({'revoked_at': now_s})
+         .eq('user_token', user_token).execute())
+        for digest, cached in list(_AUTH_SESSION_ACCESS_CACHE.items()):
+            if cached.get('user_token') == user_token:
+                _AUTH_SESSION_ACCESS_CACHE.pop(digest, None)
+        return True
+    except Exception as exc:
+        app.logger.warning(
+            f'[auth-session] revoke-all failed: {type(exc).__name__}: {str(exc)[:120]}')
+        return False
+
+
+def _auth_ensure_user_id(email, user):
+    existing = (user or {}).get('user_id')
+    if existing:
+        return existing
+    new_id = 'USR-' + uuid.uuid4().hex.upper()
+    updated = dict(user or {})
+    updated['user_id'] = new_id
+    if _auth_upsert_user(email, updated):
+        user['user_id'] = new_id
+        return new_id
+    return None
+
+
+def _auth_success_payload(email, user, issue_session=True):
+    user_id = _auth_ensure_user_id(email, user)
+    payload = {
+        'ok': True,
+        # Kept for all deployed clients and legacy URL/storage contracts.
+        'token': user.get('token'),
+        'email': email,
+        'user_id': user_id,
+    }
+    if issue_session:
+        modern = _auth_session_issue(
+            user.get('token'), user_id=user_id, client=_auth_session_client_label())
+        if modern:
+            payload.update(modern)
+    return payload
+
 def _user_auth_path():
     import os
     os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
@@ -35705,6 +36012,7 @@ def _user_auth_path():
 _AUTH_KNOWN_COLS = {
     'password_hash', 'token', 'apple_sub', 'reset_token', 'reset_expires',
     'reset_used_at', 'hash_migrated_at', 'created_at', 'last_login_at',
+    'user_id',
 }
 
 
@@ -36312,7 +36620,7 @@ def auth_signup():
     # Owner-Benachrichtigung: seit 2026-07-25 KEINE Echtzeit-Mail mehr pro
     # Signup (bei 60-400/Tag lief die Inbox voll) — der tägliche Digest-Cron
     # auf dem Hetzner-Host (/opt/aerox/signup_digest_wrapper.sh) übernimmt.
-    return jsonify({'ok': True, 'token': token, 'email': email})
+    return jsonify(_auth_success_payload(email, rec))
 
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -36356,7 +36664,76 @@ def auth_login():
             app.logger.info(f'[auth] migrated hash for {email[:3]}***')
         except Exception as e:
             app.logger.warning(f'[auth] rehash failed: {e}')
-    return jsonify({'ok': True, 'token': user['token'], 'email': email})
+    user['last_login_at'] = datetime.now(timezone.utc).isoformat()
+    try:
+        _auth_upsert_user(email, user)
+    except Exception:
+        pass
+    return jsonify(_auth_success_payload(email, user))
+
+
+@app.route('/api/auth/upgrade-session', methods=['POST'])
+def auth_upgrade_session():
+    """Issue modern credentials to an already logged-in legacy app install.
+
+    This is the zero-logout bridge for the installed base: the current AT
+    bearer is validated exactly as before, then exchanged for an AXA/AXR pair.
+    The AT account key is not rotated and old builds remain functional.
+    """
+    legacy = _request_bearer_token()
+    if not legacy or not legacy.startswith('AT-'):
+        return jsonify({'ok': False, 'error': 'legacy_token_required'}), 401
+    validation = _validate_token(legacy)
+    if validation.state is _TokenValidationState.UNAVAILABLE:
+        return _auth_store_unavailable_response()
+    if validation.state is not _TokenValidationState.VALID or not validation.email:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    user = _auth_get_user(validation.email)
+    if not user or not hmac.compare_digest(str(user.get('token') or ''), legacy):
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    return jsonify(_auth_success_payload(validation.email, user))
+
+
+@app.route('/api/auth/refresh-session', methods=['POST'])
+def auth_refresh_session():
+    body = request.get_json(silent=True) or {}
+    state, issued = _auth_session_refresh(body.get('refresh_token'))
+    if state == 'unavailable':
+        return _auth_store_unavailable_response()
+    if state != 'valid' or not issued:
+        error = 'refresh_token_expired' if state == 'expired' else 'invalid_refresh_token'
+        return jsonify({'ok': False, 'error': error}), 401
+    user_token = issued.pop('_user_token', None)
+    user_id = issued.pop('_user_id', None)
+    email, user = _auth_find_user_by('token', user_token)
+    if not email or not user:
+        return jsonify({'ok': False, 'error': 'invalid_token'}), 401
+    payload = {
+        'ok': True,
+        'token': user_token,
+        'email': email,
+        'user_id': user_id or user.get('user_id'),
+    }
+    payload.update(issued)
+    return jsonify(payload)
+
+
+@app.route('/api/auth/revoke-session', methods=['POST'])
+def auth_revoke_session():
+    """Revoke the current modern session. Legacy logout remains local-only."""
+    body = request.get_json(silent=True) or {}
+    try:
+        from flask import g as _g
+        access_hash = getattr(_g, 'aerox_access_token_hash', None)
+    except Exception:
+        access_hash = None
+    refresh_token = body.get('refresh_token')
+    # Idempotent by design: logout must never get stuck on a missing/already
+    # rotated session. The endpoint still requires some credential material.
+    if not access_hash and not refresh_token:
+        return jsonify({'ok': False, 'error': 'session_token_required'}), 400
+    _auth_session_revoke(access_hash=access_hash, refresh_token=refresh_token)
+    return jsonify({'ok': True})
 
 
 # Apple JWKS-Cache (15 Min TTL — Apple rotiert Keys selten)
@@ -36466,7 +36843,12 @@ def auth_apple():
     # SCALE-FIX: Single-Row-Lookup by apple_sub statt Full-Table-Scan.
     ex_email, ex_user = _auth_find_user_by('apple_sub', apple_sub)
     if ex_user is not None:
-        return jsonify({'ok': True, 'token': ex_user['token'], 'email': ex_email})
+        ex_user['last_login_at'] = datetime.now(timezone.utc).isoformat()
+        try:
+            _auth_upsert_user(ex_email, ex_user)
+        except Exception:
+            pass
+        return jsonify(_auth_success_payload(ex_email, ex_user))
     # Existing user via email match: NICHT automatisch linken — Sicherheit.
     # Jemand koennte sonst per Apple-Sign-In Zugriff auf einen fremden
     # Email/Password-Account erlangen, falls die Email zufaellig matched.
@@ -36498,7 +36880,7 @@ def auth_apple():
                 json.dump({'profile': {'name': name}, '_updated_at': datetime.now().isoformat()}, f)
         except Exception:
             pass
-    return jsonify({'ok': True, 'token': token, 'email': email})
+    return jsonify(_auth_success_payload(email, rec))
 
 
 def _send_password_reset_email(to_email, reset_token):
@@ -36626,6 +37008,9 @@ def auth_reset():
     # identisch zum alten Bulk-Save (gepoppte Spalten bleiben SB-seitig stehen,
     # Replay-Schutz greift über reset_used_at — unverändert).
     _auth_upsert_user(email, user)
+    # A password reset is an account-recovery boundary: every modern device
+    # session is revoked. Legacy AT clients stay compatible during rollout.
+    _auth_session_revoke_all(user.get('token'))
     app.logger.info(f'[auth-reset] PW erfolgreich gesetzt für {email[:3]}***')
     return jsonify({'ok': True})
 
@@ -36655,6 +37040,7 @@ def auth_set_password():
             return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
     user['password_hash'] = _password_hash(new_pw)
     _auth_upsert_user(email, user)
+    _auth_session_revoke_all(user.get('token'))
     app.logger.info(f'[auth-setpw] Passwort gesetzt für {email[:3]}***')
     # E-Mail zurückgeben — bei Apple-Konten oft die Private-Relay-Adresse;
     # die UI zeigt sie an, damit klar ist, WOMIT man sich künftig anmeldet.
@@ -36708,6 +37094,7 @@ def auth_delete_account():
         return jsonify({'ok': False, 'error': 'auth_required'}), 400
 
     token = user.get('token')
+    _auth_session_revoke_all(token)
     # P0 GDPR/Data-Loss-Fix (2026-06-08): NUR den eigenen Account-Row gezielt
     # löschen — KEIN _auth_save(users) Bulk-Upsert mehr. Der alte Bulk-Upsert des
     # gesamten Rest-Dicts hat unter gleichzeitigen Deletes (multi-instance) Rows
@@ -40616,8 +41003,20 @@ def _fold_codeshare_flights(flights, cs_map):
             return (0 if e.get('obs') == 'both' else 1,
                     0 if e.get('delay_known') else 1)
         # Repräsentant: der Eintrag, dessen Nummer die Operating-Nummer der
-        # Gruppe ist; sonst der plausibelste (Operating-Rang) Eintrag.
-        rep_src = next((e for e, n in members if n == k), None)
+        # Gruppe ist; bei derselben Airline aber die benutzerlesbare IATA-
+        # Schreibweise behalten (LH42 statt interner ICAO-Nummer DLH42). Die
+        # alte Logik machte daraus außerdem `airline=DL` und zerbrach dadurch
+        # Detailsuche, History-Match und Live-Tracking.
+        _km = re.match(r'^[A-Z]{3}(\d{1,4}[A-Z]?)$', k or '')
+        _same_number_iata = []
+        if _km:
+            for _e, _n in members:
+                _nm = re.match(r'^(?:[A-Z]{2}|[A-Z]\d|\d[A-Z])(\d{1,4}[A-Z]?)$', _n or '')
+                if _nm and _nm.group(1) == _km.group(1):
+                    _same_number_iata.append(_e)
+        rep_src = (min(_same_number_iata, key=_data_rank)
+                   if _same_number_iata else
+                   next((e for e, n in members if n == k), None))
         if rep_src is None:
             rep_src = min((e for e, _ in members),
                           key=lambda e: _op_rank(_fn_norm(e.get('flight'))))
@@ -40653,6 +41052,27 @@ def _fold_codeshare_flights(flights, cs_map):
         out.append(rep)
     out.sort(key=lambda f: (f.get('sched') or ''))
     return out
+
+
+def _route_entry_track_keys(entry, cs_map):
+    """Alle Flugnummer-Aliase, unter denen ein gefalteter Flug getrackt sein kann.
+
+    `aircraft_track.flight` kann die IATA- oder ICAO-Schreibweise tragen. Nach
+    der Codeshare-Faltung darf `has_track` deshalb nicht nur den sichtbaren
+    Repräsentanten prüfen (LH42), sondern auch `also_as` und das Warehouse-
+    Operating-Alias (DLH42).
+    """
+    keys = set()
+    raw_values = [entry.get('flight')] + list(entry.get('also_as') or [])
+    for raw in raw_values:
+        n = _fn_norm(raw)
+        if not n:
+            continue
+        keys.add(n)
+        op = cs_map.get(n)
+        if op:
+            keys.add(_fn_norm(op))
+    return keys
 
 
 # RESPONSE-MEMO für /api/ax/route-history (Perf-Fund 174, Audit 2026-07-15):
@@ -41040,7 +41460,7 @@ def ax_route_history(frm, to):
             # keinen bestehenden Consumer.
             trk_set = trk_prefetch or set()
             for e in flights:
-                e['has_track'] = bool(_fn_norm(e.get('flight')) in trk_set)
+                e['has_track'] = bool(_route_entry_track_keys(e, cs_map) & trk_set)
             # Hinweis: arr-Zeilen tragen die ANKUNFTS-Zeit als sched — die
             # Sortierung bleibt chronologisch-genug fürs Tages-Listing.
             flights.sort(key=lambda f: (f.get('sched') or ''))
@@ -46343,13 +46763,13 @@ def _flight_sched_passed(f, now_local):
 # WIRKLICH kennt:
 #   (a) es gab ein Delay-Signal (esti gesetzt ODER max_delay > 0),
 #   (b) die Row wurde mit IST-Status beobachtet (departed/landed/„Pünktlich"),
-#   (c) der Flug war bis sched+_DELAY_KNOWN_CONFIRM_MIN noch im LIVE-Feed
-#       sichtbar ohne esti → echtes „pünktlich" (nur zur Beobachtungszeit
-#       feststellbar — siehe _merge_into_delay_store bzw. src=='live' in
-#       _row_delay_known; aus alten SB-Rows NICHT rekonstruierbar).
 # Cancelled zählt immer als bekannt. Alles andere = UNBEKANNT → die Read-Seite
-# liefert delay_min: null statt 0 (iOS zeigt „keine Daten" statt „Pünktlich").
-_DELAY_KNOWN_CONFIRM_MIN = 20   # Min. nach sched: „noch sichtbar ohne esti" = bestätigt pünktlich
+# liefert delay_min: null statt 0 (iOS zeigt „keine Daten“ statt „Pünktlich“).
+# WICHTIG: Eine planartige Zeile, die nach Soll-Abflug noch auf dem Board steht,
+# ist gerade KEIN On-Time-Beleg. LH42 stand um 10:05 noch ohne Ist-Zeit auf
+# „Geplant“ (Soll 09:35, tatsächlich off-block 10:01); die frühere +20-min-
+# Heuristik machte daraus `delay_known=true, delay=0` und damit „Pünktlich“.
+# Null ist nur mit esti/Ist-Status oder explizitem Quellensignal belastbar.
 
 # IST-Status-Marker (substring, lowercase) — Abflug- vs. Ankunfts-Kontext ist
 # KRITISCH: bei einer ANKUNFTS-Row heißt „departed/unterwegs" nur, dass der
@@ -46399,10 +46819,9 @@ def _obs_delay_known(max_delay, cancelled, esti, status, is_arr, flag=None):
 def _row_delay_known(row, is_arr, src=None, ap=None):
     """delay_known einer ZEILE im Row-Builder-/Board-Format. Obs-Zeilen tragen
     das Flag bereits ('delay_known' aus _departed_rows_from_store /
-    _board_rows_from_obs_for_date); Live-Zeilen werden aus ihren Signalen
-    beurteilt + Kriterium (c): noch im Live-Feed sichtbar nach sched+Puffer
-    ohne esti = bestätigt pünktlich (NUR src=='live' — für Warehouse-Rows wäre
-    „jetzt > sched" trivialerweise immer wahr und damit gelogen)."""
+    _board_rows_from_obs_for_date); Live-Zeilen werden ausschließlich aus
+    belastbaren Signalen beurteilt. Die bloße Zeit nach Soll-Abflug beweist
+    weder Abflug noch Pünktlichkeit."""
     if row is None:
         return False
     flag = row.get('delay_known')
@@ -46411,15 +46830,6 @@ def _row_delay_known(row, is_arr, src=None, ap=None):
     if _obs_delay_known(row.get('delay_min'), row.get('cancelled'),
                         row.get('esti'), row.get('status'), is_arr):
         return True
-    if src == 'live':
-        try:
-            from datetime import timedelta as _tdk
-            sdt = _parse_local_iso(row.get('sched'))
-            nl = _airport_local_now(ap) if ap else None
-            if sdt is not None and nl is not None:
-                return nl >= sdt + _tdk(minutes=_DELAY_KNOWN_CONFIRM_MIN)
-        except Exception:
-            pass
     return False
 
 
@@ -47122,25 +47532,17 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         if merged_meta:
             _delay_store_meta[key] = merged_meta
         # DATEN-EHRLICHKEIT (LH400-Bug): wissen wir den Delay WIRKLICH? (a) Delay-
-        # Signal (esti/delay>0), (b) IST-Status (departed/landed/Pünktlich), (c)
-        # noch im Live-Feed sichtbar nach sched+Puffer ohne esti → bestätigt
-        # pünktlich. Nur-vor-Abflug-gesehen ohne Signal = UNBEKANNT. Das Flag lebt
+        # Signal (esti/delay>0), (b) IST-Status (departed/landed/Pünktlich).
+        # Nur-vor-Abflug bzw. nach Soll weiter „Geplant“ ohne Signal = UNBEKANNT.
+        # Das Flag lebt
         # im Meta-Store (kein DDL — airport_delay_obs hat keine jsonb-Spalte) und
         # fließt über das meta-Dict auch durch den Requeue-Puffer; SB-persistierte
         # Rows werden read-seitig aus esti/status/delay/cancelled rekonstruiert.
-        # Kriterium (c) ist dort ehrlich NICHT rekonstruierbar → nach einem
-        # Restart degradiert so eine Row konservativ auf „unbekannt" (nie
-        # fälschlich „bekannt"). Sticky: einmal True, nie wieder False.
+        # Sticky: einmal True, nie wieder False.
         if not merged_meta.get('delay_known'):
             dk = _obs_delay_known(delay, cancelled, merged_meta.get('esti'),
                                   merged_meta.get('status'),
                                   airport.endswith('#ARR'))
-            if not dk and now_local is not None:
-                sdt_k = _parse_local_iso(sched)
-                if sdt_k is not None:
-                    from datetime import timedelta as _tdk
-                    dk = now_local >= sdt_k + _tdk(
-                        minutes=_DELAY_KNOWN_CONFIRM_MIN)
             merged_meta['delay_known'] = bool(dk)
             _delay_store_meta[key] = merged_meta
         # Nur bereits abgeflogene Flüge sind echte Tages-Beobachtungen. Zukunft NICHT
@@ -47160,7 +47562,12 @@ def _merge_into_delay_store(flights, date_str, airport='FRA'):
         # engen Post-Sched-Fenster nicht erwischte, ganz fehlten → Stichprobe fiel
         # unter MIN_SAMPLE → „Daten unvollständig". Jetzt symmetrisch: erst ab
         # Abflug erfassen, dann Delay wachsen lassen ODER on-time (0) setzen.
-        if passed and not cancelled:
+        # Sollzeit allein ist kein Abflugbeleg. Eine planartige 0-Zeile nach
+        # sched (LH42: 09:35, noch „Geplant“ um 10:05) darf weder persistiert
+        # noch als pünktlich gezählt werden. Erst ein echtes Delay-/Ist-Signal
+        # verdient den Store-Eintrag; der Finalizer kann fehlende Signale später
+        # per Gegenseite/ADS-B sauber auflösen.
+        if passed and not cancelled and merged_meta.get('delay_known'):
             if delay and delay > 0:
                 prev = _delay_store.get(key, 0)
                 if delay > prev:

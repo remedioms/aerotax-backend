@@ -934,24 +934,51 @@ def test_altbestand_vergangener_pendings_heilt_sich_selbst(tmp_path):
     assert r.get_json()['changes_count'] == 0        # gar kein neuer Diff
     data = json.loads(changes_file.read_text())
     kinds = sorted((c['datum'], c['kind']) for c in data['pending'])
-    assert kinds == [(d_past, 'removed'), (d_fut, 'modified')]
-    assert [c['datum'] for c in data['history']] == [d_past]
-    assert data['history'][0]['status'] == 'past_auto'
+    assert kinds == [(d_fut, 'modified')]
+    assert sorted((c['datum'], c['kind']) for c in data['history']) == [
+        (d_past, 'modified'), (d_past, 'removed')]
+    assert all(c['status'] == 'past_auto' for c in data['history'])
     assert push.call_count == 0
 
 
-def test_past_added_und_removed_bleiben_pending(tmp_path):
-    # Nur 'modified' wird archiviert. Ein NACHGETRAGENER oder GESTRICHENER
-    # Dienst in der Vergangenheit ist für Logbuch/Steuer relevant und bleibt
-    # eine offene Kenntnisnahme. ('added' meldet der Diff nur für heute…+10 d,
-    # darum hier über 'removed' geprüft.)
+def test_past_added_und_removed_landen_ohne_badge_im_verlauf(tmp_path):
+    # Vergangene Änderungen bleiben für Logbuch/Steuer im Verlauf erhalten,
+    # sind aber nicht mehr handlungsrelevant: kein Pending, Badge oder lokaler
+    # iOS-Push. ('added' meldet der Diff nur für heute…+10 d, darum hier über
+    # 'removed' geprüft.)
     d_past = (_hb_today() - timedelta(days=1)).isoformat()
     r, push, changes_file = _post(tmp_path, old=[_tag(d_past)], new=[])
     assert r.status_code == 200
     data = json.loads(changes_file.read_text())
-    assert len(data['pending']) == 1
-    assert data['pending'][0]['kind'] == 'removed'
+    assert data['pending'] == []
+    assert len(data['history']) == 1
+    assert data['history'][0]['kind'] == 'removed'
+    assert data['history'][0]['status'] == 'past_auto'
     assert push.call_count == 0                   # Push-Gate bleibt Vergangenheit
+
+
+def test_antje_neun_alte_entfernungen_erzeugen_keine_notification(tmp_path):
+    """Regression 06.08.: 9 von 44 Tagen verschwanden kurzzeitig.
+
+    Das liegt knapp unter dem Massendegradations-Gate (9 < 10 und 9/44 < 25%)
+    und bleibt deshalb als historischer Diff nachvollziehbar. Trotzdem darf
+    kein Eintrag pending werden: Der iOS-BG-Poll baut seine lokale
+    „N Änderungen"-Notification aus genau dieser Pending-Zahl.
+    """
+    start = _hb_today() - timedelta(days=35)
+    old = [_tag((start + timedelta(days=i)).isoformat()) for i in range(44)]
+    new = old[9:]
+
+    r, push, changes_file = _post(tmp_path, old=old, new=new)
+
+    assert r.status_code == 200
+    assert r.get_json()['changes_count'] == 9
+    data = json.loads(changes_file.read_text())
+    assert data['pending'] == []
+    assert len(data['history']) == 9
+    assert {c['kind'] for c in data['history']} == {'removed'}
+    assert {c['status'] for c in data['history']} == {'past_auto'}
+    assert push.call_count == 0
 
 
 def test_pickup_flip_weder_verlauf_noch_push(tmp_path):
