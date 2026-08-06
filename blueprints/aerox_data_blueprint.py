@@ -526,7 +526,16 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     # unverändert pro Tier.
     rows = []
     if fn:
-        rows = _query('flight', fn)
+        # Zero-Padding-robust AUCH für die Flugnummer (Owner 2026-08-06, Tibor
+        # LH43 HAJ→FRA „Live-Position gerade nicht verfügbar"): das Roster
+        # liefert LH043, der FR24-gRPC-Store speichert LH43 — der exakte
+        # eq-Match verfehlte, und der Callsign-Tier kann bei Alphanumerik-
+        # Funknamen (DLH8XA) NIE treffen. Gleicher Varianten-Helfer wie beim
+        # Callsign (Prefix bleibt, nur der Zahlen-Suffix variiert).
+        for _fn_cand in _callsign_zero_variants(fn):
+            rows = _query('flight', _fn_cand)
+            if rows:
+                break
     if not rows and cs:
         # Zero-Padding-robust (Owner 2026-07-15, LX0042 „keine live position"):
         # der abgeleitete Funkname kann gestrippt (SWR42) ODER gepaddet (SWR042)

@@ -157,3 +157,59 @@ def test_aircraft_live_pos_callsign_retry_both_forms(monkeypatch):
     assert pos is not None
     assert reg == 'HB-JCA'
     assert od == ('ZRH', 'LHR')
+
+
+def test_aircraft_live_pos_flight_number_retry_both_forms(monkeypatch):
+    """FLUGNUMMERN-Tier zero-robust (Owner 2026-08-06, Tibor LH43 HAJ→FRA
+    „Live-Position gerade nicht verfügbar"): das Roster liefert LH043, der
+    FR24-gRPC-Store speichert LH43 — und der Callsign-Tier kann bei
+    Alphanumerik-Funknamen (DLH8XA) strukturell NIE treffen. Der Flug-Tier
+    muss deshalb selbst beide Zero-Formen probieren."""
+    monkeypatch.setattr(axd, '_nas_live_pos', lambda **kw: None)
+
+    class FakeQuery:
+        def __init__(self, store):
+            self.store = store
+            self._col = None
+            self._val = None
+
+        def select(self, *a, **k):
+            return self
+
+        def eq(self, col, val):
+            if col in ('callsign', 'flight', 'reg'):
+                self._col, self._val = col, val
+            return self
+
+        def gt(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
+            return self
+
+        def execute(self):
+            rows = [r for r in self.store
+                    if r.get(self._col) == self._val] if self._col else []
+
+            class R:
+                def __init__(self, data):
+                    self.data = data
+            return R(rows)
+
+    store = [{'callsign': 'DLH8XA', 'flight': 'LH43', 'reg': 'DAIZZ',
+              'reg_display': 'D-AIZZ', 'lat': 51.0, 'lon': 9.3, 'track': 200,
+              'gs_kt': 380, 'alt_ft': 23000, 'origin': 'HAJ', 'dest': 'FRA',
+              'ac_type': 'A320', 'on_ground': False,
+              'seen_ts': '2026-07-16T10:00:00Z',
+              'updated_at': '2999-01-01T00:00:00Z'}]
+
+    class FakeSB:
+        def table(self, name):
+            return FakeQuery(store)
+
+    monkeypatch.setattr(axd, '_sb', lambda: FakeSB())
+
+    pos, od, reg, ac = axd._aircraft_live_pos(flight='LH043')
+    assert pos is not None
+    assert reg == 'D-AIZZ'
+    assert od == ('HAJ', 'FRA')
