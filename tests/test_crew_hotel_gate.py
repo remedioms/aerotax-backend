@@ -63,3 +63,40 @@ def test_viewer_helper_fails_closed_on_error(monkeypatch):
     monkeypatch.setattr(app, '_ical_briefings_load', boom)
     # Fehler → ('', False) → Crew-Hotels werden ausgeblendet (nie geleakt)
     assert app._viewer_airline_and_calendar('AT-x') == ('', False)
+
+
+def test_condor_hotel_requires_station_in_own_roster(monkeypatch):
+    monkeypatch.setattr(
+        app, '_profile_load',
+        lambda t: {'profile': {'airline': 'Condor'}})
+    monkeypatch.setattr(app, '_ical_briefings_load', lambda t: {
+        '2099-07-03': {
+            'ical_imported_at': '2099-06-01T00:00:00',
+            'ical_layover_ort': 'JFK',
+            'ical_summary': 'LAYOVER',
+            'ical_location': 'JFK',
+        },
+    })
+    condor = [{
+        'id': 5, 'category': 'sleep', 'author_airline': 'Condor',
+        'title': 'CFG crew hotel',
+    }]
+    assert _ids(app._filter_crew_hotels(condor, 'AT-x', iata='JFK')) == [5]
+    assert app._filter_crew_hotels(condor, 'AT-x', iata='LAX') == []
+    assert app._filter_crew_hotels(condor, 'AT-x') == []
+
+
+def test_condor_old_roster_history_does_not_keep_hotel_access(monkeypatch):
+    monkeypatch.setattr(app, '_ical_briefings_load', lambda t: {
+        '2026-06-01': {
+            'ical_imported_at': '2026-06-01T00:00:00',
+            'ical_layover_ort': 'JFK',
+        },
+        '2026-08-10': {
+            'ical_imported_at': '2026-08-01T00:00:00',
+            'ical_summary': 'Pickup 13:00',
+            'ical_location': 'LAX',
+        },
+    })
+    assert app._condor_roster_hotel_iatas(
+        'AT-x', today='2026-08-06') == {'LAX'}

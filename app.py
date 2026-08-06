@@ -31287,7 +31287,11 @@ def _votes_save_disk(token, votes):
 #    Keine Airline mischt mit einer anderen — Swiss-Crewhotels nur für Swiss-Crew
 #    mit Kalender, Condor nur für Condor, usw. Generische Tipps (food/sight/…) und
 #    'sleep'-Einträge OHNE author_airline bleiben crowdsourced sichtbar.
+#    ZUSATZ CONDOR (Datenschutz 2026-08-06): gleiche Airline allein reicht dort
+#    nicht mehr. Die konkrete Hotelstation muss als eigener Layover/Pickup im
+#    aktuellen/kommenden Roster stehen (plus 14 Tage Korrektur-Rueckblick).
 _CREW_HOTEL_CATS = {'sleep'}
+_CONDOR_CREW_HOTEL_LOOKBACK_DAYS = 14
 
 
 def _viewer_airline_and_calendar(token):
@@ -31310,11 +31314,72 @@ def _viewer_airline_and_calendar(token):
     return (airline, has_cal)
 
 
-def _filter_crew_hotels(recs, token):
+def _condor_roster_hotel_iatas(token, today=None):
+    """Condor-Hotelstationen, die der User selbst im Roster hat.
+
+    Ausschliesslich echte iCal-Importe zaehlen. Alte Historie berechtigt nicht
+    dauerhaft zum airlineweiten Hotelverzeichnis; der kurze Rueckblick bleibt
+    fuer Korrekturen direkt nach einem Umlauf erhalten. Fail-closed bei jeder
+    unklaren oder fehlenden Rosterinformation.
+    """
+    if not token:
+        return set()
+    try:
+        today_s = str(today or _crew_ops_today())[:10]
+        cutoff = (datetime.fromisoformat(today_s).date()
+                  - timedelta(days=_CONDOR_CREW_HOTEL_LOOKBACK_DAYS))
+        briefings = _ical_briefings_load(token) or {}
+    except Exception:
+        return set()
+
+    allowed = set()
+    for datum, day in briefings.items():
+        if not isinstance(day, dict) or not day.get('ical_imported_at'):
+            continue
+        try:
+            if datetime.fromisoformat(str(datum)[:10]).date() < cutoff:
+                continue
+        except Exception:
+            continue
+
+        # Der Importer synthetisiert fuer Condor aus den umliegenden Legs ein
+        # LAYOVER-Event und persistiert dessen Station hier. Pickup ist die
+        # zweite belastbare Quelle fuer einen eigenen Hotelaufenthalt.
+        candidates = [
+            day.get('ical_layover_ort'),
+            (day.get('reader_facts') or {}).get('layover_ort')
+            if isinstance(day.get('reader_facts'), dict) else None,
+        ]
+        summary = str(day.get('ical_summary') or '').upper()
+        if ((day.get('ical_klass') or '').lower() == 'hotel_layover'
+                or 'LAYOVER' in summary or 'PICKUP' in summary
+                or re.search(r'(^|\s)P/U(?:\s|:|$)', summary)):
+            location_iatas = set(re.findall(
+                r'\b[A-Z]{3}\b', str(day.get('ical_location') or '').upper()))
+            # Bei einer gemergten Location wie "JFK, JFK - FRA" waere FRA
+            # bloss das Flugziel, nicht automatisch ein Hotelaufenthalt. Nur
+            # ein eindeutiger Location-Code darf deshalb als Fallback dienen.
+            if len(location_iatas) == 1:
+                candidates.extend(location_iatas)
+        for value in candidates:
+            iata = str(value or '').strip().upper()
+            if len(iata) == 3 and iata.isalpha():
+                allowed.add(iata)
+    return allowed
+
+
+def _filter_crew_hotels(recs, token, iata=None):
     """Entfernt airline-vertrauliche Crew-Hotels, die der Betrachter NICHT sehen darf.
     Fail-CLOSED: ohne passende Airline + gültigen Kalender werden fremde/alle
-    airline-getaggten Crew-Hotels ausgeblendet (Sicherheit vor Vollständigkeit)."""
+    airline-getaggten Crew-Hotels ausgeblendet (Sicherheit vor Vollständigkeit).
+    Condor ist zusaetzlich stationsbezogen: nur ein im eigenen Roster belegter
+    Hotelaufenthalt berechtigt zum Abruf dieser Station."""
     airline, has_cal = _viewer_airline_and_calendar(token)
+    viewer_airline_key = _canonical_airline_key(airline)
+    requested_iata = str(iata or '').strip().upper()
+    condor_iatas = (_condor_roster_hotel_iatas(token)
+                    if viewer_airline_key == 'CONDOR' else None)
+
     def _ok(r):
         if (r.get('category') or '').lower() not in _CREW_HOTEL_CATS:
             return True  # kein Crew-Hotel → crowdsourced sichtbar
@@ -31328,7 +31393,14 @@ def _filter_crew_hotels(recs, token):
         if not aa:
             return True  # generischer Schlaf-Tipp ohne Airline-Bezug → sichtbar
         # Airline-vertrauliches Crew-Hotel: nur gleiche Airline MIT gültigem Kalender
-        return bool(airline and has_cal and aa == airline)
+        same_airline = (aa == airline)
+        if viewer_airline_key == 'CONDOR':
+            same_airline = _canonical_airline_key(aa) == 'CONDOR'
+        if not (airline and has_cal and same_airline):
+            return False
+        if viewer_airline_key == 'CONDOR':
+            return bool(requested_iata and requested_iata in condor_iatas)
+        return True
     return [r for r in recs if _ok(r)]
 
 
@@ -31375,7 +31447,7 @@ def get_layover_recs(iata):
         recs = [r for r in recs if r.get('category') == cat]
     token = _request_token()
     # SICHERHEITS-GATE: fremde Airline-Crewhotels raus (Airline + gültiger Kalender).
-    recs = _filter_crew_hotels(recs, token)
+    recs = _filter_crew_hotels(recs, token, iata=iata)
     recs.sort(key=lambda r: -(r.get('vote_score') or 0))
     # Apply voted-by-me
     voted = _votes_load(token) if token else {}
@@ -31434,6 +31506,11 @@ def _canonical_airline_key(airline):
     # fielen z.B. „Air ItaXY"-Fantasienamen mit hinein).
     if 'ita airways' in v or 'alitalia' in v or v in ('az', 'ita', 'ity'):
         return 'ITA AIRWAYS'
+    # Condor: Profil-Freitext und operative IATA-/ICAO-Kuerzel muessen im
+    # selben Hotel-Bucket landen; die Roster-Berechtigung wird spaeter pro
+    # Station geprueft.
+    if 'condor' in v or v in ('de', 'cfg'):
+        return 'CONDOR'
     # Aerologic (3V/BOX, 2026-08-05, Anfrage Aerologic-Crew Philipp): EIGENER
     # Bucket — trotz der Lufthansa-Beteiligung (Cargo-Joint-Venture DHL/LH) ist
     # es ein eigener Arbeitgeber mit eigener Basis (Leipzig LEJ) und eigenen
@@ -31459,6 +31536,7 @@ _CANONICAL_AIRLINE_LABELS = {
     'LUFTHANSA CITY': 'Lufthansa City',
     'SWISS': 'SWISS',
     'ITA AIRWAYS': 'ITA Airways',
+    'CONDOR': 'Condor',
     # Damit „3V"/„BOX" als „Aerologic" benannt werden statt als roher Code.
     'AEROLOGIC': 'Aerologic',
 }
@@ -31538,12 +31616,13 @@ def _crew_hotel_admin_ok():
 def ax_crew_hotels():
     """Crew-Hotel-Verzeichnis für die Airline des anfragenden Tokens. Airline-
     getrennt: ein SWISS-User bekommt NIE die LH-Liste. Ohne erkannte Airline →
-    leer (kein falscher Default). iOS cached das + fällt offline auf sein Bundle
-    (nur Lufthansa) zurück."""
+    leer (kein falscher Default). Condor bekommt zusaetzlich nur Stationen aus
+    dem eigenen Roster. iOS cached das + faellt offline auf sein Bundle (nur
+    Lufthansa) zurueck."""
     token = _request_token()
-    raw_airline, _ = _viewer_airline_and_calendar(token)
+    raw_airline, has_calendar = _viewer_airline_and_calendar(token)
     airline = _canonical_airline_key(raw_airline)
-    if not airline:
+    if not airline or (airline == 'CONDOR' and not has_calendar):
         return jsonify({'airline': '', 'count': 0, 'hotels': []})
     hotels = _crew_hotel_dir_serve(airline)
     # EIGENE offene Vorschläge SOFORT einblenden (Owner 2026-07-19: „für die
@@ -31562,6 +31641,10 @@ def ax_crew_hotels():
                                if (m.get('iata'), (m.get('hotel') or '').lower()) not in seen]
     except Exception:
         pass
+    if airline == 'CONDOR':
+        allowed_iatas = _condor_roster_hotel_iatas(token)
+        hotels = [h for h in hotels
+                  if str(h.get('iata') or '').strip().upper() in allowed_iatas]
     return jsonify({'airline': airline, 'count': len(hotels), 'hotels': hotels})
 
 
@@ -31571,7 +31654,7 @@ def ax_crew_hotels_suggest():
     dem Profil. Owner bestätigt später (kein direkter Live-Effekt = kein
     Vandalismus). Doppelter Vorschlag → Vote hoch statt Duplikat."""
     token = _request_token()
-    raw_airline, _ = _viewer_airline_and_calendar(token)
+    raw_airline, has_calendar = _viewer_airline_and_calendar(token)
     airline = _canonical_airline_key(raw_airline)
     if not token or not airline:
         return jsonify({'ok': False, 'error': 'no_airline'}), 400
@@ -31587,6 +31670,10 @@ def ax_crew_hotels_suggest():
         return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
     if not hotel or len(hotel) > 160 or len(hotel) < 3:
         return jsonify({'ok': False, 'error': 'invalid_hotel'}), 400
+    if (airline == 'CONDOR'
+            and (not has_calendar
+                 or iata not in _condor_roster_hotel_iatas(token))):
+        return jsonify({'ok': False, 'error': 'station_not_in_own_roster'}), 403
     base = (body.get('base') or '').strip().upper() or None
     try:
         tmin = max(0, min(600, int(body.get('transfer_min') or 0)))
@@ -32373,7 +32460,7 @@ def discover_layover_recs(token):
         # Feed (recsForRealIATA) sah frisch gepostete Tipps nicht (Tibor/BLL).
         recs = _recs_load(iata)
         # SICHERHEITS-GATE (wie get_layover_recs): fremde Airline-Crewhotels raus.
-        recs = _filter_crew_hotels(recs, token)
+        recs = _filter_crew_hotels(recs, token, iata=iata)
         top = sorted(recs, key=lambda r: -(r.get('vote_score') or 0))[:3]
         if top:
             out.append({'iata': iata, 'top_recs': _public_layover_recs(top)})
@@ -53439,6 +53526,94 @@ def _normalize_feed_scheme(url):
     return url
 
 
+def _condor_calendar_privacy_required(token, url=''):
+    """True fuer Condor-Roster, fail-safe ueber Feed-Host ODER Profil.
+
+    Der Host-Gate deckt den ersten Connect ab, bevor das Profil sicher gelesen
+    werden kann; das Profil-Gate deckt geraeteseitige ``ics_text``-Uploads ab,
+    bei denen absichtlich gar keine Feed-URL zum Server kommt.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(str(url or '')).hostname or '').lower()
+        if (host == 'cube.aero' or host.endswith('.cube.aero')
+                or 'condor' in host):
+            return True
+    except Exception:
+        pass
+    try:
+        payload = _profile_load(token) or {}
+        for src in ((payload.get('profile') or {}), payload):
+            if _canonical_airline_key(src.get('airline')) == 'CONDOR':
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _condor_ics_privacy_sanitize(raw):
+    """Minimiert Condor-iCal vor JEDEM Parser-/Persistenzpfad.
+
+    Condor liefert Crew-Personalnummern, Namen und das konkrete Crew-Hotel im
+    DESCRIPTION-Freitext. Alte App-Builds koennen diesen Text noch roh senden
+    oder den Server die URL abrufen lassen. Deshalb ist der Backend-Filter die
+    zweite, zwingende Schutzschicht: Crew-/Kontakt-Felder weg, UID gehasht und
+    LOCATION nur als IATA-Station/Route erhalten. Pure + testbar.
+    """
+    if not isinstance(raw, str) or not raw:
+        return raw
+
+    physical = raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    logical = []
+    for line in physical:
+        if line[:1] in (' ', '\t') and logical:
+            logical[-1] += line[1:]
+        elif line:
+            logical.append(line)
+
+    forbidden = {
+        'DESCRIPTION', 'X-ALT-DESC', 'COMMENT', 'CONTACT', 'ATTENDEE',
+        'ORGANIZER', 'REQUEST-STATUS', 'X-WR-CALNAME', 'X-WR-CALDESC',
+    }
+    out = []
+    in_event = False
+    for line in logical:
+        upper = line.upper()
+        if upper == 'BEGIN:VEVENT':
+            in_event = True
+            out.append('BEGIN:VEVENT')
+            continue
+        if upper == 'END:VEVENT':
+            in_event = False
+            out.append('END:VEVENT')
+            continue
+        if ':' not in line:
+            out.append(line)
+            continue
+        lhs, value = line.split(':', 1)
+        name = lhs.split(';', 1)[0].upper()
+        if name in forbidden:
+            continue
+        if in_event and name == 'UID':
+            digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:32]
+            out.append(f'UID:aerox-condor-{digest}')
+            continue
+        if in_event and name == 'LOCATION':
+            decoded = (value.replace('\\n', ' ').replace('\\N', ' ')
+                       .replace('\\,', ',').strip().upper())
+            route = re.search(
+                r'\b([A-Z]{3})\s*(?:-|–|—|→|>)\s*([A-Z]{3})\b',
+                decoded)
+            if route:
+                out.append(f'LOCATION:{route.group(1)} - {route.group(2)}')
+            elif re.fullmatch(r'[A-Z]{3}', decoded):
+                out.append(f'LOCATION:{decoded}')
+            # Hoteladresse/sonstiger Freitext wird ersatzlos verworfen.
+            continue
+        out.append(line)
+    return '\r\n'.join(out) + '\r\n'
+
+
 _CALENDAR_FEED_MAX_BYTES = 1024 * 1024
 _CALENDAR_FEED_MAX_REDIRECTS = 3
 
@@ -53593,6 +53768,9 @@ def import_calendar_feed(token):
     if ics_text_2_direct and len(ics_text_2_direct) > 1_000_000:
         return jsonify({'ok': False, 'error': 'response_too_large'}), 413
     url = _normalize_feed_scheme(_sanitize_feed_url(body.get('url') or ''))
+    # Condor-Datenschutz: neue Apps senden bereits minimierten Text. Diese
+    # serverseitige Erkennung schuetzt zusaetzlich alte Builds und URL-Importe.
+    _condor_private_ics = _condor_calendar_privacy_required(token, url=url)
     # DISCOVER-GUARD (Echte-User-Audit 2026-07-22): 4 Discover-Crews fuegten
     # crewaccess.cms.discover.aero-URLs ein — das Portal liefert dort KEIN
     # iCal (Login-HTML), der Import meldete still "ok" mit 0 Events und der
@@ -53654,7 +53832,7 @@ def import_calendar_feed(token):
         text, ferr = ics_text_direct, None
     else:
         text, ferr = _fetch_calendar_feed_text(url)
-    _shadow_text_1 = text if text is not None else None
+    _shadow_text_1 = None
     if ferr in ('bad_url', 'internal_host_blocked'):
         # Format-/SSRF-Fehler des Primär-Links bleiben harte 400er (wie bisher) —
         # das ist ein Client-Eingabe-Problem, kein „anderer Link rettet es".
@@ -53669,6 +53847,9 @@ def import_calendar_feed(token):
             return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': 'upstream_error'}), 502
         err_1 = 'fetch_failed'
     if text is not None:
+        if _condor_private_ics:
+            text = _condor_ics_privacy_sanitize(text)
+        _shadow_text_1 = text
         # RFC-5545-konformer ICS-Parser via module-level pure functions —
         # siehe _parse_ics_to_events oberhalb. Erlaubt isolierte Test-Coverage
         # (tests/test_ical_parser.py) ohne Flask-Context.
@@ -53689,6 +53870,8 @@ def import_calendar_feed(token):
     _shadow_text_2 = None
     if ics_text_2_direct:
         # Geräte-Abruf: der zweite Feed kommt schon als Text mit (kein Fetch).
+        if _condor_private_ics:
+            ics_text_2_direct = _condor_ics_privacy_sanitize(ics_text_2_direct)
         _shadow_text_2 = ics_text_2_direct
         try:
             events_2 = _parse_ics_to_events(ics_text_2_direct, token=token)
@@ -53707,6 +53890,9 @@ def import_calendar_feed(token):
                 _calendar_feed_note_refresh_failure(token, url_2,
                                                     slot='calendar_feed_2')
         else:
+            if _condor_private_ics:
+                text2 = _condor_ics_privacy_sanitize(text2)
+                _shadow_text_2 = text2
             try:
                 events_2 = _parse_ics_to_events(text2, token=token)
             except Exception as _exc2:
@@ -53877,7 +54063,15 @@ def import_calendar_feed(token):
         # dieselbe Liste, die auch das Reconcile unten sieht.
         if _feed_min_trackable:
             _calendar_feed_stamp_feed_min(feed_obj, _reconcile_events)
-        if ics_text_direct:
+        if _condor_private_ics:
+            # Der persoenliche cube-Link bleibt auf dem iPhone. Auch ein alter,
+            # frueher gespeicherter URL-/Pickup-Fallback wird hier geloescht.
+            # Dieser Zweig steht VOR dem allgemeinen Direkt-/URL-Fallback,
+            # damit der Link nicht direkt danach wieder eingetragen wird.
+            feed_obj['url'] = ''
+            feed_obj.pop('pickup_ical_url', None)
+            feed_obj['source'] = _src_hint if ics_text_direct else 'ics_direct'
+        elif ics_text_direct:
             # Direkt-ICS: kein URL-Zyklus (der Server-Auto-Refresh hat nichts
             # zu holen) — Quelle ehrlich markieren, damit Diagnose/UI sie
             # unterscheiden kann. Der WERT ist neu ehrlich ('pdf' /

@@ -76,6 +76,28 @@ def _rate_limited(token, endpoint, limit, window_sec):
         return False
 
 
+def _condor_rating_station_allowed(token, iata):
+    """None = kein Condor-Account, bool = Condor + Roster-Berechtigung.
+
+    Lazy app-Imports vermeiden den Blueprint/App-Init-Zyklus. Der konkrete
+    Hotelname wird fuer Condor nie persistiert; das Stations-Gate verhindert
+    zusaetzlich frei erfundene Airline-Buckets ausserhalb des eigenen Rosters.
+    """
+    try:
+        from app import (_profile_load, _canonical_airline_key,
+                         _condor_roster_hotel_iatas)
+        payload = _profile_load(token) or {}
+        airline = ''
+        for src in ((payload.get('profile') or {}), payload):
+            airline = src.get('airline') or airline
+        if _canonical_airline_key(airline) != 'CONDOR':
+            return None
+        return str(iata or '').upper() in _condor_roster_hotel_iatas(token)
+    except Exception:
+        # Ein erkannter Condor-Pfad darf bei internem Fehler nie offen werden.
+        return False
+
+
 # ── Disk-Fallback ───────────────────────────────────────────────
 _USER_HISTORY_DIR = '_user_history_state'
 _DISK_REPORTS = 'hotel_room_reports.json'
@@ -445,6 +467,19 @@ def hotel_rooms_post(token):
 
     hotel_iata = _norm_iata(body.get('hotel_iata'))  # optional
 
+    # CONDOR: das konkrete Hotel stammt aus dem persoenlichen iCal und bleibt
+    # ausschliesslich auf diesem Geraet. Netzwerkbewertungen gehoeren in einen
+    # neutralen Airline+Station-Bucket (z.B. „Crew Hotel Condor MIA").
+    condor_station_allowed = _condor_rating_station_allowed(safe_tok, hotel_iata)
+    if condor_station_allowed is False:
+        return jsonify({'ok': False,
+                        'error': 'station_not_in_own_roster'}), 403
+    condor_bucket = condor_station_allowed is True
+    if condor_bucket:
+        if not hotel_iata or len(hotel_iata) != 3:
+            return jsonify({'ok': False, 'error': 'hotel_iata fehlt.'}), 400
+        hotel_name = f'Crew Hotel Condor {hotel_iata}'
+
     room_low = _norm_room_number(body.get('room_number_low'))
     room_high = _norm_room_number(body.get('room_number_high'))
     side = _norm_side(body.get('side'))
@@ -456,6 +491,13 @@ def hotel_rooms_post(token):
     fitness = _norm_rating(body.get('fitness_rating'))
     note = _norm_note(body.get('note'))
     renovated = _norm_year(body.get('renovated_year'))
+
+    if condor_bucket:
+        # Freitext und Zimmernummer koennten den lokalen Hotelnamen indirekt
+        # offenlegen. Der neutrale Bucket speichert nur Hotel-Qualitaetswerte.
+        room_low = room_high = None
+        note = ''
+        renovated = None
 
     # Mindest-Inhalt: mindestens 1 Rating oder note >= 6 chars oder room-range
     has_signal = (noise or view or comfort or overall or breakfast or fitness or

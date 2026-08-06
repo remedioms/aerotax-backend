@@ -110,6 +110,32 @@ def test_serve_no_airline_is_empty(client, monkeypatch):
     assert r.get_json() == {'airline': '', 'count': 0, 'hotels': []}
 
 
+def test_condor_serve_returns_only_hotels_in_own_roster(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'iata': 'JFK', 'base': 'FRA', 'hotel': 'Own Roster Hotel',
+         'transfer_min': 40, 'votes': 3},
+        {'iata': 'LAX', 'base': 'FRA', 'hotel': 'Other Crew Hotel',
+         'transfer_min': 30, 'votes': 2},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(
+        app, '_profile_load',
+        lambda t: {'profile': {'airline': 'Condor'}})
+    monkeypatch.setattr(app, '_ical_briefings_load', lambda t: {
+        '2099-07-03': {
+            'ical_imported_at': '2099-06-01T00:00:00',
+            'ical_layover_ort': 'JFK',
+        },
+    })
+    r = client.get('/api/ax/crew-hotels?token=AT-condor')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['airline'] == 'CONDOR'
+    assert body['count'] == 1
+    assert body['hotels'][0]['iata'] == 'JFK'
+
+
 # ── Suggest: schreibt status='suggested' mit Profil-Airline ────────────────────
 
 def test_suggest_writes_suggested_row(client, monkeypatch):
@@ -150,6 +176,24 @@ def test_suggest_without_airline_rejected(client, monkeypatch):
                     data=json.dumps({'iata': 'YUL', 'hotel': 'Foo'}),
                     content_type='application/json')
     assert r.status_code == 400
+
+
+def test_condor_suggest_rejects_station_outside_own_roster(client, monkeypatch):
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(
+        app, '_profile_load',
+        lambda t: {'profile': {'airline': 'Condor'}})
+    monkeypatch.setattr(app, '_ical_briefings_load', lambda t: {
+        '2099-07-03': {
+            'ical_imported_at': '2099-06-01T00:00:00',
+            'ical_layover_ort': 'JFK',
+        },
+    })
+    r = client.post('/api/ax/crew-hotels/suggest?token=AT-condor',
+                    data=json.dumps({'iata': 'LAX', 'hotel': 'Not My Hotel'}),
+                    content_type='application/json')
+    assert r.status_code == 403
+    assert r.get_json()['error'] == 'station_not_in_own_roster'
 
 
 # ── Admin: X-Admin-Token-Gate ─────────────────────────────────────────────────
@@ -208,6 +252,9 @@ def test_canonical_airline_key():
     assert app._canonical_airline_key('SWISS') == 'SWISS'
     assert app._canonical_airline_key('lx') == 'SWISS'
     assert app._canonical_airline_key('Eurowings') == 'EUROWINGS'
+    assert app._canonical_airline_key('Condor') == 'CONDOR'
+    assert app._canonical_airline_key('DE') == 'CONDOR'
+    assert app._canonical_airline_key('CFG') == 'CONDOR'
     assert app._canonical_airline_key('') == ''
     assert app._canonical_airline_key(None) == ''
 
