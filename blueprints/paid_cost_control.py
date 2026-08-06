@@ -274,6 +274,8 @@ def paid_fetch(*, sb: Any, call_key: str, provider: str,
                budget_used: Callable[[str], int],
                budget_adjust: Callable[[str, int], None],
                positive_ttl: int = 6 * 3600,
+               landed_probe: Optional[Callable[[Any], Optional[str]]] = None,
+               permanent_ttl: int = 365 * 86400,
                negative_ttls: Optional[Mapping[str, int]] = None,
                lease_seconds: int = 20, wait_seconds: float = 2.5,
                allow_local: bool = False,
@@ -285,6 +287,14 @@ def paid_fetch(*, sb: Any, call_key: str, provider: str,
     ``reserve_units`` must be the maximum provider charge for this request
     shape.  The actual charge is reconciled afterwards, atomically refunding the
     difference.  A busy waiter never performs a second paid request.
+
+    ``landed_probe`` receives the successful payload and returns the real actual
+    arrival time (ISO) when this result can never change again — a fully landed,
+    closed lookup.  Such a result is stored with ``permanent_ttl`` instead of
+    ``positive_ttl``: after a landing the actual times are final, so every
+    re-poll of that logical key was pure spend.  The probe is provider-specific
+    and MUST derive "landed" from real fields only; anything uncertain returns
+    ``None`` and keeps the normal TTL.  Negative results are untouched.
     """
     log = logger or logging.getLogger(__name__)
     neg_ttls = dict(DEFAULT_NEGATIVE_TTLS)
@@ -364,5 +374,18 @@ def paid_fetch(*, sb: Any, call_key: str, provider: str,
                   neg_ttls.get(reason, neg_ttls["upstream_error"]))
         return PaidFetchResult(source="negative", negative_reason=reason,
                                actual_units=charged)
-    _complete(sb, call_key, owner, clock(), payload, positive_ttl, None, 1)
+    result_ttl = positive_ttl
+    landed_arr = None
+    if landed_probe is not None:
+        try:
+            landed_arr = landed_probe(payload)
+        except Exception:
+            # A probe defect must never lose the paid payload; it only means
+            # the entry keeps its normal, shorter lifetime.
+            landed_arr = None
+    if landed_arr:
+        result_ttl = max(int(positive_ttl), int(permanent_ttl))
+        log.info("[paid-cache] landed-forever key=%s arr=%s",
+                 call_key[:24], landed_arr)
+    _complete(sb, call_key, owner, clock(), payload, result_ttl, None, 1)
     return PaidFetchResult(payload=payload, source="upstream", actual_units=charged)

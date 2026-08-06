@@ -1610,6 +1610,72 @@ def _budget_local_adjust(key, delta):
     _MEM_BUDGET[key] = max(0, int(_MEM_BUDGET.get(key, 0)) + int(delta))
 
 
+_FR24_LANDED_FOREVER_TTL = 365 * 86400   # „gelandet = für immer gecacht"
+_FR24_CLOSED_WINDOW_MARGIN = 1800        # Fenster-Ende muss echt vorbei sein
+
+
+def _fr24_utc_epoch(value):
+    """ISO-8601 → Epoch. NAIVE Strings gelten als UTC (FR24-Fenstergrenzen bauen
+    wir selbst aus time.gmtime(), FR24-Zeiten sind UTC). Bewusst NICHT
+    `_iso_to_epoch`: dessen astimezone() würde eine naive Zeit als LOKALE Zeit
+    lesen und das Fenster je nach Serverzone bis zu Stunden zu alt aussehen
+    lassen — genau die Richtung, die einen offenen Zeitraum fälschlich als
+    abgeschlossen stempelt. Nicht parsebar → None (nie raten)."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        parsed = _dt.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_tz.utc)
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
+def _fr24_landed_arrival(payload, params, now=None):
+    """Ist-Landung (ISO) EINES Ergebnisses, das sich NIE mehr ändern kann — sonst
+    None.
+
+    Nach der Landung sind die Ist-Zeiten endgültig; jeder weitere bezahlte Abruf
+    desselben logischen Keys ist reine Verschwendung (Vorfall 05.08.: ~3 785
+    Lookups auf 1 311 Keys, also ~3 Zahlungen pro Flug und Tag). Permanent
+    gestempelt wird aber nur, wenn BEIDE Bedingungen aus ECHTEN Feldern belegt
+    sind — nie aus Schätz- oder Sollzeiten (die kennt flight-summary/light
+    ohnehin nicht):
+
+      (1) Das ANGEFRAGTE Fenster ist geschlossen: `flight_datetime_to` liegt
+          wirklich in der Vergangenheit. Ein noch offenes Fenster (Tail-Historie
+          „letzte 7 Tage", Flugnummer „heute") kann später ZUSÄTZLICHE Zeilen
+          liefern — friert man es ein, verschwindet der nächste Flug.
+      (2) JEDE gelieferte Zeile ist beendet (`flight_ended`) UND trägt eine
+          echte Ist-Landung (`datetime_landed`) in der Vergangenheit.
+
+    Alles andere (in der Luft, nur Ist-Abflug, unparsebare Zeit, leeres/kaputtes
+    Payload) → None → exakt die bisherige TTL. Im Zweifel normale TTL."""
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get('data')
+    if not isinstance(rows, list) or not rows:
+        return None
+    ref = time.time() if now is None else float(now)
+    window_to = _fr24_utc_epoch((params or {}).get('flight_datetime_to'))
+    if window_to is None or window_to > (ref - _FR24_CLOSED_WINDOW_MARGIN):
+        return None
+    latest = None
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        if row.get('flight_ended') not in (True, 'true', 'True', 1):
+            return None
+        landed = _fr24_utc_epoch(row.get('datetime_landed'))
+        if landed is None or landed >= ref:
+            return None
+        if latest is None or landed > latest[0]:
+            latest = (landed, str(row.get('datetime_landed')))
+    return latest[1] if latest else None
+
+
 def _fr24_paid_get(path, params, *, positive_ttl=6 * 3600,
                    not_found_ttl=12 * 3600, logical_key=None):
     """Cost-controlled FR24 summary request.
@@ -1619,6 +1685,11 @@ def _fr24_paid_get(path, params, *, positive_ttl=6 * 3600,
     against BOTH caps; afterwards the difference to the actual result-count
     charge is refunded.  Existing free-only Radar/map paths never call this
     helper and remain untouched.
+
+    Ergebnisse, die einen GELANDETEN Flug in einem abgeschlossenen Zeitfenster
+    belegen, werden quasi-permanent gecacht (siehe ``_fr24_landed_arrival``) —
+    Ist-Zeiten ändern sich nach der Landung nicht mehr. Alles andere behält die
+    bisherige ``positive_ttl``.
     """
     if not _fr24_available():
         _FR24_CALL_CONTEXT.negative_reason = 'control_unavailable'
@@ -1687,6 +1758,10 @@ def _fr24_paid_get(path, params, *, positive_ttl=6 * 3600,
         fetch=lambda: _fr24_get(path, params), actual_units=_actual,
         budget_used=_budget_key_used, budget_adjust=_budget_local_adjust,
         positive_ttl=max(1, int(positive_ttl)),
+        # Gelandet + abgeschlossenes Fenster = das Ergebnis ist endgültig →
+        # quasi-permanent statt alle 6 h neu bezahlen.
+        landed_probe=lambda payload: _fr24_landed_arrival(payload, params),
+        permanent_ttl=_FR24_LANDED_FOREVER_TTL,
         negative_ttls={'not_found': max(1, int(not_found_ttl))},
         allow_local=(os.environ.get('AX_PAID_CONTROL_ALLOW_LOCAL') == '1'
                      or bool(os.environ.get('PYTEST_CURRENT_TEST'))),
