@@ -41082,6 +41082,56 @@ def _board_day_midnight_ok(want_day, bsched):
         return False
 
 
+def _obs_dep_same_instance(row, ap, want_day, dep_sched_iso):
+    """Gehört diese DEP-Beobachtungs-Row zur Leg-Instanz `want_day`/
+    `dep_sched_iso`? (Cross-Date-Guard, Owner LH780 2026-08-06: die GESTRIGE
+    21:50-Row — um Mitternacht noch im Heute-Store, `date`=Vortag, esti 22:25 —
+    dekorierte das MORGIGE Leg mit +35. `_board_day_midnight_ok` allein lässt
+    das durch: diff=-1 bei sched-Stunde ≥21 ist als Red-Eye-Toleranz gedacht
+    und passt zufällig auch auf jeden täglichen Abendflug.)
+
+    Entscheidung, stärkste Evidenz zuerst:
+      1. Row ohne `date`-Feld → True (keine Evidenz, altes Verhalten — nie
+         eine echte Beobachtung wegen fehlender Metadaten wegwerfen).
+      2. Leg-Sollzeit (`dep_sched_iso`) UND Row-`sched` (HH:MM) vorhanden →
+         beide als Flughafen-Lokalzeit vergleichen: gleiche Instanz nur bei
+         |Δ| ≤ 6 h. Trennt 24-h-Nachbarn derselben täglichen Flugnummer
+         sauber von Mitternachts-Rutschern (23:55→00:30).
+      3. Sonst Fallback auf die bestehende Mitternachts-Toleranz gegen
+         `want_day` (Parität zum Live-Scan-Gate). Wirft nie."""
+    try:
+        rd = str((row or {}).get('date') or '').strip()[:10]
+        if len(rd) != 10:
+            return True
+        m = re.search(r'(\d{1,2}):(\d{2})', str(row.get('sched') or ''))
+        if dep_sched_iso and m:
+            leg_dt = datetime.fromisoformat(
+                str(dep_sched_iso).replace('Z', '+00:00'))
+            if leg_dt.tzinfo is not None:
+                tzname = None
+                try:
+                    apc = (ap or '').upper().split('#', 1)[0]
+                    if apc and apc not in ('FRA', 'EDDF'):
+                        tzname = airport_tz(apc)
+                except Exception:
+                    tzname = None
+                try:
+                    from zoneinfo import ZoneInfo
+                    leg_dt = leg_dt.astimezone(
+                        ZoneInfo(tzname or 'Europe/Berlin')).replace(tzinfo=None)
+                except Exception:
+                    leg_dt = leg_dt.replace(tzinfo=None)
+            row_dt = datetime.strptime(rd, '%Y-%m-%d').replace(
+                hour=int(m.group(1)) % 24, minute=int(m.group(2)))
+            return abs((leg_dt - row_dt).total_seconds()) <= 6 * 3600
+        if not want_day:
+            return True
+        bs = rd + ('T%02d:%s' % (int(m.group(1)) % 24, m.group(2)) if m else '')
+        return _board_day_midnight_ok(want_day, bs if m else rd)
+    except Exception:
+        return True
+
+
 # ── LH Open API → _flight_obs_merged (Engine A2, 2026-07-22) ─────────────────
 # Der ZWEITE Board-Leser bekommt dieselbe LH-Veredelung wie
 # _flight_facts_from_obs (der Blueprint-Merge) — bisher liefen Radar-Callout-
@@ -41206,7 +41256,8 @@ def _lh_fill_obs_merged(rec, fn, date_q, dep, arr):
 
 
 def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
-                       live=True, free_only=False, arr_date=None):
+                       live=True, free_only=False, arr_date=None,
+                       dep_sched_iso=None):
     """EIN gemergter Record für einen Flug aus ALLEN verfügbaren Beobachtungen
     beider Seiten:
       • dep-Seite: Live-Board + Warehouse (airport_delay_obs) am ABFLUG-Flughafen
@@ -41263,8 +41314,12 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
     date_arr_q = (arr_date or '').strip()[:10] or None
     if date_arr_q == date_q:
         date_arr_q = None
+    # dep_sched_iso (Cross-Date-Guard LH780 2026-08-06): Soll-Abflug des Legs
+    # als ISO — schärft die dep-Row-Auswahl gegen die Vortags-/Folgetags-
+    # Instanz derselben täglichen Flugnummer (s. _obs_dep_same_instance).
+    dep_sched_q = (str(dep_sched_iso or '').strip() or None)
     ckey = (fn, date_q or '', dep or '', arr or '', bool(live), bool(free_only),
-            date_arr_q or '')
+            date_arr_q or '', dep_sched_q or '')
     hit = _FLIGHT_MERGE_CACHE.get(ckey)
     if hit and (_t.time() - hit[0]) < _FLIGHT_MERGE_TTL:
         return dict(hit[1]) if hit[1] is not None else None
@@ -41321,6 +41376,11 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
                 arr_row, arr_src = dict(bf), 'live'
                 arr_row.pop('_arr', None)
         else:
+            # Cross-Date-Guard (LH780 2026-08-06): eine dep-Board-Row mit
+            # `date`-Feld einer FREMDEN Tages-Instanz (gestriger 21:50-Lauf
+            # hängt nach Mitternacht noch im Board/Store) nicht übernehmen.
+            if not _obs_dep_same_instance(bf, ap, _want_day, dep_sched_q):
+                return
             if dep_row is None:
                 dep_row, dep_src = dict(bf), 'live'
                 dep_row.pop('_arr', None)
@@ -41376,6 +41436,18 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
             # exakte Treffer unverändert bleiben — gleiche Norm wie route-history.
             _fnn = _fn_norm(fn)
             cands = [r for r in (rows or []) if _fn_norm(r.get('flight')) == _fnn]
+        if ftype == 'departure':
+            # Cross-Date-Guard (LH780 2026-08-06): der Heute-Store enthält um
+            # Mitternacht noch die VORTAGS-Row derselben täglichen Flugnummer
+            # (date=gestern, esti/gestartet) — sie darf das angefragte Leg
+            # nicht dekorieren. Nur dep-Seite; die arr-Seite hat ihren eigenen
+            # Betriebstag (`arr_date`/Nico-Fix) und bleibt unangetastet.
+            try:
+                _dep_want = row_date or _airport_local_now(ap).strftime('%Y-%m-%d')
+            except Exception:
+                _dep_want = row_date
+            cands = [r for r in cands
+                     if _obs_dep_same_instance(r, ap, _dep_want, dep_sched_q)]
         if not cands:
             return None
         if want_other:
@@ -42191,7 +42263,8 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         try:
             m = _flight_obs_merged(op_fn, date=_merge_date, dep_iata=frm,
                                    arr_iata=to, live=True, free_only=free_only,
-                                   arr_date=_arr_date_q)
+                                   arr_date=_arr_date_q,
+                                   dep_sched_iso=s.get('dep_iso'))
         except Exception:
             m = None
         # ── VERGANGENHEITS-FALLBACK auf die persistente Blueprint-Quelle

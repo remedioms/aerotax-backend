@@ -428,7 +428,10 @@ def _obs_by_from(mapping):
     """side_effect-Fabrik: dep_iata (`from`) → gemergter Record.
     `mapping` = {'FRA': _merged(...), 'TLL': _merged(...)}."""
     def _fn(flight_no, date=None, dep_iata=None, arr_iata=None,
-            live=True, free_only=False, arr_date=None):
+            live=True, free_only=False, arr_date=None, dep_sched_iso=None):
+        # dep_sched_iso (Cross-Date-Guard 2026-08-06): Signatur-Parität zur
+        # echten _flight_obs_merged — ein Mock ohne den Kwarg stirbt am
+        # Call-Site-TypeError und die Enrichment fällt still auf None.
         return mapping.get((dep_iata or '').upper())
     return _fn
 
