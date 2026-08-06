@@ -144,8 +144,13 @@ def _get_history_dir():
 # Whitelist gegen FamilyShareField-Enum (iOS-Side).
 ALLOWED_FIELDS = {
     'layover_place', 'current_city', 'landed_status', 'next_flight',
-    'photos', 'voice_notes', 'aircraft_reg',
+    'photos', 'voice_notes', 'aircraft_reg', 'duty_times',
 }
+
+# Pick-up und Briefing sind bewusst Opt-in pro Familienperson. Bestehende und
+# neu bestätigte Family-Verbindungen behalten damit exakt ihren bisherigen
+# Umfang, bis die Crew den Schalter im Personen-Menü einschaltet.
+DEFAULT_ALLOWED_FIELDS = ALLOWED_FIELDS - {'duty_times'}
 
 ALLOWED_RELATIONS = {'partner', 'mama', 'papa', 'freund', 'kind', 'family'}
 
@@ -469,7 +474,7 @@ def _status_has_signal(status):
         return True
     for k in ('layover_place', 'layover_place_city', 'current_city', 'landed',
               'next_flight_dep_iata', 'today_dep_iata', 'today_route_label',
-              'last_seen_iso'):
+              'last_seen_iso', 'briefing_local', 'pickup_local'):
         if status.get(k) is not None:
             return True
     return False
@@ -566,6 +571,37 @@ def _parse_roster_day(row):
             'first': loc.split(',')[0].strip().upper(),
             'st': st, 'en': en, 'st_iso': st_iso, 'en_iso': en_iso,
             'is_flight': is_flight, 'sectors': secs}
+
+
+def _family_duty_times(row):
+    """Explizite (Briefing, Pick-up)-Ortszeiten eines Roster-Tags.
+
+    Verwendet dieselben kanonischen Parser wie der Roster-Change-/Live-Pfad.
+    `ical_start` ist absichtlich KEIN Fallback: je nach Airline-Export kann das
+    Pick-up, Briefing oder Abflug sein und wäre damit eine erfundene Zeit.
+    """
+    try:
+        day = dict(row or {})
+        raw = day.get('raw_event')
+        if isinstance(raw, dict):
+            for key in ('pickup', 'marker', 'reader_facts', 'summary'):
+                if not day.get(key) and raw.get(key) is not None:
+                    day[key] = raw.get(key)
+        briefing_fn = _app_attr('_rc_briefing_hhmm')
+        pickup_fn = _app_attr('_rc_pickup_hhmm')
+        briefing = briefing_fn(day) if callable(briefing_fn) else ''
+        pickup = pickup_fn(day) if callable(pickup_fn) else ''
+
+        def _valid(value):
+            value = str(value or '').strip()
+            match = re.fullmatch(r'(\d{2}):(\d{2})', value)
+            if not match:
+                return None
+            return value if int(match.group(1)) <= 23 and int(match.group(2)) <= 59 else None
+
+        return _valid(briefing), _valid(pickup)
+    except Exception:
+        return None, None
 
 
 def _flight_window_state(day, legs_live, now):
@@ -1021,6 +1057,10 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         'next_flight_etd_iso': None,
         'photo_count_today': None,
         'last_seen_iso': None,
+        # Nur bei explizitem `duty_times`-Grant. Lokale HH:MM-Werte aus klaren
+        # Roster-Markern; keine aus ical_start erratenen Zeiten.
+        'briefing_local': None,
+        'pickup_local': None,
         # „Fliegt gerade"-Block (User 2026-06-25): heute aktiver Flugtag → die
         # Family sieht ein Radar-Widget mit interpoliertem Flieger statt „In <Abflug>".
         # iOS rechnet Position/Animation selbst aus dep/arr-IATA + den Zeiten.
@@ -1092,15 +1132,15 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
     except Exception as e:
         src_fail = True
         _log().info(f'[family-watch] profile_read_skip {type(e).__name__}')
-    # next_flight: nur wenn 'next_flight' in allowed_fields. Best-effort read aus
-    # briefings/roster state via SB. Wenn nicht ladbar → bleibt None.
+    # next_flight und die explizit freigegebenen Dienstzeiten kommen aus demselben
+    # kommenden Roster-Fenster. Best-effort; wenn nicht ladbar → bleibt None.
     sb_avail, sb = _get_sb()
     # FIX (Bug-Hunt #3): die Tabelle 'briefings' EXISTIERT NICHT — die echten
     # Briefing-Daten liegen in user_ical_briefings (ical_summary „FRA-JFK 10:30-
     # 13:20, …", ical_location „JFK, FRA-JFK-FRA", ical_start). Vorher las dieser
     # Code eine Phantom-Tabelle → next_flight/layover blieben IMMER leer, auch
     # wenn die Crew die Felder freigegeben hatte.
-    if 'next_flight' in allowed_fields and sb_avail and sb is not None:
+    if allowed_fields & {'next_flight', 'duty_times'} and sb_avail and sb is not None:
         try:
             today = _fw_today().isoformat()
             # FIX „FRA-HND obwohl die Crew auf SFO-Tour ist" (2026-07-03):
@@ -1112,31 +1152,40 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
             # Jetzt: die nächsten Tage scannen und das ERSTE echte Leg-Paar
             # nehmen (datum-aufsteigend → der Rückflug schlägt die nächste Tour).
             r = (sb.table('user_ical_briefings')
-                 .select('datum,ical_summary,ical_location,ical_start')
+                 .select('datum,ical_summary,ical_location,ical_start,raw_event')
                  .eq('token', crew_token)
                  .gte('datum', today)
                  .order('datum', desc=False)
                  .limit(10).execute())
+            found_next_flight = 'next_flight' not in allowed_fields
+            found_duty_times = 'duty_times' not in allowed_fields
             for br in (r.data or []):
+                if not found_duty_times:
+                    briefing, pickup = _family_duty_times(br)
+                    if briefing or pickup:
+                        status['briefing_local'] = briefing
+                        status['pickup_local'] = pickup
+                        found_duty_times = True
                 summ = br.get('ical_summary') or ''
                 _legs2 = re.findall(r'\b([A-Z]{3})-([A-Z]{3})\b', summ)
-                if not _legs2:
-                    continue
-                # Gleiche Ketten-Regel wie oben (Ziel = Tages-Ende, Rückkehr →
-                # letzte Auswärts-Station) — beide Pfade EINE Wahrheit.
-                _chain2 = [_legs2[0][0]] + [b for _, b in _legs2]
-                _arr2 = _chain2[-1]
-                if len(_chain2) >= 3 and _arr2 == _chain2[0]:
-                    _arr2 = _chain2[-2]
-                status['next_flight_dep_iata'] = _legs2[0][0]
-                status['next_flight_arr_iata'] = _arr2
-                status['next_flight_dep_city'] = _iata_city_name(_legs2[0][0])
-                status['next_flight_arr_city'] = _iata_city_name(_arr2)
-                status['next_flight_chain'] = _chain2
-                st = br.get('ical_start')
-                if st:
-                    status['next_flight_etd_iso'] = _iso_utc_z(st)
-                break
+                if not found_next_flight and _legs2:
+                    # Gleiche Ketten-Regel wie oben (Ziel = Tages-Ende,
+                    # Rückkehr → letzte Auswärts-Station).
+                    _chain2 = [_legs2[0][0]] + [b for _, b in _legs2]
+                    _arr2 = _chain2[-1]
+                    if len(_chain2) >= 3 and _arr2 == _chain2[0]:
+                        _arr2 = _chain2[-2]
+                    status['next_flight_dep_iata'] = _legs2[0][0]
+                    status['next_flight_arr_iata'] = _arr2
+                    status['next_flight_dep_city'] = _iata_city_name(_legs2[0][0])
+                    status['next_flight_arr_city'] = _iata_city_name(_arr2)
+                    status['next_flight_chain'] = _chain2
+                    st = br.get('ical_start')
+                    if st:
+                        status['next_flight_etd_iso'] = _iso_utc_z(st)
+                    found_next_flight = True
+                if found_next_flight and found_duty_times:
+                    break
         except Exception as e:
             src_fail = True
             _log().info(f'[family-watch] briefing_read_skip {type(e).__name__}')
@@ -1683,6 +1732,9 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         status['landed'] = None
     if 'photos' not in allowed_fields:
         status['photo_count_today'] = None
+    if 'duty_times' not in allowed_fields:
+        status['briefing_local'] = None
+        status['pickup_local'] = None
     if not (allowed_fields & {'current_city', 'last_seen', 'landed_status', 'next_flight'}):
         status['last_seen_iso'] = None
     # ── „Es gibt immer eine Info" (2026-07-03, SB-RemoteProtocolError-Flakes) ──
@@ -2098,7 +2150,12 @@ def family_share_list(token):
 
 @family_watch_bp.route('/api/family-share/<token>/grant', methods=['POST'])
 def family_share_grant(token):
-    """Crew-User gewährt Family-Person Lese-Zugriff auf bestimmte Felder."""
+    """Crew-User gewährt Family-Person Lese-Zugriff auf bestimmte Felder.
+
+    Neben dem vollständigen ``fields``-Update unterstützt der Endpoint ein
+    atomares ``{field, enabled}`` für einzelne UI-Schalter. So kann ein alter
+    Offline-Cache niemals unbekannte bestehende Rechte überschreiben.
+    """
     # Token-Auth: vom before_request-Hook in app.py gecheckt (auth-required).
     # Hier nur form-validation.
     safe = _safe_token(token)
@@ -2113,6 +2170,29 @@ def family_share_grant(token):
     relation = (body.get('relation') or '').strip().lower() or 'family'
     if relation not in ALLOWED_RELATIONS:
         relation = 'family'
+    shares = _shares_load()
+
+    toggle_field = body.get('field')
+    if toggle_field is not None:
+        if toggle_field not in ALLOWED_FIELDS or not isinstance(body.get('enabled'), bool):
+            return jsonify({'ok': False, 'error': 'invalid_field_toggle'}), 400
+        existing = next((s for s in shares
+                         if s.get('crew_token') == token
+                         and s.get('family_token') == family_token), None)
+        if existing is None:
+            return jsonify({'ok': False, 'error': 'grant_not_found'}), 404
+        fields = [f for f in (existing.get('fields') or []) if f in ALLOWED_FIELDS]
+        if body['enabled'] and toggle_field not in fields:
+            fields.append(toggle_field)
+        elif not body['enabled']:
+            fields = [f for f in fields if f != toggle_field]
+        existing['fields'] = fields
+        existing['relation'] = relation
+        existing['updated_at'] = _now_utc_z()
+        if not _shares_save(shares):
+            return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+        return jsonify({'ok': True, 'fields': fields, 'relation': relation})
+
     raw_fields = body.get('fields') or []
     if not isinstance(raw_fields, list):
         return jsonify({'ok': False, 'error': 'fields_must_be_list'}), 400
@@ -2120,7 +2200,6 @@ def family_share_grant(token):
     if not fields:
         return jsonify({'ok': False, 'error': 'no_valid_fields'}), 400
 
-    shares = _shares_load()
     # Existing grant? → update statt duplizieren
     found = False
     for s in shares:
@@ -2203,8 +2282,8 @@ def family_request_approve(crew_token):
                   and r.get('family_token') == family_token), None)
     if not match:
         return jsonify({'ok': False, 'error': 'no_request'}), 404
-    raw_fields = body.get('fields') or list(ALLOWED_FIELDS)
-    fields = [f for f in raw_fields if f in ALLOWED_FIELDS] or list(ALLOWED_FIELDS)
+    raw_fields = body.get('fields') or list(DEFAULT_ALLOWED_FIELDS)
+    fields = [f for f in raw_fields if f in ALLOWED_FIELDS] or list(DEFAULT_ALLOWED_FIELDS)
     relation = match.get('relation') or 'family'
     shares = _shares_load()
     if not any(s.get('crew_token') == crew_token and s.get('family_token') == family_token

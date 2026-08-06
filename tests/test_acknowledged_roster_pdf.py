@@ -46,6 +46,33 @@ def test_split_leg_honours_explicit_utc_day_marker():
     assert 'LH752 FRA - HYD' in ics
 
 
+def test_cabin_position_and_non_787_split_leg_are_supported():
+    ics = events(
+        '16 Fri 77364 11:00 PU 400 FRA 11:57 346\n'
+        '16 Fri PU 400 JFK 20:21 346\n'
+        'Created 05Aug2026 11:45 (UTC) by Jeppesen\n',
+    )
+    assert 'DTSTART:20260116T115700Z' in ics
+    assert 'DTEND:20260116T202100Z' in ics
+    assert 'LH400 FRA - JFK' in ics
+
+
+def test_p1_cabin_position_is_supported():
+    ics = events(
+        '07 Wed 74333 09:10 P1 400 FRA JFK 11:19 20:12 346\n'
+        'Created 05Aug2026 11:45 (UTC) by Jeppesen\n',
+    )
+    assert 'LH400 FRA - JFK' in ics
+
+
+def test_four_digit_trip_id_is_supported():
+    ics = events(
+        '27 Tue 1234 11:00 PU 100 FRA MUC 12:00 14:04 32N\n'
+        'Created 05Aug2026 11:45 (UTC) by Jeppesen\n',
+    )
+    assert 'LH100 FRA - MUC' in ics
+
+
 def test_previous_utc_day_on_complete_outstation_leg():
     ics = events(
         '18 Sun 02:40 FO 753 HYD FRA (17) 22:13 07:52 78Q\n'

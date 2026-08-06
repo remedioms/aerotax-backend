@@ -46320,8 +46320,8 @@ def flight_status(token):
             return None
         raw_status = m.get('status') or ''
         _known = _obs_delay_known(
-            x.get('max_delay_min'), x.get('cancelled'), x.get('esti'),
-            x.get('status'), False)
+            m.get('max_delay_min'), m.get('cancelled'), m.get('esti'),
+            m.get('status'), False)
         return {
             'flight': number,
             'airline': m.get('airline') or '', 'airline_name': '',
@@ -54938,9 +54938,9 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
 _ACK_ROSTER_HEADER = (
     'Date (LT) Trip ID Report (LT) Pos Activity From To Start (UTC) End (UTC)'
 )
-_ACK_POSITIONS = r'(?:CP|AC|FO|SF)'
+_ACK_POSITIONS = r'(?:CP|AC|FO|SF|PU|P1)'
 _ACK_FULL_LEG_RE = re.compile(
-    r'^(?:(?P<trip>\d{5,}(?:_\d+)?)\s+)?'
+    r'^(?:(?P<trip>\d{4,}(?:_\d+)?)\s+)?'
     r'(?:(?P<report>\d{1,2}:\d{2})\s+)?'
     r'(?P<pos>' + _ACK_POSITIONS + r')\s+'
     r'(?P<num>\d{1,4}[A-Z]?)\s+(?P<frm>[A-Z]{3})\s+(?P<to>[A-Z]{3})\s+'
@@ -54949,12 +54949,12 @@ _ACK_FULL_LEG_RE = re.compile(
     r'(?:(?P<end_day>\(\d{1,2}\))\s+)?'
     r'(?P<end>\d{1,2}:\d{2})\b')
 _ACK_SPLIT_LEG_RE = re.compile(
-    r'^(?:(?P<trip>\d{5,}(?:_\d+)?)\s+)?'
+    r'^(?:(?P<trip>\d{4,}(?:_\d+)?)\s+)?'
     r'(?:(?P<report>\d{1,2}:\d{2})\s+)?'
     r'(?P<pos>' + _ACK_POSITIONS + r')\s+'
     r'(?P<num>\d{1,4}[A-Z]?)\s+(?P<station>[A-Z]{3})\s+'
     r'(?:(?P<utc_day>\(\d{1,2}\))\s+)?'
-    r'(?P<clock>\d{1,2}:\d{2})\s+(?:78S|78Q|789)\b')
+    r'(?P<clock>\d{1,2}:\d{2})\s+[A-Z0-9]{3}\b')
 _ACK_GROUND_RE = re.compile(
     r'^(?:(?P<trip>[A-Z0-9_]{5,})\s+)?'
     r'(?:(?P<report>\d{1,2}:\d{2})\s+)?'
