@@ -3827,8 +3827,10 @@ def _obs_station_dt(v, iata, service_date):
 
 def _obs_rows_to_facts(dep_row, arr_row):
     """Reiner Mapper (kein DB-Zugriff → trivial testbar): DEP-/ARR-Obs-Row →
-    normalisiertes Fakten-Dict. Delay kommt direkt aus `max_delay_min` (kein
-    Rechnen über formatgemischte Zeiten). Leere/None-Werte werden weggelassen.
+    normalisiertes Fakten-Dict. Delay kommt nur bei einem belegten Signal aus
+    `max_delay_min` (kein Rechnen über formatgemischte Zeiten); historische
+    Placeholder-Nullen sind keine Pünktlichkeitsbeobachtung. Leere/None-Werte
+    werden weggelassen.
     ZEIT-NORMALISIERUNG (Ultraplan-P0): sched/esti kommen roh gemischt (bare
     '16:50' station-lokal, naive Lokal-ISO, Offset-ISO) → hier zentral auf ISO
     MIT Station-Offset ('…T16:50:00+02:00'; Wanduhr bleibt Station-lokal lesbar,
@@ -3857,8 +3859,33 @@ def _obs_rows_to_facts(dep_row, arr_row):
             out_e = e_dt.isoformat() if e_dt is not None else ev
         return out_s, out_e
 
+    def _delay_is_known(row, is_arr):
+        """Eine gespeicherte Null ist kein Beleg. airport_delay_obs besitzt
+        historisch keine eigene delay_known-Spalte; deshalb exakt dieselbe
+        Rekonstruktion wie flight-info/route-history benutzen. Ohne Zugriff auf
+        app konservativ nur harte Signale akzeptieren."""
+        if not row:
+            return False
+        try:
+            known_fn = _life_app('_obs_delay_known')
+            if known_fn:
+                return bool(known_fn(
+                    row.get('max_delay_min'), row.get('cancelled'),
+                    row.get('esti'), row.get('status'), is_arr))
+        except Exception:
+            pass
+        if row.get('cancelled'):
+            return True
+        try:
+            if int(row.get('max_delay_min') or 0) > 0:
+                return True
+        except Exception:
+            pass
+        return bool((row.get('esti') or '').strip())
+
     facts = {}
     if dep_row:
+        dep_delay_known = _delay_is_known(dep_row, False)
         _dep_ap = (_s(dep_row.get('airport')) or '').split('#', 1)[0] or None
         sd, ed = _time_pair(dep_row, _dep_ap)
         if sd is not None:
@@ -3871,8 +3898,9 @@ def _obs_rows_to_facts(dep_row, arr_row):
             v = _s(dep_row.get(in_k))
             if v is not None:
                 facts[out_k] = v
-        if dep_row.get('max_delay_min') is not None:
+        if dep_delay_known and dep_row.get('max_delay_min') is not None:
             facts['dep_delay_min'] = dep_row.get('max_delay_min')
+            facts['dep_delay_known'] = True
         if dep_row.get('cancelled'):
             facts['cancelled'] = True
         # Route steckt in der DEP-Row: airport=Start, dest_iata=Ziel.
@@ -3883,6 +3911,7 @@ def _obs_rows_to_facts(dep_row, arr_row):
         if _d:
             facts['arr_iata'] = _d
     if arr_row:
+        arr_delay_known = _delay_is_known(arr_row, True)
         # ARR-Row: airport='<Ziel>#ARR' → Station-TZ der Ankunftsseite = Ziel.
         _arr_ap = (_s(arr_row.get('airport')) or '').split('#', 1)[0] or None
         sa, ea = _time_pair(arr_row, _arr_ap)
@@ -3895,8 +3924,9 @@ def _obs_rows_to_facts(dep_row, arr_row):
             v = _s(arr_row.get(in_k))
             if v is not None:
                 facts[out_k] = v
-        if arr_row.get('max_delay_min') is not None:
+        if arr_delay_known and arr_row.get('max_delay_min') is not None:
             facts['arr_delay_min'] = arr_row.get('max_delay_min')
+            facts['arr_delay_known'] = True
         # WANN wurde diese Ankunfts-Beobachtung zuletzt geschrieben? Der Wert
         # entscheidet, ob `est_arr` eine Messung sein KANN (siehe Select oben).
         _ua = _s(arr_row.get('updated_at'))
@@ -3927,6 +3957,8 @@ def _obs_rows_to_facts(dep_row, arr_row):
         _oa = _s(arr_row.get('dest_iata'))
         if _oa and not facts.get('dep_iata'):
             facts['dep_iata'] = _oa
+    if facts.get('dep_delay_known') or facts.get('arr_delay_known'):
+        facts['delay_known'] = True
     return facts
 
 
@@ -4535,6 +4567,15 @@ def _merge_lh_into_facts(obs, lh):
     for k in _LH_FILL_ONLY:
         if out.get(k) is None and lh.get(k) is not None:
             out[k] = lh[k]
+    # LH-Delaywerte entstehen aus einem datumsgenauen Soll/Ist-Paar. Auch 0 ist
+    # hier deshalb eine echte Beobachtung (anders als die historische
+    # airport_delay_obs-Platzhalter-Null).
+    if lh.get('dep_delay_min') is not None:
+        out['dep_delay_known'] = True
+        out['delay_known'] = True
+    if lh.get('arr_delay_min') is not None:
+        out['arr_delay_known'] = True
+        out['delay_known'] = True
     return out
 
 
@@ -5803,6 +5844,7 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
             'dep_status': facts.get('dep_status'), 'arr_status': _gated_arr,
             'dep_delay_min': facts.get('dep_delay_min'),
             'arr_delay_min': facts.get('arr_delay_min'),
+            'delay_known': bool(facts.get('delay_known')),
             'cancelled': facts.get('cancelled'),
         },
         'aircraft': {'reg': reg, 'type': ac_type},

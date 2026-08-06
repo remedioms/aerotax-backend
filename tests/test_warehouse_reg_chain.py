@@ -330,6 +330,48 @@ def test_flight_info_dep_row_still_wins(client):
     assert b['dest_name'] == 'Frankfurt'
 
 
+def test_flight_info_arrival_observation_promotes_delay_known(client):
+    rows = [_obs_row('FRA', 'HAJ', flight='LH42', date='2026-08-06',
+                     sched='2026-08-06T09:35:00', esti=None,
+                     status='Geplant', max_delay_min=0)]
+    merged = {'dep_delay_min': None, 'arr_delay_min': 0, 'delay_min': 0,
+              'delay_known': True, 'status_arr': 'Landed',
+              'sched_arr': '2026-08-06T10:25:00', 'esti_arr': None,
+              'arr_cancelled': False, 'cancelled': False, 'delay_side': 'arr',
+              'sides': {'dep': 'obs', 'arr': 'obs'}}
+    with patch.object(A, 'sb', _fake_sb(rows)), \
+         patch.object(A, 'SB_AVAILABLE', True), \
+         patch.object(A, '_flight_from_live_board', return_value=None), \
+         patch.object(A, '_arrival_gate_terminal', return_value=(None, None)), \
+         patch.object(A, '_flight_obs_merged', return_value=merged), \
+         patch.object(BP, '_flight_facts_from_obs', return_value={}):
+        b = _flight_info(client, 'LH42', '2026-08-06').get_json()
+    assert b['delay_known'] is True
+    assert b['delay_min'] == 0
+    assert b['arr_delay_min'] == 0
+
+
+def test_flight_info_unknown_delay_never_exports_placeholder_numbers(client):
+    rows = [_obs_row('FRA', 'HAJ', flight='LH42', date='2026-08-06',
+                     sched='2026-08-06T09:35:00', esti=None,
+                     status='Geplant', max_delay_min=0)]
+    merged = {'dep_delay_min': 0, 'arr_delay_min': 0, 'delay_min': 0,
+              'delay_known': False, 'status_arr': None, 'sched_arr': None,
+              'esti_arr': None, 'arr_cancelled': False, 'cancelled': False,
+              'delay_side': None, 'sides': {'dep': 'obs', 'arr': None}}
+    with patch.object(A, 'sb', _fake_sb(rows)), \
+         patch.object(A, 'SB_AVAILABLE', True), \
+         patch.object(A, '_flight_from_live_board', return_value=None), \
+         patch.object(A, '_arrival_gate_terminal', return_value=(None, None)), \
+         patch.object(A, '_flight_obs_merged', return_value=merged), \
+         patch.object(BP, '_flight_facts_from_obs', return_value={}):
+        b = _flight_info(client, 'LH42', '2026-08-06').get_json()
+    assert b['delay_known'] is False
+    assert b['delay_min'] is None
+    assert b['dep_delay_min'] is None
+    assert b['arr_delay_min'] is None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _sb_day_reg — Tail direkt aus den SB-Tages-Rows
 # ══════════════════════════════════════════════════════════════════════════════

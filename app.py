@@ -44267,6 +44267,14 @@ def ax_flight_info(flightno):
             out['arr_cancelled'] = merged.get('arr_cancelled')
             out['delay_side'] = merged.get('delay_side')
             out['obs_sides'] = merged.get('sides')
+            # Der Dual-Side-Merge kann den Beleg erst auf der Ankunftsseite
+            # finden (z.B. Landed/on-time). Dieses Urteil muss den ursprünglich
+            # unbekannten DEP-Record aufwerten; sonst liefert der Endpoint den
+            # Widerspruch delay_known=false neben drei Delay-Nullen aus.
+            if merged.get('delay_known'):
+                out['delay_known'] = True
+                if merged.get('delay_min') is not None:
+                    out['delay_min'] = merged.get('delay_min')
             # Cancelled = OR beider Seiten (nur eine Seite meldet die Streichung).
             if merged.get('cancelled') and not out.get('cancelled'):
                 out['cancelled'] = True
@@ -44459,6 +44467,12 @@ def ax_flight_info(flightno):
                     out['delay_known'] = False
         except Exception:
             pass
+        # Öffentlicher Datenvertrag: bei unbekanntem Delay sind auch alle
+        # numerischen Delay-Felder null. Placeholder-0 darf kein Consumer als
+        # „pünktlich“ interpretieren. Cancelled bleibt davon unberührt.
+        if not out.get('delay_known'):
+            for _k in ('delay_min', 'dep_delay_min', 'arr_delay_min'):
+                out[_k] = None
         return _public_cache_headers(jsonify(out))
     # Weder Historie noch Live-Feed → Client fällt auf AeroDataBox zurück.
     return jsonify({'ok': True, 'found': False, 'flight': fn, 'source': 'none'})
@@ -44489,11 +44503,19 @@ def ax_aircraft_history(reg):
                 flights = []
                 for x in rows:
                     ap = (x.get('airport') or '').split('#', 1)[0]
+                    is_arr = '#ARR' in (x.get('airport') or '').upper()
+                    known = _obs_delay_known(
+                        x.get('max_delay_min'), x.get('cancelled'),
+                        x.get('esti'), x.get('status'), is_arr)
                     flights.append({
                         'date': x.get('date'), 'flight': x.get('flight'),
-                        'origin': ap, 'dest': x.get('dest_iata'),
-                        'dest_name': x.get('dest_name'), 'airline': x.get('airline'),
-                        'sched': x.get('sched'), 'delay_min': x.get('max_delay_min'),
+                        # ARR-Row-Konvention: airport=Ziel, dest_iata=Herkunft.
+                        'origin': (x.get('dest_iata') if is_arr else ap),
+                        'dest': (ap if is_arr else x.get('dest_iata')),
+                        'dest_name': (None if is_arr else x.get('dest_name')),
+                        'airline': x.get('airline'), 'sched': x.get('sched'),
+                        'delay_min': (x.get('max_delay_min') if known else None),
+                        'delay_known': known,
                         'cancelled': x.get('cancelled'), 'status': x.get('status'),
                     })
                 resp = jsonify({
@@ -46297,6 +46319,9 @@ def flight_status(token):
         if not m:
             return None
         raw_status = m.get('status') or ''
+        _known = _obs_delay_known(
+            x.get('max_delay_min'), x.get('cancelled'), x.get('esti'),
+            x.get('status'), False)
         return {
             'flight': number,
             'airline': m.get('airline') or '', 'airline_name': '',
@@ -46668,7 +46693,8 @@ def _warehouse_latest_flight_for_reg(reg):
             'sched': x.get('sched'),
             'esti': x.get('esti'),
             'status': (x.get('status') or '').strip() or None,
-            'delay_min': x.get('max_delay_min'),
+            'delay_min': (x.get('max_delay_min') if _known else None),
+            'delay_known': _known,
             'cancelled': bool(x.get('cancelled')),
             'date': x.get('date'),
             'source': 'warehouse',
@@ -47956,6 +47982,8 @@ def _punctuality_stats_from_obs(date_str, airport='FRA', airline=None):
     rows = _delay_obs_rows_for_date(date_str, airport)
     airline = (airline or '').upper().strip()
     total = 0
+    scheduled_total = 0
+    unknown = 0
     cancelled = 0
     delayed = 0
     on_time = 0
@@ -47971,11 +47999,18 @@ def _punctuality_stats_from_obs(date_str, airport='FRA', airline=None):
                 al = (fn[:2] if fn else '')
             if (al or '').upper() != airline:
                 continue
-        total += 1
+        scheduled_total += 1
         if bool(row.get('cancelled')):
+            total += 1
             cancelled += 1
             continue
         md = int(row.get('max_delay_min') or 0)
+        known = _obs_delay_known(md, False, row.get('esti'),
+                                 row.get('status'), (airport or '').upper().endswith('#ARR'))
+        if not known:
+            unknown += 1
+            continue
+        total += 1
         if md >= _PUNCTUALITY_DELAY_THRESHOLD_MIN:
             delayed += 1
             delay_vals.append(md)
@@ -47987,11 +48022,12 @@ def _punctuality_stats_from_obs(date_str, airport='FRA', airline=None):
     incomplete = active < _PUNCTUALITY_MIN_SAMPLE
     return {'total': total, 'on_time': on_time, 'delayed': delayed,
             'cancelled': cancelled, 'on_time_pct': pct, 'avg_delay_min': avg_delay,
+            'unknown': unknown,
             'sample_size': active, 'data_incomplete': incomplete,
             'min_sample': _PUNCTUALITY_MIN_SAMPLE,
             # EHRLICH: ab wann ein Flug als „verspätet" zählt (D15-Standard, 15 Min).
             'delay_threshold_min': _PUNCTUALITY_DELAY_THRESHOLD_MIN,
-            'scheduled_total': total}
+            'scheduled_total': scheduled_total}
 
 
 def _aerodatabox_punctuality(iata, airline):

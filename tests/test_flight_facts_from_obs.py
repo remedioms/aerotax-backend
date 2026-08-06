@@ -111,6 +111,35 @@ def test_cancelled_flag_from_either_side():
     assert _obs_rows_to_facts(None, None) == {}
 
 
+def test_placeholder_zero_without_observation_is_not_exported():
+    row = {'airport': 'FRA', 'date': '2026-08-06', 'sched': '09:35',
+           'esti': None, 'status': 'Geplant', 'max_delay_min': 0,
+           'cancelled': False}
+    f = _obs_rows_to_facts(row, None)
+    assert 'dep_delay_min' not in f
+    assert f.get('delay_known') is not True
+
+
+def test_zero_after_actual_departure_is_a_known_on_time_observation():
+    row = {'airport': 'FRA', 'date': '2026-08-06', 'sched': '09:35',
+           'esti': None, 'status': 'Abgeflogen', 'max_delay_min': 0,
+           'cancelled': False}
+    f = _obs_rows_to_facts(row, None)
+    assert f['dep_delay_min'] == 0
+    assert f['dep_delay_known'] is True
+    assert f['delay_known'] is True
+
+
+def test_zero_after_landing_is_a_known_arrival_observation():
+    row = {'airport': 'HAJ#ARR', 'date': '2026-08-06', 'sched': '10:25',
+           'esti': None, 'status': 'Landed', 'max_delay_min': 0,
+           'cancelled': False}
+    f = _obs_rows_to_facts(None, row)
+    assert f['arr_delay_min'] == 0
+    assert f['arr_delay_known'] is True
+    assert f['delay_known'] is True
+
+
 # ── _flight_facts_from_obs: Datums-Disziplin (P1-3) ─────────────────────────
 
 class _FakeQ:
