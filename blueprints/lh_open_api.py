@@ -1605,3 +1605,158 @@ def lh_flight_debug(flight, date):
         'flight': flight, 'date': date,
         'facts': lh_flight_facts(flight, date, dep, arr, caller='debug'),
     })
+
+
+# ── Shuttler: Tages-Flugliste einer Strecke (flightstatus/route) ─────────────
+# Für Pendler, die mit dem Flieger zur Base kommen: EIN Call liefert alle
+# Flüge einer Strecke an einem Tag (verprobt 2026-08-06 FRA-HAM: LH-Mainline,
+# VL City Airlines UND Condor DE in derselben Antwort — deshalb hier bewusst
+# KEIN is_lh_group-Gate; die Antwort enthält, was LH über die Strecke weiß).
+# Flugpläne sind stabil → lange TTL; Ist-Zeiten/Annullierungen sind NICHT
+# Aufgabe dieser Liste (dafür gibt es lh_flight_facts pro gewähltem Flug).
+
+_ROUTE_TTL_S = 12 * 3600
+_ROUTE_MEMO_MAX = 256
+_route_memo = {}                 # (dep,arr,date) → (expires_ts, list, answered)
+_route_lock = threading.Lock()
+
+
+def _ensure_offset(iso_str, iata):
+    """Offset-loses Lokal-ISO ('2026-08-07T07:00[:00]') → Offset-ISO über die
+    Stations-Zeitzone. Trägt das ISO schon einen Offset, bleibt es unberührt.
+    Fallback-Pfad für Antworten ohne ScheduledTimeUTC-Block — die Rechnung
+    „kommt er vor dem Report an?" braucht INSTANTS, keine Wanduhrzeiten
+    (Zeitzonen-Fehlerklasse). Pure; bei unbekannter Station bleibt das naive
+    ISO stehen (Consumer datieren stations-lokal), es wird NIE ein Offset
+    erfunden."""
+    if not iso_str:
+        return None
+    s = str(iso_str).strip()
+    if re.search(r'(Z|[+-]\d{2}:\d{2})$', s):
+        return s
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        from airport_tz import airport_tz as _atz
+        tz = _atz((iata or '').upper().strip())
+        if not tz:
+            return s
+        naive = _dt.strptime(s[:16], '%Y-%m-%dT%H:%M')
+        return naive.replace(tzinfo=ZoneInfo(tz)).isoformat()
+    except Exception:
+        return s
+
+
+def parse_route_flights(data):
+    """flightstatus/route-Response → Liste Flug-Dicts. Pure, wirft nie.
+    Skalar-hart (LH-Known-Issue: Ein-Element-Arrays kommen als Objekt).
+    Zeiten als Offset-ISO (`_side_times`, Fallback `_ensure_offset`).
+    `operated_by` nur bei echtem Wet-Lease (Abweichung), nie „LH von LH"."""
+    out = []
+    fl = (((data or {}).get('FlightStatusResource') or {})
+          .get('Flights') or {}).get('Flight')
+    fl = fl if isinstance(fl, list) else ([fl] if isinstance(fl, dict) else [])
+    for f in fl:
+        if not isinstance(f, dict):
+            continue
+        try:
+            mkt = _carrier_designator(f.get('MarketingCarrier'))
+            if not mkt:
+                continue
+            dep_b = f.get('Departure') or {}
+            arr_b = f.get('Arrival') or {}
+            dep_ap = str(dep_b.get('AirportCode') or '').upper() or None
+            arr_ap = str(arr_b.get('AirportCode') or '').upper() or None
+            dep_sched, _ = _side_times(dep_b)
+            arr_sched, _ = _side_times(arr_b)
+            op = _carrier_designator(f.get('OperatingCarrier'))
+            status = ((f.get('FlightStatus') or {}).get('Code') or '').strip()
+            row = {
+                'flight': mkt,
+                'dep': dep_ap,
+                'arr': arr_ap,
+                'sched_dep': _ensure_offset(dep_sched, dep_ap),
+                'sched_arr': _ensure_offset(arr_sched, arr_ap),
+            }
+            if op and op != mkt:
+                row['operated_by'] = op
+            if status:
+                # Status-Code 1:1 durchreichen (CD=cancelled etc.) — die UI
+                # entscheidet; hier wird nichts interpretiert oder verworfen.
+                row['status'] = status
+            out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def route_flights(dep_iata, arr_iata, date, caller='shuttle_user'):
+    """Alle Flüge einer Strecke an einem Tag → (list, answered).
+    `answered=False` heißt Lücke (Budget-Gate/5xx) — der Aufrufer darf daraus
+    NIE „keine Flüge" machen. Eine echte leere Antwort (404) ist answered=True.
+    Memo + geteilter Cache (`lhroute`-Kind in ax_paid_call_cache), TTL 12 h —
+    dieselbe TTL lokal wie geteilt (Frische darf nicht vom Worker abhängen).
+    Wirft nie."""
+    dep = re.sub(r'[^A-Z]', '', str(dep_iata or '').upper())[:3]
+    arr = re.sub(r'[^A-Z]', '', str(arr_iata or '').upper())[:3]
+    d = str(date or '').strip()[:10]
+    if (len(dep) != 3 or len(arr) != 3 or not lh_open_configured()
+            or not re.match(r'^\d{4}-\d{2}-\d{2}$', d)):
+        return [], False
+    key = (dep, arr, d)
+    now = time.time()
+    with _route_lock:
+        hit = _route_memo.get(key)
+        if hit and now < hit[0]:
+            return list(hit[1]), hit[2]
+
+    # Geteilter Cache: ein Prozess (oder der Stand vor dem letzten Deploy)
+    # hat die Strecke evtl. schon bezahlt. Shape: {'flights': […]}; wie bei
+    # den Fakten werden NUR echte Antworten geschrieben, nie Lücken.
+    client = _shared_sb()
+    if client is not None:
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            now_dt = _dt.now(_tz.utc)
+            r = (client.table('ax_paid_call_cache')
+                 .select('call_key,result,result_until')
+                 .eq('call_key', _shared_key('lhroute', f'{dep}{arr}', d,
+                                             None, None))
+                 .execute())
+            for row in (getattr(r, 'data', None) or []):
+                res = row.get('result')
+                left = _shared_until(row.get('result_until'), now_dt)
+                if left > 0 and isinstance(res, dict) and res.get('answered'):
+                    lst = [x for x in (res.get('flights') or [])
+                           if isinstance(x, dict)]
+                    with _route_lock:
+                        _route_memo[key] = (now + min(left, _ROUTE_TTL_S),
+                                            lst, True)
+                    return list(lst), True
+        except Exception as e:
+            log.warning('[lh_open] route shared-read: %s', type(e).__name__)
+
+    data = _get(f'/operations/flightstatus/route/{dep}/{arr}/{d}',
+                caller=caller)
+    answered = last_call_answered()          # 404 = „keine Flüge" = Antwort
+    flights = parse_route_flights(data) if data else []
+    if not answered:
+        return [], False                     # Lücke: nichts cachen
+    with _route_lock:
+        _route_memo[key] = (now + _ROUTE_TTL_S, flights, True)
+        if len(_route_memo) > _ROUTE_MEMO_MAX:
+            items = sorted(_route_memo.items(), key=lambda kv: kv[1][0])
+            for k, _v in items[:len(items) // 4 or 1]:
+                _route_memo.pop(k, None)
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    now_dt = _dt.now(_tz.utc)
+    _shared_write([{
+        'call_key': _shared_key('lhroute', f'{dep}{arr}', d, None, None),
+        'provider': _SHARED_PROVIDER,
+        'result': {'flights': flights, 'answered': True},
+        'result_until': (now_dt + _td(seconds=_ROUTE_TTL_S)).isoformat(),
+        'negative_reason': None,
+        'negative_until': None,
+        'updated_at': now_dt.isoformat(),
+    }])
+    return list(flights), True
