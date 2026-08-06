@@ -53624,7 +53624,13 @@ def import_calendar_feed(token):
         if _url_2_raw:
             err_2 = 'bad_url_2'
         url_2 = ''
-    if not url_2 and 'url_2' not in body and not ics_text_direct and not ics_text_2_direct:
+    # Auch beim GERÄTE-ICS-Pfad nachsehen, ob ein Zweitfeed konfiguriert ist.
+    # Fehlt dessen Text, ist das ein partieller Fetch-Fehler — nicht „kein
+    # zweiter Kalender". Sonst würde das Reconcile einen Duty-only-Upload als
+    # vollständige Wahrheit behandeln und vorhandene LEON-Off-Days löschen.
+    # URL-Importe laden den gespeicherten Zweitlink wie bisher serverseitig;
+    # Geräte-Importe markieren ihn nur als fehlend.
+    if not url_2 and 'url_2' not in body and not ics_text_2_direct:
         try:
             _pf = _profile_load(token) or {}
             for _src in ((_pf.get('profile') or {}), _pf):
@@ -53633,8 +53639,11 @@ def import_calendar_feed(token):
                     _u2 = _normalize_feed_scheme(
                         _sanitize_feed_url(_c2.get('url') or ''))
                     if _u2.startswith('https://'):
-                        url_2 = _u2
-                    break
+                        if ics_text_direct:
+                            err_2 = 'missing_ics_text_2'
+                        else:
+                            url_2 = _u2
+                        break
         except Exception:
             pass
 

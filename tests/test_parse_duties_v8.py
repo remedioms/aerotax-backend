@@ -94,3 +94,31 @@ def test_confirmed_cutoff_day_duty_remains_importable():
     assert not PARSER.is_planned_for_cutoff(
         row, date(2026, 8, 6), date(2026, 8, 6)
     )
+
+
+def test_unflown_past_row_is_reported_separately_from_planned_rows():
+    row = _row(**{
+        "Departure place": "FRA",
+        "Arrival place": "JFK",
+        "Flight number": "DE2016",
+    })
+
+    assert not PARSER.is_planned_for_cutoff(
+        row, date(2026, 8, 5), date(2026, 8, 6)
+    )
+    assert PARSER.is_unflown_past(
+        row, date(2026, 8, 5), date(2026, 8, 6)
+    )
+
+
+def test_historical_row_with_aircraft_evidence_is_not_warned():
+    row = _row(**{
+        "Departure place": "FRA",
+        "Arrival place": "JFK",
+        "Flight number": "DE2016",
+        "Aircraft registration": "D-ABOA",
+    })
+
+    assert not PARSER.is_unflown_past(
+        row, date(2026, 8, 5), date(2026, 8, 6)
+    )

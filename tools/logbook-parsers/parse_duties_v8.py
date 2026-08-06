@@ -269,6 +269,15 @@ def is_planned_for_cutoff(r, duty_date, cutoff):
     )
 
 
+def is_unflown_past(r, duty_date, cutoff):
+    """Historische Zeile ohne Ist-Beleg: behalten, aber sichtbar warnen.
+
+    Die Prüfung ist bewusst getrennt von `is_planned_for_cutoff`, weil jener
+    Helper für Daten vor dem Cutoff per Definition immer False liefert.
+    """
+    return duty_date < cutoff and looks_unflown(r)
+
+
 def is_zero_duration_marker(r):
     """Historischer OffBlock-Marker ohne ableitbare Flug- oder FSTD-Zeit.
 
@@ -435,9 +444,9 @@ def main():
                                      f"{s(r, 'Arrival place')}",
                                      s(r, 'Total time')))
                 continue
-            if dt.date() < cutoff:
-                unflown_past.append((dt.strftime('%Y-%m-%d'),
-                                     s(r, 'Flight number')))
+        elif is_unflown_past(r, dt.date(), cutoff):
+            unflown_past.append((dt.strftime('%Y-%m-%d'),
+                                 s(r, 'Flight number')))
 
         role = norm_role(s(r, 'Function'))
         total = hhmm_to_min(s(r, 'Total time'))

@@ -129,14 +129,15 @@ def test_merge_keeps_events_without_uid():
 
 # ── Import-Endpoint (Zwei-Link) ──────────────────────────────────────────────
 
-def _patch_persistence(monkeypatch, fetch_map):
+def _patch_persistence(monkeypatch, fetch_map, existing_profile=None):
     """Profil-/Briefing-Persistenz + Netz-Fetch für Endpoint-Tests stubben.
     `fetch_map`: url → (text, err) — gleiche Signatur wie
     `_fetch_calendar_feed_text` (der einzige Netz-Punkt des Endpoints)."""
     saved = {}
     monkeypatch.setattr(backend, '_fetch_calendar_feed_text',
                         lambda url: fetch_map.get(url, (None, 'fetch_failed')))
-    monkeypatch.setattr(backend, '_profile_load', lambda t: {})
+    monkeypatch.setattr(backend, '_profile_load',
+                        lambda t: existing_profile or {})
     monkeypatch.setattr(backend, '_profile_load_from_disk', lambda t: {})
     monkeypatch.setattr(
         backend, '_profile_save',
@@ -255,6 +256,26 @@ def test_invalid_second_link_is_honest_bad_url_2(monkeypatch):
     assert j['ok'] is True
     assert j['error_2'] == 'bad_url_2'
     assert j['events_count_1'] == 4 and j['events_count_2'] == 0
+
+
+def test_device_primary_without_stored_secondary_text_skips_reconcile(monkeypatch):
+    """Defekter/alter iOS-Client: Duty-Text kam an, der konfigurierte
+    Off-Days-Feed aber nicht. Bestehende Off-Days dürfen nicht verschwinden."""
+    saved = _patch_persistence(
+        monkeypatch, {},
+        existing_profile={'profile': {
+            'calendar_feed_2': {'url': SYN_OFF_URL},
+        }})
+    client = backend.app.test_client()
+    r = client.post('/api/user/calendar-feed/tok-leon-test/import',
+                    json={'ics_text': _duty_text()})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j['ok'] is True
+    assert j['error_2'] == 'missing_ics_text_2'
+    assert j['events_count_1'] == 4 and j['events_count_2'] == 0
+    assert j['reconcile'].get('skipped') == 'partial_feed_failure'
+    assert '2026-08-10' in (saved.get('briefings') or {})
 
 
 def test_single_link_fetch_fail_stays_502(monkeypatch):
