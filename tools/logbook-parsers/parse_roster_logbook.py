@@ -5,6 +5,7 @@ Supported, deliberately narrow formats:
 
 * Lufthansa Jeppesen ``Acknowledged Roster`` (confirmedPlan/yearPlan)
 * Condor ``Duty plan requested at ... - All times: Local FRA``
+* Condor NetLine/Crew ``Individual duty plan``
 
 Both documents can contain future planned duties.  A logbook may only contain
 completed flying, so this parser requires the document's own generation time
@@ -88,6 +89,25 @@ CONDOR_FLIGHT = re.compile(
     r"(?:(?P<report>\d{1,2}:\d{2})\s+)?"
     r"(?P<frm>[A-Z]{3})\s+(?P<start>\d{1,2}:\d{2})\s+-\s+"
     r"(?P<end>\d{1,2}:\d{2})\s+(?P<to>[A-Z]{3})\b"
+)
+
+CONDOR_INDIVIDUAL_CREATED = re.compile(
+    r"printed by CREWLINK\s+(\d{2})([A-Za-z]{3})(\d{2})\s+"
+    r"(\d{1,2}):(\d{2})"
+)
+CONDOR_INDIVIDUAL_PERIOD = re.compile(
+    r"Period:\s*(\d{2})([A-Za-z]{3})(\d{2})\s*-\s*"
+    r"(\d{2})([A-Za-z]{3})(\d{2})"
+)
+CONDOR_INDIVIDUAL_TOTAL = re.compile(r"Flight time\s+(\d{1,3}):(\d{2})")
+CONDOR_INDIVIDUAL_DAY = re.compile(
+    r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(\d{2})\b"
+)
+CONDOR_INDIVIDUAL_FLIGHT = re.compile(
+    r"^DE\s+(?P<number>\d{3,4}[A-Z]?)\s+(?:R\s+)?"
+    r"(?P<frm>[A-Z]{3})\s+(?P<start>\d{4})\s+"
+    r"(?P<end>\d{4})\s+(?P<to>[A-Z]{3})\s+"
+    r"(?P<type>[A-Z0-9]{3})(?:\s+JU)?$"
 )
 
 
@@ -460,11 +480,174 @@ def parse_condor_text(text):
     }
 
 
+def _compact_clock(day, value):
+    if not re.fullmatch(r"\d{4}", value):
+        raise ValueError("invalid compact roster clock")
+    return _clock(day, f"{value[:2]}:{value[2:]}")
+
+
+def _individual_day(period_start, period_end, previous, weekday, dom):
+    candidates = []
+    cursor = period_start
+    while cursor <= period_end:
+        if cursor.day == int(dom) and cursor.strftime("%a") == weekday:
+            candidates.append(cursor)
+        cursor += timedelta(days=1)
+    if previous is not None:
+        candidates = [candidate for candidate in candidates
+                      if candidate > previous]
+    if not candidates:
+        raise ValueError("Condor individual-plan weekday/date mismatch")
+    return candidates[0]
+
+
+def parse_condor_individual_segments(header_text, segments, role):
+    """Parse schedule columns cropped from a NetLine Individual duty plan.
+
+    The PDF paints three independent schedule columns on each landscape page.
+    Whole-page extraction interleaves their glyphs, so callers must provide
+    the columns in chronological reading order.  The printed flight-time total
+    remains a strict end-to-end control over all (past and future) flight rows.
+    """
+    if ("Individual duty plan" not in header_text
+            or "NetLine/Crew(CFG)" not in header_text):
+        raise ValueError("unsupported Condor individual duty-plan format")
+    created_match = CONDOR_INDIVIDUAL_CREATED.search(header_text)
+    period_match = CONDOR_INDIVIDUAL_PERIOD.search(header_text)
+    total_match = CONDOR_INDIVIDUAL_TOTAL.search(header_text)
+    if not created_match or not period_match or not total_match:
+        raise ValueError(
+            "Condor individual-plan timestamp, period or total missing")
+    created_day, created_mon, created_year, created_hour, created_minute = (
+        created_match.groups())
+    # CREWLINK prints the workstation-local timestamp.  Its timezone is not
+    # stated in the document, so creation-day legs are conservatively excluded
+    # instead of guessing.  Earlier roster flight clocks are UTC: their raw
+    # differences reconcile exactly to the printed Flight time control total.
+    created_local = datetime(
+        2000 + int(created_year), _month(created_mon), int(created_day),
+        int(created_hour), int(created_minute), tzinfo=ZoneInfo("Europe/Berlin"))
+    start_day, start_mon, start_year, end_day, end_mon, end_year = (
+        period_match.groups())
+    period_start = date(2000 + int(start_year), _month(start_mon),
+                        int(start_day))
+    period_end = date(2000 + int(end_year), _month(end_mon), int(end_day))
+    if period_end < period_start:
+        raise ValueError("invalid Condor individual-plan period")
+    role_map = {"CP": "PIC", "FO": "FO", "PU": "FB", "ST": "FB"}
+    if role not in role_map:
+        raise ValueError("unsupported Condor individual-plan crew role")
+
+    legs = []
+    previous_day = current_day = None
+    all_block_min = 0
+    seen_candidate = future = current_day_excluded = 0
+    for segment in segments:
+        for raw in segment.splitlines():
+            line = raw.strip()
+            # A summary value from the neighbouring printed column can touch
+            # the day label (for example ``:00] Sat18``).  The date token
+            # itself remains intact, so find it instead of requiring column 0.
+            anchor = CONDOR_INDIVIDUAL_DAY.search(line)
+            if anchor:
+                current_day = _individual_day(
+                    period_start, period_end, previous_day,
+                    anchor.group(1), anchor.group(2))
+                previous_day = current_day
+            match = CONDOR_INDIVIDUAL_FLIGHT.match(line)
+            if not match:
+                continue
+            if current_day is None:
+                raise ValueError(
+                    "Condor individual-plan flight without day anchor")
+            seen_candidate += 1
+            start = _compact_clock(current_day, match.group("start"))
+            end = _compact_clock(current_day, match.group("end"))
+            if end <= start:
+                end += timedelta(days=1)
+            block = int((end - start).total_seconds() // 60)
+            if not 0 < block < 1200:
+                raise ValueError("invalid Condor individual-plan block time")
+            all_block_min += block
+            if end.date() >= created_local.date():
+                if end.date() == created_local.date():
+                    current_day_excluded += 1
+                else:
+                    future += 1
+                continue
+            legs.append(_leg(
+                "DE", match.group("number"), match.group("frm"),
+                match.group("to"), start, end, match.group("type"),
+                role_map[role],
+                remarks=("Condor Individual Duty Plan; roster times UTC; "
+                         "completed before document creation"),
+            ))
+    if not seen_candidate:
+        raise ValueError("Condor individual-plan contains no flight rows")
+    expected_block_min = (int(total_match.group(1)) * 60
+                          + int(total_match.group(2)))
+    if all_block_min != expected_block_min:
+        raise ValueError(
+            "Condor individual-plan block total mismatch: "
+            f"source={expected_block_min} parsed={all_block_min}")
+    return legs, {
+        "format": "condor_individual_duty_plan",
+        "created_at": created_local.astimezone(timezone.utc).isoformat(),
+        "period": f"{period_start.isoformat()}/{period_end.isoformat()}",
+        "future_legs_excluded": future,
+        "creation_day_legs_excluded": current_day_excluded,
+        "deadheads_excluded": 0,
+        "verified_source_block_total": expected_block_min,
+        "source_role": role,
+    }
+
+
+def parse_condor_individual_pdf(pdf):
+    if len(pdf.pages) < 3:
+        raise ValueError("Condor individual-plan pages missing")
+    header_text = "\n".join(
+        (page.extract_text(x_tolerance=2, y_tolerance=2) or "")
+        for page in pdf.pages)
+    first = pdf.pages[0]
+    role_text = first.crop((70, 50, 280, 130)).extract_text(
+        x_tolerance=2, y_tolerance=2) or ""
+    roles = set(re.findall(r"\b(?:CP|FO|PU|ST)\b", role_text))
+    if len(roles) != 1:
+        raise ValueError("Condor individual-plan crew role is ambiguous")
+
+    segments = []
+    found_total = False
+    for page in pdf.pages:
+        if page.width < 700 or page.height < 500:
+            raise ValueError("unexpected Condor individual-plan page geometry")
+        for column in range(3):
+            segment = page.crop((
+                page.width * column / 3,
+                page.height * 0.15,
+                page.width * (column + 1) / 3,
+                page.height * 0.95,
+            )).extract_text(x_tolerance=2, y_tolerance=2) or ""
+            if "Flight time" in segment:
+                segments.append(segment.split("Flight time", 1)[0])
+                found_total = True
+                break
+            segments.append(segment)
+        if found_total:
+            break
+    if not found_total:
+        raise ValueError("Condor individual-plan schedule summary missing")
+    return parse_condor_individual_segments(
+        header_text, segments, roles.pop())
+
+
 def parse_text(text):
     if re.search(r"(?im)^\s*Acknowledged Roster\s*$", text[:500]):
         return parse_acknowledged_text(text)
     if "Duty plan requested at" in text[:1000]:
         return parse_condor_text(text)
+    if "Individual duty plan" in text[:1000]:
+        raise ValueError(
+            "Condor individual duty plan requires PDF column extraction")
     raise ValueError("unsupported roster-logbook PDF format")
 
 
@@ -506,7 +689,11 @@ def parse_sources(paths):
         seen_hashes.add(digest)
         with pdfplumber.open(path) as pdf:
             text = "\n".join((page.extract_text() or "") for page in pdf.pages)
-        legs, meta = parse_text(text)
+            if ("Individual duty plan" in text[:1000]
+                    and "NetLine/Crew(CFG)" in text[:1000]):
+                legs, meta = parse_condor_individual_pdf(pdf)
+            else:
+                legs, meta = parse_text(text)
         source_id = digest[:16]
         parsed.append((source_id, legs, meta))
         reports.append({**meta, "sha256_prefix": source_id,

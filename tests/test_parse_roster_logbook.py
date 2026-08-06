@@ -150,6 +150,52 @@ P Mo 20 DE1142 32B DAIAG JU C5 12:30 DUS 13:45 - 16:15 SUF
     assert meta["verified_source_block_total"] == 537
 
 
+def test_condor_individual_plan_columns_reconcile_total_and_exclude_future():
+    header = """Individual duty plan for [redacted]
+NetLine/Crew(CFG) printed by CREWLINK 03Aug26 19:18 Page 1
+Period: 01Jul26 - 31Aug26
+Flight time 13:38 Off days 14
+"""
+    segments = [
+        """Fri10 C/I DUS 0235
+DE 1616 DUS 0417 0722 HER 32N JU
+DE 1663 HER 0838 1200 FRA 320 JU
+Sat11 C/I FRA 1110
+DE 1662 R FRA 1320 1622 HER 32N JU
+""",
+        """[BZW 0:00] Tue04 C/I DUS 1000
+DE 1414 DUS 1221 1630 FNC 32H JU
+""",
+    ]
+    legs, meta = PARSER.parse_condor_individual_segments(
+        header, segments, "ST")
+    assert [leg["flight"] for leg in legs] == [
+        "DE1616", "DE1663", "DE1662"]
+    assert legs[0]["dep_iso"] == "2026-07-10T04:17:00Z"
+    assert legs[0]["arr_iso"] == "2026-07-10T07:22:00Z"
+    assert all(leg["role"] == "FB" for leg in legs)
+    assert meta["future_legs_excluded"] == 1
+    assert meta["verified_source_block_total"] == 818
+
+
+def test_condor_individual_plan_rejects_block_total_mismatch():
+    header = """Individual duty plan for [redacted]
+NetLine/Crew(CFG) printed by CREWLINK 03Aug26 19:18 Page 1
+Period: 01Jul26 - 31Aug26
+Flight time 01:00 Off days 14
+"""
+    try:
+        PARSER.parse_condor_individual_segments(
+            header,
+            ["Fri10 C/I DUS 0235\nDE 1616 DUS 0417 0722 HER 32N JU\n"],
+            "ST",
+        )
+    except ValueError as exc:
+        assert "block total mismatch" in str(exc)
+    else:
+        raise AssertionError("mismatched source total was accepted")
+
+
 def test_merge_prefers_newest_document_revision():
     old = {
         "date": "2026-01-01", "flight": "LH84", "from": "FRA", "to": "DUS",
