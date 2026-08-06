@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import sys
+from datetime import date
 
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(__file__)),
@@ -61,3 +62,35 @@ def test_fstd_field_does_not_erase_confirmed_operating_leg():
 def test_fstd_code_is_never_persisted_as_aircraft_registration():
     source = open(os.path.join(TOOLS, "parse_duties_v8.py"), encoding="utf-8").read()
     assert "not RE_FSTD.fullmatch(reg_raw)" in source
+
+
+def test_future_duty_is_planned_even_with_prefilled_crew_and_times():
+    row = _row(**{
+        "Departure place": "FRA",
+        "Arrival place": "JFK",
+        "Departure time": "08:00",
+        "Arrival time": "16:00",
+        "Total time": "08:00",
+        "Flight number": "LH400",
+        "PIC": "Vorbefuellt",
+        "FO": "Vorbefuellt",
+        "PIC time": "08:00",
+    })
+
+    assert not PARSER.looks_unflown(row)
+    assert PARSER.is_planned_for_cutoff(
+        row, date(2026, 8, 18), date(2026, 8, 6)
+    )
+
+
+def test_confirmed_cutoff_day_duty_remains_importable():
+    row = _row(**{
+        "Departure place": "FRA",
+        "Arrival place": "JFK",
+        "Flight number": "LH400",
+        "Aircraft registration": "D-AIXA",
+    })
+
+    assert not PARSER.is_planned_for_cutoff(
+        row, date(2026, 8, 6), date(2026, 8, 6)
+    )

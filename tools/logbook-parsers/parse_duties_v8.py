@@ -254,6 +254,21 @@ def looks_unflown(r):
     return True
 
 
+def is_planned_for_cutoff(r, duty_date, cutoff):
+    """Noch nicht importierbare Dienstplanzeile relativ zum Ist-Cutoff.
+
+    Ein Datum *nach* dem Cutoff ist per Definition noch nicht geflogen. Einige
+    OffBlock-Exporte befüllen für kommende Umläufe bereits PIC/FO sowie
+    Zeitklassen; diese Planwerte dürfen ``looks_unflown`` nicht als Ist-Beleg
+    überstimmen. Am Cutoff-Tag selbst bleibt dagegen die bestehende
+    Evidenzprüfung aktiv, weil ein bereits absolvierter Flug desselben Tages
+    legitim importiert werden kann.
+    """
+    return duty_date > cutoff or (
+        duty_date == cutoff and looks_unflown(r)
+    )
+
+
 def is_zero_duration_marker(r):
     """Historischer OffBlock-Marker ohne ableitbare Flug- oder FSTD-Zeit.
 
@@ -411,8 +426,8 @@ def main():
             continue
 
         # ── noch nicht geflogen (Dienstplan-Vorbelegung) ──────────────────
-        if looks_unflown(r):
-            if dt.date() >= cutoff and not keep_planned:
+        if is_planned_for_cutoff(r, dt.date(), cutoff):
+            if not keep_planned:
                 skipped['geplant'] += 1
                 planned_rows.append((dt.strftime('%Y-%m-%d'), typ,
                                      s(r, 'Flight number'),
