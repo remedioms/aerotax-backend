@@ -50392,6 +50392,14 @@ def _parse_ics_to_events_v2(text):
                 _reason = v.strip()[:40]
                 if _reason:
                     current['ax_incomplete'] = _reason
+            elif k == 'X-AEROX-SOURCE':
+                # Herkunfts-Marker synthetisierter Events (aktuell nur
+                # 'ki_fallback' aus dem Roster-Import-KI-Lesepfad). Additiv —
+                # Diagnose/Forensik erkennt daran, welche Tage NICHT aus einem
+                # deterministischen Parser stammen.
+                _src = v.strip()[:32]
+                if _src:
+                    current['ax_source'] = _src
             elif k == 'STATUS':
                 if v.upper() == 'CANCELLED':
                     current['_cancelled'] = True
@@ -50840,6 +50848,12 @@ def _parse_ics_to_events_legacy(text):
                 _hn = v.strip()[:60]
                 if _hn:
                     current['ax_hotel'] = _hn
+            elif k == 'X-AEROX-SOURCE':
+                # Herkunfts-Marker synthetisierter Events (aktuell nur
+                # 'ki_fallback' aus dem Roster-Import-KI-Lesepfad). Additiv.
+                _src = v.strip()[:32]
+                if _src:
+                    current['ax_source'] = _src
             elif k == 'STATUS':
                 if v.upper() == 'CANCELLED':
                     current['_cancelled'] = True
@@ -54350,7 +54364,8 @@ def _acknowledged_roster_text_to_ics(text, carrier='LH'):
         prodid='AeroX Lufthansa Acknowledged Roster PDF Import'), None
 
 
-def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
+def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import',
+                       extra_lines=None):
     """Synthetische Event-Tupel (uid_suffix, start, end, summary, all_day[, dep_tzid])
     → ICS-String. Geteilt von CrewAccess- und Discover-Roster-Parser.
 
@@ -54364,8 +54379,14 @@ def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
 
     Optionales 7. Element `location`: IATA-Code für eine LOCATION-Zeile
     (synthetisierte LAYOVER-Events aus der CrewAccess-Layover-Spalte).
+
+    `extra_lines`: zusätzliche, bereits fertige ICS-Zeilen (z.B.
+    ``X-AEROX-SOURCE:ki_fallback``), die JEDEM VEVENT dieses Aufrufs angehängt
+    werden. Additiv — ohne das Argument ist die Ausgabe byte-identisch zu
+    vorher, alle bestehenden Aufrufer bleiben unberührt.
     """
     lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', f'PRODID:-//{prodid}//DE']
+    extras = [str(line) for line in (extra_lines or []) if str(line).strip()]
     for ev_tuple in events:
         uid, start, end, summary, all_day = ev_tuple[:5]
         dep_tzid = ev_tuple[5] if len(ev_tuple) > 5 else None
@@ -54388,6 +54409,7 @@ def _pdf_events_to_ics(events, year, month, prodid='AeroX Roster PDF Import'):
             # LAYOVER-Events tragen die Station als LOCATION (LH-Feed-Form) —
             # ical_layover_ort/Nightstop-Ableitung lesen genau dieses Feld.
             lines.append(f'LOCATION:{location}')
+        lines.extend(extras)
         lines.append('END:VEVENT')
     lines.append('END:VCALENDAR')
     return '\r\n'.join(lines)
@@ -55054,6 +55076,467 @@ def _repair_ios_reprinted_roster_text(text):
     return candidate if is_discover else raw
 
 
+# ── KI-Lese-Fallback für den Roster-Import (Owner-Auftrag 2026-08-06) ────────
+# ZWECK: Wenn ein User einen Dienstplan hochlädt, dessen Format KEIN
+# deterministischer Parser versteht (unbekannte Airline / neues Format), liest
+# Claude die Roh-Fakten EINMALIG strukturiert — statt dass der User „0
+# Einträge" bekommt.
+#
+# LEITPLANKEN (nicht verhandelbar):
+#  1. DETERMINISTIC-FIRST — dieser Pfad hängt AUSSCHLIESSLICH am expliziten
+#     User-Import (`import_roster_pdf`) und feuert NUR, wenn die komplette
+#     deterministische Kaskade (CrewAccess → Discover → Acknowledged → CAS)
+#     für diesen Upload NICHTS erzeugt hat. Im periodischen 6h-Sync existiert
+#     er nicht.
+#  2. KEINE FAKE-WERTE — der Prompt verpflichtet auf EXTRAKTION. Serverseitig
+#     wird jede zurückgegebene HH:MM-Zeit und jeder Tag-im-Monat als Substring
+#     im Quelltext gegengeprüft; was dort nicht wörtlich steht, wird verworfen
+#     (Log-Marker `hallucination-drop`). Fehlt ein Wert, bleibt er leer.
+#  3. Der Fallback darf einen Import NIE schlechter machen: jeder Fehler wird
+#     geloggt und lässt den bisherigen „0 Einträge"-Weg unverändert.
+#  4. Kosten-/Missbrauchsdeckel: max. 3 Läufe pro Token und Tag, Quelltext auf
+#     60.000 Zeichen gekappt, EIN Versuch (kein Retry-Hämmern), Timeout 90 s.
+#  5. DATENSCHUTZ: Der Quelltext geht an Anthropic. Geloggt werden nur Länge,
+#     sha-Präfix und Token-Präfix — NIE Inhalt.
+#
+# Ergebnis-Events tragen `X-AEROX-SOURCE:ki_fallback` → additives Feld
+# `ax_source` im Event-Dict, damit Diagnose/Forensik sie erkennt.
+_ROSTER_AI_MAX_CHARS = 60000
+_ROSTER_AI_DAILY_MAX = 3
+_ROSTER_AI_TIMEOUT_S = 90
+_ROSTER_AI_MAX_TOKENS = 16000          # Roster = viele Zeilen → großzügig
+_ROSTER_AI_MARKER = 'ki_fallback'
+_ROSTER_AI_HINT = ('Dieser Plan wurde von KI gelesen — bitte Zeiten '
+                   'stichprobenartig prüfen.')
+_ROSTER_AI_LEARN_NOTE = 'AEROX_ROSTER_AI_LEARN_V1'
+_ROSTER_AI_CALLS = {}                  # (token, 'YYYYMMDD') -> int
+_ROSTER_AI_CALLS_LOCK = _req_threading.Lock()
+_ROSTER_AI_HHMM_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
+_ROSTER_AI_IATA_RE = re.compile(r'^[A-Z]{3}$')
+
+_ROSTER_AI_SYSTEM = (
+    "Du liest Crew-Dienstpläne (Roster) und gibst NUR die Roh-Fakten "
+    "strukturiert zurück. Du EXTRAHIERST, du INTERPRETIERST NICHT.\n"
+    "Harte Regeln:\n"
+    "1. Jede Uhrzeit und jede Tageszahl, die du zurückgibst, MUSS wörtlich so "
+    "im übergebenen Text stehen. Rechne nichts um, runde nicht, ergänze "
+    "nichts, konvertiere keine Zeitzonen.\n"
+    "2. Fehlt ein Wert im Plan, bleibt das Feld leer (null). Rate NIE.\n"
+    "3. Erfinde keine Flüge, keine Flughäfen, keine Tage. Lieber ein Feld "
+    "weniger als ein erfundenes.\n"
+    "4. Uhrzeiten exakt im Format HH:MM, genau wie im Text.\n"
+    "5. `summary` ist die Aktivitäts-Bezeichnung WÖRTLICH aus dem Plan "
+    "(z.B. \"O\", \"SBY\", \"U\", \"OFF\") — keine Übersetzung, keine "
+    "Ausformulierung.\n"
+    "6. Antworte ausschließlich mit JSON, ohne Fließtext davor oder danach.\n\n"
+    "Antwortformat:\n"
+    '{"items": [ {"day": 1, "month_hint": "YYYY-MM", "summary": "…", '
+    '"location": null, "start_hhmm": null, "end_hhmm": null, '
+    '"from_iata": null, "to_iata": null, "flight_no": null, '
+    '"all_day": true} ]}\n'
+    "`month_hint` ist der Monat, zu dem der Tag gehört (wichtig, wenn ein "
+    "PDF mehrere Monate enthält)."
+)
+
+
+def _roster_ai_budget_take(token):
+    """Tagesdeckel: max. `_ROSTER_AI_DAILY_MAX` KI-Läufe pro Token und Tag.
+
+    Bewusst in-memory (Muster der `_REDAKTION_*`-Stores): der Deckel ist ein
+    Kosten-/Missbrauchsschutz, kein Abrechnungszähler. Ein Prozess-Neustart
+    setzt ihn zurück — das ist billiger als eine DB-Runde im Import-Pfad.
+    Liefert True, wenn der Lauf erlaubt ist (und zählt ihn dann hoch).
+    """
+    day = datetime.now(timezone.utc).strftime('%Y%m%d')
+    key = (token, day)
+    with _ROSTER_AI_CALLS_LOCK:
+        for stale in [k for k in _ROSTER_AI_CALLS if k[1] != day]:
+            _ROSTER_AI_CALLS.pop(stale, None)
+        used = _ROSTER_AI_CALLS.get(key, 0)
+        if used >= _ROSTER_AI_DAILY_MAX:
+            return False
+        _ROSTER_AI_CALLS[key] = used + 1
+        return True
+
+
+def _roster_ai_parse_json(raw_text):
+    """Codefence-/Präambel-tolerant (Muster `_redaktion_parse_json`)."""
+    txt = (raw_text or '').strip()
+    if txt.startswith('```'):
+        txt = re.sub(r'^```[a-zA-Z]*\s*', '', txt)
+        txt = re.sub(r'\s*```$', '', txt)
+    start = txt.find('{')
+    end = txt.rfind('}')
+    if start < 0 or end <= start:
+        return []
+    try:
+        obj = json.loads(txt[start:end + 1])
+    except ValueError:
+        return []
+    items = obj.get('items') if isinstance(obj, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _roster_ai_call_anthropic(text):
+    """RAW-HTTP-Call gegen die Messages-API (Muster
+    `_redaktion_call_anthropic`): x-api-key + anthropic-version, kein SDK
+    (steht nicht in requirements). EIN Versuch, Timeout 90 s.
+
+    Liefert `(items|None, model)`. Wirft bei HTTP-Fehlern — der Caller fängt.
+    """
+    key = (os.getenv('ANTHROPIC_API_KEY') or '').strip()
+    model = (os.getenv('AEROX_ROSTER_AI_MODEL') or '').strip() or 'claude-opus-5'
+    if not key:
+        return None, model
+    import requests as _requests
+    body = {
+        'model': model,
+        'max_tokens': _ROSTER_AI_MAX_TOKENS,
+        'system': _ROSTER_AI_SYSTEM,
+        'messages': [{'role': 'user', 'content':
+                      'Lies den folgenden Dienstplan-Text und gib die '
+                      'Roh-Fakten als JSON zurück.\n\n' + text}],
+    }
+    # Reines Ablesen einer Tabelle — `effort: low` spart Denk-Tokens (und damit
+    # Geld/Latenz) ohne Qualitätsverlust bei dieser Aufgabe. `effort` gibt es
+    # erst ab der 4.5/4.6-Generation; wer AEROX_ROSTER_AI_MODEL auf ein älteres
+    # Modell dreht, setzt AEROX_ROSTER_AI_EFFORT="" und schickt das Feld nicht.
+    effort = os.getenv('AEROX_ROSTER_AI_EFFORT')
+    effort = 'low' if effort is None else effort.strip()
+    if effort:
+        body['output_config'] = {'effort': effort}
+    resp = _requests.post(
+        'https://api.anthropic.com/v1/messages',
+        headers={'x-api-key': key,
+                 'anthropic-version': '2023-06-01',
+                 'Content-Type': 'application/json'},
+        json=body,
+        timeout=_ROSTER_AI_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    parts = resp.json().get('content') or []
+    raw = ''.join(p.get('text', '') for p in parts if p.get('type') == 'text')
+    return _roster_ai_parse_json(raw), model
+
+
+def _roster_ai_period(month_hint, src):
+    """`month_hint` → (year, month) oder (None, None).
+
+    Das JAHR muss wörtlich im Quelltext stehen — sonst gibt es kein Datum
+    (Keine-Fake-Werte-Regel). Der Monatsname wird NICHT gegengeprüft: ein
+    fremdsprachiger Plan („Mai 2026") würde sonst pauschal scheitern.
+    """
+    hint = str(month_hint or '').strip()
+    year = month = None
+    m = re.match(r'^(\d{4})-(\d{1,2})$', hint)
+    if m:
+        year, month = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.match(r'^([A-Za-z]{3,9})\.?\s+(\d{4})$', hint)
+        if m:
+            name = m.group(1).lower()
+            month = _CREWACCESS_MONTHS.get(name)
+            if not month:
+                for full, num in _CREWACCESS_MONTHS.items():
+                    if full.startswith(name):
+                        month = num
+                        break
+            year = int(m.group(2))
+    if not year or not month or not 1 <= month <= 12:
+        return None, None
+    if not 1990 <= year <= 2100 or str(year) not in (src or ''):
+        return None, None
+    return year, month
+
+
+def _roster_ai_validate_items(items, text):
+    """Halluzinations-Guard. Liefert `(valide_items, verworfen_count)`.
+
+    Verworfen wird ein Event, wenn
+      * Periode/Tag nicht auflösbar sind oder der Tag NICHT als Substring im
+        Quelltext vorkommt,
+      * eine zurückgegebene Uhrzeit kein HH:MM ist oder NICHT wörtlich im
+        Quelltext steht,
+      * es ein Ganztags-Marker ohne Zeiten ist, dessen `summary` nicht wörtlich
+        im Quelltext steht (das wäre eine reine Erfindung).
+    Optionale Felder (IATA-Codes, Flugnummer, Location) werden EINZELN
+    fallengelassen, wenn sie nicht im Text stehen — der Tag bleibt erhalten,
+    nur die unbelegte Angabe verschwindet.
+    """
+    from datetime import date as _date
+    src = text or ''
+    src_upper = src.upper()
+    src_squeezed = re.sub(r'\s+', '', src_upper)
+    out = []
+    dropped = 0
+    for raw_item in (items or [])[:400]:
+        if not isinstance(raw_item, dict):
+            dropped += 1
+            continue
+        year, month = _roster_ai_period(raw_item.get('month_hint'), src)
+        if not year:
+            dropped += 1
+            continue
+        try:
+            day = int(raw_item.get('day'))
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        if not 1 <= day <= 31:
+            dropped += 1
+            continue
+        if f'{day:02d}' not in src and str(day) not in src:
+            dropped += 1
+            continue
+        try:
+            _date(year, month, day)
+        except ValueError:
+            dropped += 1
+            continue
+
+        clean = {}
+        times_ok = True
+        for field in ('start_hhmm', 'end_hhmm'):
+            value = raw_item.get(field)
+            value = value.strip() if isinstance(value, str) else ''
+            if not value:
+                clean[field] = None
+                continue
+            if not _ROSTER_AI_HHMM_RE.match(value) or value not in src:
+                times_ok = False
+                break
+            clean[field] = value
+        if not times_ok:
+            dropped += 1
+            continue
+
+        for field in ('from_iata', 'to_iata', 'location'):
+            value = raw_item.get(field)
+            value = value.strip().upper() if isinstance(value, str) else ''
+            clean[field] = (value if _ROSTER_AI_IATA_RE.match(value)
+                            and value in src_upper else None)
+        flight = raw_item.get('flight_no')
+        flight = re.sub(r'\s+', '', flight.upper()) if isinstance(flight, str) else ''
+        clean['flight_no'] = (flight[:8] if flight and flight in src_squeezed
+                              else None)
+
+        summary = raw_item.get('summary')
+        summary = ' '.join(str(summary).split())[:60] if summary else ''
+        # Ohne VOLLSTÄNDIGES Zeitpaar bleibt der Tag ganztägig — eine Endzeit
+        # zu erfinden wäre ein Fake-Wert.
+        all_day = (bool(raw_item.get('all_day'))
+                   or not (clean['start_hhmm'] and clean['end_hhmm']))
+        if all_day and (not summary or summary.upper() not in src_upper):
+            dropped += 1
+            continue
+
+        clean.update({'day': day, 'year': year, 'month': month,
+                      'summary': summary, 'all_day': all_day})
+        out.append(clean)
+    return out, dropped
+
+
+def _roster_ai_base_iata(text, token):
+    """Basis-Station aus dem PDF-Kopf, sonst Profil-Homebase, sonst None.
+
+    None heißt bewusst „unbekannt" — dann fällt die Zeitzonen-Auflösung auf
+    Europe/Berlin (wie im Discover-Parser), aber es wird KEIN Flughafen in
+    Summary/Route erfunden.
+    """
+    m = re.search(r'\bBase:\s*([A-Z]{3})\b', (text or '')[:1500])
+    if m:
+        return m.group(1)
+    try:
+        hb = ((_profile_load(token) or {}).get('profile') or {}).get('homebase')
+    except Exception:
+        hb = None
+    hb = str(hb or '').strip().upper()
+    return hb if _ROSTER_AI_IATA_RE.match(hb) else None
+
+
+def _roster_ai_events(items, base_iata):
+    """Validierte KI-Items → Event-Tupel im `_pdf_events_to_ics`-Format.
+
+    Zeiten werden — wie beim Discover-Parser — als STATIONS-LOKAL behandelt
+    (TZ via `airport_tz`); DTSTART trägt die TZID der Abflugstation, damit
+    `_ics_parse_dt` den richtigen Tages-Bucket bekommt.
+    """
+    from datetime import timedelta as _td, timezone as _tzu, date as _date
+    from zoneinfo import ZoneInfo as _ZI
+
+    def _stn_tz(iata):
+        for name in ((airport_tz(iata) if iata else None), 'Europe/Berlin'):
+            if not name:
+                continue
+            try:
+                return _ZI(name)
+            except Exception:
+                continue
+        return _tzu.utc
+
+    events = []
+    for item in items:
+        day = _date(item['year'], item['month'], item['day'])
+        frm = item.get('from_iata') or base_iata
+        to = item.get('to_iata') or frm
+        summary = item.get('summary') or ''
+        flight = item.get('flight_no')
+        if flight and item.get('from_iata') and item.get('to_iata'):
+            summary = f"{flight} {item['from_iata']} - {item['to_iata']}"
+        elif flight:
+            summary = f'{flight} {summary}'.strip()
+        summary = (summary or 'Dienst')[:60]
+        location = item.get('location')
+        if item['all_day']:
+            events.append((f'ki-{len(events)}', day, day + _td(days=1),
+                           summary, True, None, location))
+            continue
+        sh, sm = (int(x) for x in item['start_hhmm'].split(':'))
+        eh, em = (int(x) for x in item['end_hhmm'].split(':'))
+        dep_tz = _stn_tz(frm)
+        start_local = datetime(day.year, day.month, day.day, sh, sm,
+                               tzinfo=dep_tz)
+        start_utc = start_local.astimezone(_tzu.utc).replace(tzinfo=None)
+        arr_tz = _stn_tz(to)
+        end_utc = datetime(day.year, day.month, day.day, eh, em,
+                           tzinfo=arr_tz).astimezone(_tzu.utc).replace(tzinfo=None)
+        if end_utc <= start_utc:
+            # Übernacht — die minimale, nicht ratende Korrektur (Muster
+            # `_discover_roster_text_to_ics.add_leg`).
+            end_utc = datetime(day.year, day.month, day.day, eh, em,
+                               tzinfo=arr_tz).astimezone(
+                                   _tzu.utc).replace(tzinfo=None) + _td(days=1)
+        events.append((f'ki-{len(events)}', start_local.replace(tzinfo=None),
+                       end_utc, summary, False, getattr(dep_tz, 'key', None),
+                       location))
+    return events
+
+
+def _roster_ai_learn_store(token, capped_text, valid_items, model, src_sha):
+    """Lern-Warteschlange (Owner-Zusatz 2026-08-06).
+
+    Jeder ERFOLGREICHE KI-Lauf wird als Lern-Beispiel archiviert, damit daraus
+    später ein echter deterministischer Parser gebaut werden kann („einmal
+    lernen, dann für immer können" — Marker-Lexikon-Muster).
+
+    Reuse der privaten, service-key-only Import-Inbox (`ax_logbook_upload`) mit
+    eigenem note-Marker — kein neues Schema, keine neue Tabelle. Die Zeile
+    bleibt `processed=False`: sie IST das Lernmaterial und wird — anders als
+    die Roster-PDFs — nach Verarbeitung NICHT automatisch gelöscht. Dedupe über
+    den sha256 des Quelltexts (im Dateinamen kodiert), damit derselbe Plan
+    nicht doppelt archiviert wird.
+    """
+    filename = f'roster-ai-learn-{src_sha[:16]}.json'
+    try:
+        if SB_AVAILABLE:
+            def _find_existing():
+                return (sb.table('ax_logbook_upload').select('id')
+                        .eq('token', token).eq('note', _ROSTER_AI_LEARN_NOTE)
+                        .eq('filename', filename).limit(1).execute())
+            existing, failed = _supabase_execute_with_timeout(
+                'roster_ai_learn_dedupe', _find_existing)
+            if not failed and (getattr(existing, 'data', None) or []):
+                app.logger.info(
+                    f'[roster-ai] learn-queue-existing tok={token[:8]} '
+                    f'sha={src_sha[:16]}')
+                return True
+    except Exception:
+        # Ein degradierter Read darf das Lernmaterial nicht verhindern.
+        pass
+    payload = {
+        'v': 1,
+        'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'model': model,
+        'source_sha256': src_sha,
+        'source_chars': len(capped_text or ''),
+        'source_text': capped_text or '',
+        'events': valid_items,
+    }
+    try:
+        blob = json.dumps(payload, ensure_ascii=False, default=str).encode('utf-8')
+    except (TypeError, ValueError):
+        return False
+    stored = _logbook_upload_store(token, filename, blob,
+                                   _ROSTER_AI_LEARN_NOTE)
+    level = app.logger.info if stored else app.logger.warning
+    level(f'[roster-ai] learn-queue-{"ok" if stored else "fail"} '
+          f'tok={token[:8]} sha={src_sha[:16]} '
+          f'chars={len(capped_text or "")} events={len(valid_items or [])}')
+    return stored
+
+
+def _roster_ai_fallback_ics(text, token, det_error):
+    """EIN KI-Lese-Versuch für einen Upload, den kein Parser versteht.
+
+    Liefert einen ICS-String oder None. Wirft NIE — jeder Fehlerpfad landet im
+    Log und lässt den bisherigen „0 Einträge"-Weg unverändert.
+    """
+    src = text or ''
+    if not src.strip():
+        return None
+    if not (os.getenv('ANTHROPIC_API_KEY') or '').strip():
+        app.logger.info(f'[roster-ai] skip-no-key tok={token[:8]} '
+                        f'det_error={det_error}')
+        return None
+    if not _roster_ai_budget_take(token):
+        app.logger.warning(f'[roster-ai] daily-cap tok={token[:8]} '
+                           f'max={_ROSTER_AI_DAILY_MAX}')
+        return None
+
+    import hashlib as _hl
+    capped = src[:_ROSTER_AI_MAX_CHARS]
+    src_sha = _hl.sha256(capped.encode('utf-8', 'replace')).hexdigest()
+    # DATENSCHUTZ: nur Länge + sha-Präfix + Token-Präfix — NIE Inhalt.
+    app.logger.info(
+        f'[roster-ai] call tok={token[:8]} det_error={det_error} '
+        f'chars={len(capped)} truncated={len(src) > _ROSTER_AI_MAX_CHARS} '
+        f'sha={src_sha[:16]}')
+    try:
+        items, model = _roster_ai_call_anthropic(capped)
+    except Exception as exc:
+        app.logger.warning(f'[roster-ai] call-fail tok={token[:8]} '
+                           f'err={type(exc).__name__}: {str(exc)[:160]}')
+        return None
+    if not items:
+        app.logger.warning(f'[roster-ai] empty-answer tok={token[:8]} '
+                           f'model={model}')
+        return None
+
+    valid, dropped = _roster_ai_validate_items(items, capped)
+    if dropped:
+        app.logger.warning(
+            f'[roster-ai] hallucination-drop tok={token[:8]} '
+            f'dropped={dropped} kept={len(valid)} sha={src_sha[:16]}')
+    if not valid:
+        app.logger.warning(f'[roster-ai] no-valid-events tok={token[:8]} '
+                           f'sha={src_sha[:16]}')
+        return None
+
+    try:
+        events = _roster_ai_events(valid, _roster_ai_base_iata(capped, token))
+    except Exception as exc:
+        app.logger.warning(f'[roster-ai] build-fail tok={token[:8]} '
+                           f'err={type(exc).__name__}: {str(exc)[:160]}')
+        return None
+    if not events:
+        return None
+
+    anchor_year, anchor_month = min((v['year'], v['month']) for v in valid)
+    ics = _pdf_events_to_ics(
+        events, anchor_year, anchor_month,
+        prodid='AeroX KI-Fallback Roster Import',
+        extra_lines=(f'X-AEROX-SOURCE:{_ROSTER_AI_MARKER}',))
+    try:
+        _roster_ai_learn_store(token, capped, valid, model, src_sha)
+    except Exception as exc:
+        app.logger.warning(f'[roster-ai] learn-queue-error tok={token[:8]} '
+                           f'err={type(exc).__name__}: {str(exc)[:160]}')
+    app.logger.info(
+        f'[roster-ai] ok tok={token[:8]} model={model} events={len(events)} '
+        f'sha={src_sha[:16]}')
+    return ics
+
+
 _ROSTER_PDF_QUEUE_NOTE = 'AEROX_ROSTER_PDF_V1'
 
 
@@ -55124,6 +55607,7 @@ def import_roster_pdf(token):
     standard_calendars = []
     cas_results = []
     periods = []
+    ai_fallback_used = False
 
     for upload in files:
         data = upload.read()
@@ -55186,6 +55670,19 @@ def import_roster_pdf(token):
                 periods.extend(re.findall(
                     r'(?m)^Month:\s*([A-Za-z]+\s+\d{4})\s*$', text))
         if perr:
+            # DETERMINISTIC-FIRST: erst hier — die komplette deterministische
+            # Kaskade hat für DIESEN Upload nichts erzeugt. Nur der explizite
+            # User-Import kommt hierher; der periodische Sync nie.
+            ai_ics = None
+            if perr in ('unsupported_pdf_format', 'no_roster_days'):
+                ai_ics = _roster_ai_fallback_ics(text, token, perr)
+            if ai_ics:
+                standard_calendars.append(ai_ics)
+                ai_fallback_used = True
+                app.logger.info(
+                    f'[roster-pdf] ai-fallback tok={token[:8]} '
+                    f'sha={upload_sha} det_error={perr}')
+                continue
             app.logger.warning(
                 f'[roster-pdf] parse-fail tok={token[:8]} sha={upload_sha} '
                 f'error={perr}')
@@ -55268,6 +55765,12 @@ def import_roster_pdf(token):
         payload = {}
     if status == 200 and payload.get('ok'):
         payload['source'] = 'pdf'
+        if ai_fallback_used:
+            # Ehrlich benennen: mindestens ein Upload wurde von der KI gelesen,
+            # nicht von einem deterministischen Parser. Der iOS-Client zeigt
+            # unbekannte Felder nicht an — kein UI-Zwang, aber das Feld ist da.
+            payload['source'] = _ROSTER_AI_MARKER
+            payload['ki_hint'] = _ROSTER_AI_HINT
         periods = [period for period in periods if period]
         if len(periods) == 1:
             payload['period'] = periods[0]
