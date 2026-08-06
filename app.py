@@ -26795,6 +26795,20 @@ def send_chat_message(token, channel_id):
                if status == 403 else 'invalid_channel')
         err = err or 'not_a_member'
         return jsonify({'ok': False, 'error': err}), status
+    # SESSION-BINDUNG der Destination-Lobby (Review-P1 06.08.): der Stations-
+    # Channel wird bei jedem Aufenthalt wiederverwendet — ein verspätet
+    # gesendeter POST aus einer FRÜHEREN Aufenthalts-Session (Client sendet
+    # seine session_id mit) darf nicht im aktuellen Lobby-Zeitraum landen.
+    # Alte Clients ohne session_id behalten das bisherige Verhalten (der
+    # Access-Gate oben verlangt ohnehin eine AKTIVE Lobby des Tokens).
+    lobby_session = (body.get('session_id') or '').strip()
+    if lobby_session and _group_id_from_channel(channel_id) and \
+            re.fullmatch(r'destination_[A-Z]{3}',
+                         _group_id_from_channel(channel_id) or ''):
+        current = _destination_lobby_for_token(token) or {}
+        if str(current.get('session_id') or '') != lobby_session:
+            return jsonify({'ok': False,
+                            'error': 'lobby_session_expired'}), 410
     # Retry nach unklarem Transport-Ausgang: dieselbe Client-Operation darf
     # niemals eine zweite Chat-Nachricht und einen zweiten Push erzeugen.
     if client_message_id:

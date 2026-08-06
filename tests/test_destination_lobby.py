@@ -254,3 +254,50 @@ def test_destination_fanout_does_not_push_on_join_itself():
         payload = A.get_destination_lobby(TOKEN).get_json()['lobby']
     assert payload['member_count'] == 2
     push.assert_not_called()
+
+
+def test_send_rejects_stale_lobby_session():
+    """Review-P1 06.08.: ein replayter POST aus einer FRÜHEREN Aufenthalts-
+    Session (Client sendet session_id) darf nicht im aktuellen Lobby-
+    Zeitraum landen — 410, keine Nachricht, kein Push."""
+    with (
+        A.app.test_request_context(
+            '/send', method='POST',
+            json={'text': 'hallo aus der alten session',
+                  'session_id': 'destination_JFK_1111111111'}),
+        patch.object(A, '_channel_access_error', return_value=None),
+        patch.object(A, '_destination_lobby_for_token', return_value={
+            'session_id': 'destination_JFK_2222222222',
+            'channel_id': 'group__destination_JFK',
+        }),
+    ):
+        resp = A.send_chat_message(TOKEN, 'group__destination_JFK')
+    payload, status = resp if isinstance(resp, tuple) else (resp, 200)
+    assert status == 410
+    assert payload.get_json()['error'] == 'lobby_session_expired'
+
+
+def test_send_accepts_current_lobby_session():
+    """Gegenprobe: die AKTUELLE Session passiert das Gate — gleiche Mock-
+    Kulisse wie test_destination_send_enqueues_message_push_after_join."""
+    channel = 'group__destination_JFK'
+    with (
+        A.app.test_request_context(
+            '/', method='POST',
+            json={'text': 'Hallo',
+                  'session_id': 'destination_JFK_2222222222'}),
+        patch.object(A, '_chat_path', return_value='/tmp/chat.json'),
+        patch.object(A, '_channel_access_error', return_value=None),
+        patch.object(A, '_destination_lobby_for_token', return_value={
+            'session_id': 'destination_JFK_2222222222',
+            'channel_id': channel,
+        }),
+        patch.object(A, '_token_rate_limited', return_value=False),
+        patch.object(A, '_profile_load', return_value={'profile': {}}),
+        patch.object(A, '_dm_messages_save_to_supabase', return_value=True),
+        patch.object(A, '_dm_load_messages_from_disk', return_value=[]),
+        patch.object(A, '_dm_save_messages_disk'),
+        patch.object(A, '_chat_push_fanout_async'),
+    ):
+        response = A.send_chat_message(TOKEN, channel)
+    assert response.get_json()['ok'] is True
