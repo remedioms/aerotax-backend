@@ -21854,6 +21854,11 @@ def _logbook_type_group(raw_type):
 # Tabelle aktiv ohne Policies — nur der Service-Key (Backend) kommt ran.
 
 _LOGBOOK_IMPORT_CACHE_S = 6 * 3600
+# A negative cache exists only to spare routine SB reads for users without an
+# import.  White-glove upserts write the DB directly, so keeping ``{}`` for six
+# hours hid a newly imported logbook until the cache expired.  Positive blobs
+# remain long-lived; an empty result is rechecked quickly.
+_LOGBOOK_IMPORT_NEGATIVE_CACHE_S = 60
 
 
 def _logbook_import_path(token):
@@ -21872,11 +21877,15 @@ def _logbook_import_load(token):
     import time as _t
     pth = _logbook_import_path(token)
     try:
-        if pth and os.path.exists(pth) \
-                and _t.time() - os.path.getmtime(pth) < _LOGBOOK_IMPORT_CACHE_S:
+        if pth and os.path.exists(pth):
             with open(pth) as f:
                 d = json.load(f)
-            if isinstance(d, dict):
+            positive = isinstance(d, dict) and bool(
+                d.get('legs') or d.get('sim'))
+            ttl = (_LOGBOOK_IMPORT_CACHE_S if positive
+                   else _LOGBOOK_IMPORT_NEGATIVE_CACHE_S)
+            if isinstance(d, dict) \
+                    and _t.time() - os.path.getmtime(pth) < ttl:
                 return d
     except Exception:
         pass

@@ -3,6 +3,7 @@ Roster-Sektoren + manuelles Overlay (Landungen/PF/Nacht) + Summen pro Muster.
 Rein offline — seedet Sektoren über den manual-briefings-Store, kein Netz."""
 import os
 import sys
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -366,6 +367,39 @@ IMPORT_BLOB = {'legs': [
 
 def _seed_import(blob=IMPORT_BLOB):
     backend._atomic_write_json(backend._logbook_import_path(TOKEN), blob)
+
+
+def test_stale_negative_import_cache_refreshes_after_direct_upsert(
+        monkeypatch, tmp_path):
+    path = tmp_path / 'logbook_import.json'
+    backend._atomic_write_json(str(path), {})
+    stale = datetime.now().timestamp() \
+        - backend._LOGBOOK_IMPORT_NEGATIVE_CACHE_S - 1
+    os.utime(path, (stale, stale))
+    imported = {'legs': [IMPORT_BLOB['legs'][0]], 'sim': []}
+
+    class Query:
+        def select(self, *_args, **_kwargs): return self
+        def eq(self, *_args, **_kwargs): return self
+        def limit(self, *_args, **_kwargs): return self
+        def execute(self): return SimpleNamespace(data=[imported])
+
+    class Store:
+        def table(self, name):
+            assert name == 'ax_logbook_import'
+            return Query()
+
+    monkeypatch.setattr(backend, '_logbook_import_path', lambda _token: str(path))
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(backend, 'sb', Store())
+    monkeypatch.setattr(
+        backend, '_supabase_execute_with_timeout',
+        lambda _name, call, timeout_s: (call(), False),
+    )
+
+    assert backend._logbook_import_load(TOKEN)['legs'][0]['flight'] == 'LH500'
+    assert backend._LOGBOOK_IMPORT_CACHE_S \
+        > backend._LOGBOOK_IMPORT_NEGATIVE_CACHE_S
 
 
 def test_import_merge_dedupe_and_sort():
