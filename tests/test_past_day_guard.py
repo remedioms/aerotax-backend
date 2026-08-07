@@ -119,6 +119,31 @@ def test_past_day_with_fresh_flights_takes_new_data():
         f'Neuaufbau MIT Sektoren muss gewinnen, got {flights}'
 
 
+def test_past_explicit_vacation_replaces_stale_flight():
+    """Ein korrigierter PDF-Roster darf einen Phantom-Flug in der
+    Vergangenheit durch die ausdrueckliche Aussage ``Urlaub`` ersetzen.
+
+    Das ist der Gian-Luca-Fall: Der alte Monatswechsel-Parser legte den
+    MSP-Rueckflug auf den 02./03. August. Nach dem Parser-Fix erzeugt die PDF
+    dort korrekt Urlaub; der Vergangenheits-Guard darf die alten Sektoren
+    beim Re-Import nicht wiederbeleben.
+    """
+    yesterday = _day(-1)
+    existing = {yesterday: _flown_day(yesterday)}
+    briefings = {yesterday: {
+        'ical_summary': 'Urlaub',
+        'ical_start_iso': '',
+        'ical_end_iso': '',
+    }}
+
+    kept = backend._preserve_past_flown_days(briefings, existing)
+
+    assert kept == 0
+    assert briefings[yesterday]['ical_summary'] == 'Urlaub'
+    assert not (briefings[yesterday].get('ical_sectors') or []), \
+        'Expliziter Urlaub muss veraltete Phantom-Sektoren entfernen'
+
+
 def test_past_marker_day_without_old_sectors_untouched():
     """Ein legitimer sektorloser Vergangenheits-Tag (reine Layover-
     Fortsetzung) bleibt, wie der Import ihn baut — kein Alt-Zwang."""

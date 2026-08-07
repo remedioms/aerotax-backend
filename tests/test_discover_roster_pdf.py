@@ -152,6 +152,66 @@ Created 31Aug2026 10:00 (UTC) by TEST 1 ( 1)
     assert leg['arr_iso'] == '2026-09-01T01:35:00Z'
 
 
+def test_end_of_month_tour_continuation_stays_in_september():
+    """Gian-Luca-Regression: Die zweite Seite eines August-Rosters fuehrt den
+    Umlauf nach MSP am 01.-03. September fort. Diese Zeilen duerfen niemals
+    die ausdruecklichen Urlaubstage 01.-03. August ueberschreiben.
+
+    Fixture aus dem echten Tabellen-Shape anonymisiert; Wochentage und Daten
+    entsprechen August/September 2026.
+    """
+    text = """Released roster
+Period: August 2026
+Crew member: TST, Test, Month
+Rank: CM Base: FRA
+All times local
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+01 Sat U
+02 Sun U
+03 Mon U
+31 Mon 10:05 14:30 CM 052 FRA MSP 11:35 14:00 333 48:10 20260831_52 9:25 11:25 14:00
+_604
+Created 24Jul2026 16:36 (UTC) by TEST 1 ( 2)
+Released roster
+Period: August 2026
+Date Report Release Tags Pos Activity From To Start End A/C Layover Trip ID Flight Duty Rest
+01 Tue Layover: MSP
+02 Wed 14:40 CM 053 MSP 15:55 33Y
+03 Thu 08:05 CM 053 FRA 07:35 33Y 8:40 10:25 69:55
+Monthly Jan - Aug Planned in year
+Created 24Jul2026 16:36 (UTC) by TEST 2 ( 2)
+"""
+    ics, err = backend._discover_roster_text_to_ics(text)
+    assert err is None, err
+    events = backend._parse_ics_to_events(ics)
+    phantom = {
+        day: {
+            'ical_summary': '4Y53 MSP - FRA',
+            'ical_sectors': [{
+                'flight': '4Y53', 'from': 'MSP', 'to': 'FRA',
+                'dep_iso': f'{day}T19:55:00Z',
+                'arr_iso': f'{day}T21:35:00Z',
+            }],
+        }
+        for day in ('2026-08-02', '2026-08-03')
+    }
+    briefings, _ = backend._ics_events_to_briefings(
+        events, existing=phantom)
+    backend._attach_sectors(briefings, events, existing=phantom)
+    backend._preserve_past_flown_days(briefings, phantom)
+    sectors = backend._build_ical_sectors(events)
+
+    assert briefings['2026-08-02']['ical_summary'] == 'Urlaub'
+    assert briefings['2026-08-03']['ical_summary'] == 'Urlaub'
+    assert 'MSP' not in briefings['2026-08-02']['ical_summary']
+    assert not (briefings['2026-08-02'].get('ical_sectors') or [])
+    assert not (briefings['2026-08-03'].get('ical_sectors') or [])
+    assert '2026-08-02' not in sectors and '2026-08-03' not in sectors
+    assert briefings['2026-09-01']['ical_summary'] == 'Layover MSP'
+    assert [(s['flight'], s['from'], s['to'])
+            for s in sectors['2026-09-02']] == [('4Y53', 'MSP', 'FRA')]
+
+
 def test_overnight_closer_rolls_into_next_year():
     """Dasselbe gilt am Jahresende: 31. Dezember -> 1. Januar 2027."""
     text = """Roster
