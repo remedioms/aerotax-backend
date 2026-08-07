@@ -6,6 +6,7 @@ bleiben.
 """
 
 import json
+from unittest.mock import patch
 
 import app as A
 
@@ -166,3 +167,49 @@ def test_public_profile_may_resolve_axu_but_owner_routes_may_not(monkeypatch):
         A.request.view_args = {'token': ref}
         A._resolve_public_user_refs_at_boundary()
         assert A.request.view_args['token'] == ref
+
+
+def test_axu_cannot_authenticate_chat_owner_route(monkeypatch):
+    """Regression fuer den live gemeldeten AXU-Impersonation-Request."""
+    monkeypatch.setenv('RECOVERY_SECRET', 'r' * 64)
+    public_ref = A._public_user_ref(FRIEND)
+    client = A.app.test_client()
+
+    with patch.object(A, '_dm_messages_save_to_supabase', return_value=True) as save:
+        response = client.post(
+            f'/api/crew-chat/{public_ref}/channel/group__known/send',
+            headers={'Authorization': 'Bearer ' + public_ref},
+            json={'text': 'forged message'},
+        )
+
+    assert response.status_code == 401
+    assert response.get_json()['error'] == 'unauthorized'
+    save.assert_not_called()
+
+
+def test_axu_cannot_authenticate_nonstandard_crew_owner_route(monkeypatch):
+    """Family-Endpunkte nennen den Owner crew_token statt token."""
+    monkeypatch.setenv('RECOVERY_SECRET', 'r' * 64)
+    public_ref = A._public_user_ref(FRIEND)
+
+    response = A.app.test_client().post(
+        f'/api/feed-status/{public_ref}/react',
+        headers={'Authorization': 'Bearer ' + public_ref},
+        json={'emoji': 'x'},
+    )
+
+    assert response.status_code == 401
+    assert response.get_json()['error'] == 'unauthorized'
+
+
+def test_axu_cannot_read_family_roster_as_account_owner(monkeypatch):
+    monkeypatch.setenv('RECOVERY_SECRET', 'r' * 64)
+    public_ref = A._public_user_ref(FRIEND)
+
+    response = A.app.test_client().get(
+        f'/api/family-roster/{public_ref}',
+        headers={'Authorization': 'Bearer ' + public_ref},
+    )
+
+    assert response.status_code == 401
+    assert response.get_json()['error'] == 'unauthorized'

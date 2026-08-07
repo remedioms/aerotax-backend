@@ -66,6 +66,25 @@ def test_modern_bearer_is_normalized_before_legacy_handlers(monkeypatch):
         assert A._request_bearer_token() == 'AT-LEGACY123456'
 
 
+def test_modern_bearer_passes_strict_owner_gate_after_normalization(monkeypatch):
+    """Neue AXA-Sessions und alte AT-URL-Vertraege funktionieren zusammen."""
+    owner = 'AT-LEGACY123456'
+    valid = A._TokenValidationResult(A._TokenValidationState.VALID,
+                                     'known@example.test')
+    monkeypatch.setattr(
+        A, '_auth_session_access_principal',
+        lambda token: ('valid', owner)
+    )
+    monkeypatch.setattr(A, '_validate_token', lambda token: valid)
+    monkeypatch.setattr(A, '_BUG004_REQUIRE_TOKEN_BINDING', True)
+
+    with A.app.test_request_context(
+            f'/api/crew-chat/{owner}/channel/group__known/send',
+            method='POST', headers={'Authorization': 'Bearer AXA-modern'}):
+        assert A._normalize_modern_session_bearer() is None
+        assert A._bug004_token_auth_gate() is None
+
+
 def test_expired_modern_bearer_is_rejected(monkeypatch):
     monkeypatch.setattr(
         A, '_auth_session_access_principal',

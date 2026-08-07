@@ -108,3 +108,30 @@ def test_friends_write_with_mismatched_bearer_is_denied_in_legacy_mode():
         )
     assert response.status_code == 401
     assert response.get_json()['error'] == 'token_binding_mismatch'
+
+
+def test_matching_legacy_at_bearer_still_passes_strict_owner_gate():
+    """Alte Builds mit AT im Pfad und Header bleiben eingeloggt."""
+    valid = A._TokenValidationResult(A._TokenValidationState.VALID,
+                                     'known@example.test')
+    with A.app.test_request_context(
+            f'/api/crew-chat/{TOKEN}/channel/group__known/send',
+            method='POST',
+            headers={'Authorization': 'Bearer ' + TOKEN}):
+        with patch.object(A, '_validate_token', return_value=valid), \
+                patch.object(A, '_BUG004_REQUIRE_TOKEN_BINDING', True):
+            assert A._bug004_token_auth_gate() is None
+
+
+def test_legacy_scoped_family_capability_still_passes_owner_gate(monkeypatch):
+    """Alte AT-FAM-Pair-Codes bleiben ohne Account-Logout nutzbar."""
+    from blueprints import family_watch
+
+    scoped = 'AT-FAM-LEGACY-CAPABILITY'
+    monkeypatch.setattr(
+        family_watch, '_scoped_token_crew',
+        lambda token: TOKEN if token == scoped else None,
+    )
+    with A.app.test_request_context(
+            f'/api/family-roster/{scoped}', method='GET'):
+        assert A._bug004_token_auth_gate() is None

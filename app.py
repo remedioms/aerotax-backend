@@ -636,6 +636,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/flight/',         # /<callsign>/crew/<token> → Friend-PII (wer fliegt mit)
     '/api/family-request/', # /<crew_token>/pending → Requester-PII (Name/Avatar)
     '/api/family-watch/',   # /<family_token>/feed → Crew-Status (AT-FAM-Gate greift)
+    '/api/family-roster/',  # /<family_token> → geteilter Crew-Plan (PII)
     '/api/crew-chat/',      # alle DM/Inbox/Channel-Reads
     '/api/destination-lobby/',  # eigener aktueller Aufenthalts-Chat aus dem Roster
     '/api/moderation/',     # block/mute-Listen
@@ -692,6 +693,35 @@ def _bug004_get_route_needs_auth(path):
         if path.startswith(prefix):
             return True
     return False
+
+
+_BUG004_NONSTANDARD_OWNER_PREFIXES = (
+    '/api/family-request/',
+    '/api/feed-status/',
+    '/api/family-roster/',
+)
+
+
+def _bug004_route_owner_token(path):
+    """Liest die vom Router erkannte eigene Identitaet des Aufrufers.
+
+    Fast alle AeroX-Routen nennen den Slot ``token``. Die aelteren Family-
+    Endpunkte nennen denselben Owner dagegen ``crew_token`` oder
+    ``family_token``. Nur fuer diese bekannten Pfade werden die abweichenden
+    Namen als Owner behandelt; gleichnamige Ziel-IDs anderer Routen bleiben
+    weiterhin zulaessige AXU-Public-Refs.
+    """
+    view_args = request.view_args or {}
+    if not isinstance(view_args, dict):
+        return None
+    if view_args.get('token') is not None:
+        return view_args.get('token')
+    if any((path or '').startswith(prefix)
+           for prefix in _BUG004_NONSTANDARD_OWNER_PREFIXES):
+        for key in ('crew_token', 'family_token'):
+            if view_args.get(key) is not None:
+                return view_args.get(key)
+    return None
 
 
 # ── AUTH-BINDING (BUG-AUDIT 2026-06-07, gehärtet 2026-06-08) ─────────────
@@ -878,10 +908,29 @@ def _bug004_token_auth_gate():
             requires_check = False
         if not requires_check:
             return None
-        m = _BUG004_TOKEN_PATH_RE.search(path)
-        if not m:
-            return None  # kein AT-...-Token im Pfad → kein Auth-Gate
-        token = m.group(1)
+        # Der kanonische Owner-Slot heisst in den geschuetzten AeroX-Routen
+        # ``token``. Er muss IMMER ein internes AT-Konto sein. Vorher suchte
+        # das Gate nur per Regex nach einem AT-...-Segment und liess den Request
+        # komplett durch, wenn stattdessen eine oeffentliche AXU-ID (oder ein
+        # frei erfundener String) im Owner-Slot stand. Dadurch konnte eine
+        # kopierte AXU-ID z. B. als Chat-Absender auftreten, obwohl AXU nur eine
+        # oeffentliche Referenz und niemals ein Login-Credential ist.
+        #
+        # Legacy-kompatibel: alte Builds senden weiterhin AT im Pfad und als
+        # Bearer. Neue Builds senden AXA als Bearer; der vorher registrierte
+        # _normalize_modern_session_bearer-Hook hat ihn hier bereits auf den
+        # internen AT-Principal normalisiert. Nur AXU/sonstige Owner-Werte
+        # werden neu abgewiesen, bestehende Nutzer-Sessions bleiben gueltig.
+        route_owner = _bug004_route_owner_token(path)
+        if route_owner is not None:
+            token = str(route_owner).strip()
+            if not _BUG004_TOKEN_PATH_RE.fullmatch('/' + token):
+                return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+        else:
+            m = _BUG004_TOKEN_PATH_RE.search(path)
+            if not m:
+                return None  # keine owner-scoped AeroX-Identitaet im Pfad
+            token = m.group(1)
         # Guest-Tokens: explicit pass-through (Route entscheidet selbst)
         if token.startswith('AT-GUEST-'):
             return None
@@ -53579,6 +53628,33 @@ def _attach_sectors(briefings, events, existing=None, identity_mode='legacy'):
         app.logger.warning(f'[ical-briefings] sectors-attach-fail: {str(e)[:160]}')
 
 
+def _briefing_is_explicit_off_duty(day):
+    """True bei einer eindeutigen Frei-/Urlaubs-/Krank-Aussage im Neuimport.
+
+    Der Vergangenheits-Guard darf einen alten Flug nicht wiederherstellen, wenn
+    der neue autoritative Roster fuer denselben Tag ausdruecklich Abwesenheit
+    meldet. Schwache sektorlose Fallbacks (insbesondere Layover-Marker) bleiben
+    davon unberuehrt. Gemergte Marker mit echtem Bodendienst, z.B.
+    ``Off Day · B4``, sind ebenfalls KEIN dienstfreier Tag.
+    """
+    try:
+        if not isinstance(day, dict):
+            return False
+        klass = str(day.get('klass') or day.get('ical_klass') or '') \
+            .strip().casefold()
+        if klass in _RC_OFF_DUTY_KLASS:
+            return True
+        summary = str(day.get('ical_summary') or day.get('summary') or '') \
+            .strip().upper()
+        if not summary or _summary_has_ground_duty(summary):
+            return False
+        return bool(re.search(
+            r'\b(?:URLAUB|VACATION|ABSENCE|SICKNESS|SICK|KRANK|'
+            r'OFF DAY|DAY OFF|FREE DAY|REST DAY)\b', summary))
+    except Exception:
+        return False
+
+
 def _preserve_past_flown_days(briefings, existing, skip_dates=None):
     """SCHUTZPLANKE (Tibor-Vorfall 2026-08-02, „Tirana fehlt"): Ein Import darf
     einen VERGANGENEN Tag, der gespeicherte Flug-Sektoren trägt, nicht durch
@@ -53593,11 +53669,12 @@ def _preserve_past_flown_days(briefings, existing, skip_dates=None):
     Reconcile rettete nichts, weil der Tag ja in feed_dates stand.
 
     Regel: Datum < heute UND alter Tag hat ical_sectors UND der Neuaufbau hat
-    KEINE → der alte Tagessatz bleibt KOMPLETT stehen. Geflogene Historie kann
-    nicht rückwirkend storniert werden; ein Voll-Import MIT Flug-Events für den
-    Tag baut ihn weiterhin normal neu (der Guard greift nur bei sektorlosem
-    Neuaufbau). Zukunftstage bleiben bewusst REPLACE-Semantik (Streichungen
-    müssen verschwinden — Owner-Regel „golden truth"). Läuft NACH
+    KEINE → der alte Tagessatz bleibt KOMPLETT stehen. Ausnahme: der neue
+    Roster sagt eindeutig Frei/Urlaub/Krank; dann ist das positive Evidenz für
+    eine Korrektur und der Neuaufbau gewinnt. Ein Voll-Import MIT Flug-Events
+    für den Tag baut ihn ebenfalls normal neu. Zukunftstage bleiben bewusst
+    REPLACE-Semantik (Streichungen müssen verschwinden — Owner-Regel „golden
+    truth"). Läuft NACH
     `_attach_sectors`, VOR dem Save; in-place, gibt die Zahl der bewahrten
     Tage zurück, wirft nie.
 
@@ -53621,6 +53698,12 @@ def _preserve_past_flown_days(briefings, existing, skip_dates=None):
                 continue
             new = briefings.get(d)
             if isinstance(new, dict) and not (new.get('ical_sectors') or []):
+                if _briefing_is_explicit_off_duty(new):
+                    app.logger.info(
+                        f'[ical-briefings] past-day-correction: {d} alter '
+                        f'Flug durch expliziten Frei-Tag ersetzt '
+                        f'({str(new.get("ical_summary") or new.get("ical_klass"))[:60]!r})')
+                    continue
                 briefings[d] = dict(old)
                 kept += 1
                 app.logger.info(
