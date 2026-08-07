@@ -18,7 +18,7 @@
        - "127.0.0.1:8080:8080"
 -    mem_limit: 2g
 +    cpu_shares: 1024
-+    mem_limit: 4g
++    mem_limit: 5g
 @@ aerotax-poll @@
 -    mem_limit: 1200m
 +    cpus: "0.65"
