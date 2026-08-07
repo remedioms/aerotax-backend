@@ -23,13 +23,18 @@ from blueprints import paid_cost_control as PCC
 
 @pytest.fixture(autouse=True)
 def _reset_budget():
+    # Unit-Tests duerfen weder den heutigen produktiven Supabase-Zaehler lesen
+    # noch ihn erhoehen. Nur `_MEM_BUDGET.clear()` reicht bei lokal gesetzten
+    # Supabase-Credentials nicht: `_budget_key_used` nimmt sonst das Maximum aus
+    # dem echten `ax_api_budget` (z.B. 5 statt der im Test erzeugten 4 Credits).
     BP._MEM_BUDGET.clear()
     BP._FR24_REG_CACHE.clear()
     PCC.reset_local_state()
-    yield
-    BP._MEM_BUDGET.clear()
-    BP._FR24_REG_CACHE.clear()
-    PCC.reset_local_state()
+    with patch.object(BP, '_sb', return_value=None):
+        yield
+        BP._MEM_BUDGET.clear()
+        BP._FR24_REG_CACHE.clear()
+        PCC.reset_local_state()
 
 
 _ICAO2IATA = {'EDDF': 'FRA', 'KJFK': 'JFK', 'KIAD': 'IAD', 'LEBL': 'BCN',
@@ -98,10 +103,17 @@ def test_flights_by_reg_normalizes_sorts_limits():
     assert mget.call_args[0][1]['registrations'] == 'D-AIHW'
     # … Ergebnis neueste-zuerst + Limit 2
     assert [l['flight_no'] for l in legs] == ['LH401', 'LH400']
-    # Provider hält limit=2 ein; Billing ist 2/<30d bzw. 3/>30d pro Treffer.
-    age = time.time() - datetime.fromisoformat(
-        '2026-07-08T19:00:00+00:00').replace(tzinfo=timezone.utc).timestamp()
-    assert BP._budget_key_used(BP._fr24_budget_key()) == 2 * (2 if age < 30*86400 else 3)
+    # Provider hält limit=2 ein; Billing ist 2/<30d bzw. 3/>30d PRO Treffer.
+    # Die beiden Fixtures liegen neun Stunden auseinander und überschreiten die
+    # 30-Tage-Grenze deshalb nicht gleichzeitig (am 07.08.2026: 3 + 2 Credits).
+    expected = 0
+    now = time.time()
+    for row in resp['data'][-2:]:
+        observed = datetime.fromisoformat(
+            row['datetime_takeoff'].replace('Z', '+00:00'))
+        age = now - observed.replace(tzinfo=timezone.utc).timestamp()
+        expected += 2 if age < 30 * 86400 else 3
+    assert BP._budget_key_used(BP._fr24_budget_key()) == expected
     # Explizites Provider-Limit bindet die Maximalreserve hart.
     assert mget.call_args[0][1]['limit'] == 2
 

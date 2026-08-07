@@ -1,0 +1,31 @@
+# Compose-Patch fuer den CX33-Performance-Umbau (2026-08-07).
+# ANWENDEN AUF: /opt/aerox/compose.yaml nach dem CX23 -> CX33 Rescale.
+# Rollback: /opt/aerox/compose.yaml.bak-perf-20260807-1150.
+#
+# Ziele:
+#  1) vier Public-Gunicorn-Worker fuer vier vCPUs;
+#  2) API darf freie CPU dynamisch nutzen (kein hartes API-Cap);
+#  3) Poll- und MQTT-Hintergrundlast koennen den interaktiven Pfad nicht mehr
+#     auf allen Kernen verdraengen;
+#  4) die 8 GB RAM des CX33 geben jedem Prozess einen ehrlichen Schutzrahmen.
+#
+--- compose.yaml.cx23
++++ compose.yaml.cx33
+@@ aerotax-backend @@
+-    command: ["gunicorn","app:app","--bind","0.0.0.0:8080","--workers","3","--worker-class","gthread","--threads","8","--timeout","1800","--graceful-timeout","60","--max-requests","5000","--max-requests-jitter","500","--access-logfile","-","--error-logfile","-"]
++    command: ["gunicorn","app:app","--bind","0.0.0.0:8080","--workers","4","--worker-class","gthread","--threads","8","--timeout","1800","--graceful-timeout","60","--max-requests","5000","--max-requests-jitter","500","--access-logfile","-","--error-logfile","-"]
+     ports:
+       - "127.0.0.1:8080:8080"
+-    mem_limit: 2g
++    cpu_shares: 1024
++    mem_limit: 4g
+@@ aerotax-poll @@
+-    mem_limit: 1200m
++    cpus: "0.65"
++    cpu_shares: 128
++    mem_limit: 1600m
+@@ aerotax-lhmqtt @@
+     command: ["python3","lh_mqtt_daemon.py"]
++    cpus: "0.15"
++    cpu_shares: 64
+     mem_limit: 256m

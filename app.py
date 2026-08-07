@@ -23083,8 +23083,54 @@ def save_crewlog(token):
 # 27.07. über 178 Aufrufe: p50 = 473 ms, p90 = 4,3 s, p99 = 20,4 s, max 23,9 s.
 # Die Spitze entsteht NICHT durch den Feed-Import (der läuft längst im
 # Hintergrund-Thread), sondern durch synchron nachgeladene Airport-Boards auf
-# einem kalten Worker. 3 s liegen weit über p90 — der Normalfall merkt nichts.
-_BRIEFING_ENRICH_BUDGET_S = 3.0
+# einem kalten Worker. Interaktive Starts dürfen davon nicht mehrere Sekunden
+# blockiert werden: die Resolver-Caches/Poller liefern die Details beim nächsten
+# Refresh nach, der erste Read bleibt hart unter einer Sekunde Zusatzbudget.
+_BRIEFING_ENRICH_BUDGET_S = 0.75
+
+# Derselbe Feed-Screen und mehrere Karten fragen Briefings beim Mounten nahezu
+# gleichzeitig ab. Ein kurzer prozesslokaler Memo teilt die fertig gemergte und
+# angereicherte Antwort; alle bestehenden Builds verwenden weiter denselben
+# Endpoint und profitieren ohne Vertragsänderung. 20 s sind deutlich kürzer als
+# der normale App-Refresh und als die 90-s-Leaf-Caches der Live-Resolver.
+_BRIEFING_RESPONSE_TTL_S = 20.0
+_BRIEFING_RESPONSE_MEMO = {}       # token -> (expires_monotonic, data)
+_BRIEFING_RESPONSE_LOCK = _req_threading.Lock()
+# Ein begrenzter, pro Worker wiederverwendeter Pool statt pro Request neue
+# Threads. Wall und Briefing sind I/O-lastig; acht Slots reichen, ohne bei acht
+# parallelen Gunicorn-Threads je drei neue Unterthreads zu erzeugen.
+_INTERACTIVE_READ_EXECUTOR = _sb_cf.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix='interactive-read')
+
+
+def _briefing_response_memo_get(token):
+    now = time.monotonic()
+    with _BRIEFING_RESPONSE_LOCK:
+        hit = _BRIEFING_RESPONSE_MEMO.get(token)
+        if hit and hit[0] > now:
+            return hit[1]
+        if hit:
+            _BRIEFING_RESPONSE_MEMO.pop(token, None)
+    return None
+
+
+def _briefing_response_memo_put(token, data):
+    with _BRIEFING_RESPONSE_LOCK:
+        _BRIEFING_RESPONSE_MEMO[token] = (
+            time.monotonic() + _BRIEFING_RESPONSE_TTL_S, data)
+        if len(_BRIEFING_RESPONSE_MEMO) > 1000:
+            now = time.monotonic()
+            for key, value in list(_BRIEFING_RESPONSE_MEMO.items()):
+                if value[0] <= now:
+                    _BRIEFING_RESPONSE_MEMO.pop(key, None)
+            if len(_BRIEFING_RESPONSE_MEMO) > 1000:
+                for key in list(_BRIEFING_RESPONSE_MEMO)[:250]:
+                    _BRIEFING_RESPONSE_MEMO.pop(key, None)
+
+
+def _briefing_response_memo_invalidate(token):
+    with _BRIEFING_RESPONSE_LOCK:
+        _BRIEFING_RESPONSE_MEMO.pop(token, None)
 
 
 @app.route('/api/user/briefing/<token>', methods=['GET'])
@@ -23108,13 +23154,31 @@ def get_briefings(token):
     # Hintergrund (gedrosselt) — Plan-Änderungen lösen die bestehende Push-Kette
     # aus, ohne dass der User die App öffnet. No-op ohne Verbindung.
     _maybe_refresh_flightops(token)
+    datum = request.args.get('datum')
+    _memo = _briefing_response_memo_get(token)
+    if _memo is not None:
+        if datum:
+            return jsonify({'datum': datum, 'briefing': _memo.get(datum, {})})
+        return jsonify({'count': len(_memo), 'briefings': _memo})
+
+    # Die beiden Sources sind voneinander unabhängig. Auf Hetzner/Supabase war
+    # ihre frühere serielle Ausführung ein kompletter zusätzlicher RTT auf jedem
+    # kalten Worker. Fehlersemantik bleibt unverändert: manual ist primary und
+    # kann 500 liefern; iCal degradiert best-effort auf leer.
+    _manual_future = _INTERACTIVE_READ_EXECUTOR.submit(
+        _manual_briefings_load, token)
+    _ical_future = _INTERACTIVE_READ_EXECUTOR.submit(
+        _ical_briefings_load, token)
     try:
-        data = dict(_manual_briefings_load(token) or {})
+        data = dict(_manual_future.result() or {})
     except Exception as e:
         print(f'[get_briefings] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'error': 'internal_error'}), 500
     try:
-        ical_data = _ical_briefings_load(token) or {}
+        ical_data = _ical_future.result() or {}
+    except Exception:
+        ical_data = {}
+    try:
         for k, v in (ical_data or {}).items():
             if not isinstance(v, dict): continue
             merged = dict(data.get(k) or {})
@@ -23211,7 +23275,7 @@ def get_briefings(token):
                     pass
     except Exception:
         pass
-    datum = request.args.get('datum')
+    _briefing_response_memo_put(token, data)
     if datum:
         return jsonify({'datum': datum, 'briefing': data.get(datum, {})})
     return jsonify({'count': len(data), 'briefings': data})
@@ -23236,6 +23300,7 @@ def put_briefing(token, datum):
         data = dict(_manual_briefings_load(token) or {})
         data[datum] = body
         _manual_briefings_save(token, data)
+        _briefing_response_memo_invalidate(token)
     except Exception as e:
         print(f'[put_briefing] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
@@ -26493,6 +26558,40 @@ def _crew_dm_pair_accepted(token_a, token_b):
     return False
 
 
+def _crew_dm_pair_authorized_from_supabase(token_a, token_b):
+    """Fast authoritative DM gate.
+
+    Returns True/False when Supabase answered and None when the caller must use
+    the existing disk/legacy fallback.  The previous implementation expanded
+    both complete friend payloads (including group reads and incoming-request
+    reads) and then queried crew requests again.  A normal DM open therefore
+    needed up to ten remote reads before loading a single message.
+    """
+    if not SB_AVAILABLE or sb is None or not token_a or not token_b:
+        return None
+    pair = {token_a, token_b}
+    try:
+        rows = (sb.table('user_friends')
+                .select('owner_token,friend_token,status')
+                .in_('owner_token', list(pair))
+                .in_('friend_token', list(pair))
+                .eq('status', 'accepted').limit(4).execute()).data or []
+        if any({row.get('owner_token'), row.get('friend_token')} == pair
+               for row in rows):
+            return True
+        rows = (sb.table('crew_dm_requests')
+                .select('sender_token,recipient_token,status')
+                .in_('sender_token', list(pair))
+                .in_('recipient_token', list(pair))
+                .eq('status', 'accepted').limit(4).execute()).data or []
+        return any({row.get('sender_token'), row.get('recipient_token')} == pair
+                   for row in rows)
+    except Exception as e:
+        app.logger.warning(
+            f'[crew-dm] fast-auth-fail {type(e).__name__}: {str(e)[:120]}')
+        return None
+
+
 def _crew_dm_pair_authorized(token_a, token_b):
     try:
         if (token_b in _blocked_by(token_a) or
@@ -26500,6 +26599,9 @@ def _crew_dm_pair_authorized(token_a, token_b):
             return False
     except Exception:
         return False
+    fast = _crew_dm_pair_authorized_from_supabase(token_a, token_b)
+    if fast is not None:
+        return fast
     try:
         a_friends = set((_friends_load(token_a).get('friends') or []))
         b_friends = set((_friends_load(token_b).get('friends') or []))
@@ -26584,6 +26686,11 @@ def _resolve_friend_token(my_token, friend_token):
     cleaned = re.sub(r'[^A-Za-z0-9_-]', '', friend_token)
     if not cleaned:
         return friend_token
+    # Vollstaendige interne IDs muessen nicht erst ueber die gesamte
+    # Freundesliste aufgeloest werden. Der nachfolgende Authorisierungs-Gate
+    # entscheidet weiterhin verbindlich, ob der Zugriff erlaubt ist.
+    if _INTERNAL_USER_TOKEN_RE.fullmatch(cleaned):
+        return cleaned
     try:
         friends = (_friends_load(my_token) or {}).get('friends') or []
     except Exception:
@@ -26765,16 +26872,17 @@ def _channel_access_error(token, channel_id):
 
 
 @app.route('/api/crew-chat/<token>/channel/<channel_id>', methods=['GET'])
-def get_chat_messages(token, channel_id):
+def get_chat_messages(token, channel_id, _access_checked=False):
     """Liefert Messages für Channel. Query: ?since_ts=epoch (nur neuere)."""
     if not _chat_path(channel_id):
         return jsonify({'error': 'invalid_channel'}), 400
     # Membership-Gate: ohne diesen konnte JEDER auth'd User einen beliebigen
     # Group-Channel (oder fremden DM-Channel) lesen, nur indem er die channel_id
     # kannte (Isolation-Leak). DMs sind zusätzlich friend-gated via /dm-Wrapper.
-    _gate = _channel_access_error(token, channel_id)
-    if _gate is not None:
-        return _gate
+    if not _access_checked:
+        _gate = _channel_access_error(token, channel_id)
+        if _gate is not None:
+            return _gate
     # PERF Owner 06.08. („im chat selber super langsam"): Anzeige-Read über
     # den Schnellpfad — die letzten 400 reichen für jede Chat-Ansicht; der
     # Voll-Loader (2000, mit Lazy-Migration) bleibt den Mutationspfaden.
@@ -27779,7 +27887,19 @@ def get_dm_inbox(token):
     DM-Channel-Files) + zählt unread (Messages neuer als last_seen_<channel>).
     Vorher: Frontend musste N+1 Calls machen pro Friend.
     """
-    friends = list(_friends_load(token).get('friends') or [])
+    # Nur Friend-Edges laden. `_friends_load` holt zusaetzlich eingehende
+    # Requests und Friend-Gruppen; fuer die Inbox war das reine Latenz.
+    if SB_AVAILABLE and sb is not None:
+        try:
+            rows = (sb.table('user_friends').select('friend_token,status')
+                    .eq('owner_token', token).eq('status', 'accepted')
+                    .execute()).data or []
+            friends = [row.get('friend_token') for row in rows
+                       if row.get('friend_token')]
+        except Exception:
+            friends = list(_friends_load(token).get('friends') or [])
+    else:
+        friends = list(_friends_load(token).get('friends') or [])
     # Additiv fuer neue Builds: akzeptierte Crew-Chats bleiben bewusst KEINE
     # Freundschaft, erscheinen aber im selben DM-Inbox-Vertrag. Alte Builds
     # ignorieren unbekannte Request-Endpunkte und funktionieren unveraendert.
@@ -27788,8 +27908,17 @@ def get_dm_inbox(token):
             continue
         peer = (row.get('recipient_token') if row.get('sender_token') == token
                 else row.get('sender_token'))
-        if peer and peer not in friends and _crew_dm_pair_authorized(token, peer):
-            friends.append(peer)
+        if not peer or peer in friends:
+            continue
+        # Die akzeptierte Request-Zeile ist selbst der Authorisierungsbeleg.
+        # Nur der Block-Gate bleibt fail-closed; ein erneuter kompletter
+        # Pair-Auth-Read pro Inbox-Zeile ist unnoetig.
+        try:
+            if peer in _blocked_by(token) or token in _blocked_by(peer):
+                continue
+        except Exception:
+            continue
+        friends.append(peer)
     last_seen = _dm_lastseen_load(token) or {}
     # send_chat_message speichert author_token PII-truncated als
     # `token[:16] + "…"`. Beim Vergleich hier muessen wir gegen dieselbe
@@ -27914,7 +28043,10 @@ def get_dm(token, friend_token):
     if not ch: return jsonify({'error':'invalid_tokens'}), 400
     if not _crew_dm_pair_authorized(token, friend_token):
         return jsonify({'error': 'not_friends_or_accepted'}), 403
-    return get_chat_messages(token, ch)
+    # Der Wrapper hat den identischen Pair-Gate gerade verbindlich geprueft.
+    # Ohne diesen Marker pruefte der generische Channel-Handler denselben Gate
+    # ein zweites Mal und verdoppelte die teuerste DB-Arbeit jedes DM-Loads.
+    return get_chat_messages(token, ch, _access_checked=True)
 
 
 @app.route('/api/crew-chat/<token>/dm/<friend_token>/send', methods=['POST'])
@@ -29164,7 +29296,49 @@ def create_wall_post(token):
     response_post = dict(post)
     response_post.pop('author_token', None)
     response_post['is_mine'] = True
+    _wall_feed_memo_invalidate()
     return jsonify({'ok': True, 'post': response_post})
+
+
+# Kurzer L1-Memo für identische, personalisierte Wall-Reads. Er ist absichtlich
+# nur wenige Sekunden lang: genug um parallele Mounts/Tab-Wechsel alter und neuer
+# Builds zusammenzufassen, aber kurz genug, dass fremde Posts/Counter praktisch
+# sofort sichtbar werden. Mutations-Responses bleiben weiterhin autoritativ.
+_WALL_FEED_TTL_S = 8.0
+_WALL_FEED_MEMO = {}
+_WALL_FEED_MEMO_LOCK = _req_threading.Lock()
+
+
+def _wall_feed_memo_get(key):
+    now = time.monotonic()
+    with _WALL_FEED_MEMO_LOCK:
+        hit = _WALL_FEED_MEMO.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        if hit:
+            _WALL_FEED_MEMO.pop(key, None)
+    return None
+
+
+def _wall_feed_memo_put(key, payload):
+    with _WALL_FEED_MEMO_LOCK:
+        _WALL_FEED_MEMO[key] = (time.monotonic() + _WALL_FEED_TTL_S, payload)
+        if len(_WALL_FEED_MEMO) > 2000:
+            now = time.monotonic()
+            for cache_key, value in list(_WALL_FEED_MEMO.items()):
+                if value[0] <= now:
+                    _WALL_FEED_MEMO.pop(cache_key, None)
+            if len(_WALL_FEED_MEMO) > 2000:
+                for cache_key in list(_WALL_FEED_MEMO)[:500]:
+                    _WALL_FEED_MEMO.pop(cache_key, None)
+
+
+def _wall_feed_memo_invalidate():
+    # Eine Wall-Mutation betrifft potenziell jeden personalisierten Viewer
+    # (Post/Counter/Kommentar). Prozesslokal deshalb komplett leeren; andere
+    # Gunicorn-Worker sind durch den kurzen 8-s-TTL begrenzt.
+    with _WALL_FEED_MEMO_LOCK:
+        _WALL_FEED_MEMO.clear()
 
 
 @app.route('/api/wall/<token>/feed', methods=['GET'])
@@ -29207,10 +29381,11 @@ def get_wall_feed(token):
     # „Lufthansa Cargo" gehören operativ in DIESELBE Wall-Sicht. Ohne den
     # Kanonisierer sähe ein Cargo-Profil nur noch Cargo-Posts.
     airline_filter = _canonical_airline_key(request.args.get('airline')) or None
-    friends = set((_friends_load(token).get('friends') or []))
-    friends.add(token)
-    blocked = _blocked_by(token)
-    muted = _muted_by(token)
+    _memo_key = (token, limit, before_ts, mode, airline_filter)
+    _memo = _wall_feed_memo_get(_memo_key)
+    if _memo is not None:
+        return jsonify(_memo)
+
     # Bounded Feed-Read (Data-Layer-Refactor 2026-07-01): statt load-ALL
     # (bis 5000 Posts, select *) nur ein Fenster der neuesten Posts holen —
     # überfetcht (×3, max 300) weil blocked/muted/hidden client-des-Tokens
@@ -29218,9 +29393,31 @@ def get_wall_feed(token):
     # Disk-only-Posts (SB war beim Erstellen down) werden dazugemischt; stale
     # Disk-Kopien bereits geladener IDs NICHT (SB-Counter sind frischer).
     _fetch_n = min(max(limit * 3, 60), 300)
-    posts = _wall_posts_load_recent(
-        _fetch_n, before_ts=before_ts,
-        author_in=(friends if mode == 'friends' else None))
+
+    # Friends, Likes und das Post-Fenster sind unabhängige Supabase-Reads. Sie
+    # seriell auszuführen kostete auf dem Live-Host rund drei Netzwerk-RTTs, bevor
+    # überhaupt Avatare aufgelöst wurden. Default `all` startet alle drei sofort;
+    # `friends` wartet nur dort auf die Friend-IDs, wo der Query sie wirklich
+    # benötigt. Block/Mute/Dislike sind lokale Disk-Reads und laufen nebenher.
+    _friends_future = _INTERACTIVE_READ_EXECUTOR.submit(_friends_load, token)
+    _likes_future = _INTERACTIVE_READ_EXECUTOR.submit(_wall_likes_load, token)
+    _posts_future = None
+    if mode != 'friends':
+        _posts_future = _INTERACTIVE_READ_EXECUTOR.submit(
+            _wall_posts_load_recent, _fetch_n,
+            before_ts=before_ts, author_in=None)
+    blocked = _blocked_by(token)
+    muted = _muted_by(token)
+    disliked_ids = _wall_dislikes_load(token) or set()
+    friends = set((_friends_future.result().get('friends') or []))
+    friends.add(token)
+    if _posts_future is None:
+        _posts_future = _INTERACTIVE_READ_EXECUTOR.submit(
+            _wall_posts_load_recent, _fetch_n,
+            before_ts=before_ts, author_in=friends)
+    posts = _posts_future.result()
+    liked_ids = _likes_future.result() or set()
+
     if posts is None:
         # SB down → Disk-Fallback (altes Verhalten)
         posts = _wall_load_posts_from_disk() or []
@@ -29255,25 +29452,16 @@ def get_wall_feed(token):
     if before_ts > 0:
         feed = [p for p in feed if (p.get('ts') or 0) < before_ts]
     feed = feed[:limit]
-    # Add liked/disliked-by-me flags (SB primary, Disk fallback)
-    liked_ids = _wall_likes_load(token) or set()
-    disliked_ids = _wall_dislikes_load(token) or set()
     # author_avatar LIVE aus dem Profil auflösen (statt dem evtl. veralteten
     # Post-Snapshot) — so zeigt ein neu gesetztes Profilfoto sofort auf ALLEN
     # alten Posts des Users. Pro-Author einmal cachen (Feed hat oft mehrere
     # Posts desselben Users).
-    _avatar_cache = {}
-    def _author_avatar(tok):
-        if not tok:
-            return None
-        if tok in _avatar_cache:
-            return _avatar_cache[tok]
-        try:
-            av = ((_profile_load(tok) or {}).get('profile', {}) or {}).get('avatar_url')
-        except Exception:
-            av = None
-        _avatar_cache[tok] = av
-        return av
+    # Ein Bulk-Lookup statt N× `_profile_load`/Supabase-Roundtrip. Der Helper
+    # besitzt zusätzlich einen 5-min-Avatar-TTL und wird bereits von Forum-Listen
+    # genutzt; Wall verwendete bisher noch den alten N+1-Pfad.
+    _avatar_urls = _author_avatar_urls([
+        p.get('author_token') for p in feed
+        if isinstance(p, dict) and not p.get('is_anonymous')])
     for p in feed:
         # `id` defensiv lesen — ein Post ohne id (Legacy/teil-migrierte SB-Row)
         # würde sonst per KeyError die ganze Feed-Seite mit 500 killen (#25).
@@ -29302,7 +29490,7 @@ def get_wall_feed(token):
         else:
             # author_avatar live aus dem Profil (frisch) — überschreibt den
             # evtl. veralteten Snapshot. None wenn der User (noch) keins hat.
-            av = _author_avatar(p.get('author_token'))
+            av = _avatar_urls.get(p.get('author_token'))
             if av:
                 p['author_avatar'] = av
             else:
@@ -29313,7 +29501,9 @@ def get_wall_feed(token):
         # für ALLE Posts (nicht nur anonyme) auf den opaken Key umschreiben.
         if p.get('image_url'):
             p['image_url'] = _wall_img_sanitize_urls(p['image_url'])
-    return jsonify({'count': len(feed), 'posts': feed})
+    _payload = {'count': len(feed), 'posts': feed}
+    _wall_feed_memo_put(_memo_key, _payload)
+    return jsonify(_payload)
 
 
 # Per-Post-Lock-Dict für Like-Counter-Race-Schutz.
@@ -29364,6 +29554,7 @@ def toggle_like(token, post_id):
         if counters is None:
             counters = _wall_disk_counter_bump(post_id, like_delta=delta)
         new_count = int(counters.get('like_count') or 0) if counters else 0
+    _wall_feed_memo_invalidate()
     return jsonify({'ok': True, 'like_count': new_count, 'liked_by_me': liked_by_me})
 
 
@@ -29409,6 +29600,7 @@ def toggle_dislike(token, post_id):
                                                dislike_delta=d_delta)
         new_dislike = int(counters.get('dislike_count') or 0) if counters else 0
         new_like = int(counters.get('like_count') or 0) if counters else 0
+    _wall_feed_memo_invalidate()
     return jsonify({'ok': True, 'dislike_count': new_dislike, 'like_count': new_like,
                     'disliked_by_me': disliked_by_me, 'liked_by_me': post_id in liked})
 
@@ -29503,6 +29695,7 @@ def add_comment(token, post_id):
                                    actor_token=token)
     except Exception:
         pass
+    _wall_feed_memo_invalidate()
     return jsonify({'ok': True, 'comment': response_c})
 
 
@@ -29608,6 +29801,7 @@ def delete_wall_post(token, post_id):
                         os.remove(img_path)
         except Exception as e:
             app.logger.warning(f'[wall-delete] image cleanup failed: {e}')
+    _wall_feed_memo_invalidate()
     return jsonify({'ok': True})
 
 
@@ -40667,10 +40861,66 @@ def _native_board_cached(iata, flight_type, allow_paid=True):
 
 def _fra_board_cached(flight_type):
     """Gecachtes FRA-Board (dep/arr). None bei Quelle-down. Stale wird sofort
-    serviert + async aufgefrischt (_board_swr) — nie mehr 10 s im Request."""
+    serviert + async aufgefrischt (_board_swr) — nie mehr 10 s im Request.
+
+    Der Roh-Snapshot liegt zusätzlich auf dem zwischen API- und Poll-Container
+    geteilten Persistenz-Volume. Dadurch startet ein neuer Gunicorn-Worker oder
+    ein Deploy nicht mehr mit einem kalten 20-Seiten-Fraport-Scrape im ersten
+    User-Request: er serviert den letzten Poll-Snapshot sofort und revalidiert
+    ihn im Hintergrund. Der Endpoint-/Response-Vertrag bleibt unverändert."""
     ckey = 'FRA_' + ('arr' if flight_type == 'arrival' else 'dep')
+    if not _AIRPORT_BOARD_CACHE.get(ckey):
+        persisted = _fra_board_disk_load(flight_type)
+        if persisted:
+            # timestamp=0 erzwingt im _board_swr sofort eine asynchrone
+            # Revalidierung, während der persistierte Stand direkt zurückgeht.
+            _AIRPORT_BOARD_CACHE[ckey] = (0.0, persisted)
     return _board_swr(_AIRPORT_BOARD_CACHE, ckey, _AIRPORT_BOARD_TTL,
                       lambda: _fra_board_fetch(flight_type))
+
+
+_FRA_BOARD_DISK_MAX_AGE_S = 30 * 60
+
+
+def _fra_board_disk_path(flight_type):
+    suffix = 'arr' if flight_type == 'arrival' else 'dep'
+    try:
+        os.makedirs(_USER_HISTORY_DIR, exist_ok=True)
+        return os.path.join(_USER_HISTORY_DIR,
+                            f'fra_board_warm_{suffix}.json')
+    except Exception:
+        return None
+
+
+def _fra_board_disk_load(flight_type):
+    path = _fra_board_disk_path(flight_type)
+    if not path:
+        return None
+    try:
+        with open(path) as handle:
+            payload = json.load(handle) or {}
+        saved_at = float(payload.get('saved_at') or 0)
+        rows = payload.get('flights')
+        if (not isinstance(rows, list) or not rows
+                or time.time() - saved_at > _FRA_BOARD_DISK_MAX_AGE_S):
+            return None
+        return rows
+    except Exception:
+        return None
+
+
+def _fra_board_disk_save(flight_type, flights):
+    path = _fra_board_disk_path(flight_type)
+    if not path or not isinstance(flights, list) or not flights:
+        return
+    try:
+        _atomic_write_json(path, {
+            'saved_at': time.time(),
+            'flights': flights,
+        }, max_items=1000)
+    except Exception as exc:
+        app.logger.info(
+            f'[board] warm-cache-write-skip {type(exc).__name__}')
 
 
 def _fra_board_fetch(flight_type):
@@ -40693,6 +40943,7 @@ def _fra_board_fetch(flight_type):
     if flights is None:
         return None
     _AIRPORT_BOARD_CACHE[ckey] = (_t.time(), flights)
+    _fra_board_disk_save(flight_type, flights)
     return flights
 
 
@@ -40866,6 +41117,104 @@ def _store_key_base(airport):
     """Nackter IATA-Code aus einem Store-Key ('FRA#ARR' → 'FRA') — für TZ-Lookup."""
     ap = (airport or 'FRA').upper().strip()
     return ap.split('#', 1)[0]
+
+
+# Der Live-Board-Response ist rein query-abhaengig; das Token wird bereits vom
+# globalen Owner-Gate validiert und beeinflusst den Inhalt nicht. Ein sehr kurzer
+# gemeinsamer L1-Memo verhindert deshalb, dass mehrere Homescreen-Mounts (auch
+# aus alten Builds) dieselbe grosse Tafel in jedem Gunicorn-Thread neu filtern,
+# historisieren und anreichern. Keine API-Aenderung, keine Cross-User-Daten.
+_AIRPORT_BOARD_RESPONSE_TTL_S = 12.0
+_AIRPORT_BOARD_RESPONSE_MEMO = {}
+_AIRPORT_BOARD_RESPONSE_MEMO_LOCK = _req_threading.Lock()
+
+
+def _airport_board_response_memo_get(key):
+    now = time.monotonic()
+    with _AIRPORT_BOARD_RESPONSE_MEMO_LOCK:
+        hit = _AIRPORT_BOARD_RESPONSE_MEMO.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        if hit:
+            _AIRPORT_BOARD_RESPONSE_MEMO.pop(key, None)
+    return None
+
+
+def _airport_board_response_memo_put(key, payload):
+    with _AIRPORT_BOARD_RESPONSE_MEMO_LOCK:
+        _AIRPORT_BOARD_RESPONSE_MEMO[key] = (
+            time.monotonic() + _AIRPORT_BOARD_RESPONSE_TTL_S, payload)
+        if len(_AIRPORT_BOARD_RESPONSE_MEMO) > 1000:
+            now = time.monotonic()
+            for cache_key, value in list(_AIRPORT_BOARD_RESPONSE_MEMO.items()):
+                if value[0] <= now:
+                    _AIRPORT_BOARD_RESPONSE_MEMO.pop(cache_key, None)
+            if len(_AIRPORT_BOARD_RESPONSE_MEMO) > 1000:
+                for cache_key in list(_AIRPORT_BOARD_RESPONSE_MEMO)[:250]:
+                    _AIRPORT_BOARD_RESPONSE_MEMO.pop(cache_key, None)
+
+
+# `_merge_into_delay_store` schreibt jede neue Beobachtung best-effort nach
+# Supabase. Das ist wichtig fuer die Tageshistorie, darf aber nicht mehr den
+# interaktiven Board-Request um dutzende serielle DB-Roundtrips verlaengern.
+# Pro Worker laeuft maximal ein Persist-Task; pro Airport/Richtung wird kurz
+# dedupliziert. Der separate Poll-Container bleibt der autoritative regelmaessige
+# Persistenzpfad, dieser Queue-Pfad ist die weiterhin additive User-Read-Ernte.
+_BOARD_DELAY_MERGE_EXECUTOR = _sb_cf.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix='board-persist')
+_BOARD_DELAY_MERGE_LOCK = _req_threading.Lock()
+_BOARD_DELAY_MERGE_PENDING = {}  # (date, airport) -> (scheduled_at, future)
+_BOARD_DELAY_MERGE_MIN_INTERVAL_S = 20.0
+_BOARD_DELAY_MERGE_MAX_PENDING = 4
+
+
+def _board_delay_merge_worker(flights, date_str, airport):
+    try:
+        _merge_into_delay_store(flights, date_str, airport)
+    except Exception as exc:
+        app.logger.warning(
+            f'[board] async-delay-merge-fail {airport} '
+            f'{type(exc).__name__}: {str(exc)[:140]}')
+
+
+def _queue_board_delay_merge(flights, date_str, airport):
+    """Queue bounded persistence and return immediately.
+
+    Returns True when work was scheduled, False when an equivalent recent/in-
+    flight task already covers it or the deliberately small queue is full.
+    """
+    if not flights or not date_str:
+        return False
+    airport = (airport or 'FRA').upper()
+    key = (date_str, airport)
+    now = time.monotonic()
+    with _BOARD_DELAY_MERGE_LOCK:
+        entry = _BOARD_DELAY_MERGE_PENDING.get(key)
+        if entry:
+            scheduled_at, future = entry
+            if (not future.done()
+                    or now - scheduled_at < _BOARD_DELAY_MERGE_MIN_INTERVAL_S):
+                return False
+        active = sum(1 for _ts, future in _BOARD_DELAY_MERGE_PENDING.values()
+                     if not future.done())
+        if active >= _BOARD_DELAY_MERGE_MAX_PENDING:
+            return False
+        # Snapshot: der Route-Pfad reichert/filtert seine Dicts danach weiter an.
+        # Der Persist-Worker darf niemals diese sichtbare Response mutieren.
+        snapshot = [dict(row) for row in flights if isinstance(row, dict)]
+        if not snapshot:
+            return False
+        future = _BOARD_DELAY_MERGE_EXECUTOR.submit(
+            _board_delay_merge_worker, snapshot, date_str, airport)
+        _BOARD_DELAY_MERGE_PENDING[key] = (now, future)
+        if len(_BOARD_DELAY_MERGE_PENDING) > 100:
+            for old_key, (_ts, old_future) in list(
+                    _BOARD_DELAY_MERGE_PENDING.items()):
+                if old_future.done() and old_key != key:
+                    _BOARD_DELAY_MERGE_PENDING.pop(old_key, None)
+                if len(_BOARD_DELAY_MERGE_PENDING) <= 80:
+                    break
+    return True
 
 
 def _departed_rows_from_store(airport):
@@ -45826,6 +46175,12 @@ def airport_board(token):
     # now-relativ und kennt vergangene Tage nicht; die SB-Tabelle hält sie pro
     # Airport. Heute/Zukunft fallen NICHT in diesen Pfad (Live-Tafel unten).
     date_param = (request.args.get('date') or '').strip()
+    days_param = (request.args.get('days') or '').strip()
+    _response_memo_key = (
+        board_ap, ftype, airline, limit, date_param, days_param)
+    _response_memo = _airport_board_response_memo_get(_response_memo_key)
+    if _response_memo is not None:
+        return jsonify(_response_memo)
     if date_param:
         import re as _re
         if not _re.match(r'^\d{4}-\d{2}-\d{2}$', date_param):
@@ -45842,10 +46197,12 @@ def airport_board(token):
             # ist abrufbar. Departures: '<AP>', Arrivals: '<AP>#ARR'.
             hist = _board_rows_from_obs_for_date(
                 date_param, _store_key_for(board_ap, ftype), airline or None)
-            return jsonify({'ok': True, 'airport': board_ap, 'type': ftype,
-                            'date': date_param, 'count': len(hist[:limit]),
-                            'flights': hist[:limit], 'departed_today': [],
-                            'source': 'airport_delay_obs'})
+            _payload = {'ok': True, 'airport': board_ap, 'type': ftype,
+                        'date': date_param, 'count': len(hist[:limit]),
+                        'flights': hist[:limit], 'departed_today': [],
+                        'source': 'airport_delay_obs'}
+            _airport_board_response_memo_put(_response_memo_key, _payload)
+            return jsonify(_payload)
     # ── RECENT-Tafel: „Früher heute" über die LETZTEN ~3 TAGE ───────────────
     # ?days=N (N=1..3) → die gespeicherten/abgeflogenen Flüge der letzten N
     # Betriebstage (heute + N-1 vorige) aus airport_delay_obs, gruppiert pro Tag.
@@ -45853,7 +46210,6 @@ def airport_board(token):
     # live), vorige Tage rein aus der SB-Persistenz (`_board_rows_from_obs_for_date`).
     # So sieht die iOS-Tafel nicht nur den heutigen Verlauf, sondern auch gestern/
     # vorgestern, ohne pro Tag einen eigenen `?date=`-Call zu brauchen.
-    days_param = (request.args.get('days') or '').strip()
     if days_param:
         try:
             ndays = max(1, min(int(days_param), 3))
@@ -45884,9 +46240,11 @@ def airport_board(token):
                 day_rows = _board_rows_from_obs_for_date(d, store_key, airline or None)
             recent.append({'date': d, 'count': len(day_rows[:limit]),
                            'flights': day_rows[:limit]})
-        return jsonify({'ok': True, 'airport': board_ap, 'type': ftype,
-                        'days': ndays, 'recent_days': recent,
-                        'source': 'airport_delay_obs'})
+        _payload = {'ok': True, 'airport': board_ap, 'type': ftype,
+                    'days': ndays, 'recent_days': recent,
+                    'source': 'airport_delay_obs'}
+        _airport_board_response_memo_put(_response_memo_key, _payload)
+        return jsonify(_payload)
     src = None
     flights = None
     if iata in ('FRA', 'EDDF') or airport in ('FRA', 'EDDF'):
@@ -45903,7 +46261,7 @@ def airport_board(token):
         # damit die Ankunfts-Tafel genauso eine „Früher heute"-Historie aufbaut.
         if flights:
             try:
-                _merge_into_delay_store(
+                _queue_board_delay_merge(
                     flights, _fra_local_now().strftime('%Y-%m-%d'),
                     _store_key_for('FRA', ftype))
             except Exception:
@@ -45930,7 +46288,7 @@ def airport_board(token):
             # dem eigenen Store-Key '<AP>#ARR' (siehe _store_key_for), Abflüge wie
             # bisher unter '<AP>'. So baut JEDE Tafel (dep UND arr) ihre Historie auf.
             try:
-                _merge_into_delay_store(
+                _queue_board_delay_merge(
                     rows, _fra_local_now().strftime('%Y-%m-%d'),
                     _store_key_for(out_airport, ftype))
             except Exception:
@@ -45993,12 +46351,17 @@ def airport_board(token):
             if _lg and (_t_lg.time() - _lg[0]) < _BOARD_LAST_GOOD_MAX_AGE:
                 _lg_flights = _lg[1] or []
                 _lg_dep = _lg[2] or []
-                return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
-                                'count': len(_lg_flights[:limit]),
-                                'flights': _lg_flights[:limit],
-                                'departed_today': _lg_dep[:120],
-                                'source': 'cache_stale', 'stale': True,
-                                'stale_age_sec': int(_t_lg.time() - _lg[0])})
+                _payload = {
+                    'ok': True, 'airport': out_airport, 'type': ftype,
+                    'count': len(_lg_flights[:limit]),
+                    'flights': _lg_flights[:limit],
+                    'departed_today': _lg_dep[:120],
+                    'source': 'cache_stale', 'stale': True,
+                    'stale_age_sec': int(_t_lg.time() - _lg[0]),
+                }
+                _airport_board_response_memo_put(
+                    _response_memo_key, _payload)
+                return jsonify(_payload)
         except Exception:
             pass
         # EHRLICHER GRUND (Owner 2026-07-28, „LAX meldet source_unavailable, SFO
@@ -46127,12 +46490,14 @@ def airport_board(token):
     except Exception:
         flights_out = flights[:limit]
         departed_out = departed[:120]
-    return jsonify({'ok': True, 'airport': out_airport, 'type': ftype,
-                    'count': len(flights_out), 'flights': flights_out,
-                    'departed_today': departed_out,
-                    'source': src,
-                    'cached_ttl': (_AIRPORT_BOARD_TTL if src == 'fraport'
-                                   else _NATIVE_BOARD_TTL)})
+    _payload = {'ok': True, 'airport': out_airport, 'type': ftype,
+                'count': len(flights_out), 'flights': flights_out,
+                'departed_today': departed_out,
+                'source': src,
+                'cached_ttl': (_AIRPORT_BOARD_TTL if src == 'fraport'
+                               else _NATIVE_BOARD_TTL)}
+    _airport_board_response_memo_put(_response_memo_key, _payload)
+    return jsonify(_payload)
 
 
 # ── Einzelflug-Status (Flugnummer → Flugplan/Status) ──────────────────────
