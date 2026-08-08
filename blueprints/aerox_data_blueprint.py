@@ -6536,7 +6536,14 @@ def ax_flown_track():
         try:
             d0 = _dt.datetime.strptime(date, '%Y-%m-%d').replace(tzinfo=_dt.timezone.utc)
             lo_iso = d0.strftime('%Y-%m-%dT00:00:00Z')
-            hi_iso = (d0 + _dt.timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+            # Ein Service-Tag ist kein UTC-Kalendertag: Langstrecken koennen
+            # nach Mitternacht landen. Nur der fertige Story-Abruf liest darum
+            # 12 h in den Folgetag hinein. Live-/Radar-Aufrufe behalten exakt
+            # ihr bisheriges 24-h-Fenster. 36 h ab Tagesbeginn decken LH780 ab,
+            # ohne bereits die naechste taegliche Rotation einzusammeln.
+            window_hours = 36 if story_mode else 24
+            hi_iso = (d0 + _dt.timedelta(hours=window_hours)).strftime(
+                '%Y-%m-%dT%H:%M:%SZ')
         except Exception:
             date = None
     if not date:
