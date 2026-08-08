@@ -88,7 +88,7 @@ def test_level_none_shorthand_string():
 def test_level_important_keeps_direct_interactions_only():
     p = {FRIEND: {'level': 'important'}}
     # durch: direkte Interaktionen
-    for t in ('dm', 'friend_request', 'buddy_request', 'friend_accept',
+    for t in ('dm', 'goodflight', 'friend_request', 'buddy_request', 'friend_accept',
               'friend_accepted', 'buddy_accepted'):
         assert allow(p, t) is True, t
     # geblockt: Ambient
@@ -111,6 +111,7 @@ def test_level_important_is_fail_open_for_unmapped_types():
 def test_level_custom_respects_the_chip_selection():
     p = {FRIEND: {'level': 'custom', 'types': ['dm', 'community']}}
     assert allow(p, 'dm') is True
+    assert allow(p, 'goodflight') is True
     assert allow(p, 'forum_reply') is True
     assert allow(p, 'trade_closed') is True
     assert allow(p, 'group_message') is False

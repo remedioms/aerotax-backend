@@ -79,9 +79,15 @@ def _rate_limited(token, endpoint, limit, window_sec):
 def _condor_rating_station_allowed(token, iata):
     """None = kein Condor-Account, bool = Condor + Roster-Berechtigung.
 
-    Lazy app-Imports vermeiden den Blueprint/App-Init-Zyklus. Der konkrete
-    Hotelname wird fuer Condor nie persistiert; das Stations-Gate verhindert
-    zusaetzlich frei erfundene Airline-Buckets ausserhalb des eigenen Rosters.
+    Lazy app-Imports vermeiden den Blueprint/App-Init-Zyklus.
+
+    Seit der Owner-Entscheidung 2026-08-08 („solange du dafuer sorgst das nur
+    condor crew mit valid ical link die hotels sehen ist das doch alles in
+    ordnung") wird der echte Hotelname persistiert — aber NUR fuer eine Station,
+    die im eigenen, echt importierten Roster steht. `_condor_roster_hotel_iatas`
+    zaehlt ausschliesslich Briefings mit `ical_imported_at`, das Kalender-Gate
+    steckt also bereits darin. Fail-closed: jeder Fehler auf einem erkannten
+    Condor-Pfad sperrt.
     """
     try:
         from app import (_profile_load, _canonical_airline_key,
@@ -467,18 +473,19 @@ def hotel_rooms_post(token):
 
     hotel_iata = _norm_iata(body.get('hotel_iata'))  # optional
 
-    # CONDOR: das konkrete Hotel stammt aus dem persoenlichen iCal und bleibt
-    # ausschliesslich auf diesem Geraet. Netzwerkbewertungen gehoeren in einen
-    # neutralen Airline+Station-Bucket (z.B. „Crew Hotel Condor MIA").
+    # CONDOR-STATIONS-GATE (Owner 2026-08-08): der echte Hotelname darf jetzt
+    # gespeichert werden — wie bei Lufthansa —, aber nur zu einer Station, die
+    # im eigenen importierten Roster steht. Ohne Station gibt es nichts zu
+    # pruefen, also verlangt der Condor-Pfad die IATA. Alt-Zeilen unter
+    # „Crew Hotel Condor <IATA>" bleiben unangetastet liegen; sie werden weder
+    # geloescht noch umgeschrieben (der Client blendet den Alt-Topf aus, damit
+    # er keinen Schnitt eines echten Hauses verfaelscht).
     condor_station_allowed = _condor_rating_station_allowed(safe_tok, hotel_iata)
     if condor_station_allowed is False:
         return jsonify({'ok': False,
                         'error': 'station_not_in_own_roster'}), 403
-    condor_bucket = condor_station_allowed is True
-    if condor_bucket:
-        if not hotel_iata or len(hotel_iata) != 3:
-            return jsonify({'ok': False, 'error': 'hotel_iata fehlt.'}), 400
-        hotel_name = f'Crew Hotel Condor {hotel_iata}'
+    if condor_station_allowed is True and (not hotel_iata or len(hotel_iata) != 3):
+        return jsonify({'ok': False, 'error': 'hotel_iata fehlt.'}), 400
 
     room_low = _norm_room_number(body.get('room_number_low'))
     room_high = _norm_room_number(body.get('room_number_high'))
@@ -492,12 +499,10 @@ def hotel_rooms_post(token):
     note = _norm_note(body.get('note'))
     renovated = _norm_year(body.get('renovated_year'))
 
-    if condor_bucket:
-        # Freitext und Zimmernummer koennten den lokalen Hotelnamen indirekt
-        # offenlegen. Der neutrale Bucket speichert nur Hotel-Qualitaetswerte.
-        room_low = room_high = None
-        note = ''
-        renovated = None
+    # Zimmernummer, Notiz und Baujahr werden fuer Condor nicht mehr entfernt:
+    # sie waren nur deshalb gesperrt, weil der neutrale Bucket den Hotelnamen
+    # verbergen musste. Mit dem echten Namen tragen sie genau so viel (bzw.
+    # wenig) wie bei jeder anderen Airline.
 
     # Mindest-Inhalt: mindestens 1 Rating oder note >= 6 chars oder room-range
     has_signal = (noise or view or comfort or overall or breakfast or fitness or

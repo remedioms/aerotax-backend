@@ -92,8 +92,12 @@ def test_condor_direct_import_persists_only_sanitized_events(monkeypatch):
     assert 'DE2360' in persisted
 
 
-def test_condor_hotel_rating_persists_only_neutral_station_bucket(
+def test_condor_hotel_rating_persists_the_real_hotel_name(
         client, monkeypatch):
+    """Owner 2026-08-08: „solange du dafuer sorgst das nur condor crew mit valid
+    ical link die hotels sehen ist das doch alles in ordnung." Der echte Name
+    wird gespeichert (wie bei LH) — das Stations-Gate bleibt die Bedingung, s.
+    test_condor_hotel_rating_rejects_station_outside_own_roster."""
     captured = []
     _allow_token(monkeypatch)
     # Frühere Full-Suite-Tests reloaden ``app``; den Endpoint-Gate deshalb an
@@ -111,27 +115,49 @@ def test_condor_hotel_rating_persists_only_neutral_station_bucket(
 
     response = client.post('/api/hotel-rooms/AT-condor/report',
                            headers={'Authorization': 'Bearer AT-condor'}, json={
-        'hotel_name': 'Secret iCal Hotel Miami',
+        'hotel_name': 'Pullman Miami Airport',
         'hotel_iata': 'MIA',
         'room_number_low': 412,
         'overall_rating': 5,
         'breakfast_rating': 4,
-        'note': 'The secret hotel name is in this free text too.',
+        'note': 'Zimmer zum Innenhof, ruhig.',
         'renovated_year': 2024,
     })
 
     assert response.status_code == 200
     assert len(captured) == 1
     row = captured[0]
-    assert row['hotel_name'] == 'Crew Hotel Condor MIA'
+    assert row['hotel_name'] == 'Pullman Miami Airport'
     assert row['hotel_iata'] == 'MIA'
     assert row['overall_rating'] == 5
     assert row['breakfast_rating'] == 4
-    assert row['room_number_low'] is None
-    assert row['room_number_high'] is None
-    assert row['note'] == ''
-    assert row['renovated_year'] is None
-    assert 'Secret iCal Hotel' not in str(row)
+    # Volle Parität mit LH: Zimmer-Bezug, Notiz und Baujahr bleiben erhalten.
+    assert row['room_number_low'] == 412
+    assert row['note'] == 'Zimmer zum Innenhof, ruhig.'
+    assert row['renovated_year'] == 2024
+    # Die ausgelieferte Zeile traegt KEINEN Airline-Tag und kein Melder-Token —
+    # die Zuordnung „Condor schlaeft hier" entsteht ausschliesslich im
+    # gegateten Crew-Hotel-Verzeichnis, nie in dieser oeffentlichen Liste.
+    public = str(response.get_json()['report'])
+    assert 'ondor' not in public
+    assert 'reported_by_token' not in public
+
+
+def test_condor_hotel_rating_requires_station(client, monkeypatch):
+    """Ohne IATA gibt es nichts gegen den Roster zu pruefen → 400, nie offen."""
+    _allow_token(monkeypatch)
+    monkeypatch.setattr(hotel_rooms, '_condor_rating_station_allowed',
+                        lambda token, iata: True)
+    monkeypatch.setattr(hotel_rooms, '_rate_limited',
+                        lambda *args, **kwargs: False)
+
+    response = client.post('/api/hotel-rooms/AT-condor/report',
+                           headers={'Authorization': 'Bearer AT-condor'}, json={
+        'hotel_name': 'Pullman Miami Airport',
+        'overall_rating': 5,
+    })
+
+    assert response.status_code == 400
 
 
 def test_condor_hotel_rating_rejects_station_outside_own_roster(

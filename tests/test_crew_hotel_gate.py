@@ -86,6 +86,39 @@ def test_condor_hotel_requires_station_in_own_roster(monkeypatch):
     assert app._filter_crew_hotels(condor, 'AT-x') == []
 
 
+def test_condor_without_calendar_sees_no_crew_hotel(monkeypatch):
+    """Owner-Bedingung 2026-08-08 woertlich: „nur condor crew mit valid ical
+    link". Ohne importierten Kalender gibt es keine Roster-Station — und damit
+    kein Hotel, egal welche Station angefragt wird."""
+    _mock_viewer(monkeypatch, 'Condor', False)
+    condor = [{'id': 5, 'category': 'sleep', 'author_airline': 'Condor',
+               'title': 'CFG crew hotel'}]
+    assert app._filter_crew_hotels(condor, 'AT-x', iata='JFK') == []
+    assert app._condor_roster_hotel_iatas('AT-x') == set()
+
+
+def test_foreign_airline_never_sees_condor_crew_hotel(monkeypatch):
+    """Gegenprobe zum P0 von 2026-07-13, diesmal mit Condor als Autor."""
+    _mock_viewer(monkeypatch, 'Lufthansa', True)
+    condor = [{'id': 5, 'category': 'sleep', 'author_airline': 'Condor',
+               'title': 'CFG crew hotel'},
+              {'id': 6, 'category': 'food', 'author_airline': 'Condor',
+               'title': 'CFG pizza'}]
+    assert _ids(app._filter_crew_hotels(condor, 'AT-x', iata='JFK')) == [6]
+
+
+def test_condor_crew_hotels_endpoint_needs_calendar(monkeypatch):
+    """`/api/ax/crew-hotels` liefert Condor ohne gueltigen Kalender leer aus —
+    fail-closed BEVOR das Verzeichnis ueberhaupt gelesen wird."""
+    _mock_viewer(monkeypatch, 'Condor', False)
+    monkeypatch.setattr(app, '_crew_hotel_dir_serve',
+                        lambda a: [{'iata': 'JFK', 'hotel': 'Should never leak'}])
+    app.app.config.update(TESTING=True)
+    client = app.app.test_client()
+    body = client.get('/api/ax/crew-hotels?token=AT-x').get_json()
+    assert body == {'airline': '', 'count': 0, 'hotels': []}
+
+
 def test_condor_old_roster_history_does_not_keep_hotel_access(monkeypatch):
     monkeypatch.setattr(app, '_ical_briefings_load', lambda t: {
         '2026-06-01': {

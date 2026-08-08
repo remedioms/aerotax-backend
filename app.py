@@ -10509,8 +10509,10 @@ def _user_profile_path(token):
 # metadata-jsonb für unknown keys). Side-Keys: subscription (W18) sowie
 # sponsored_slots, marker_mapping, lufthansa_credentials, lufthansa_last_sync
 # (W18-Followup 2026-06-10, via _profile_sidekey_get/_set) werden in
-# metadata-jsonb mitgespiegelt; lufthansa_events + crew_aircraft bleiben
-# disk-only (Bloat bzw. separater Patch).
+# metadata-jsonb mitgespiegelt. crew_aircraft ist seit 2026-08-08 ebenfalls in
+# metadata-jsonb (Persistenz-Fix, siehe _crew_aircraft_load/_save — vorher
+# disk-only und damit nach jedem Redeploy weg); lufthansa_events bleibt
+# disk-only (Bloat).
 
 _PROFILE_KNOWN_COLS = {
     'name', 'homebase', 'position', 'airline', 'hometown',
@@ -10911,6 +10913,10 @@ def _profile_load(token, fresh=False):
 _PROFILE_BULK_META_KEYS = (
     'avatar_url', 'share_location', 'current_city', 'location_source',
     'role', 'account_type',
+    # Pro-Freund-Sichtbarkeit. Das Dict bleibt serverintern; friends-today
+    # verwendet nur den Eintrag des anfragenden Freundes und liefert den Blob
+    # niemals an den Client aus.
+    'friend_visibility',
     # CREW-NOTE (Owner 2026-07-18, Boardkarten-Tap): 24h-Kurznachricht an die
     # Freunde — friends-today reicht text+ts durch, iOS blendet nach 24h aus.
     'crew_note_text', 'crew_note_ts',
@@ -10977,6 +10983,12 @@ def _profiles_load_bulk(tokens, include_metadata=False):
                                     v = True
                                 elif v == 'false':
                                     v = False
+                                elif k == 'friend_visibility' and isinstance(v, str):
+                                    try:
+                                        parsed = json.loads(v)
+                                        v = parsed if isinstance(parsed, dict) else {}
+                                    except Exception:
+                                        v = {}
                                 elif isinstance(v, str) and v.isdigit() \
                                         and k in ('share_location',
                                                   'commute_minutes'):
@@ -12537,6 +12549,7 @@ _PUSH_PREF_KEYS = ('dm', 'group_message', 'friend_request',
 # data['type'] (Call-Sites) → Pref-Key. Nicht gemappte Typen → immer senden.
 _PUSH_TYPE_TO_PREF = {
     'dm': 'dm',
+    'goodflight': 'dm',
     'group_message': 'group_message',
     'friend_request': 'friend_request',
     'buddy_request': 'friend_request',
@@ -12597,7 +12610,7 @@ _PUSH_FRIEND_LEVELS = ('all', 'important', 'custom', 'none')
 # NUR Typen, die ein anderer AeroX-User tatsächlich auslösen kann
 # (roster_change/flight_update/inbound_* haben keinen Auslöser → nie hier).
 _PUSH_FRIEND_ART_TO_TYPES = {
-    'dm': ('dm',),
+    'dm': ('dm', 'goodflight'),
     'group_message': ('group_message', 'group_added'),
     'friend_request': ('friend_request', 'buddy_request', 'friend_accept',
                        'friend_accepted', 'buddy_accepted'),
@@ -17028,6 +17041,102 @@ _FRIEND_ROSTER_MEMO = {}
 _FRIEND_ROSTER_MEMO_LOCK = _req_threading.Lock()
 _FRIEND_ROSTER_MEMO_TTL = 60.0
 
+_FRIEND_VISIBILITY_MAX = 500
+
+
+def _friend_day_is_sick(day):
+    """True nur für klare Krank-Marker; unbekannte Dienste bleiben sichtbar."""
+    if not isinstance(day, dict):
+        return False
+    klass = str(day.get('klass') or '').strip().upper()
+    marker = str(day.get('marker') or '').strip().lower()
+    return (klass == 'KRANK' or 'krank' in marker or 'sick' in marker
+            or marker in ('k', 'kk'))
+
+
+def _friend_visibility_share_sick(owner_profile, viewer_token):
+    """Default True (abwärtskompatibel), explizites False bleibt strikt."""
+    prefs = (owner_profile or {}).get('friend_visibility')
+    if not isinstance(prefs, dict):
+        return True
+    entry = prefs.get(viewer_token)
+    if not isinstance(entry, dict):
+        return True
+    return entry.get('share_sick_status') is not False
+
+
+def _invalidate_friend_visibility_memos(owner_token, viewer_token):
+    """Eine geänderte Freigabe muss im nächsten Read sofort wirksam sein."""
+    try:
+        with _FRIEND_ROSTER_MEMO_LOCK:
+            for key in list(_FRIEND_ROSTER_MEMO):
+                if len(key) >= 2 and key[0] == viewer_token and key[1] == owner_token:
+                    _FRIEND_ROSTER_MEMO.pop(key, None)
+    except Exception:
+        pass
+    try:
+        prefix = f'{viewer_token}|'
+        for key in list(_FRIENDS_TODAY_MEMO):
+            if str(key).startswith(prefix):
+                _FRIENDS_TODAY_MEMO.pop(key, None)
+    except Exception:
+        pass
+
+
+@app.route('/api/user/friend-visibility/<token>/<friend_token>',
+           methods=['GET', 'PUT'])
+def friend_visibility_settings(token, friend_token):
+    """Welche sensiblen Statusfelder darf genau dieser Freund sehen?
+
+    Die Einstellung gehört dem Owner ``token`` und ist nicht Teil des
+    öffentlichen Profils. Nur bestehende Freunde können als Empfänger gesetzt
+    werden. Aktuell bewusst minimal: Krank-Status. Weitere Felder können später
+    additiv ergänzt werden, ohne den Wire-Contract zu brechen.
+    """
+    token = str(token or '').strip()
+    friend_token = str(friend_token or '').strip()
+    if not token or not friend_token:
+        return jsonify({'ok': False, 'error': 'missing_token'}), 400
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
+    if friend_token not in ((_friends_load(token) or {}).get('friends') or []):
+        return jsonify({'ok': False, 'error': 'not_friends'}), 403
+
+    full = _profile_load(token, fresh=request.method == 'PUT') or {}
+    profile = dict(full.get('profile') or {})
+    stored = profile.get('friend_visibility')
+    prefs = dict(stored) if isinstance(stored, dict) else {}
+    current = prefs.get(friend_token)
+    current = dict(current) if isinstance(current, dict) else {}
+
+    if request.method == 'GET':
+        return jsonify({'ok': True,
+                        'share_sick_status':
+                            current.get('share_sick_status') is not False})
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body.get('share_sick_status'), bool):
+        return jsonify({'ok': False, 'error': 'invalid_share_sick_status'}), 400
+    share_sick = body['share_sick_status']
+    if share_sick:
+        current.pop('share_sick_status', None)
+    else:
+        current['share_sick_status'] = False
+    if current:
+        if friend_token in prefs or len(prefs) < _FRIEND_VISIBILITY_MAX:
+            prefs[friend_token] = current
+        else:
+            return jsonify({'ok': False, 'error': 'too_many_preferences'}), 400
+    else:
+        prefs.pop(friend_token, None)
+    profile['friend_visibility'] = prefs
+    if not _profile_save(token, profile, full_disk_payload={
+            **full, 'token': token, 'profile': profile}):
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    _profile_memo_invalidate(token)
+    _invalidate_friend_visibility_memos(token, friend_token)
+    return jsonify({'ok': True, 'share_sick_status': share_sick})
+
 
 @app.route('/api/user/friend-roster/<token>/<friend_token>', methods=['GET'])
 def get_friend_roster(token, friend_token):
@@ -17067,6 +17176,9 @@ def get_friend_roster(token, friend_token):
     if friend_token not in (me.get('friends') or []):
         return jsonify({'ok': False, 'shared': False,
                         'error': 'not_friends', 'days': []}), 403
+    _friend_profile = (_profile_load(friend_token) or {}).get('profile') or {}
+    _share_sick_status = _friend_visibility_share_sick(_friend_profile, token)
+    _hidden_sick_day = False
     # KEIN share_roster-Opt-Out mehr (Produkt-Entscheidung 2026-06-25): eine
     # ANGENOMMENE Freundschaft IST die Zustimmung, den Plan zu teilen. Es gibt
     # keinen Aus-Schalter mehr (im Client entfernt) — wer dich als Freund:in
@@ -17089,6 +17201,9 @@ def get_friend_roster(token, friend_token):
     out = []
     for _i, day in enumerate(tage):
         if not isinstance(day, dict): continue
+        if not _share_sick_status and _friend_day_is_sick(day):
+            _hidden_sick_day = True
+            continue
         d = day.get('datum')
         if not d: continue
         try:
@@ -17152,7 +17267,7 @@ def get_friend_roster(token, friend_token):
     # nur Punkte/Per-Tag-Pillen statt verbundener Tour-Balken (Bild #55). Die FAMILIE
     # sieht den Plan über genau diese Quelle KORREKT — Friends jetzt genauso
     # (User 2026-06-30: „mach es einfach wie bei Family, die sehen es komplett richtig").
-    if not out:
+    if not out and not _hidden_sick_day:
         try:
             briefs = _ical_briefings_load(friend_token) or {}
             # Homebase des Freundes (lazy, 10-min-Memo) — für den Same-Day-
@@ -17874,6 +17989,12 @@ def get_friends_today(token):
         # vorher wurde sein voller Tagesplan (Marker/Routing/Layover/Zeiten/Flug-
         # nummern) trotz Opt-out durchgereicht. Spiegelt get_friend_roster.
         if pr.get('share_roster') is False:
+            return (_idx, None)
+        # Personenbezogene Krank-Info nur an Freunde ausliefern, denen der
+        # Owner sie explizit lässt. Ausblenden geschieht vor JEDER Ableitung
+        # (Live-State, Route, Ort, Flugnummer), damit kein Seitenkanal bleibt.
+        if (_friend_day_is_sick(day)
+                and not _friend_visibility_share_sick(pr, token)):
             return (_idx, None)
         rf = day.get('reader_facts') or {}
         # WO IST DIE CREW JETZT (2026-07-04): rf['layover_ort'] ist der Über-
@@ -27138,7 +27259,9 @@ def send_chat_message(token, channel_id):
     # 2026-07-02: dieser generische Send-Pfad (den die iOS-App für Gruppen
     # nutzt und über den auch /dm/send läuft) hatte vorher KEINEN Push.
     try:
-        _chat_push_fanout_async(token, channel_id, text, message_id=msg.get('id'))
+        _chat_push_fanout_async(token, channel_id, text,
+                                message_id=msg.get('id'),
+                                message_kind=msg.get('kind'))
     except Exception:
         pass
     return jsonify({'ok': True, 'message': msg})
@@ -35675,6 +35798,7 @@ def _push_outbox_drain(max_batches=4):
                             message_id=job_data.get('message_id'),
                             sender_name_override=job_data.get('sender_name'),
                             ephemeral_author=bool(job_data.get('ephemeral_author')),
+                            message_kind=job_data.get('message_kind'),
                             _from_outbox=True)
                         delivery = {
                             'ok': bool(ok), 'terminal': bool(ok),
@@ -35809,6 +35933,7 @@ def _chat_push_preview(text):
 
 def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
                             sender_name_override=None, ephemeral_author=False,
+                            message_kind=None,
                             _from_outbox=False):
     """Push-Fanout für Chat-Messages (DM- UND Group-Channels) — der HEADLINE-
     Fix für 'keine Push bei neuer Nachricht' (2026-07-02): der generische
@@ -35833,6 +35958,8 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
             data={'_internal_job': 'chat_fanout',
                   'channel_id': channel_id,
                   'message_id': message_id,
+                  'message_kind': ('goodflight'
+                                   if message_kind == 'goodflight' else None),
                   'sender_name': (str(sender_name_override)[:60]
                                   if sender_name_override else None),
                   'ephemeral_author': bool(ephemeral_author)},
@@ -35930,7 +36057,10 @@ def _chat_push_fanout_async(author_token, channel_id, text, message_id=None,
                     if _from_outbox:
                         return False
                     continue
-                if is_group:
+                if message_kind == 'goodflight':
+                    title = sender_name
+                    payload_type = 'goodflight'
+                elif is_group:
                     title = f"{sender_name} · {group_name}" if group_name else sender_name
                     payload_type = 'group_message'
                 else:
@@ -50954,53 +51084,186 @@ def friend_remind(token):
     return jsonify({'ok': True})
 
 
-# ── Crew + Aircraft pro Flugtag (lokal-augmented, im Profile gespeichert) ──
+# ── Crew + Aircraft pro Flugtag (owner-only, im Profil gespeichert) ─────────
+#
+# PERSISTENZ-FIX (2026-08-08). Vorher schrieben `_crew_aircraft_load/_save`
+# per rohem `open()/json.dump` DIREKT in `profile_<token>.json` — also an
+# `_profile_save` VORBEI. Folge: die Einträge erreichten Supabase nie und waren
+# nach jedem Redeploy weg (dieselbe Fehlerklasse wie der Flugbuch-Historien-
+# Verlust: Container-Dateien überleben keinen Deploy). Zusätzlich klobberte der
+# rohe `json.dump` beim Schreiben potenziell parallele Profil-Änderungen, weil
+# er den Disk-Payload ohne `_atomic_write_json` überschrieb.
+#
+# Jetzt exakt der Weg, den `flight-notes` schon geht: der Store liegt in
+# `user_profiles.metadata.crew_aircraft` (jsonb — KEIN Schema-Change nötig,
+# `_PROFILE_KNOWN_COLS` kennt den Key nicht, also landet er automatisch in
+# metadata) und wird über `_profile_sidekey_set` → `_profile_save` geschrieben:
+# SB primary, Disk nur noch Spiegel. Der alte Top-Level-Disk-Key bleibt als
+# Legacy-Quelle erhalten und wird beim ersten Zugriff einmalig hochgezogen.
+#
+# PII: die Einträge enthalten CREW-NAMEN — Angaben über DRITTE. Der Store ist
+# owner-only. Durchgesetzt wird das vom BUG-004-Gate: `/api/user/crew-aircraft/`
+# steht in `_BUG004_GET_PII_PREFIXES` (auch der GET braucht Auth) und die Route
+# ist NICHT als Cross-User-Route deklariert, d.h. der Bearer muss constant-time
+# (`hmac.compare_digest`) gleich dem Pfad-Token sein. Kein Freund-, Family- oder
+# Discovery-Pfad liest den Key: `_profiles_load_bulk` zieht per Default nur die
+# schlanken `_PROFILE_BULK_META_KEYS`, und `_PUBLIC_PROFILE_FIELDS` (Profil-GET,
+# Friends-Liste) enthält `crew_aircraft` nicht.
+_CREW_AIRCRAFT_DATUM_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+_CREW_AIRCRAFT_MAX_CREW = 12
+_CREW_AIRCRAFT_NAME_MAX = 60
+_CREW_AIRCRAFT_FUNCTION_MAX = 8
+# Der Store hängt jetzt in metadata-jsonb und wird bei JEDEM `_profile_load`
+# mitgelesen. Deshalb ein hartes Dach statt stillem Wachstum — und ein
+# ehrliches 413 statt heimlich Tage wegzuwerfen (kein stiller Datenverlust).
+_CREW_AIRCRAFT_MAX_BYTES = 256_000
+# Personalnummern gehören NICHT in diesen Store: im Projekt fallen PKs beim
+# Parsen weg, Identitäten laufen serverseitig ausschliesslich über
+# `lh_pk_number` — nicht über frei getippte Crew-Listen. Die Feld-Whitelist
+# unten nimmt ohnehin nur name+function; diese Liste dokumentiert die bewusst
+# verworfenen Keys, damit ein späterer Client sie nicht versehentlich
+# durchschmuggelt.
+_CREW_AIRCRAFT_DROPPED_CREW_KEYS = (
+    'pk', 'pk_number', 'lh_pk_number', 'personalnummer', 'personalnr',
+    'staff_id', 'staff_number', 'employee_id', 'crew_id',
+)
 
-def _crew_aircraft_load(token):
-    p = _user_profile_path(token)
-    try:
-        with open(p) as f:
-            return (json.load(f) or {}).get('crew_aircraft', {}) or {}
-    except Exception:
+
+def _crew_aircraft_merge(durable, legacy):
+    """Newest-wins-Merge (Muster wie beim user-history-Volume).
+
+    `durable` = Stand aus der Datenbank, `legacy` = alter Container-Stand.
+    Vergleichsschlüssel ist `updated_at`; ohne Stempel gewinnt der durable
+    Stand. Der Legacy-Stand füllt damit nur Tage, die in der DB fehlen.
+    """
+    out = {}
+    for src in (legacy, durable):
+        if not isinstance(src, dict):
+            continue
+        for datum, entry in src.items():
+            if not isinstance(entry, dict):
+                continue
+            prev = out.get(datum)
+            if prev is None:
+                out[datum] = entry
+                continue
+            if str(entry.get('updated_at') or '') >= str(prev.get('updated_at') or ''):
+                out[datum] = entry
+    return out
+
+
+def _crew_aircraft_load(token, migrate=True):
+    """Owner-Store SB-first; zieht den Legacy-Container-Stand einmalig hoch.
+
+    `_profile_load` liefert beides in EINEM Aufruf: den durablen Stand unter
+    `profile.crew_aircraft` (SB metadata-jsonb) und — solange die Datei auf
+    dem Container noch existiert — den alten Top-Level-Disk-Key.
+    """
+    if not token:
         return {}
+    try:
+        full = _profile_load(token) or {}
+    except Exception:
+        app.logger.warning('[crew-aircraft] profile_load_failed')
+        return {}
+    prof = full.get('profile') or {}
+    durable = prof.get('crew_aircraft')
+    durable = durable if isinstance(durable, dict) else {}
+    legacy = full.get('crew_aircraft')          # Top-Level = alter Disk-Stand
+    legacy = legacy if isinstance(legacy, dict) else {}
+    if not legacy:
+        return durable
+    merged = _crew_aircraft_merge(durable, legacy)
+    if migrate and merged != durable:
+        # Einmalig UND idempotent: `_profile_sidekey_set` schreibt denselben
+        # Stand in die DB und in den Legacy-Top-Level-Key → beim nächsten Read
+        # ist merged == durable und dieser Zweig läuft nicht mehr an.
+        if _crew_aircraft_save(token, merged):
+            app.logger.info(
+                f'[crew-aircraft] warm-migrate tok={token[:8]} '
+                f'{len(merged)} Tage disk→supabase')
+    return merged
 
 
 def _crew_aircraft_save(token, data):
-    p = _user_profile_path(token)
-    try:
-        existing = {}
-        try:
-            with open(p) as f: existing = json.load(f) or {}
-        except Exception: pass
-        existing['crew_aircraft'] = data
-        with open(p, 'w') as f: json.dump(existing, f)
-        return True
-    except Exception:
+    """Schreibt über `_profile_save`: SB metadata-jsonb + Disk-Spiegel."""
+    if not token or not isinstance(data, dict):
         return False
+    try:
+        return bool(_profile_sidekey_set(token, 'crew_aircraft', data))
+    except Exception:
+        app.logger.exception('[crew-aircraft] save_failed')
+        return False
+
+
+def _crew_aircraft_sanitize_crew(raw_list):
+    """Nur `name` + `function` überleben — Personalnummern werden verworfen."""
+    out = []
+    for c in (raw_list or [])[:_CREW_AIRCRAFT_MAX_CREW]:
+        if not isinstance(c, dict):
+            continue
+        name = _sanitize_flight_note(str(c.get('name') or ''))[:_CREW_AIRCRAFT_NAME_MAX]
+        func = _sanitize_flight_note(
+            str(c.get('function') or ''))[:_CREW_AIRCRAFT_FUNCTION_MAX]
+        if not name and not func:
+            continue
+        # Bewusst KEIN Durchreichen weiterer Keys (siehe
+        # _CREW_AIRCRAFT_DROPPED_CREW_KEYS): das Dict wird neu gebaut.
+        out.append({'name': name, 'function': func})
+    return out
 
 
 @app.route('/api/user/crew-aircraft/<token>', methods=['GET'])
 def get_crew_aircraft(token):
-    return jsonify({'data': _crew_aircraft_load(token)})
+    """Owner-only — Crew-Namen sind PII Dritter (siehe Kopf-Kommentar)."""
+    if not token:
+        return jsonify({'error': 'invalid token'}), 400
+    try:
+        return jsonify({'data': _crew_aircraft_load(token)})
+    except Exception:
+        app.logger.exception('[crew-aircraft] get_failed')
+        return jsonify({'error': 'internal_error'}), 500
 
 
 @app.route('/api/user/crew-aircraft/<token>/<datum>', methods=['POST'])
 def set_crew_aircraft(token, datum):
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    if not _CREW_AIRCRAFT_DATUM_RE.match(datum or ''):
+        return jsonify({'ok': False, 'error': 'invalid_datum'}), 400
     body = request.get_json(silent=True) or {}
-    data = _crew_aircraft_load(token)
-    entry = data.get(datum, {})
-    if 'aircraft_reg' in body: entry['aircraft_reg'] = (body['aircraft_reg'] or '').upper()[:8]
-    if 'aircraft_type' in body: entry['aircraft_type'] = (body['aircraft_type'] or '')[:16]
-    if 'crew' in body and isinstance(body['crew'], list):
-        entry['crew'] = [{
-            'name': str(c.get('name', ''))[:60],
-            'function': str(c.get('function', ''))[:8],
-        } for c in body['crew'][:12]]
-    if 'notes' in body: entry['notes'] = str(body['notes'])[:500]
-    if 'locked' in body: entry['locked'] = bool(body['locked'])
-    if 'unlock_reason' in body: entry['unlock_reason'] = str(body['unlock_reason'])[:500]
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
+    data = dict(_crew_aircraft_load(token))
+    entry = dict(data.get(datum) or {})
+    if 'aircraft_reg' in body:
+        entry['aircraft_reg'] = _sanitize_flight_note(
+            str(body.get('aircraft_reg') or '')).upper()[:8]
+    if 'aircraft_type' in body:
+        entry['aircraft_type'] = _sanitize_flight_note(
+            str(body.get('aircraft_type') or ''))[:16]
+    if isinstance(body.get('crew'), list):
+        entry['crew'] = _crew_aircraft_sanitize_crew(body.get('crew'))
+    if 'notes' in body:
+        entry['notes'] = _sanitize_flight_note(str(body.get('notes') or ''))
+    if 'locked' in body:
+        entry['locked'] = bool(body.get('locked'))
+    if 'unlock_reason' in body:
+        entry['unlock_reason'] = _sanitize_flight_note(
+            str(body.get('unlock_reason') or ''))
+    # Stempel für den newest-wins-Merge (Legacy-Einträge haben keinen).
+    entry['updated_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     data[datum] = entry
-    _crew_aircraft_save(token, data)
+    try:
+        size = len(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+    except Exception:
+        size = 0
+    if size > _CREW_AIRCRAFT_MAX_BYTES:
+        app.logger.warning(
+            f'[crew-aircraft] store_full tok={token[:8]} bytes={size}')
+        return jsonify({'ok': False, 'error': 'store_full'}), 413
+    if not _crew_aircraft_save(token, data):
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
     return jsonify({'ok': True, 'entry': entry})
 
 

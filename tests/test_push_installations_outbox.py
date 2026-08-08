@@ -219,6 +219,7 @@ def test_chat_request_persists_fanout_job_before_returning():
     assert result == 'fanout-1'
     assert enqueue.call_args.kwargs['idempotency_key'] == 'chat-fanout:m-1'
     assert enqueue.call_args.kwargs['data']['_internal_job'] == 'chat_fanout'
+    assert enqueue.call_args.kwargs['data']['message_kind'] is None
     wake.assert_called_once()
     executor.assert_not_called()
 
@@ -238,6 +239,21 @@ def test_chat_fanout_worker_enqueues_idempotent_child_rows():
     assert enqueue.call_args.kwargs['idempotency_key'] == f'chat:m-1:{recipient}'
 
 
+def test_goodflight_fanout_uses_feed_push_type():
+    recipient = 'AT-OTHER-123456'
+    with patch.object(A, '_profile_load', return_value={
+            'profile': {'name': 'Basti'}}), \
+            patch.object(A, '_muted_by', return_value=[]), \
+            patch.object(A, '_blocked_by', return_value=[]), \
+            patch.object(A, '_push_outbox_enqueue', return_value='child-1') as enqueue:
+        ok = A._chat_push_fanout_async(
+            USER, f'dm__{USER}__{recipient}', 'Guten Flug!', message_id='m-gf',
+            message_kind='goodflight', _from_outbox=True)
+    assert ok is True
+    assert enqueue.call_args.kwargs['data']['type'] == 'goodflight'
+    assert enqueue.call_args.kwargs['data']['channel_id'].startswith('dm__')
+
+
 def test_outbox_drain_resolves_internal_chat_fanout_job():
     row = {
         'id': 'fanout-1', 'attempts': 1, 'user_token': USER,
@@ -253,7 +269,8 @@ def test_outbox_drain_resolves_internal_chat_fanout_job():
         A._push_outbox_drain(max_batches=2)
     fanout.assert_called_once_with(
         USER, 'dm__a__b', 'hello', message_id='m-1',
-        sender_name_override=None, ephemeral_author=False, _from_outbox=True)
+        sender_name_override=None, ephemeral_author=False, message_kind=None,
+        _from_outbox=True)
     assert mark.call_args.args[1]['reason'] == 'chat_fanout_enqueued'
     assert mark.call_args.args[1]['terminal'] is True
 
