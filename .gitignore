@@ -32,3 +32,6 @@ supabase/.temp/
 
 # raw uncompressed reference DB (only the .gz is committed/deployed)
 data/aerox_reference.sqlite
+
+# Render-/Debug-Ausgaben (2026-08-09): landeten versehentlich im Repo
+tmp/

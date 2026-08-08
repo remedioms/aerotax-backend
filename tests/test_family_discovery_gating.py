@@ -321,51 +321,47 @@ _FILTER_PROFILES = [
 ]
 
 
-def test_filter_airline_only_no_q(tmp_path):
-    """airline-Filter ohne q gibt nur die passende Airline zurück."""
+def test_filter_airline_only_no_q_is_rejected(tmp_path):
+    """airline-Filter OHNE Namen listet nichts mehr (Owner 2026-08-09).
+
+    Bis heute gab `?airline=lufthansa` die Belegschaft aus — ein Discovery-
+    Endpunkt, mit dem sich die Nutzerschaft einer Airline aufzählen liess."""
     d = str(tmp_path)
     _write_disk_profiles(d, _FILTER_PROFILES)
     r = _search_raw(d, 'airline=lufthansa')
-    assert r.status_code == 200
-    names = {u['name'] for u in r.get_json()['users']}
-    assert 'Luisa Hoffmann' in names
-    assert 'Lea Schmidt' in names
-    assert 'Erik Wenzel' not in names
+    assert r.status_code == 400
+    assert r.get_json().get('error') == 'min_query_or_filter_required'
+    assert r.get_json()['users'] == []
 
 
-def test_filter_homebase_only_no_q(tmp_path):
-    """homebase-Filter ohne q gibt nur den passenden Homebase zurück."""
+def test_filter_homebase_only_no_q_is_rejected(tmp_path):
+    """homebase-Filter OHNE Namen listet keine Base mehr auf."""
     d = str(tmp_path)
     _write_disk_profiles(d, _FILTER_PROFILES)
     r = _search_raw(d, 'homebase=FRA')
-    assert r.status_code == 200
-    names = {u['name'] for u in r.get_json()['users']}
-    assert 'Luisa Hoffmann' in names
-    assert 'Erik Wenzel' not in names
-    assert 'Lea Schmidt' not in names
+    assert r.status_code == 400
+    assert r.get_json().get('error') == 'min_query_or_filter_required'
 
 
-def test_filter_airline_and_homebase_combined(tmp_path):
-    """Kombinierter Filter airline+homebase ohne q schneidet korrekt."""
+def test_filter_airline_and_homebase_combined_without_name_rejected(tmp_path):
+    """Auch kombiniert bleibt es ein Listing ohne Namen → 400."""
     d = str(tmp_path)
     _write_disk_profiles(d, _FILTER_PROFILES)
     r = _search_raw(d, 'airline=lufthansa&homebase=MUC')
-    assert r.status_code == 200
-    names = {u['name'] for u in r.get_json()['users']}
-    assert 'Lea Schmidt' in names          # Lufthansa + MUC
-    assert 'Luisa Hoffmann' not in names   # Lufthansa aber FRA
-    assert 'Erik Wenzel' not in names      # Eurowings
+    assert r.status_code == 400
 
 
-def test_filter_airline_case_insensitive_disk(tmp_path):
-    """airline-Vergleich ist case-insensitiv (disk-Pfad): 'LUFTHANSA' == 'lufthansa'."""
+def test_filter_airline_still_refines_a_name_search(tmp_path):
+    """Die Parameter bleiben als VERFEINERUNG erhalten (Vertrag unverändert):
+    Name + airline schneidet korrekt, listet aber nie allein."""
     d = str(tmp_path)
     _write_disk_profiles(d, _FILTER_PROFILES)
-    r = _search_raw(d, 'airline=LUFTHANSA')
+    r = _search_raw(d, 'q=le&airline=lufthansa')
     assert r.status_code == 200
     names = {u['name'] for u in r.get_json()['users']}
-    assert 'Luisa Hoffmann' in names
     assert 'Lea Schmidt' in names
+    assert 'Erik Wenzel' not in names
+    assert 'Luisa Hoffmann' not in names   # Name matcht nicht
 
 
 def test_no_filter_no_q_returns_400(tmp_path):
@@ -375,3 +371,137 @@ def test_no_filter_no_q_returns_400(tmp_path):
     r = _search_raw(d, '')
     assert r.status_code == 400
     assert r.get_json().get('error') == 'min_query_or_filter_required'
+
+
+def test_single_letter_query_returns_400(tmp_path):
+    """Ein einzelner Buchstabe darf nie die halbe Datenbank liefern."""
+    d = str(tmp_path)
+    _write_disk_profiles(d, _FILTER_PROFILES)
+    r = _search_raw(d, 'q=l')
+    assert r.status_code == 400
+    assert r.get_json().get('error') == 'min_query_or_filter_required'
+
+
+# ── NUR-NAME-SUCHE auf dem PRODUKTIVEN Supabase-Pfad (Owner 2026-08-09) ──────
+#
+# Der Airline-/Homebase-Match sass NICHT im Disk-Fallback, sondern im
+# Supabase-Zweig (`_ors` mit `airline.ilike.{q}%` + 3-Buchstaben-Homebase).
+# Diese Tests fahren deshalb den echten SB-Pfad mit einem Fake-Client, der die
+# PostgREST-Filter-Grammatik (or_ / ilike) auswertet.
+
+class _FakeSBResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakeSBQuery:
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def select(self, *_a, **_kw):
+        return self
+
+    @staticmethod
+    def _ilike(value, pattern):
+        import re as _re
+        rx = '^' + '.*'.join(_re.escape(p) for p in pattern.split('%')) + '$'
+        return _re.match(rx, str(value or ''), _re.IGNORECASE) is not None
+
+    def _match_term(self, row, term):
+        col, op, pattern = term.split('.', 2)
+        assert op == 'ilike', term
+        return self._ilike(row.get(col.strip('"')), pattern)
+
+    def or_(self, expr):
+        terms = expr.split(',')
+        self.rows = [r for r in self.rows
+                     if any(self._match_term(r, t) for t in terms)]
+        return self
+
+    def ilike(self, col, pattern):
+        self.rows = [r for r in self.rows if self._ilike(r.get(col), pattern)]
+        return self
+
+    def limit(self, n):
+        self.rows = self.rows[:n]
+        return self
+
+    def execute(self):
+        return _FakeSBResult(self.rows)
+
+
+class _FakeSB:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def table(self, _name):
+        return _FakeSBQuery(self.rows)
+
+
+_SB_ROWS = [
+    {'token': 'AT-C1', 'name': 'Petra Wunderlich', 'homebase': 'FRA',
+     'airline': 'Condor', 'position': 'FA', 'metadata': {}},
+    {'token': 'AT-C2', 'name': 'Jonas Bauer', 'homebase': 'FRA',
+     'airline': 'Condor', 'position': 'FA', 'metadata': {}},
+    {'token': 'AT-L1', 'name': 'Conny Dorsch', 'homebase': 'MUC',
+     'airline': 'Lufthansa', 'position': 'Pilot', 'metadata': {}},
+    {'token': 'AT-L2', 'name': 'Frank Rasch', 'homebase': 'FRA',
+     'airline': 'Lufthansa', 'position': 'FA', 'metadata': {}},
+]
+
+
+def _search_sb(qs, rows=None):
+    with patch.object(A, 'SB_AVAILABLE', True), \
+         patch.object(A, 'sb', _FakeSB(rows if rows is not None else _SB_ROWS)), \
+         patch.object(A, '_validate_token', return_value=_VALID), \
+         patch.object(A, '_blocked_by', return_value=set()):
+        return A.app.test_client().get(
+            f'/api/user/search?token=AT-SEARCHER&{qs}', headers=_AUTH)
+
+
+def test_sb_airline_name_returns_no_airline_roster():
+    """„condor" darf keine Condor-Belegschaft mehr auflisten — nur Menschen,
+    die so HEISSEN (hier: niemand)."""
+    r = _search_sb('q=condor')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['users'] == [], body
+    assert body['count'] == 0
+
+
+def test_sb_homebase_code_returns_no_base_roster():
+    """Ein 3-Buchstaben-Kürzel („FRA") ist kein Basis-Listing mehr — es bleibt
+    ein Namens-Präfix. „Frank" heisst so, die übrigen FRA-Basierten
+    (Wunderlich, Bauer) tauchen NICHT mehr auf."""
+    r = _search_sb('q=FRA')
+    assert r.status_code == 200
+    assert {u['name'] for u in r.get_json()['users']} == {'Frank Rasch'}
+
+
+def test_sb_name_search_still_works():
+    """Namenssuche bleibt: Präfix des vollen Namens UND Wortstart im Nachnamen."""
+    names = {u['name'] for u in _search_sb('q=wunder').get_json()['users']}
+    assert names == {'Petra Wunderlich'}
+    names = {u['name'] for u in _search_sb('q=con').get_json()['users']}
+    assert names == {'Conny Dorsch'}   # Name, NICHT die Condor-Crew
+
+
+def test_sb_result_fields_are_minimal():
+    """Pro Treffer nur, was „Freundschaftsanfrage senden" + Einordnung braucht."""
+    users = _search_sb('q=wunder').get_json()['users']
+    assert len(users) == 1
+    assert set(users[0]) <= {'token', 'name', 'airline', 'homebase',
+                             'position', 'avatar_url', 'account_type', 'role'}
+
+
+def test_sb_limit_capped_and_truncated_flag():
+    """Obergrenze 25 statt 50 + additives `truncated` („präzisier deine Suche")."""
+    rows = [{'token': f'AT-M{i}', 'name': f'Martin Muster{i:02d}',
+             'homebase': 'FRA', 'airline': 'Condor', 'position': 'FA',
+             'metadata': {}} for i in range(40)]
+    body = _search_sb('q=martin&limit=50', rows=rows).get_json()
+    assert body['count'] == 25
+    assert body.get('truncated') is True
+    # Unterhalb der Grenze bleibt das Feld weg (byte-kompatibel für alte Apps).
+    body = _search_sb('q=wunder').get_json()
+    assert 'truncated' not in body

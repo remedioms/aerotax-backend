@@ -160,6 +160,58 @@ def test_condor_hotel_rating_requires_station(client, monkeypatch):
     assert response.status_code == 400
 
 
+def test_old_app_still_writes_and_reads_the_legacy_station_bucket(
+        client, monkeypatch):
+    """RÜCKWÄRTSKOMPATIBILITÄT (Owner: „das muss rückwärtskompatibel sein, habe
+    viele User"). Eine ALTE App sendet fuer Condor weiterhin den anonymen Topf
+    „Crew Hotel Condor <IATA>" und liest ihn per by-hotel zurueck. Beides muss
+    unveraendert durchlaufen: gleicher Status, gleiche Antwort-Form, gleicher
+    Name — kein Fehler, keine leere Liste."""
+    captured = []
+    _allow_token(monkeypatch)
+    monkeypatch.setattr(hotel_rooms, '_condor_rating_station_allowed',
+                        lambda token, iata: iata == 'MIA')
+    monkeypatch.setattr(hotel_rooms, '_rate_limited',
+                        lambda *args, **kwargs: False)
+    monkeypatch.setattr(hotel_rooms, '_sb_insert_report',
+                        lambda row: captured.append(dict(row)) or True)
+    monkeypatch.setattr(hotel_rooms, '_disk_load', lambda name: [])
+    monkeypatch.setattr(hotel_rooms, '_disk_save', lambda name, rows: True)
+
+    # 1) Schreiben in EXAKT der alten Form (Topf-Name, ohne Zimmer/Notiz).
+    response = client.post('/api/hotel-rooms/AT-condor/report',
+                           headers={'Authorization': 'Bearer AT-condor'}, json={
+        'hotel_name': 'Crew Hotel Condor MIA',
+        'hotel_iata': 'MIA',
+        'overall_rating': 4,
+    })
+    assert response.status_code == 200
+    payload = response.get_json()
+    # Antwort-Form unveraendert (keine entfernten Felder, keine neuen Pflichtfelder).
+    assert payload['ok'] is True
+    assert set(payload) == {'ok', 'report', 'persisted_to'}
+    assert payload['report']['hotel_name'] == 'Crew Hotel Condor MIA'
+    assert captured[0]['hotel_name'] == 'Crew Hotel Condor MIA'
+
+    # 2) Eine VOR dem Umbau abgegebene Bewertung bleibt ueber denselben Weg
+    #    sichtbar — der Server filtert den Alt-Topf nicht weg.
+    monkeypatch.setattr(hotel_rooms, '_sb_list_by_hotel',
+                        lambda name, iata: None)
+    monkeypatch.setattr(hotel_rooms, '_disk_load', lambda name: [{
+        'id': 'legacy-1', 'hotel_name': 'Crew Hotel Condor MIA',
+        'hotel_iata': 'MIA', 'overall_rating': 5, 'upvote_count': 2,
+        'deleted': False, 'created_at': '2026-08-01T10:00:00+00:00',
+    }])
+    listing = client.get('/api/hotel-rooms/by-hotel'
+                         '?hotel_name=Crew%20Hotel%20Condor%20MIA&hotel_iata=MIA')
+    assert listing.status_code == 200
+    body = listing.get_json()
+    assert body['ok'] is True
+    assert body['count'] == 1
+    assert body['reports'][0]['hotel_name'] == 'Crew Hotel Condor MIA'
+    assert body['reports'][0]['overall_rating'] == 5
+
+
 def test_condor_hotel_rating_rejects_station_outside_own_roster(
         client, monkeypatch):
     _allow_token(monkeypatch)

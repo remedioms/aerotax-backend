@@ -11809,7 +11809,23 @@ def user_search():
     token-Param wird genutzt um (a) eigene Blocks rauszufiltern und (b) den
     Searcher selbst nicht zurückzugeben. Privacy: liefert nur public profile-
     Felder, NIEMALS email/apple_sub/internal.
-    Rate-Limit: max 20 Ergebnisse pro Call, Query muss ≥2 Zeichen haben.
+    Rate-Limit: 300 Anfragen/h pro Konto, max 25 Ergebnisse pro Call
+    (Default 20), Query muss ≥2 NAMENS-Zeichen haben.
+
+    NUR-NAME-SUCHE (Owner 2026-08-09, „bei freunde suchen/ base/airline und so
+    sollten nicht alle zeigen.. nur nach namen.. / es steht sogar so da aber
+    funktioniert so nicht.. condor alleine gibt 50 treffer"):
+    `q` matcht ausschliesslich den NAMEN (Präfix des vollen Namens ODER Präfix
+    eines Namens-Worts). Die frühere Ein-Feld-Bequemlichkeit (q matchte
+    zusätzlich Airline-Präfix und bei 3 Buchstaben die Homebase) machte aus
+    „condor" bzw. „FRA" eine Belegschafts-/Basis-Liste — also Aufzählbarkeit
+    personenbezogener Daten über einen Discovery-Endpunkt. Sie ist ersatzlos
+    raus. Airline und Homebase bleiben ANZEIGE am Treffer (Einordnung), die
+    expliziten Parameter `airline=`/`homebase=` wirken nur noch VERFEINERND
+    ZUSÄTZLICH zu einem Namen — allein listen sie nichts mehr (400).
+    Obergrenze: 25 statt 50 Treffer, plus additives `truncated`-Flag
+    („präzisier deine Suche"). Kein Vertragsbruch: Pfad, Methode und
+    Antwort-Form bleiben, alte Apps bekommen nur weniger Treffer.
 
     AUTH-PFLICHT (2026-08-01): Die Antwort enthält pro Treffer das ROHE `token`
     des gefundenen Users — und ein Token IST das Bearer-Credential (das Gate in
@@ -11823,6 +11839,10 @@ def user_search():
     Follow-Flow (friend-requests/send mit `friend_token`) sind nicht-optional
     darauf angewiesen. Der eigentliche Fix (opake Discovery-ID statt Token) muss
     beidseitig mit einem App-Build kommen.
+    NACHTRAG 2026-08-03: genau dieser Fix ist inzwischen da, ohne App-Build —
+    der Pfad steht in `_PUBLIC_USER_REF_PATH_PREFIXES`, das ausgelieferte
+    `token` ist an der HTTP-Grenze eine AXU-Referenz (AES-SIV, deterministisch,
+    beim nächsten Request wieder auflösbar), kein Bearer-Credential mehr.
     """
     _bearer = _request_bearer_token()
     if not _bearer:
@@ -11841,7 +11861,12 @@ def user_search():
     airline = _search_filter_sanitize((request.args.get('airline') or '').strip().lower())
     homebase = _search_filter_sanitize((request.args.get('homebase') or '').strip().upper())
     try:
-        limit = min(max(int(request.args.get('limit') or 20), 1), 50)
+        # Obergrenze 25 (vorher 50, Owner 2026-08-09): eine Namenssuche, die
+        # eine halbe Bildschirmseite fremder Menschen ausschüttet, ist kein
+        # „Freund finden" mehr. Wer mehr braucht, tippt mehr — das Ergebnis
+        # trägt dafür `truncated`. Alte Apps fragen weiter limit=50 und
+        # bekommen einfach weniger Zeilen (kein Vertragsbruch).
+        limit = min(max(int(request.args.get('limit') or 20), 1), 25)
     except (TypeError, ValueError):
         # `?limit=abc` warf vorher ValueError → 500 statt einer Antwort.
         limit = 20
@@ -11855,8 +11880,14 @@ def user_search():
     # Friend-Request-Core lehnt zusätzlich serverseitig ab (auch für alte Builds).
     # Der `exclude_family`-Opt-in bleibt unverändert erhalten.
     exclude_family = str(request.args.get('exclude_family') or '').strip() in ('1', 'true', 'yes')
-    # Mindestens ein Filter muss gesetzt sein damit das nicht zu User-Listing wird
-    if len(q) < 2 and not airline and not homebase:
+    # Ein NAME ist Pflicht — sonst ist das kein Suchen, sondern Auflisten.
+    # Vorher genügte `airline=`/`homebase=` allein: `?homebase=FRA` gab die
+    # halbe Base, `?airline=condor` die Belegschaft. Beide Parameter dürfen
+    # jetzt nur noch VERFEINERN (zusätzlich zu ≥2 Namens-Zeichen).
+    # Fehlercode bewusst unverändert (`min_query_or_filter_required`) — Android
+    # mappt genau diesen String auf „Bitte mindestens zwei Zeichen eingeben"
+    # (AeroXCrewCommunityRepository/CrewCommunityViewModel).
+    if len(q) < 2:
         return jsonify({'count': 0, 'users': [],
                         'error': 'min_query_or_filter_required'}), 400
     blocked = _blocked_by(searcher_token) if searcher_token else set()
@@ -11884,15 +11915,13 @@ def user_search():
                 # Substring-Treffer wie „JohANnes" bei Suche „an".
                 # PostgREST or_()-Filter: name ILIKE 'q%' OR name ILIKE '% q%'
                 #
-                # EIN-FELD-SUCHE (Owner 19.07 „Suche funktioniert nicht per
-                # Homebase oder Airline"): die iOS-Suche schickt ALLES als q —
-                # die separaten airline=/homebase=-Parameter nutzt kein Client.
-                # q matcht daher zusätzlich Airline-Präfix („condor", „swiss")
-                # und bei exakt 3 Buchstaben die Homebase („FRA", „ZRH").
-                _ors = [f"name.ilike.{q}%", f"name.ilike.% {q}%",
-                        f"airline.ilike.{q}%"]
-                if len(q) == 3 and q.isalpha():
-                    _ors.append(f"homebase.ilike.{q}")
+                # NUR NAME (Owner 2026-08-09). Hier standen zusätzlich
+                # `airline.ilike.{q}%` und — bei exakt 3 Buchstaben —
+                # `homebase.ilike.{q}` (Ein-Feld-Bequemlichkeit vom 19.07.).
+                # Damit listete „condor" die Condor-Belegschaft und „FRA" die
+                # Base FRA. Die Oberfläche versprach die ganze Zeit reine
+                # Namenssuche; jetzt tut es der Server auch.
+                _ors = [f"name.ilike.{q}%", f"name.ilike.% {q}%"]
                 qbuilder = qbuilder.or_(",".join(_ors))
             if airline:
                 # ilike ohne Wildcard = exakter case-insensitiver Vergleich
@@ -11999,7 +12028,14 @@ def user_search():
             pass
     # Sortiere alphabetisch nach Name
     results.sort(key=lambda u: (u.get('name') or '').lower())
-    return jsonify({'count': len(results), 'users': results, 'source': used_source})
+    # `truncated` ADDITIV (alte Clients ignorieren unbekannte Keys): die Liste
+    # lief in die Obergrenze, es gibt also womöglich weitere Namensträger. Die
+    # App bittet daraufhin um einen genaueren Namen, statt eine willkürlich
+    # abgeschnittene Menschenliste als „das Ergebnis" auszugeben.
+    payload = {'count': len(results), 'users': results, 'source': used_source}
+    if len(results) >= limit:
+        payload['truncated'] = True
+    return jsonify(payload)
 
 
 # ── Kontakte-Matching (B1 Tibor 2026-07-12) ─────────────────────────────────
@@ -17054,15 +17090,67 @@ def _friend_day_is_sick(day):
             or marker in ('k', 'kk'))
 
 
-def _friend_visibility_share_sick(owner_profile, viewer_token):
-    """Default True (abwärtskompatibel), explizites False bleibt strikt."""
+def _friend_day_text(day):
+    if not isinstance(day, dict):
+        return ''
+    return ' '.join(str(day.get(key) or '') for key in (
+        'klass', 'marker', 'routing')).strip().upper()
+
+
+def _friend_day_is_training(day):
+    text = _friend_day_text(day)
+    return any(word in text for word in (
+        'TRAINING', 'SCHULUNG', 'RECURRENT', 'GROUND SCHOOL', 'SIMULATOR'))
+
+
+def _friend_day_is_part_time(day):
+    text = _friend_day_text(day)
+    tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', text))
+    return ('TEILZEIT' in text or 'PART TIME' in text
+            or bool(tokens & {'TZ', 'PT', 'TZA'}))
+
+
+def _friend_day_is_vacation(day):
+    text = _friend_day_text(day)
+    tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', text))
+    return ('URLAUB' in text or 'HOLIDAY' in text or 'VACATION' in text
+            or bool(tokens & {'VAC', 'UR'}))
+
+
+def _friend_day_is_standby(day):
+    text = _friend_day_text(day)
+    tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', text))
+    return ('STANDBY' in text or 'BEREITSCHAFT' in text or 'RESERVE' in text
+            or bool(tokens & {'SBY', 'RSV'}))
+
+
+def _friend_day_hidden_for_viewer(day, owner_profile, viewer_token):
+    checks = (
+        ('share_sick_status', _friend_day_is_sick),
+        ('share_training_status', _friend_day_is_training),
+        ('share_part_time_status', _friend_day_is_part_time),
+        ('share_vacation_status', _friend_day_is_vacation),
+        ('share_standby_status', _friend_day_is_standby),
+    )
+    return any(check(day)
+               and not _friend_visibility_value(owner_profile, viewer_token, key)
+               for key, check in checks)
+
+
+def _friend_visibility_value(owner_profile, viewer_token, key):
+    """Per-friend Freigabe; fehlende neue Keys bleiben abwärtskompatibel an."""
     prefs = (owner_profile or {}).get('friend_visibility')
     if not isinstance(prefs, dict):
         return True
     entry = prefs.get(viewer_token)
     if not isinstance(entry, dict):
         return True
-    return entry.get('share_sick_status') is not False
+    return entry.get(key) is not False
+
+
+def _friend_visibility_share_sick(owner_profile, viewer_token):
+    return _friend_visibility_value(
+        owner_profile, viewer_token, 'share_sick_status')
 
 
 def _invalidate_friend_visibility_memos(owner_token, viewer_token):
@@ -17090,8 +17178,8 @@ def friend_visibility_settings(token, friend_token):
 
     Die Einstellung gehört dem Owner ``token`` und ist nicht Teil des
     öffentlichen Profils. Nur bestehende Freunde können als Empfänger gesetzt
-    werden. Aktuell bewusst minimal: Krank-Status. Weitere Felder können später
-    additiv ergänzt werden, ohne den Wire-Contract zu brechen.
+    werden. Alle Schalter sind standardmäßig an, damit ältere Clients und
+    bestehende Freundschaften ihr bisheriges Verhalten behalten.
     """
     token = str(token or '').strip()
     friend_token = str(friend_token or '').strip()
@@ -17109,19 +17197,23 @@ def friend_visibility_settings(token, friend_token):
     current = prefs.get(friend_token)
     current = dict(current) if isinstance(current, dict) else {}
 
+    fields = ('share_sick_status', 'share_training_status',
+              'share_part_time_status', 'share_vacation_status',
+              'share_standby_status')
     if request.method == 'GET':
-        return jsonify({'ok': True,
-                        'share_sick_status':
-                            current.get('share_sick_status') is not False})
+        return jsonify({'ok': True, **{
+            key: current.get(key) is not False for key in fields}})
 
     body = request.get_json(silent=True) or {}
-    if not isinstance(body.get('share_sick_status'), bool):
-        return jsonify({'ok': False, 'error': 'invalid_share_sick_status'}), 400
-    share_sick = body['share_sick_status']
-    if share_sick:
-        current.pop('share_sick_status', None)
-    else:
-        current['share_sick_status'] = False
+    supplied = [key for key in fields if key in body]
+    if not supplied or any(not isinstance(body.get(key), bool)
+                           for key in supplied):
+        return jsonify({'ok': False, 'error': 'invalid_friend_permissions'}), 400
+    for key in supplied:
+        if body[key]:
+            current.pop(key, None)
+        else:
+            current[key] = False
     if current:
         if friend_token in prefs or len(prefs) < _FRIEND_VISIBILITY_MAX:
             prefs[friend_token] = current
@@ -17135,14 +17227,15 @@ def friend_visibility_settings(token, friend_token):
         return jsonify({'ok': False, 'error': 'persist_failed'}), 500
     _profile_memo_invalidate(token)
     _invalidate_friend_visibility_memos(token, friend_token)
-    return jsonify({'ok': True, 'share_sick_status': share_sick})
+    return jsonify({'ok': True, **{
+        key: current.get(key) is not False for key in fields}})
 
 
 @app.route('/api/user/friend-roster/<token>/<friend_token>', methods=['GET'])
 def get_friend_roster(token, friend_token):
     """Liefert das Roster eines Friends (Tag-Detail-Liste) für Tour-Compare.
-    Privacy: nur wenn beide friends sind UND Friend hat share_roster=true im
-    Profile (Default off). Honest empty array wenn nicht geteilt.
+    Privacy: nur bei gegenseitiger Freundschaft und aktiver per-Freund-Freigabe.
+    Die Freigabe ist aus Rückwärtskompatibilität standardmäßig an.
     Query: ?days=30 (default 30, max 90)
 
     KURZ-MEMO (Kalender-8s-Profiling 2026-07-20): p50 lag bei 3,2 s PRO Freund
@@ -17177,8 +17270,7 @@ def get_friend_roster(token, friend_token):
         return jsonify({'ok': False, 'shared': False,
                         'error': 'not_friends', 'days': []}), 403
     _friend_profile = (_profile_load(friend_token) or {}).get('profile') or {}
-    _share_sick_status = _friend_visibility_share_sick(_friend_profile, token)
-    _hidden_sick_day = False
+    _hidden_private_day = False
     # KEIN share_roster-Opt-Out mehr (Produkt-Entscheidung 2026-06-25): eine
     # ANGENOMMENE Freundschaft IST die Zustimmung, den Plan zu teilen. Es gibt
     # keinen Aus-Schalter mehr (im Client entfernt) — wer dich als Freund:in
@@ -17201,8 +17293,8 @@ def get_friend_roster(token, friend_token):
     out = []
     for _i, day in enumerate(tage):
         if not isinstance(day, dict): continue
-        if not _share_sick_status and _friend_day_is_sick(day):
-            _hidden_sick_day = True
+        if _friend_day_hidden_for_viewer(day, _friend_profile, token):
+            _hidden_private_day = True
             continue
         d = day.get('datum')
         if not d: continue
@@ -17267,7 +17359,7 @@ def get_friend_roster(token, friend_token):
     # nur Punkte/Per-Tag-Pillen statt verbundener Tour-Balken (Bild #55). Die FAMILIE
     # sieht den Plan über genau diese Quelle KORREKT — Friends jetzt genauso
     # (User 2026-06-30: „mach es einfach wie bei Family, die sehen es komplett richtig").
-    if not out and not _hidden_sick_day:
+    if not out and not _hidden_private_day:
         try:
             briefs = _ical_briefings_load(friend_token) or {}
             # Homebase des Freundes (lazy, 10-min-Memo) — für den Same-Day-
@@ -17344,6 +17436,10 @@ def get_friend_roster(token, friend_token):
                         if not dedup or dedup[-1] != c:
                             dedup.append(c)
                     routing = '-'.join(dedup) if len(dedup) >= 2 else None
+                if _friend_day_hidden_for_viewer(
+                        {'klass': klass, 'marker': summ, 'routing': routing},
+                        _friend_profile, token):
+                    continue
                 # Nightstop wie im PRIMÄR-Pfad ableiten statt roh `ical_layover_ort`
                 # zu servieren: ein Same-Day-Turnaround ZURÜCK zur Homebase
                 # (ZRH-LIS-ZRH) trug sonst über den rohen Reader-Wert einen
@@ -17993,8 +18089,7 @@ def get_friends_today(token):
         # Personenbezogene Krank-Info nur an Freunde ausliefern, denen der
         # Owner sie explizit lässt. Ausblenden geschieht vor JEDER Ableitung
         # (Live-State, Route, Ort, Flugnummer), damit kein Seitenkanal bleibt.
-        if (_friend_day_is_sick(day)
-                and not _friend_visibility_share_sick(pr, token)):
+        if _friend_day_hidden_for_viewer(day, pr, token):
             return (_idx, None)
         rf = day.get('reader_facts') or {}
         # WO IST DIE CREW JETZT (2026-07-04): rf['layover_ort'] ist der Über-
@@ -51088,9 +51183,12 @@ def friend_remind(token):
 #
 # PERSISTENZ-FIX (2026-08-08). Vorher schrieben `_crew_aircraft_load/_save`
 # per rohem `open()/json.dump` DIREKT in `profile_<token>.json` — also an
-# `_profile_save` VORBEI. Folge: die Einträge erreichten Supabase nie und waren
-# nach jedem Redeploy weg (dieselbe Fehlerklasse wie der Flugbuch-Historien-
-# Verlust: Container-Dateien überleben keinen Deploy). Zusätzlich klobberte der
+# `_profile_save` VORBEI. Folge: die Einträge erreichten Supabase NIE. Bis zum
+# 04.08. war das dieselbe Fehlerklasse wie der Flugbuch-Historien-Verlust
+# (Container-Dateien überleben keinen Deploy); seit `main-5f08d85` liegt
+# `_user_history_state` auf einem Volume, der Store überlebt also Deploys —
+# aber weiterhin nur auf EINEM Host, ohne DB-Backup und mit einer eigenen,
+# abweichenden Kopie auf dem zweiten Origin (NAS). Zusätzlich klobberte der
 # rohe `json.dump` beim Schreiben potenziell parallele Profil-Änderungen, weil
 # er den Disk-Payload ohne `_atomic_write_json` überschrieb.
 #
@@ -51109,7 +51207,25 @@ def friend_remind(token):
 # Discovery-Pfad liest den Key: `_profiles_load_bulk` zieht per Default nur die
 # schlanken `_PROFILE_BULK_META_KEYS`, und `_PUBLIC_PROFILE_FIELDS` (Profil-GET,
 # Friends-Liste) enthält `crew_aircraft` nicht.
-_CREW_AIRCRAFT_DATUM_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+#
+# RÜCKWÄRTSKOMPATIBILITÄT (Owner-Auflage 2026-08-08: „das muss rückwärts-
+# kompatibel sein, habe viele User"): Pfad, Methode, Body-Form und Antwort-
+# Form bleiben BYTE-GLEICH zum alten Verhalten. Was ein alter Client heute
+# schickt, läuft weiterhin mit 200 durch — insbesondere:
+#   * jedes `<datum>`, das der alte Handler als Dict-Key akzeptierte, wird
+#     weiter akzeptiert (KEIN neues 400 auf ein Format, das vorher ging);
+#     nur die Länge wird gedeckelt, damit metadata-jsonb nicht unbegrenzt
+#     wächst.
+#   * ein Nicht-Objekt-Body wird wie ein leerer Patch behandelt statt
+#     abgelehnt.
+#   * `crew`-Einträge bleiben 1:1 in Anzahl und Reihenfolge erhalten
+#     (auch leere) — ein Client, der 12 Zeilen schreibt, liest 12 zurück.
+#   * `entry` behält alle bisherigen Felder mit unveränderten Typen; neu ist
+#     ausschliesslich das ADDITIVE, optionale `updated_at` (String), das der
+#     newest-wins-Merge braucht. Swift-`Codable` ignoriert unbekannte Keys.
+# Neue Fehlerstatus gibt es nur für Fälle, die vorher schon kaputt waren oder
+# die kein realer Client erreicht (siehe `set_crew_aircraft`).
+_CREW_AIRCRAFT_DATUM_MAX = 32
 _CREW_AIRCRAFT_MAX_CREW = 12
 _CREW_AIRCRAFT_NAME_MAX = 60
 _CREW_AIRCRAFT_FUNCTION_MAX = 8
@@ -51173,14 +51289,21 @@ def _crew_aircraft_load(token, migrate=True):
     legacy = legacy if isinstance(legacy, dict) else {}
     if not legacy:
         return durable
-    merged = _crew_aircraft_merge(durable, legacy)
+    # FEHLERTOLERANT: scheitert der Warm-Pfad, gewinnt der alte Weg — der
+    # Aufrufer bekommt weiterhin Daten statt eines 500ers. Die Migration wird
+    # beim nächsten Zugriff einfach erneut versucht (idempotent).
+    try:
+        merged = _crew_aircraft_merge(durable, legacy)
+    except Exception:
+        app.logger.exception('[crew-aircraft] merge_failed')
+        return durable or legacy
     if migrate and merged != durable:
         # Einmalig UND idempotent: `_profile_sidekey_set` schreibt denselben
         # Stand in die DB und in den Legacy-Top-Level-Key → beim nächsten Read
         # ist merged == durable und dieser Zweig läuft nicht mehr an.
         if _crew_aircraft_save(token, merged):
             app.logger.info(
-                f'[crew-aircraft] warm-migrate tok={token[:8]} '
+                f'[crew-aircraft] warm-migrate tok={str(token)[:8]} '
                 f'{len(merged)} Tage disk→supabase')
     return merged
 
@@ -51197,16 +51320,23 @@ def _crew_aircraft_save(token, data):
 
 
 def _crew_aircraft_sanitize_crew(raw_list):
-    """Nur `name` + `function` überleben — Personalnummern werden verworfen."""
+    """Nur `name` + `function` überleben — Personalnummern werden verworfen.
+
+    Anzahl und Reihenfolge bleiben erhalten (auch leere Zeilen): der alte
+    Handler baute die Liste 1:1 in derselben Länge, ein alter Client liest
+    also genau so viele Zeilen zurück wie er geschrieben hat.
+    """
     out = []
     for c in (raw_list or [])[:_CREW_AIRCRAFT_MAX_CREW]:
         if not isinstance(c, dict):
+            # Der alte Handler wäre hier mit AttributeError in einen 500
+            # gelaufen. Statt den Request zu killen: leere Zeile, Position
+            # bleibt erhalten.
+            out.append({'name': '', 'function': ''})
             continue
         name = _sanitize_flight_note(str(c.get('name') or ''))[:_CREW_AIRCRAFT_NAME_MAX]
         func = _sanitize_flight_note(
             str(c.get('function') or ''))[:_CREW_AIRCRAFT_FUNCTION_MAX]
-        if not name and not func:
-            continue
         # Bewusst KEIN Durchreichen weiterer Keys (siehe
         # _CREW_AIRCRAFT_DROPPED_CREW_KEYS): das Dict wird neu gebaut.
         out.append({'name': name, 'function': func})
@@ -51215,25 +51345,33 @@ def _crew_aircraft_sanitize_crew(raw_list):
 
 @app.route('/api/user/crew-aircraft/<token>', methods=['GET'])
 def get_crew_aircraft(token):
-    """Owner-only — Crew-Namen sind PII Dritter (siehe Kopf-Kommentar)."""
-    if not token:
-        return jsonify({'error': 'invalid token'}), 400
+    """Owner-only — Crew-Namen sind PII Dritter (siehe Kopf-Kommentar).
+
+    Antwort-Form unverändert: `{'data': {datum: entry}}`, immer 200. Ein
+    Lesefehler degradiert wie früher auf `{}` statt einen 500er an alte
+    Clients auszuliefern (der alte `_crew_aircraft_load` fing ebenfalls
+    alles ab und lieferte `{}`).
+    """
     try:
         return jsonify({'data': _crew_aircraft_load(token)})
     except Exception:
         app.logger.exception('[crew-aircraft] get_failed')
-        return jsonify({'error': 'internal_error'}), 500
+        return jsonify({'data': {}})
 
 
 @app.route('/api/user/crew-aircraft/<token>/<datum>', methods=['POST'])
 def set_crew_aircraft(token, datum):
-    if not token:
-        return jsonify({'ok': False, 'error': 'invalid token'}), 400
-    if not _CREW_AIRCRAFT_DATUM_RE.match(datum or ''):
+    # KOMPATIBILITÄT: kein neues 400 auf Eingaben, die der alte Handler
+    # akzeptierte. `datum` wird nur gedeckelt/entschärft (Control-Chars raus,
+    # Längen-Cap) — jedes reale `YYYY-MM-DD` passiert unverändert.
+    datum = _sanitize_flight_note(str(datum or ''))[:_CREW_AIRCRAFT_DATUM_MAX]
+    if not datum:
         return jsonify({'ok': False, 'error': 'invalid_datum'}), 400
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
     if not isinstance(body, dict):
-        return jsonify({'ok': False, 'error': 'body_must_be_object'}), 400
+        # Alter Handler: Liste/None → AttributeError → 500. Jetzt: wie ein
+        # leerer Patch behandeln, Antwort-Form bleibt die gewohnte.
+        body = {}
     data = dict(_crew_aircraft_load(token))
     entry = dict(data.get(datum) or {})
     if 'aircraft_reg' in body:
@@ -51251,17 +51389,26 @@ def set_crew_aircraft(token, datum):
     if 'unlock_reason' in body:
         entry['unlock_reason'] = _sanitize_flight_note(
             str(body.get('unlock_reason') or ''))
-    # Stempel für den newest-wins-Merge (Legacy-Einträge haben keinen).
+    # ADDITIVES Feld (String) für den newest-wins-Merge — Legacy-Einträge
+    # haben keinen. Alte Clients ignorieren unbekannte Keys.
     entry['updated_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     data[datum] = entry
+    # 413 nur oberhalb von 256 KB Gesamt-Store — das erreicht kein realer
+    # Client (ein voller Tag ist ~1 KB). Bewusst ein ehrlicher Fehler statt
+    # heimlich Tage wegzuwerfen.
     try:
         size = len(json.dumps(data, ensure_ascii=False).encode('utf-8'))
     except Exception:
         size = 0
     if size > _CREW_AIRCRAFT_MAX_BYTES:
         app.logger.warning(
-            f'[crew-aircraft] store_full tok={token[:8]} bytes={size}')
+            f'[crew-aircraft] store_full tok={str(token)[:8]} bytes={size}')
         return jsonify({'ok': False, 'error': 'store_full'}), 413
+    # 500 NUR wenn weder Datenbank noch Disk gehalten haben (`_profile_save`
+    # meldet schon True, sobald EIN Pfad sass). Der alte Handler gab auch dann
+    # `{'ok': true}` zurück und liess den Client im Glauben, gespeichert zu
+    # haben — genau das kostet Daten. Ein ehrlicher Fehler lässt den Client
+    # erneut senden; die Erfolgs-Antwort selbst ist unverändert.
     if not _crew_aircraft_save(token, data):
         return jsonify({'ok': False, 'error': 'persist_failed'}), 500
     return jsonify({'ok': True, 'entry': entry})

@@ -293,21 +293,17 @@ def test_personalnummern_are_discarded():
         assert needle not in blob
 
 
-def test_invalid_datum_is_rejected():
-    store = _FakeStore(sb={'name': 'X'}, disk={'token': TOK, 'profile': {}})
-    r = _run(store, lambda: _post(datum='irgendwas', body={'notes': 'x'}))
-    assert r.status_code == 400
-    assert r.get_json()['error'] == 'invalid_datum'
-    assert not store.sb_writes
-
-
 def test_malformed_crew_entries_do_not_500():
+    """Kaputte Zeilen killen den Request nicht — Position bleibt erhalten."""
     store = _FakeStore(sb={'name': 'X'}, disk={'token': TOK, 'profile': {}})
     r = _run(store, lambda: _post(body={'crew': ['nur-ein-string', None,
                                                  {'name': 'Ok', 'function': 'FB'}]}))
     assert r.status_code == 200
     assert store.sb_writes[-1]['crew_aircraft']['2026-08-08']['crew'] == [
-        {'name': 'Ok', 'function': 'FB'}]
+        {'name': '', 'function': ''},
+        {'name': '', 'function': ''},
+        {'name': 'Ok', 'function': 'FB'},
+    ]
 
 
 def test_notes_are_html_stripped_and_capped():
@@ -317,6 +313,128 @@ def test_notes_are_html_stripped_and_capped():
     note = store.sb_writes[-1]['crew_aircraft']['2026-08-08']['notes']
     assert '<b>' not in note
     assert len(note) <= A._FLIGHT_NOTE_MAX_CHARS
+
+
+# ════════════════════════════════════════════════════════════════════
+# RÜCKWÄRTSKOMPATIBILITÄT (Owner-Auflage: „habe viele User")
+# Alte App-Versionen im Store werden nicht aktualisiert — der exakt alte
+# Aufruf muss weiterlaufen und alte Einträge müssen lesbar bleiben.
+# ════════════════════════════════════════════════════════════════════
+
+def test_exact_legacy_call_shape_still_works():
+    """Body und Antwort exakt in der alten Form: Felder, Typen, Status 200."""
+    store = _FakeStore(sb={'name': 'X'}, disk={'token': TOK, 'profile': {}})
+    legacy_body = {
+        'aircraft_reg': 'D-AIXB', 'aircraft_type': 'A320-200',
+        'crew': [{'name': 'Paula', 'function': 'PU'},
+                 {'name': 'Florian', 'function': 'FB'}],
+        'notes': 'Catering vergessen',
+        'locked': True, 'unlock_reason': 'Tag korrigiert',
+    }
+    r = _run(store, lambda: _post(body=legacy_body))
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j['ok'] is True
+    e = j['entry']
+    assert e['aircraft_reg'] == 'D-AIXB'
+    assert e['aircraft_type'] == 'A320-200'
+    assert e['notes'] == 'Catering vergessen'
+    assert e['locked'] is True
+    assert e['unlock_reason'] == 'Tag korrigiert'
+    assert e['crew'] == legacy_body['crew']
+    # Typen unverändert (ein falscher Typ killt den Swift-Decode komplett).
+    assert isinstance(e['aircraft_reg'], str) and isinstance(e['locked'], bool)
+    assert isinstance(e['crew'], list) and isinstance(e['crew'][0], dict)
+    # Neu ist ausschliesslich das ADDITIVE, optionale updated_at (String).
+    assert set(e) - set(legacy_body) == {'updated_at'}
+    assert isinstance(e['updated_at'], str)
+
+
+def test_get_response_shape_unchanged():
+    store = _FakeStore(sb={'name': 'X'}, disk={'token': TOK, 'profile': {}})
+
+    def _flow():
+        _post(body={'notes': 'x'})
+        return _get()
+
+    r = _run(store, _flow)
+    assert r.status_code == 200
+    j = r.get_json()
+    assert list(j) == ['data'] and isinstance(j['data'], dict)
+
+
+def test_entry_written_before_the_fix_is_still_readable():
+    """Der Kern der Owner-Auflage: was eine alte App VOR dem Deploy
+    geschrieben hat (Legacy-Datei, kein `updated_at`), findet sie danach
+    unverändert wieder."""
+    pre_fix = {'2026-08-07': {'aircraft_reg': 'D-AIAA', 'aircraft_type': 'A320',
+                              'crew': [{'name': 'Janine', 'function': 'CM'}],
+                              'notes': 'alt', 'locked': False,
+                              'unlock_reason': ''}}
+    store = _FakeStore(sb={'name': 'X'},
+                       disk={'token': TOK, 'profile': {'name': 'X'},
+                             'crew_aircraft': pre_fix})
+    r = _run(store, lambda: _get())
+    assert r.status_code == 200
+    assert r.get_json()['data']['2026-08-07'] == pre_fix['2026-08-07']
+
+
+def test_writing_a_new_day_keeps_pre_fix_days():
+    """Schreiben nach dem Deploy darf die Alt-Tage nicht wegwischen."""
+    pre_fix = {'2026-08-07': {'notes': 'alt'}}
+    store = _FakeStore(sb={'name': 'X'},
+                       disk={'token': TOK, 'profile': {'name': 'X'},
+                             'crew_aircraft': pre_fix})
+
+    def _flow():
+        _post(datum='2026-08-08', body={'notes': 'neu'})
+        return _get()
+
+    data = _run(store, _flow).get_json()['data']
+    assert data['2026-08-07']['notes'] == 'alt'
+    assert data['2026-08-08']['notes'] == 'neu'
+
+
+def test_non_iso_datum_is_still_accepted_like_before():
+    """Der alte Handler nahm JEDEN Pfad-String als Key — kein neues 400."""
+    store = _FakeStore(sb={'name': 'X'}, disk={'token': TOK, 'profile': {}})
+    r = _run(store, lambda: _post(datum='2026-08', body={'notes': 'x'}))
+    assert r.status_code == 200
+    assert r.get_json()['ok'] is True
+    assert '2026-08' in store.sb_writes[-1]['crew_aircraft']
+
+
+def test_non_object_body_does_not_break_the_endpoint():
+    store = _FakeStore(sb={'name': 'X'}, disk={'token': TOK, 'profile': {}})
+
+    def _flow():
+        return A.app.test_client().post(
+            f'/api/user/crew-aircraft/{TOK}/2026-08-08',
+            json=['kaputt'], headers={'Authorization': f'Bearer {TOK}'})
+
+    r = _run(store, _flow)
+    assert r.status_code == 200
+    assert r.get_json()['ok'] is True
+
+
+def test_read_still_answers_when_warm_migration_fails():
+    """Scheitert der Warm-/Merge-Pfad, gewinnt der alte Weg — kein 500er."""
+    pre_fix = {'2026-08-07': {'notes': 'alt'}}
+    store = _FakeStore(sb={'name': 'X'},
+                       disk={'token': TOK, 'profile': {'name': 'X'},
+                             'crew_aircraft': pre_fix})
+    with patch.object(A, '_crew_aircraft_save', return_value=False):
+        r = _run(store, lambda: _get())
+    assert r.status_code == 200
+    assert r.get_json()['data']['2026-08-07']['notes'] == 'alt'
+
+
+def test_read_degrades_to_empty_instead_of_500():
+    store = _FakeStore(sb={'name': 'X'}, disk={'token': TOK, 'profile': {}})
+    with patch.object(A, '_crew_aircraft_load', side_effect=RuntimeError('boom')):
+        r = _run(store, lambda: _get())
+    assert r.status_code == 200
+    assert r.get_json() == {'data': {}}
 
 
 def test_store_cap_rejects_instead_of_dropping_days():

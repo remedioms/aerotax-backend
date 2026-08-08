@@ -34,11 +34,36 @@ def test_sick_marker_detection_is_narrow():
     assert not A._friend_day_is_sick({'marker': 'Training'})
 
 
+def test_private_roster_symbol_classifiers_are_narrow():
+    assert A._friend_day_is_training({'marker': 'Mandatory Training'})
+    assert A._friend_day_is_training({'marker': 'Simulator'})
+    assert A._friend_day_is_part_time({'klass': 'TZ'})
+    assert A._friend_day_is_vacation({'marker': 'Urlaub'})
+    assert A._friend_day_is_standby({'marker': 'SBY'})
+    assert not A._friend_day_is_training({'routing': 'FRA-SIN'})
+
+
 def test_visibility_defaults_to_shared_and_honors_explicit_false():
     assert A._friend_visibility_share_sick({}, FRIEND)
     profile = {'friend_visibility': {FRIEND: {'share_sick_status': False}}}
     assert not A._friend_visibility_share_sick(profile, FRIEND)
     assert A._friend_visibility_share_sick(profile, 'someone-else')
+
+
+def test_all_friend_permissions_default_on_and_are_per_viewer():
+    profile = {'friend_visibility': {FRIEND: {
+        'share_training_status': False,
+        'share_part_time_status': False,
+        'share_vacation_status': False,
+    }}}
+    assert not A._friend_visibility_value(
+        profile, FRIEND, 'share_training_status')
+    assert not A._friend_visibility_value(
+        profile, FRIEND, 'share_part_time_status')
+    assert not A._friend_visibility_value(
+        profile, FRIEND, 'share_vacation_status')
+    assert A._friend_visibility_value(
+        profile, 'someone-else', 'share_training_status')
 
 
 def test_settings_endpoint_persists_private_choice(monkeypatch):
@@ -61,6 +86,35 @@ def test_settings_endpoint_persists_private_choice(monkeypatch):
     assert status == 200
     assert response.get_json()['share_sick_status'] is False
     assert saved['friend_visibility'][FRIEND]['share_sick_status'] is False
+
+
+def test_settings_endpoint_updates_one_permission_without_resetting_others(
+        monkeypatch):
+    saved = {}
+    existing = {'share_sick_status': False}
+    monkeypatch.setattr(A, '_friends_load', lambda token: {'friends': [FRIEND]})
+    monkeypatch.setattr(A, '_profile_load', lambda token, fresh=False: {
+        'token': token,
+        'profile': {'friend_visibility': {FRIEND: dict(existing)}}})
+    monkeypatch.setattr(A, '_profile_save',
+                        lambda token, profile, full_disk_payload=None:
+                            saved.update(profile) is None)
+    monkeypatch.setattr(A, '_profile_memo_invalidate', lambda token: None)
+    monkeypatch.setattr(A, '_invalidate_friend_visibility_memos',
+                        lambda owner, viewer: None)
+
+    with A.app.test_request_context(
+            f'/api/user/friend-visibility/{OWNER}/{FRIEND}', method='PUT',
+            json={'share_training_status': False}, headers=_headers()):
+        response, status = _direct_response(
+            A.friend_visibility_settings(OWNER, FRIEND))
+    assert status == 200
+    payload = response.get_json()
+    assert payload['share_training_status'] is False
+    assert payload['share_sick_status'] is False
+    stored = saved['friend_visibility'][FRIEND]
+    assert stored['share_training_status'] is False
+    assert stored['share_sick_status'] is False
 
 
 def test_settings_endpoint_rejects_non_friend(monkeypatch):
