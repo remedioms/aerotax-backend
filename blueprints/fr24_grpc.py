@@ -628,7 +628,10 @@ def _shape_trail(td, fallback_reg=None):
                           if tp.get("ground_speed") is not None else tp.get("spd")),
             "track_deg": _i(tp.get("track")
                               if tp.get("track") is not None else tp.get("heading")),
-            "ts": tp.get("timestamp") or tp.get("snapshot_id"),
+            # Playback liefert snapshot_id als String. Nach aussen bleibt der
+            # Trail-Vertrag trotzdem numerische Epoch, damit Freshness-/Map-
+            # Rechnungen nicht an float-minus-string scheitern.
+            "ts": _i(tp.get("timestamp") or tp.get("snapshot_id")),
         })
     if not pts:
         return None

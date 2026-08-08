@@ -6022,9 +6022,13 @@ def ax_tail_history():
 
 
 def _iso_to_epoch(s):
-    """ISO-8601 (mit +00:00 oder Z) → Epoch-Sekunden (int) | None."""
+    """ISO-8601 oder numerischer Provider-Timestamp → Epoch (int) | None."""
     if not s:
         return None
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        pass
     try:
         from datetime import datetime, timezone
         return int(datetime.fromisoformat(str(s).replace('Z', '+00:00'))
@@ -6665,7 +6669,7 @@ def ax_flown_track():
             candidate_points = [
                 {'lat': p['lat'], 'lon': p['lon'], 'alt': p.get('alt_ft'),
                  'gs': p.get('gs_kt'), 'trk': p.get('track_deg'),
-                 'ts': p.get('ts')} for p in trail['points']]
+                 'ts': _iso_to_epoch(p.get('ts'))} for p in trail['points']]
             candidate_complete = _flown_track_covers_route(
                 candidate_points, candidate_dep, candidate_arr)
             # Vollstaendigkeit schlaegt Punktzahl. Eine dichte, aber bei 3.357 km

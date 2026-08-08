@@ -56,14 +56,17 @@ def _fr24_trail(base_ts):
         'duration_min': 735,
         'points': [
             {'lat': AIRPORTS['FRA'][0], 'lon': AIRPORTS['FRA'][1],
-             'alt_ft': 0, 'gs_kt': 10, 'track_deg': 70, 'ts': base_ts},
+             'alt_ft': 0, 'gs_kt': 10, 'track_deg': 70,
+             'ts': str(base_ts)},
             {'lat': 48.0, 'lon': 30.0, 'alt_ft': 35_000,
-             'gs_kt': 510, 'track_deg': 105, 'ts': base_ts + 14_000},
+             'gs_kt': 510, 'track_deg': 105,
+             'ts': str(base_ts + 14_000)},
             {'lat': 28.0, 'lon': 70.0, 'alt_ft': 37_000,
-             'gs_kt': 500, 'track_deg': 120, 'ts': base_ts + 28_000},
+             'gs_kt': 500, 'track_deg': 120,
+             'ts': str(base_ts + 28_000)},
             {'lat': AIRPORTS['SIN'][0], 'lon': AIRPORTS['SIN'][1],
              'alt_ft': 0, 'gs_kt': 20, 'track_deg': 190,
-             'ts': base_ts + 44_100},
+             'ts': str(base_ts + 44_100)},
         ],
     }
 
@@ -200,7 +203,7 @@ def test_playback_shape_reads_nested_fr24_actuals_and_identity():
     assert shaped['points'][-1]['alt_ft'] == 37_000
     assert shaped['points'][-1]['gs_kt'] == 20
     assert shaped['points'][-1]['track_deg'] == 190
-    assert shaped['points'][-1]['ts'] == '1786139100'
+    assert shaped['points'][-1]['ts'] == 1_786_139_100
 
 
 def test_incomplete_story_remains_short_cached_without_paid_fallback():
