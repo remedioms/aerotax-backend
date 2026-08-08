@@ -6466,6 +6466,12 @@ def ax_flown_track():
     date = (request.args.get('date') or '').strip() or None      # YYYY-MM-DD (UTC)
     dep = _norm_iata(request.args.get('dep')) if request.args.get('dep') else None
     arr = _norm_iata(request.args.get('arr')) if request.args.get('arr') else None
+    # Nur der fertige Instagram-Rueckblick darf eine bereits gespeicherte,
+    # unvollstaendige Spur noch einmal aus dem KOSTENLOSEN FR24-Playback
+    # vervollstaendigen. Normale Live-/Radar-Aufrufe behalten exakt ihre
+    # bisherige Heute-Kaskade; insbesondere wird hier niemals die bezahlte
+    # Flight-Summary verwendet.
+    story_mode = request.args.get('story') == '1'
     if not reg and not flight_no:
         return jsonify({'ok': False, 'error': 'reg_or_flight_required'}), 400
     # hex/lat/lon früh parsen: hex entscheidet unten über Frische-Gate (Tier 1)
@@ -6488,7 +6494,7 @@ def ax_flown_track():
     q_lat, q_lon = _qf(request.args.get('lat')), _qf(request.args.get('lon'))
 
     memo_key = ('flown_track', reg, flight_no or '', date or '', dep or '', arr or '',
-                q_hex or '')
+                q_hex or '', 'story' if story_mode else 'live')
     cached = _memo_get(memo_key)
     if cached is not None:
         return jsonify(cached)
@@ -6572,19 +6578,21 @@ def ax_flown_track():
     is_today = (not date) or (date == time.strftime('%Y-%m-%d', time.gmtime()))
     current_complete = _flown_track_covers_route(points, dep, arr)
     provider_duration_min = None
-    # FR24 Playback behaelt gelandete Trails noch per Flight-ID. Darum auch die
-    # letzten drei Tage backfillen, wenn unsere Harvester-Spur erkennbar vor dem
-    # Ziel abbricht (LH780: FRA→Kaukasus statt FRA→SIN). Vollstaendige eigene
-    # Tracks bleiben Tier 1 und kosten keinen Provider-Call.
-    recent_for_fr24 = is_today
-    if date:
+    # Live bleibt wie bisher: kostenloser FR24-Trail nur fuer heute. Der explizite
+    # Story-Modus darf fuer die letzten drei Tage noch das kostenlose Playback
+    # per bereits gespeicherter aircraft_live-Flight-ID lesen. Fehlt die ID,
+    # bleibt die Backend-Spur ehrlich unvollstaendig — kein Paid-Fallback.
+    recent_story = False
+    if story_mode and date:
         try:
             _service_day = _dt.datetime.strptime(date, '%Y-%m-%d').date()
             _today = _dt.datetime.now(_dt.timezone.utc).date()
-            recent_for_fr24 = 0 <= (_today - _service_day).days <= 3
+            recent_story = 0 <= (_today - _service_day).days <= 3
         except Exception:
-            recent_for_fr24 = False
-    if (len(points) < 3 or tier1_stale or not current_complete) and recent_for_fr24:
+            recent_story = False
+    needs_live_trail = (len(points) < 3 or tier1_stale) and is_today
+    needs_story_trail = (len(points) < 3 or not current_complete) and recent_story
+    if needs_live_trail or needs_story_trail:
         reg_disp = None
         t_lat, t_lon = q_lat, q_lon
         if t_lat is None or t_lon is None:
@@ -6618,26 +6626,8 @@ def ax_flown_track():
             except Exception:
                 trail = None
         if trail is None and not q_hex:
-            fid = _aircraft_live_flightid(reg or None, flight_no, max_age_h=72)
-            summary = None
-            # `aircraft_live` wird bewusst nach wenigen Stunden bereinigt. Fuer
-            # gelandete Rueckblicke deshalb die permanente fr24_id aus der
-            # offiziellen, budget-gateten Flight-Summary holen. Das ist ein
-            # harter Cache-Treffer fuer alle weiteren Oeffnungen desselben Flugs.
-            if not fid and flight_no and date:
-                try:
-                    summary = _fr24_flight_by_number(flight_no, date=date) or None
-                except Exception:
-                    summary = None
-                if summary:
-                    summary_dep = (summary.get('dep_iata') or '').upper()
-                    summary_arr = (summary.get('arr_iata') or '').upper()
-                    route_matches = ((not req_dep or summary_dep == req_dep)
-                                     and (not req_arr or summary_arr == req_arr))
-                    if route_matches:
-                        fid = summary.get('fr24_id')
-                        reg = reg or re.sub(
-                            r'[^A-Z0-9]', '', (summary.get('reg') or '').upper())
+            fid = _aircraft_live_flightid(
+                reg or None, flight_no, max_age_h=(72 if story_mode else 20))
             if fid:
                 try:
                     from blueprints import fr24_grpc
@@ -6647,8 +6637,7 @@ def ax_flown_track():
                     # normalerweise liefert Tier 1 den echten ersten Timestamp.
                     playback_ts = None
                     if not is_today:
-                        playback_ts = _iso_to_epoch(
-                            (summary or {}).get('sched_dep')) or first_ts
+                        playback_ts = first_ts
                         if playback_ts is None and date:
                             playback_ts = int(_dt.datetime.strptime(
                                 date, '%Y-%m-%d').replace(
@@ -6766,25 +6755,18 @@ def ax_flown_track():
     # Position → iOS setzt dort einen Flugzeug-Marker (Owner: „end with airplane").
     in_flight = False
     if source in ('aircraft_track', 'fr24_trail') and points:
-        # Auf dem letzten ECHTEN Fix rechnen (Punkt mit ts) — nie auf einem
-        # evtl. angehängten Airport-Punkt. Kein Datums-Gate: Langstrecken wie
-        # LH780 starten am UTC-Vortag und sind nach Mitternacht weiterhin live.
-        _lp = next((p for p in reversed(points) if p.get('ts')), None)
-        if _lp:
-            try:
-                _lp_ts = float(_lp['ts'])
-            except (TypeError, ValueError):
-                _lp_ts = 0
-            fresh = _lp_ts > 0 and (time.time() - _lp_ts) < 30 * 60
-            # Boden-Heuristik: Taxi-Crumbs (Airport-Sweep, allow_ground) sind
-            # frisch, aber kein Flug — niedrig UND langsam = am Boden.
-            grounded = (_lp.get('alt') or 0) < 300 and (_lp.get('gs') or 0) < 80
-            bb = _iata_latlon(arr) if arr else None
-            d_arr = (_haversine_km(bb[0], bb[1], _lp['lat'], _lp['lon'])
-                     if bb else None)
-            # In der Luft = frischer, nicht-gegroundeter Fix, der noch nicht am
-            # Ziel angekommen ist (> 8 km ≈ kurz vorm Aufsetzen).
-            in_flight = fresh and not grounded and (d_arr is None or d_arr > 8.0)
+        today = time.strftime('%Y-%m-%d', time.gmtime())
+        if (not date) or date >= today:
+            # Auf dem letzten ECHTEN Fix rechnen (Punkt mit ts) — nie auf einem
+            # evtl. angehängten Airport-Punkt.
+            _lp = next((p for p in reversed(points) if p.get('ts')), None)
+            if _lp:
+                fresh = (time.time() - _lp['ts']) < 30 * 60
+                grounded = (_lp.get('alt') or 0) < 300 and (_lp.get('gs') or 0) < 80
+                bb = _iata_latlon(arr) if arr else None
+                d_arr = (_haversine_km(bb[0], bb[1], _lp['lat'], _lp['lon'])
+                         if bb else None)
+                in_flight = fresh and not grounded and (d_arr is None or d_arr > 8.0)
 
     track_complete = (source != 'great_circle'
                       and _flown_track_covers_route(points, dep, arr))
@@ -6806,12 +6788,12 @@ def ax_flown_track():
     resp = jsonify(out)
     # Historische, echte Spur ist unveränderlich → lange Edge-TTL; laufend/approx kurz.
     past = bool(date) and date < time.strftime('%Y-%m-%d', time.gmtime())
-    # Ein UTC-Vortagsflug kann noch stundenlang unterwegs sein. Nur wirklich
-    # abgeschlossene, vollstaendige Historie ist fuer 24 h unveraenderlich;
-    # Teilspuren muessen weiterlaufen und werden nach 45 s neu geladen.
-    ttl = 86400 if (past and track_complete and not in_flight
-                    and source in ('aircraft_track', 'track_archive',
-                                   'fr24_trail')) else 45
+    stable_history = source in ('aircraft_track', 'track_archive', 'fr24_trail')
+    # Der normale Endpoint behaelt seinen bisherigen Cache-Vertrag. Nur der
+    # Story-Key bleibt bei einer noch unvollstaendigen Spur kurz, damit ein
+    # spaeter gespeicherter letzter Fix den Export freischalten kann.
+    ttl = 86400 if (past and stable_history
+                    and (track_complete or not story_mode)) else 45
     resp.headers['Cache-Control'] = 'public, max-age=%d' % ttl
     return resp
 

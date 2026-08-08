@@ -68,7 +68,7 @@ def _fr24_trail(base_ts):
     }
 
 
-def _call(trail, live_fid=0x39ABCDEF):
+def _call(trail, live_fid=0x39ABCDEF, *, story=True):
     service_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
     date = service_date.isoformat()
     base_ts = int(dt.datetime.combine(
@@ -91,7 +91,7 @@ def _call(trail, live_fid=0x39ABCDEF):
             patch.object(ADSB, '_rate_limited', return_value=False):
         with A.app.test_request_context(
                 f'/api/ax/flown-track?reg=DABVM&flight_no=LH780&date={date}'
-                '&dep=FRA&arr=SIN'):
+                '&dep=FRA&arr=SIN' + ('&story=1' if story else '')):
             response = BP.ax_flown_track()
     if isinstance(response, tuple):
         response = response[0]
@@ -102,7 +102,7 @@ def test_recent_partial_track_is_replaced_by_complete_fr24_playback():
     service_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
     base_ts = int(dt.datetime.combine(
         service_date, dt.time(10, 0), tzinfo=dt.timezone.utc).timestamp())
-    body, fetch, _, _, _ = _call(_fr24_trail(base_ts))
+    body, fetch, summary, _, _ = _call(_fr24_trail(base_ts))
 
     assert body['source'] == 'fr24_trail'
     assert body['track_complete'] is True
@@ -112,20 +112,34 @@ def test_recent_partial_track_is_replaced_by_complete_fr24_playback():
     assert body['max_altitude_ft'] == 37_000
     assert body['points'][-1]['lat'] == pytest.approx(AIRPORTS['SIN'][0])
     assert fetch.call_args.kwargs['timestamp'] is not None
+    summary.assert_not_called()
 
 
-def test_historical_summary_id_backfills_after_live_snapshot_was_pruned():
+def test_story_never_buys_a_summary_when_free_flight_id_was_pruned():
     service_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
     base_ts = int(dt.datetime.combine(
         service_date, dt.time(10, 0), tzinfo=dt.timezone.utc).timestamp())
     body, fetch, summary, _, _ = _call(_fr24_trail(base_ts), live_fid=None)
 
-    summary.assert_called_once_with('LH780', date=service_date.isoformat())
-    assert fetch.call_args.args[0] == '39abcdef'
-    assert fetch.call_args.kwargs['timestamp'] == base_ts
-    assert body['source'] == 'fr24_trail'
-    assert body['track_complete'] is True
-    assert body['distance_km'] > 9_000
+    summary.assert_not_called()
+    fetch.assert_not_called()
+    assert body['source'] == 'aircraft_track'
+    assert body['track_complete'] is False
+    assert body['distance_km'] is None
+
+
+def test_normal_historical_route_does_not_activate_story_playback():
+    service_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+    base_ts = int(dt.datetime.combine(
+        service_date, dt.time(10, 0), tzinfo=dt.timezone.utc).timestamp())
+    body, fetch, summary, _, headers = _call(
+        _fr24_trail(base_ts), story=False)
+
+    fetch.assert_not_called()
+    summary.assert_not_called()
+    assert body['source'] == 'aircraft_track'
+    assert body['track_complete'] is False
+    assert headers['Cache-Control'] == 'public, max-age=86400'
 
 
 def test_partial_track_never_publishes_a_misleading_distance_or_duration():
@@ -167,7 +181,7 @@ def test_playback_shape_reads_nested_fr24_actuals_and_identity():
     assert shaped['points'][-1]['ts'] == '1786139100'
 
 
-def test_cross_midnight_flight_stays_live_and_is_never_cached_as_history():
+def test_incomplete_story_remains_short_cached_without_paid_fallback():
     trail = _fr24_trail(int(time.time()) - 6 * 3600)
     trail['duration_min'] = None
     trail['points'][-1].update({
@@ -178,7 +192,7 @@ def test_cross_midnight_flight_stays_live_and_is_never_cached_as_history():
 
     assert body['source'] == 'fr24_trail'
     assert body['track_complete'] is False
-    assert body['in_flight'] is True
+    assert body['in_flight'] is False
     assert body['distance_km'] is None
     assert body['duration_min'] is None
     assert headers['Cache-Control'] == 'public, max-age=45'
