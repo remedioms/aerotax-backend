@@ -1818,6 +1818,10 @@ def _fr24_summary_to_leg(f):
     diverted = bool(f.get('dest_icao_actual')
                     and f.get('dest_icao_actual') != f.get('dest_icao'))
     return {
+        # Dauerhafter FR24-Schluessel: fuer gelandete Fluege kann damit das
+        # anonyme Playback die vollstaendige echte Punktfolge laden. Vorher
+        # ging die ID bei der Summary-Normalisierung verloren.
+        'fr24_id': f.get('fr24_id'),
         'flight_no': f.get('flight'), 'flight': f.get('flight'),
         # ECHTER Funkname (LH fliegt LH1412 als „DLH8UA", nicht „DLH1412") — den
         # braucht iOS für die Live-Position (adsb.lol nach Callsign) und die
@@ -1942,6 +1946,7 @@ def _fr24_flight_by_number(flight_no, date=None):
     if legs:
         l = legs[0]
         out = {
+            'fr24_id': l.get('fr24_id'),
             'flight': l['flight_no'], 'callsign': l.get('callsign'),
             'airline': '', 'airline_name': '',
             'dep_iata': l['src'], 'dep_name': '', 'arr_iata': l['dst'], 'arr_name': '',
@@ -6061,6 +6066,64 @@ def _aircraft_live_flightid(reg, flight_no, max_age_h=20):
     return None
 
 
+def _flown_track_covers_route(points, dep, arr, tolerance_km=300.0):
+    """Ob die echte Spur beide Airports abdeckt (fehlendes Taxi ist erlaubt)."""
+    if len(points or []) < 2 or not dep or not arr:
+        return False
+    origin, destination = _iata_latlon(dep), _iata_latlon(arr)
+    if not origin or not destination:
+        return False
+    first, last = points[0], points[-1]
+    try:
+        start_gap = _haversine_km(
+            origin[0], origin[1], float(first['lat']), float(first['lon']))
+        end_gap = _haversine_km(
+            destination[0], destination[1], float(last['lat']), float(last['lon']))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return start_gap <= tolerance_km and end_gap <= tolerance_km
+
+
+def _flown_track_stats(points, complete):
+    """Darstellungswerte nur aus einer vollstaendigen echten Punktfolge."""
+    max_alt = None
+    alts = []
+    for p in points or []:
+        try:
+            if p.get('alt') is not None:
+                alts.append(int(round(float(p['alt']))))
+        except (TypeError, ValueError):
+            pass
+    if alts:
+        max_alt = max(alts)
+    if not complete:
+        return None, None, max_alt
+
+    distance = 0.0
+    for a, b in zip(points, points[1:]):
+        try:
+            distance += _haversine_km(
+                float(a['lat']), float(a['lon']),
+                float(b['lat']), float(b['lon']))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    timestamps = []
+    for p in points:
+        try:
+            ts = float(p.get('ts'))
+            if ts > 0:
+                timestamps.append(ts)
+        except (TypeError, ValueError):
+            pass
+    duration = None
+    if len(timestamps) >= 2:
+        minutes = int(round((max(timestamps) - min(timestamps)) / 60.0))
+        if 0 < minutes <= 20 * 60:
+            duration = minutes
+    return int(round(distance)), duration, max_alt
+
+
 def _flown_track_db(reg, flight_no, dep, arr, lo_iso, hi_iso, fresh_max_s=None):
     """Tier 1: die ECHTE geflogene Spur aus der eigenen aircraft_track-Tabelle
     (Breadcrumbs vom Harvester + FR24-Rückschreibungen). Isoliert EIN Leg:
@@ -6507,7 +6570,21 @@ def ax_flown_track():
     # klappt der Trail für JEDE Airline (Radar-Tap eines fremden Fliegers), nicht
     # nur für die LH-Group-Fleet in aircraft_live. Sonst Fallback auf aircraft_live.
     is_today = (not date) or (date == time.strftime('%Y-%m-%d', time.gmtime()))
-    if (len(points) < 3 or tier1_stale) and is_today:
+    current_complete = _flown_track_covers_route(points, dep, arr)
+    provider_duration_min = None
+    # FR24 Playback behaelt gelandete Trails noch per Flight-ID. Darum auch die
+    # letzten drei Tage backfillen, wenn unsere Harvester-Spur erkennbar vor dem
+    # Ziel abbricht (LH780: FRA→Kaukasus statt FRA→SIN). Vollstaendige eigene
+    # Tracks bleiben Tier 1 und kosten keinen Provider-Call.
+    recent_for_fr24 = is_today
+    if date:
+        try:
+            _service_day = _dt.datetime.strptime(date, '%Y-%m-%d').date()
+            _today = _dt.datetime.now(_dt.timezone.utc).date()
+            recent_for_fr24 = 0 <= (_today - _service_day).days <= 3
+        except Exception:
+            recent_for_fr24 = False
+    if (len(points) < 3 or tier1_stale or not current_complete) and recent_for_fr24:
         reg_disp = None
         t_lat, t_lon = q_lat, q_lon
         if t_lat is None or t_lon is None:
@@ -6541,34 +6618,72 @@ def ax_flown_track():
             except Exception:
                 trail = None
         if trail is None and not q_hex:
-            fid = _aircraft_live_flightid(reg or None, flight_no)
+            fid = _aircraft_live_flightid(reg or None, flight_no, max_age_h=72)
+            summary = None
+            # `aircraft_live` wird bewusst nach wenigen Stunden bereinigt. Fuer
+            # gelandete Rueckblicke deshalb die permanente fr24_id aus der
+            # offiziellen, budget-gateten Flight-Summary holen. Das ist ein
+            # harter Cache-Treffer fuer alle weiteren Oeffnungen desselben Flugs.
+            if not fid and flight_no and date:
+                try:
+                    summary = _fr24_flight_by_number(flight_no, date=date) or None
+                except Exception:
+                    summary = None
+                if summary:
+                    summary_dep = (summary.get('dep_iata') or '').upper()
+                    summary_arr = (summary.get('arr_iata') or '').upper()
+                    route_matches = ((not req_dep or summary_dep == req_dep)
+                                     and (not req_arr or summary_arr == req_arr))
+                    if route_matches:
+                        fid = summary.get('fr24_id')
+                        reg = reg or re.sub(
+                            r'[^A-Z0-9]', '', (summary.get('reg') or '').upper())
             if fid:
                 try:
                     from blueprints import fr24_grpc
-                    trail = fr24_grpc.flown_trail_by_flightid(fid)
+                    first_ts = next((p.get('ts') for p in points if p.get('ts')), None)
+                    # Playback braucht die Abflug-Epoch. Bei komplett fehlendem
+                    # Track ist die Mitte des Servicetags ein robuster Fallback;
+                    # normalerweise liefert Tier 1 den echten ersten Timestamp.
+                    playback_ts = None
+                    if not is_today:
+                        playback_ts = _iso_to_epoch(
+                            (summary or {}).get('sched_dep')) or first_ts
+                        if playback_ts is None and date:
+                            playback_ts = int(_dt.datetime.strptime(
+                                date, '%Y-%m-%d').replace(
+                                    tzinfo=_dt.timezone.utc).timestamp()) + 12 * 3600
+                    trail = fr24_grpc.flown_trail_by_flightid(
+                        fid, timestamp=playback_ts)
                 except Exception:
                     trail = None
         if trail and trail.get('points'):
             tw_reg = re.sub(r'[^A-Z0-9]', '', (trail.get('reg') or reg or '').upper())
             _flown_track_writeback(tw_reg, trail)
-            # Ersetzen, wenn der Trail mindestens gleich gut ist — oder die
-            # eigene Spur STALE war (dann ist der frische Trail immer die
-            # bessere Wahrheit, auch wenn er kürzer ist).
-            if len(trail['points']) >= len(points) \
-                    or (tier1_stale and len(trail['points']) >= 2):
+            candidate_dep = req_dep or trail.get('origin') or dep
+            candidate_arr = req_arr or trail.get('dest') or arr
+            candidate_points = [
+                {'lat': p['lat'], 'lon': p['lon'], 'alt': p.get('alt_ft'),
+                 'gs': p.get('gs_kt'), 'trk': p.get('track_deg'),
+                 'ts': p.get('ts')} for p in trail['points']]
+            candidate_complete = _flown_track_covers_route(
+                candidate_points, candidate_dep, candidate_arr)
+            # Vollstaendigkeit schlaegt Punktzahl. Eine dichte, aber bei 3.357 km
+            # abgebrochene Eigen-Spur darf den kompletten FR24-Trail nicht mehr
+            # blockieren. Bei gleicher Qualitaet bleibt die bisherige Punktzahl-
+            # Regel erhalten.
+            if (candidate_complete and not current_complete) \
+                    or len(candidate_points) >= len(points) \
+                    or (tier1_stale and len(candidate_points) >= 2):
                 source = 'fr24_trail'
                 reg = reg or tw_reg
-                if tier1_stale:
-                    # Route der STALE-Spur nicht durchreichen — explizite
-                    # Request-Route > Trail-Route > Segment-Ableitung.
-                    dep = req_dep or trail.get('origin') or dep
-                    arr = req_arr or trail.get('dest') or arr
-                else:
-                    dep = dep or trail.get('origin')
-                    arr = arr or trail.get('dest')
-                points = [{'lat': p['lat'], 'lon': p['lon'], 'alt': p.get('alt_ft'),
-                           'gs': p.get('gs_kt'), 'trk': p.get('track_deg'),
-                           'ts': p.get('ts')} for p in trail['points']]
+                # Explizite Request-Route > Trail-Route > Segment-Ableitung.
+                # Das gilt auch fuer unvollstaendige (nicht nur stale) Tier-1-
+                # Spuren, damit Coverage und Laender dieselben Airports nutzen.
+                dep, arr = candidate_dep, candidate_arr
+                points = candidate_points
+                provider_duration_min = trail.get('duration_min')
+                current_complete = candidate_complete
                 tier1_stale = False
 
     # Stale-Fallback-Plausibilität: konnte Tier 2 die veraltete Spur NICHT
@@ -6671,9 +6786,22 @@ def ax_flown_track():
                 # Marker (live bestätigt: D-AIUN sinkend, in_flight=False).
                 in_flight = fresh and not grounded and (d_arr is None or d_arr > 8.0)
 
+    track_complete = (source != 'great_circle'
+                      and _flown_track_covers_route(points, dep, arr))
+    distance_km, track_duration_min, max_altitude_ft = _flown_track_stats(
+        points, track_complete)
+    provider_duration = provider_duration_min
+    try:
+        provider_duration = int(provider_duration) if provider_duration else None
+    except (TypeError, ValueError):
+        provider_duration = None
+    duration_min = provider_duration or track_duration_min
+
     out = {'ok': True, 'reg': reg or None, 'flight': flight_no, 'date': date,
            'dep': dep, 'arr': arr, 'source': source, 'in_flight': in_flight,
-           'count': len(points), 'points': points}
+           'count': len(points), 'track_complete': track_complete,
+           'distance_km': distance_km, 'duration_min': duration_min,
+           'max_altitude_ft': max_altitude_ft, 'points': points}
     _memo_put(memo_key, out)
     resp = jsonify(out)
     # Historische, echte Spur ist unveränderlich → lange Edge-TTL; laufend/approx kurz.

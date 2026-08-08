@@ -534,20 +534,41 @@ async def _detail_by_fid_async(provider, fid):
         return {"row": {}, "detail": d} if d else None
 
 
-def flown_trail_by_flightid(fid):
+async def _historic_detail_by_fid_async(provider, fid, timestamp):
+    """Historische FR24-Spur per exakter Flight-ID.
+
+    `flight_details` ist laut FR24 nur fuer Live-Fluege bestimmt. Nach der
+    Landung liefert derselbe Flight-ID-Schluessel ueber `playback_flight` die
+    vollstaendige Trail- und Schedule-Antwort. `timestamp` ist die echte/erste
+    beobachtete Abflug-Epoch und disambiguiert wiederverwendete IDs.
+    """
+    async with _client_for(provider) as f:
+        det = await asyncio.wait_for(
+            f.playback_flight.fetch(flight_id=fid, timestamp=timestamp),
+            timeout=_TIMEOUT_S)
+        d = det.to_dict()
+        return {"row": {}, "detail": d} if d else None
+
+
+def flown_trail_by_flightid(fid, timestamp=None):
     """Trail DIREKT über die FR24-flightid (aircraft_live.flightid aus dem
     NAS-Harvester) — funktioniert damit auch für HEX-LOSE Aufrufer (Suche/
     MyPlane/Crew-Karten), für die das live_feed-Hex-Matching nie zuverlässig
     war. Kein No-Match-Empty-Risiko (die ID ist exakt) → kein Futter für den
     Freeze-on-Empties-Limiter. Gleiche Rückgabe-Shape wie flown_trail();
-    None wenn keine Spur."""
+    `timestamp` gesetzt = gelandeter/historischer Flug via FR24 Playback;
+    ansonsten Live-Details. None wenn keine Spur."""
     if not available() or not fid:
         return None
     if not _allow_call():
         return None
     for provider in _providers():
         try:
-            td = _run(_detail_by_fid_async(provider, fid))
+            if timestamp is not None:
+                td = _run(_historic_detail_by_fid_async(
+                    provider, fid, int(float(timestamp))))
+            else:
+                td = _run(_detail_by_fid_async(provider, fid))
         except Exception as e:
             log.warning("fr24_grpc fid-trail provider=%s fehlgeschlagen: %s", provider, e)
             td = None
@@ -581,6 +602,9 @@ def _shape_trail(td, fallback_reg=None):
     row = td.get("row") or {}
     xi = row.get("extra_info") or {}
     route = xi.get("route") or {}
+    ai = d.get("aircraft_info") or {}
+    si = d.get("schedule_info") or {}
+    fi = d.get("flight_info") or {}
 
     def _i(v):
         try:
@@ -602,11 +626,28 @@ def _shape_trail(td, fallback_reg=None):
         })
     if not pts:
         return None
+
+    actual_dep = si.get("actual_departure") or d.get("actual_departure")
+    actual_arr = si.get("actual_arrival") or d.get("actual_arrival")
+    duration_min = None
+    try:
+        seconds = int(actual_arr) - int(actual_dep)
+        if 0 < seconds <= 20 * 3600:
+            duration_min = int(round(seconds / 60.0))
+    except (TypeError, ValueError):
+        pass
+
     return {
-        "reg": (str(xi.get("reg") or reg or "").strip().upper()) or None,
-        "flight": (str(xi.get("flight") or "").strip().upper()) or None,
+        "flightid": d.get("flightid") or fi.get("flightid") or row.get("flightid"),
+        "reg": (str(xi.get("reg") or ai.get("reg") or d.get("reg")
+                    or reg or "").strip().upper()) or None,
+        "flight": (str(xi.get("flight") or si.get("flight_number")
+                       or d.get("flight_number") or "").strip().upper()) or None,
         "origin": (str(route.get("from") or "").strip().upper()) or None,
         "dest": (str(route.get("to") or "").strip().upper()) or None,
+        "actual_departure": actual_dep,
+        "actual_arrival": actual_arr,
+        "duration_min": duration_min,
         "points": pts,
     }
 
