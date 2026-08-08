@@ -472,7 +472,22 @@ def _callsign_zero_variants(cs):
     return out
 
 
-def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35):
+def _live_pos_instance_ok(pos, sched_dep_iso):
+    """Gehört dieser Positions-Snapshot zur Leg-Instanz mit Soll-Abflug
+    `sched_dep_iso`? Dünner Adapter auf die pure Regel in `leg_status_gate`
+    (dort steht der Prod-Beleg LH712 FRA→ICN und die Begründung der Schwellen).
+    Ohne `sched_dep_iso` IMMER True → alle Alt-Aufrufer unverändert. Wirft nie."""
+    if not sched_dep_iso or not pos:
+        return True
+    try:
+        from blueprints.leg_status_gate import live_pos_same_instance
+        return live_pos_same_instance(pos.get('seen_ts'), sched_dep_iso)
+    except Exception:
+        return True
+
+
+def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35,
+                       sched_dep_iso=None):
     """Positions-Snapshot aus dem NAS-Harvester-Store (Supabase `aircraft_live`,
     gefüllt via FR24-**gRPC** — sieht AUCH über Russland/Ozean, wo freies ADS-B
     blind ist). Owner-Idee 2026-07-08: „geht ein Flug offline, simulieren wir aus
@@ -487,7 +502,16 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     frische Snapshots (< max_age_min).
 
     Rückgabe: (pos, (src,dst), reg_display, ac_type) | (None, None, None, None).
-    pos-Keys wie iOS AXLifecycleLive (lat/lon/track/gs/alt/on_ground)."""
+    pos-Keys wie iOS AXLifecycleLive (lat/lon/track/gs/alt/on_ground).
+
+    INSTANZ-BINDUNG (Sweep-Befund 2026-08-09, LH712 FRA→ICN): `aircraft_live`
+    trägt KEIN Datum — die Zeile identifiziert nur „welche Maschine fliegt diese
+    Nummer nach X gerade". Bei einer TÄGLICHEN Langstrecke ist das die Instanz
+    von GESTERN, und sie matcht das Leg von MORGEN exakt. Aufrufer, die den
+    Soll-Abflug ihres Legs kennen, geben ihn als `sched_dep_iso` mit; ein
+    Snapshot außerhalb von [dep−6 h, dep+20 h] ist dann beweisbar ein anderer
+    Lauf und wird verworfen (kein Fallback, keine geratene Position).
+    OHNE `sched_dep_iso` bleibt alles exakt wie bisher (fail-open)."""
     # NAS-RAM-Store zuerst (via Tunnel, spart Supabase-Disk-IO). NAS_LIVE_URL
     # gesetzt ⇒ NAS-first; Miss/Timeout/aus ⇒ Supabase-Fallback unten.
     _nas = _nas_live_pos(reg=reg, flight=flight, callsign=callsign, dep=dep,
@@ -496,6 +520,10 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
         # Taxi-Gate auch für den NAS-Pfad (gemeinsame Stelle) — vorher rutschte
         # ein Pushback-Snapshot als „airborne" durch, nur der SB-Pfad gatete.
         _apply_taxi_gate(_nas[0])
+        # Instanz-Bindung ebenfalls an der GEMEINSAMEN Stelle: der NAS-RAM-Store
+        # keyt genau wie Supabase ohne Datum (s. Docstring).
+        if not _live_pos_instance_ok(_nas[0], sched_dep_iso):
+            return None, None, None, None
         return _nas
     sb = _sb()
     if sb is None:
@@ -569,6 +597,8 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
         # die echte Kennung.
         'callsign': (r.get('callsign') or '').strip().upper() or None,
     })
+    if not _live_pos_instance_ok(pos, sched_dep_iso):
+        return None, None, None, None            # 24-h-Nachbar → verwerfen
     reg_disp = (r.get('reg_display') or r.get('reg') or '').strip().upper() or None
     ac_type = (r.get('ac_type') or '').strip().upper() or None
     return pos, (src, dst), reg_disp, ac_type

@@ -176,6 +176,68 @@ def landed_status_plausible(status, *, now: Optional[float] = None,
     return now >= (sched_ts - _LANDED_SLACK_MIN * 60.0)
 
 
+# ── INSTANZ-FENSTER EINES LEGS (Sweep-Befund 2026-08-09, LH712 FRA→ICN) ─────
+# EINE Quelle für die beiden Schwellen, die das Projekt für „gehört dieser
+# Beleg zu DIESER Tages-Instanz?" benutzt. app._DEP_EARLY_MARGIN_H /
+# app._DEP_LATE_MARGIN_H lesen sie von hier, damit nicht drei verschiedene
+# Zahlen entstehen.
+#   EARLY 6 h  — kein Linienflug geht 6 h VOR Plan raus.
+#   LATE 20 h  — jenseits davon ist es keine Verspätung mehr, sondern eine
+#                Umplanung bzw. der 24-h-Nachbar derselben täglichen Nummer.
+DEP_EARLY_MARGIN_H = 6
+DEP_LATE_MARGIN_H = 20
+
+
+def live_pos_same_instance(seen_ts, sched_dep_iso, *,
+                           early_h: float = DEP_EARLY_MARGIN_H,
+                           late_h: float = DEP_LATE_MARGIN_H) -> bool:
+    """Kann ein LIVE-POSITIONS-Snapshot (`aircraft_live`, Beobachtungszeit
+    `seen_ts`) zum Leg mit Soll-Abflug `sched_dep_iso` gehören?
+
+    WARUM (Prod-Beleg, gelesen 2026-08-08T21:09Z): `aircraft_live` keyt einen
+    Snapshot NUR über Flugnummer/Funkname/Reg + Ziel — es gibt dort KEIN Datum.
+    Bei einer täglich fliegenden Langstrecke ist die Maschine von GESTERN zum
+    Abfrage-Zeitpunkt noch in der Luft und matcht die Zeile von MORGEN exakt:
+    `flight=LH712, dest=ICN, on_ground=false, seen_ts 2026-08-08T21:01:09Z`
+    (D-AIXB über Xinjiang) klebte am Roster-Leg LH712 FRA→ICN mit Soll-Abflug
+    2026-08-09T13:35:00Z — 16,6 h VOR dessen Abflug. Über die FlightState-Engine
+    (T3: Position + Kinematik ⇒ AIRBORNE, `phase_conf=observed`) wurde daraus
+    `status='airborne'` an einem Flug, der noch gar nicht gestartet war.
+    Der vorhandene Riegel `app._obs_dep_same_instance` konnte das nicht fangen:
+    er prüft Board-/Warehouse-Rows über deren `date`/`sched`-Spalten — ein
+    Positions-Snapshot hat beide nicht und lief nie durch ihn.
+
+    REGEL: der Snapshot muss im Instanz-Fenster [sched_dep − 6 h, sched_dep +
+    20 h] liegen — dieselben Schwellen wie `_gate_facts_dep_against_leg` /
+    `_lh_facts_same_instance`. Ein wirklich fliegender Flug liegt IMMER darin
+    (Off-Block frühestens kurz vor Plan, längster Linienflug < 20 h), auch ein
+    stark verspäteter.
+
+    FAIL-OPEN: fehlt `seen_ts` ODER `sched_dep_iso` oder ist eins unparsbar,
+    True — keine Evidenz ⇒ exakt bisheriges Verhalten. Pure, wirft nie."""
+    try:
+        if seen_ts is None or sched_dep_iso is None:
+            return True
+        if isinstance(seen_ts, (int, float)):
+            seen = float(seen_ts)
+            if seen > 4102444800:                 # ms-Epoch heuristisch
+                seen /= 1000.0
+        else:
+            seen = _parse_iso_utc(seen_ts)
+        if isinstance(sched_dep_iso, datetime):
+            _d = sched_dep_iso
+            if _d.tzinfo is None:                 # naiv = UTC (nie Lokalzeit)
+                _d = _d.replace(tzinfo=timezone.utc)
+            dep = _d.timestamp()
+        else:
+            dep = _parse_iso_utc(sched_dep_iso)
+        if seen is None or dep is None:
+            return True
+        return (dep - early_h * 3600.0) <= seen <= (dep + late_h * 3600.0)
+    except Exception:
+        return True
+
+
 def gated_leg_status(status, *, now: Optional[float] = None,
                      sched_arr_iso: Optional[str] = None,
                      est_arr_iso: Optional[str] = None,

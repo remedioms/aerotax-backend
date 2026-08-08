@@ -17667,7 +17667,7 @@ def _active_sector_flight_numbers(day):
         return []
 
 
-def _friends_live_leg_check(fno, frm, to):
+def _friends_live_leg_check(fno, frm, to, sched_dep_iso=None):
     """GRATIS-Gegencheck gegen den aircraft_live-Store (NAS-Harvester/FR24-gRPC)
     für die lay_eff-Kaskade: fliegt die Maschine dieser Flugnummer GERADE
     (route-konsistent, dest == to)?
@@ -17678,10 +17678,17 @@ def _friends_live_leg_check(fno, frm, to):
     Reiner Supabase/NAS-Read (kein Paid-Spend), wirft nie. Existiert, weil die
     reine Plan-Uhr (ARR-DECKEL arr+30min) einen real verspäteten, obs-losen Leg
     sonst ans Ziel teleportiert, während die Maschine noch fliegt oder gar noch
-    am Abflug-Gate steht (Nachfix 2026-07-10)."""
+    am Abflug-Gate steht (Nachfix 2026-07-10).
+
+    `sched_dep_iso` = Soll-Abflug DIESES Legs (ISO/datetime). Ohne ihn kann der
+    datums-lose `aircraft_live`-Store bei einer TÄGLICHEN Flugnummer die Instanz
+    eines NACHBARTAGES liefern (Sweep-Befund 2026-08-09, LH712 FRA→ICN) — hier
+    ist die Fehlrichtung „gestriges Leg meldet airborne, weil die HEUTIGE
+    Rotation fliegt". Fehlt er, bleibt alles wie bisher (fail-open)."""
     try:
         from blueprints.aerox_data_blueprint import _aircraft_live_pos, _iata_latlon
-        pos, _rt, _rg, _ty = _aircraft_live_pos(flight=fno, dep=to)
+        pos, _rt, _rg, _ty = _aircraft_live_pos(flight=fno, dep=to,
+                                                sched_dep_iso=sched_dep_iso)
         if not pos or pos.get('lat') is None or pos.get('lon') is None:
             return None
         if not pos.get('on_ground'):
@@ -18238,7 +18245,8 @@ def get_friends_today(token):
                         if (arr_dt is not None and not delay_pin
                                 and datetime.now(timezone.utc)
                                 >= arr_dt + timedelta(minutes=30)):
-                            _lv = _friends_live_leg_check(fno, frm, to)
+                            _lv = _friends_live_leg_check(fno, frm, to,
+                                                          sched_dep_iso=dep)
                             if _lv == 'airborne':
                                 # Maschine fliegt NACHWEISLICH → Board-Row
                                 # stale; wie Zweig (3): unterwegs, geplanten
@@ -18294,7 +18302,8 @@ def get_friends_today(token):
                         # ABFLUG-Flughafen → Pin bleibt. Nur ohne Gegenbeweis
                         # gilt die Plan-Annahme (kein erfundener Ort).
                         if arr_dt is not None:
-                            _lv = _friends_live_leg_check(fno, frm, to)
+                            _lv = _friends_live_leg_check(fno, frm, to,
+                                                          sched_dep_iso=dep)
                             if _lv == 'airborne':
                                 pos = None
                                 break
@@ -18398,8 +18407,15 @@ def get_friends_today(token):
                         _clp = None
                         _cp = _cr = _crg = _cty = None
                         try:
+                            # INSTANZ-BINDUNG (Sweep 2026-08-09, LH712 FRA→ICN):
+                            # `aircraft_live` keyt ohne Datum → ohne den
+                            # Soll-Abflug dieses Legs liefert eine täglich
+                            # fliegende Nummer die Position des NACHBARTAGES.
+                            # Dieselbe Schranke, die `_flights_live_obs_wrong_day`
+                            # eine Zeile höher für die Board-Obs zieht.
                             _cp, _cr, _crg, _cty = _aircraft_live_pos(
-                                flight=fno, dep=_arr_ia)
+                                flight=fno, dep=_arr_ia,
+                                sched_dep_iso=_leg_dep_iso)
                             if _cp and not _cp.get('on_ground'):
                                 _clp = {'lat': _cp.get('lat'), 'lon': _cp.get('lon'),
                                         'track': _cp.get('track'), 'gs': _cp.get('gs'),
@@ -43304,8 +43320,13 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
 #   • später als +20 h ist keine Abflug-Schätzung mehr, sondern Umplanung.
 # Dazwischen bleibt jeder reale (auch sehr große) Delay unangetastet; die
 # 24-h-Nachbarn beider Richtungen fallen sicher heraus.
-_DEP_EARLY_MARGIN_H = 6
-_DEP_LATE_MARGIN_H = 20
+# EINE QUELLE (2026-08-09): die Zahlen stehen seit dem Positions-Instanz-Riegel
+# (`leg_status_gate.live_pos_same_instance`, Fall LH712 FRA→ICN) genau einmal im
+# Projekt — sonst hätte dieselbe Regel drei verschiedene Schwellen.
+from blueprints.leg_status_gate import (            # noqa: E402  (Modul-Mitte)
+    DEP_EARLY_MARGIN_H as _DEP_EARLY_MARGIN_H,
+    DEP_LATE_MARGIN_H as _DEP_LATE_MARGIN_H,
+)
 
 
 def _gate_facts_dep_against_leg(facts, leg_dep_iso):
@@ -44194,10 +44215,30 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 # (füllt das Airborne-/Taxi-Gate über Ozean/Russland — dieselbe
                 # Quelle wie flights_live). Best-effort, on_ground egal (die Engine
                 # entscheidet selbst per Kinematik).
+                # ── INSTANZ-BINDUNG DES POSITIONS-SNAPSHOTS (Sweep 2026-08-09,
+                # LH712 FRA→ICN, DRITTER eigener 24-h-Nachbar-Weg) ────────────
+                # `aircraft_live` kennt KEIN Datum: die Zeile sagt nur „diese
+                # Maschine fliegt LH712 nach ICN gerade". Bei einer täglichen
+                # Langstrecke ist das die Instanz von GESTERN — und sie matchte
+                # das Leg von MORGEN punktgenau. Über die Engine (T3: Position +
+                # Kinematik ⇒ AIRBORNE, conf=observed) wurde daraus
+                # `status='airborne'` an einem Flug, der noch gar nicht gestartet
+                # war. BELEG (Prod, 2026-08-08T21:09Z): `flight=LH712, dest=ICN,
+                # on_ground=false, alt 39100 ft, seen_ts 2026-08-08T21:01:09Z`
+                # (D-AIXB, 43.63N/87.03E) am Roster-Leg mit dep_iso
+                # 2026-08-09T13:35:00Z — 16,6 h VOR dessen Abflug. Die
+                # Zeit-/Delay-Felder blieben sauber (obs_sides dep/arr beide
+                # None) — nur der STATUS war vergiftet, deshalb sahen weder der
+                # Board-Riegel `_obs_dep_same_instance` (braucht date/sched einer
+                # Board-Row) noch die Physik-Gates (räumen nur terminale
+                # 'landed') etwas davon.
+                # Der Soll-Abflug DIESES Legs bindet den Snapshot jetzt an die
+                # Instanz — gleiche Schwellen wie `_gate_facts_dep_against_leg`.
                 _fs_cp = _fs_cr = _fs_crg = _fs_cty = None
                 try:
                     from blueprints.aerox_data_blueprint import _aircraft_live_pos as _fs_alp
-                    _fs_cp, _fs_cr, _fs_crg, _fs_cty = _fs_alp(flight=op_fn, dep=to)
+                    _fs_cp, _fs_cr, _fs_crg, _fs_cty = _fs_alp(
+                        flight=op_fn, dep=to, sched_dep_iso=s.get('dep_iso'))
                     _fs_obs += _fs_oal(_fs_cp, _fs_cr, _fs_crg, _fs_cty)
                 except Exception:
                     pass
