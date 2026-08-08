@@ -22053,6 +22053,15 @@ def _logbook_enrich_async(token, wanted):
                     f = _flight_facts_from_obs(flight, date, frm, to) or {}
                 except Exception:
                     f = {}
+                # STALE = Beobachtung eines FREMDEN Tages (s. ausführliche
+                # Begründung in `_enrich_leg_delays`, 2026-08-08). Hier wiegt
+                # das doppelt schwer: das Flugbuch ist ein NACHWEIS-Dokument
+                # (FCL.050). Eine Reg oder eine Landezeit aus der Rotation des
+                # Nachbartages wäre ein erfundener Beleg — und `reg` ist genau
+                # die Fehlerklasse „Rotations-Fallback riet fremde Reg"
+                # (Tibor-Welle 01.08.2026). Lieber keine Zeile.
+                if f.get('stale'):
+                    f = {}
                 reg, actype = f.get('reg'), f.get('type')
                 actual_arr_iso = _logbook_measured_arrival_from_facts(f)
                 # Auch das leere Ergebnis festhalten (mit Zeitstempel): sonst
@@ -42302,6 +42311,84 @@ def _obs_dep_same_instance(row, ap, want_day, dep_sched_iso):
         return True
 
 
+# ── BETRIEBSTAG AN DER STATION (Sweep-Befund 2026-08-08, LH757 BOM→FRA) ──────
+# Flughafen-Tafeln, das Warehouse (`airport_delay_obs`) UND die LH Open API
+# keyen einen Flug am KALENDERTAG SEINER ABFLUG-STATION — nicht am UTC-Tag.
+# Für jede Station, deren Offset den Abflug über die UTC-Mitternacht schiebt,
+# sind das ZWEI VERSCHIEDENE TAGE, und ein UTC-Tag als Datums-Schlüssel trifft
+# dann punktgenau den 24-h-NACHBARN derselben täglichen Flugnummer.
+#
+# BELEG (Prod, 08.08.2026): Roster-Leg LH757 BOM→FRA, dep 2026-08-08T21:10Z.
+# An der Station BOM (UTC+5:30) ist das der 09.08., 02:40 Ortszeit. Gefragt
+# wurde mit dem UTC-Tag '2026-08-08'; LH antwortete mit dem Lauf der VORNACHT
+# (`lhfacts:LH757:2026-08-08:BOM:FRA` → sched_dep 2026-08-08T02:40+05:30,
+# est_dep 03:11 IST = 2026-08-07T21:41Z, est_arr 08:21 CEST = 2026-08-08T06:21Z)
+# — exakt die Zeiten, die am Leg klebten. Der richtige Eintrag lag daneben
+# bereit: `lhfacts:LH757:2026-08-09:BOM:FRA` (sched_dep 2026-08-09T02:40+05:30).
+_LEG_INSTANCE_MARGIN_H = 6
+
+
+def _station_operating_day(when, iata):
+    """Betriebstag ('YYYY-MM-DD') eines Zeitpunkts AN DER STATION `iata`.
+
+    `when` ist ein aware/naiver ISO-String oder ein datetime (naiv = UTC).
+    Gibt None zurück, wenn die Zone der Station unbekannt oder `when`
+    unparsbar ist — der Aufrufer behält dann exakt sein bisheriges Verhalten.
+    Es wird NIE eine Zone geraten (Owner-Regel „keine Fake-Werte"). Pure
+    (bis auf den TZ-Lookup), testbar, wirft nie."""
+    ap = (iata or '').upper().strip()
+    ap = _DE_ICAO_TO_IATA.get(ap, ap)
+    if len(ap) != 3 or not ap.isalpha():
+        return None
+    dt = when
+    if not isinstance(dt, datetime):
+        s = str(when or '').strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        except Exception:
+            return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        tzname = 'Europe/Berlin' if ap in ('FRA', 'EDDF') else airport_tz(ap)
+        if not tzname:
+            return None
+        from zoneinfo import ZoneInfo as _ZI
+        return dt.astimezone(_ZI(tzname)).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def _lh_facts_same_instance(lh, dep_sched_iso):
+    """PUR: gehören LH-Fakten (`_obs_rows_to_facts`-Shape) zur SELBEN Tages-
+    Instanz wie das Leg mit Soll-Abflug `dep_sched_iso`?
+
+    Zweite Schranke hinter dem Betriebstag-Schlüssel — dieselbe Rolle, die
+    `_obs_dep_same_instance` für Board-/Warehouse-Rows spielt (der LH-Overlay
+    lief bisher an JEDEM Instanz-Guard vorbei: er greift genau dann, wenn
+    beide Board-Seiten fehlen). Verglichen werden zwei PLÄNE (LH `sched_dep`
+    gegen die Leg-Sollzeit) — die unterscheiden sich durch Umplanung um
+    Stunden, nie um ~24 h. Fehlt eine der beiden Größen, wird NICHT verworfen
+    (keine Evidenz ⇒ altes Verhalten). Wirft nie."""
+    try:
+        if not isinstance(lh, dict) or not lh or not dep_sched_iso:
+            return True
+        _ls = lh.get('sched_dep')
+        if not _ls:
+            return True
+        a = datetime.fromisoformat(str(_ls).replace('Z', '+00:00'))
+        b = datetime.fromisoformat(str(dep_sched_iso).replace('Z', '+00:00'))
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=timezone.utc)
+        if b.tzinfo is None:
+            b = b.replace(tzinfo=timezone.utc)
+        return abs((a - b).total_seconds()) <= _LEG_INSTANCE_MARGIN_H * 3600
+    except Exception:
+        return True
+
+
 # ── LH Open API → _flight_obs_merged (Engine A2, 2026-07-22) ─────────────────
 # Der ZWEITE Board-Leser bekommt dieselbe LH-Veredelung wie
 # _flight_facts_from_obs (der Blueprint-Merge) — bisher liefen Radar-Callout-
@@ -42381,11 +42468,20 @@ def _lh_apply_obs_fill(rec, lh):
     return out if (rec is not None or filled) else None
 
 
-def _lh_fill_obs_merged(rec, fn, date_q, dep, arr):
+def _lh_fill_obs_merged(rec, fn, date_q, dep, arr, dep_sched_iso=None):
     """Gated impure Hülle um `_lh_apply_obs_fill`: LH nur ziehen, wenn dem
     Board-Record KERN-Zeiten fehlen (Budget-Schutz — board-komplette Flüge
     zahlen keinen LH-Call; das (flight,date)-Memo in lh_flight_facts dedupt
-    Fan-out-Pfade zusätzlich). Wirft nie."""
+    Fan-out-Pfade zusätzlich). Wirft nie.
+
+    `dep_sched_iso` (Sweep-Befund 2026-08-08, LH757 BOM→FRA): die Soll-
+    Abflugzeit DES LEGS. Ist sie bekannt, wird der LH-Datums-Schlüssel daraus
+    am BETRIEBSTAG DER ABFLUG-STATION gerechnet statt am UTC-Tag — sonst
+    antwortet LH bei jedem Abflug, der die UTC-Mitternacht überschreitet, mit
+    dem 24-h-Nachbarn derselben täglichen Flugnummer. Zusätzlich muss der
+    gelieferte LH-`sched_dep` zur Leg-Sollzeit passen
+    (`_lh_facts_same_instance`) — ohne diesen Riegel lief der LH-Overlay als
+    EINZIGER Anreicherungspfad ganz ohne Instanz-Prüfung."""
     need = (rec is None or rec.get('sched_dep') is None
             or rec.get('sched_arr') is None
             or (rec.get('esti_arr') is None
@@ -42397,7 +42493,11 @@ def _lh_fill_obs_merged(rec, fn, date_q, dep, arr):
         if not is_lh_group(fn):
             return rec
         import time as _tlh
-        d = (date_q or _tlh.strftime('%Y-%m-%d', _tlh.gmtime()))
+        # BETRIEBSTAG DER ABFLUG-STATION schlägt den UTC-Tag (s. Docstring).
+        # Nur wenn die Station-TZ bekannt ist; sonst bleibt alles wie bisher.
+        d = (_station_operating_day(dep_sched_iso, dep) if dep_sched_iso
+             else None)
+        d = d or date_q or _tlh.strftime('%Y-%m-%d', _tlh.gmtime())
         # NUR betriebsnahe Tage (heute−1…+2). INCIDENT 2026-07-22: Konsumenten
         # iterieren MONATE über diesen Merge (Logbuch/Historie — live gesehen
         # WK34/2026-07-04 bis 2026-07-28) — jeder Tag ein LH-Call legte die
@@ -42413,6 +42513,11 @@ def _lh_fill_obs_merged(rec, fn, date_q, dep, arr):
         lh = lh_flight_facts(fn, d, dep, arr, cached_only=True,
                              caller='obs_overlay')
     except Exception:
+        return rec
+    # INSTANZ-RIEGEL: eine LH-Antwort, deren Plan-Abflug nicht zur Leg-Sollzeit
+    # passt, beschreibt eine FREMDE Tages-Instanz — lieber gar keine Fakten als
+    # die des Nachbartages (Owner-Regel „keine Fake-Werte").
+    if not _lh_facts_same_instance(lh, dep_sched_iso):
         return rec
     out = _lh_apply_obs_fill(rec, lh)
     if rec is None and out is not None:
@@ -42688,7 +42793,8 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         # letzte freie Quelle (Engine A2): purer LH-Record statt None.
         _rec0 = None
         try:
-            _rec0 = _lh_fill_obs_merged(None, fn, date_q, dep, arr)
+            _rec0 = _lh_fill_obs_merged(None, fn, date_q, dep, arr,
+                                        dep_sched_iso=dep_sched_q)
         except Exception:
             _rec0 = None
         _FLIGHT_MERGE_CACHE[ckey] = (_t.time(),
@@ -42910,9 +43016,12 @@ def _flight_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
         pass
     # LH Open API (Engine A2): Lücken der Board-Sicht autoritativ füllen —
     # NACH allen Scrubs (der LH-Fill soll nicht als „Fremd-Rotation" wieder
-    # rausfliegen; LH ist date-exakt). Fill-only, wirft nie.
+    # rausfliegen). LH ist date-exakt — aber am BETRIEBSTAG DER ABFLUG-STATION,
+    # nicht am UTC-Tag (Sweep-Befund 2026-08-08, s. `_station_operating_day`);
+    # genau diese stille Gleichsetzung war der Bug. Fill-only, wirft nie.
     try:
-        rec = _lh_fill_obs_merged(rec, fn, date_q, dep, arr)
+        rec = _lh_fill_obs_merged(rec, fn, date_q, dep, arr,
+                                  dep_sched_iso=dep_sched_q)
     except Exception:
         pass
     _FLIGHT_MERGE_CACHE[ckey] = (_t.time(), dict(rec))
@@ -43189,6 +43298,48 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
         return facts
 
 
+# Physik-Fenster für die ABFLUG-Seite (Sweep-Befund 2026-08-08). Bewusst
+# ASYMMETRISCH, damit kein echter Wert verloren geht:
+#   • früher als −6 h ist unmöglich — kein Flug geht 6 h VOR Plan raus,
+#   • später als +20 h ist keine Abflug-Schätzung mehr, sondern Umplanung.
+# Dazwischen bleibt jeder reale (auch sehr große) Delay unangetastet; die
+# 24-h-Nachbarn beider Richtungen fallen sicher heraus.
+_DEP_EARLY_MARGIN_H = 6
+_DEP_LATE_MARGIN_H = 20
+
+
+def _gate_facts_dep_against_leg(facts, leg_dep_iso):
+    """PUR: verwirft die ABFLUG-Seite eines `_flight_facts_from_obs`-Ergebnisses,
+    wenn dessen `est_dep` physikalisch unmöglich weit vom Soll-Abflug des Legs
+    (`leg_dep_iso`) entfernt liegt — dann beschreibt sie eine FREMDE Tages-
+    rotation. Spiegelbild zu `_gate_facts_arr_against_leg`, das es für die
+    Ankunfts-Seite seit 2026-07-16 gibt; die Abflug-Seite lief bis 2026-08-08
+    ungeprüft (gemessen im Bestand: Legs mit est_dep exakt −24 h, während die
+    est_arr korrekt war). `sched_dep`/`reg`/Gate bleiben unangetastet.
+    Gibt `facts` (evtl. mutiert) zurück. Wirft nie."""
+    try:
+        if not isinstance(facts, dict) or not leg_dep_iso:
+            return facts
+        _ed = facts.get('est_dep')
+        if not _ed:
+            return facts
+        _ed_dt = datetime.fromisoformat(str(_ed).replace('Z', '+00:00'))
+        _ld_dt = datetime.fromisoformat(str(leg_dep_iso).replace('Z', '+00:00'))
+        if _ed_dt.tzinfo is None:
+            _ed_dt = _ed_dt.replace(tzinfo=timezone.utc)
+        if _ld_dt.tzinfo is None:
+            _ld_dt = _ld_dt.replace(tzinfo=timezone.utc)
+        if (_ed_dt < _ld_dt - timedelta(hours=_DEP_EARLY_MARGIN_H)
+                or _ed_dt > _ld_dt + timedelta(hours=_DEP_LATE_MARGIN_H)):
+            for _k in ('est_dep', 'dep_delay_min', 'dep_delay_known',
+                       'dep_status'):
+                if _k in facts:
+                    facts[_k] = None
+        return facts
+    except Exception:
+        return facts
+
+
 # Wie viele Minuten VOR der behaupteten Ankunft darf eine Beobachtung
 # geschrieben worden sein und trotzdem als Messung gelten? Uhren zwischen
 # Scraper-Host und Flughafen-Tafel laufen nicht sekundengleich, und manche
@@ -43364,14 +43515,28 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
             except Exception:
                 cs_map = {}
         op_fn = cs_map.get(fn, fn)
-        # Datum: bevorzugt der ECHTE Abflugtag des Legs (dep_iso, korrekt an der
-        # Tag-Grenze / in West-Zeitzonen), sonst der Tages-Key.
+        # Datum: bevorzugt der ECHTE Abflugtag des Legs (dep_iso), sonst der
+        # Tages-Key.
+        # BETRIEBSTAG STATT UTC-TAG (Sweep-Befund 2026-08-08, LH757 BOM→FRA):
+        # dieser Schlüssel geht an Quellen, die am KALENDERTAG DER ABFLUG-
+        # STATION keyen (Flughafen-Tafeln, `airport_delay_obs`, LH Open API,
+        # FR24). `dep_dt.strftime` lieferte den UTC-Tag — bei jedem Abflug, der
+        # die UTC-Mitternacht überschreitet, ist das der Tag DANEBEN und man
+        # greift den 24-h-Nachbarn derselben täglichen Flugnummer.
+        # BOM (UTC+5:30), dep 2026-08-08T21:10Z = 09.08. 02:40 Ortszeit: gefragt
+        # wurde '2026-08-08', geliefert wurde der Lauf der Vornacht. Messung
+        # 08.08.: 1807 von 32906 gespeicherten Sektoren haben einen
+        # abweichenden Betriebstag (Spitzenreiter LAX/DEL/BOM/BOS/IAD).
+        # Ist die Stations-TZ unbekannt, bleibt es beim bisherigen UTC-Tag —
+        # nie raten.
         leg_date = None
         if dep_dt is not None:
-            try:
-                leg_date = dep_dt.strftime('%Y-%m-%d')
-            except Exception:
-                leg_date = None
+            leg_date = _station_operating_day(dep_dt, frm)
+            if leg_date is None:
+                try:
+                    leg_date = dep_dt.strftime('%Y-%m-%d')
+                except Exception:
+                    leg_date = None
         leg_date = leg_date or (str(date or '')[:10] or None)
         # MITTERNACHTS-LÜCKE (Flake test_friend_roster_free_only…, 2026-07-16):
         # ein Leg, das kurz VOR UTC-Mitternacht abflog und noch in der Luft ist
@@ -43396,6 +43561,10 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                     and dep_dt - timedelta(minutes=15) <= now
                     <= _arr_dt + timedelta(minutes=10)
                     and leg_date != now.strftime('%Y-%m-%d')):
+                # Nur der Live-Scan-Gate wird geöffnet. Der LH-Overlay bleibt
+                # trotzdem datums-scharf: er nimmt seit dem Betriebstag-Fix
+                # (2026-08-08) den Tag aus `dep_sched_iso` an der Station und
+                # nicht mehr den UTC-Tag aus `date_q`.
                 _merge_date = None
         except Exception:
             _merge_date = leg_date
@@ -43412,22 +43581,17 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # echt-UTC → in die Ziel-TZ wandeln und den lokalen Tag nehmen (nicht den
         # UTC-Tag: eine 07:45-CEST-Ankunft ist um 05:45Z schon der Ortstag 16.). Nur
         # gesetzt, wenn wirklich verschieden — Nicht-Übernacht-Legs bleiben unberührt.
+        # Seit dem Betriebstag-Fix (2026-08-08) vergleicht das den ABFLUG-
+        # Betriebstag mit dem ANKUNFTS-Betriebstag — beide stations-lokal,
+        # also endlich in derselben Einheit (vorher: Ziel-Ortstag gegen
+        # UTC-Abflugtag, was den arr-Sonderweg auch dann öffnete, wenn beide
+        # Seiten denselben Betriebstag haben).
         _arr_date_q = None
         try:
-            _ar2 = s.get('arr_iso')
-            if _ar2 and leg_date:
-                _adt2 = datetime.fromisoformat(str(_ar2).replace('Z', '+00:00'))
-                if _adt2.tzinfo is None:
-                    _adt2 = _adt2.replace(tzinfo=timezone.utc)
-                _to_norm = _DE_ICAO_TO_IATA.get(to, to)
-                _tzname = ('Europe/Berlin' if _to_norm in ('FRA', 'EDDF')
-                           else airport_tz(_to_norm))
-                if _tzname:
-                    from zoneinfo import ZoneInfo as _ZI
-                    _arr_local_day = _adt2.astimezone(
-                        _ZI(_tzname)).strftime('%Y-%m-%d')
-                    if _arr_local_day != leg_date:
-                        _arr_date_q = _arr_local_day
+            if leg_date:
+                _arr_local_day = _station_operating_day(s.get('arr_iso'), to)
+                if _arr_local_day and _arr_local_day != leg_date:
+                    _arr_date_q = _arr_local_day
         except Exception:
             _arr_date_q = None
         try:
@@ -43490,7 +43654,34 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 # der nächste Request innerhalb der LH-TTL ist komplett.
                 _fc = _facts_from_obs(op_fn, leg_date, dep_iata=frm, arr_iata=to,
                                       lh_cached_only=True)
-                if isinstance(_fc, dict) and _fc:
+                # ── STALE = FREMDER BEOBACHTUNGSTAG (Sweep-Befund 2026-08-08,
+                # zweiter, EIGENER Fehler neben dem Betriebstag-Bug) ──────────
+                # `_flight_facts_from_obs` liest bewusst d−1/d/d+1 (die ARR-Row
+                # eines Nachtflugs liegt auf d+1) und fällt, wenn für den
+                # ANGEFRAGTEN Tag gar keine Row existiert, auf den Nachbartag
+                # zurück — markiert das aber ehrlich als `stale`/`obs_date`.
+                # Der Vertrag dieser Markierung steht wörtlich in
+                # `_merge_lh_into_facts`: „wird sie downstream komplett
+                # verworfen". JEDER andere Konsument hält ihn ein
+                # (flight-info-Gate `foreign_day_arr`, der Detail-Merge, der
+                # Dual-Side-Merge). NUR dieser Enricher las die Markierung nie
+                # — und klebte damit die Ist-Zeit des 24-h-NACHBARN ans Leg.
+                # MESSUNG (Prod, 2026-08-08): 40 gespeicherte Sektoren mit
+                # est_dep ≈ −24 h bei KORREKTER est_arr. Beispiel LH099
+                # MUC→FRA am 07.08.: für den 07.08. existiert keine
+                # airport_delay_obs-Row (der Scraper sieht die Strecke nur
+                # jeden zweiten Tag), die jüngste ist der 06.08. mit
+                # sched 11:18 / esti 11:18 → genau der gespeicherte Wert
+                # `2026-08-06T11:18:00+02:00`. Die est_arr blieb richtig, weil
+                # sie schon aus `m` stand und Facts nur LÜCKEN füllen.
+                # Das ist NICHT der Betriebstag-Bug: MUC/MAD/ZRH haben am
+                # Mittag keinen Tagesversatz — der Schlüssel war korrekt, es
+                # gab die Row schlicht nicht.
+                # Datenverlust entsteht keiner: der Leg fällt damit in die
+                # Quellen-Kaskade unten (FR24-Eskalation für gelandete Legs)
+                # bzw. in die Neu-Abfrage am Ankunfts-Betriebstag — beide
+                # liefern eine ECHTE Messung statt einer fremden Rotation.
+                if isinstance(_fc, dict) and _fc and not _fc.get('stale'):
                     _facts = _fc
                 # ── ÜBERNACHT-ARR-DATUM (Tibor LH455-R4, 2026-07-16) ──────────
                 # Ein Nachtflug (dep 15.07 abends → arr 16.07 08:25) wird über
@@ -43505,15 +43696,25 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 # (arr_iso-Datum) neu abfragen. Nie eine implausible Ist-Ankunft
                 # ans Leg hängen. Wirft nie.
                 _facts = _gate_facts_arr_against_leg(_facts, s.get('arr_iso'))
+                # Spiegelbild für die ABFLUG-Seite (2026-08-08): auch sie kann
+                # die Instanz des Nachbartages tragen.
+                _facts = _gate_facts_dep_against_leg(_facts, s.get('dep_iso'))
+                # Auch hier der BETRIEBSTAG der Ankunfts-Station statt des
+                # UTC-Tags (2026-08-08) — `_flight_facts_from_obs` liest
+                # `airport_delay_obs`, und dort ist `date` der Stations-Tag.
+                # Bis dahin widersprach diese Stelle dem `_arr_date_q` 100
+                # Zeilen weiter oben, das es schon stations-lokal rechnete.
                 _arr_day = None
                 try:
                     _ar = s.get('arr_iso')
                     if _ar:
-                        _adt = datetime.fromisoformat(
-                            str(_ar).replace('Z', '+00:00'))
-                        if _adt.tzinfo is None:
-                            _adt = _adt.replace(tzinfo=timezone.utc)
-                        _arr_day = _adt.strftime('%Y-%m-%d')
+                        _arr_day = _station_operating_day(_ar, to)
+                        if _arr_day is None:
+                            _adt = datetime.fromisoformat(
+                                str(_ar).replace('Z', '+00:00'))
+                            if _adt.tzinfo is None:
+                                _adt = _adt.replace(tzinfo=timezone.utc)
+                            _arr_day = _adt.strftime('%Y-%m-%d')
                 except Exception:
                     _arr_day = None
                 if (_arr_day and leg_date and _arr_day != leg_date
@@ -43522,6 +43723,10 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                                            dep_iata=frm, arr_iata=to,
                                            lh_cached_only=True)
                     _fc2 = _gate_facts_arr_against_leg(_fc2, s.get('arr_iso'))
+                    # Auch hier: ein Nachbartags-Fallback ist keine Ankunft
+                    # DIESES Legs (gleicher Vertrag wie oben).
+                    if isinstance(_fc2, dict) and _fc2.get('stale'):
+                        _fc2 = None
                     if isinstance(_fc2, dict) and _fc2 and _fc2.get('est_arr'):
                         # ARR-Tag-Row bringt die richtige Ist-Ankunft; die DEP-Tag-
                         # Facts (dep-Seite) bleiben Vorrang für dep_*/reg, die arr-
