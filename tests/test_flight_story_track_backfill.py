@@ -68,8 +68,9 @@ def _fr24_trail(base_ts):
     }
 
 
-def _call(trail, live_fid=0x39ABCDEF, *, story=True):
-    service_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+def _call(trail, live_fid=0x39ABCDEF, *, story=True, day_offset=-1):
+    service_date = (dt.datetime.now(dt.timezone.utc).date()
+                    + dt.timedelta(days=day_offset))
     date = service_date.isoformat()
     base_ts = int(dt.datetime.combine(
         service_date, dt.time(10, 0), tzinfo=dt.timezone.utc).timestamp())
@@ -148,6 +149,19 @@ def test_normal_historical_route_does_not_activate_story_playback():
         dt.datetime.combine(service_date + dt.timedelta(days=1), dt.time(),
                             tzinfo=dt.timezone.utc)
         .strftime('%Y-%m-%dT%H:%M:%SZ'))
+
+
+def test_live_route_keeps_its_free_fr24_gap_filler():
+    service_date = dt.datetime.now(dt.timezone.utc).date()
+    base_ts = int(dt.datetime.combine(
+        service_date, dt.time(0, 5), tzinfo=dt.timezone.utc).timestamp())
+    body, fetch, summary, _, _, _ = _call(
+        _fr24_trail(base_ts), story=False, day_offset=0)
+
+    assert body['source'] == 'fr24_trail'
+    assert body['track_complete'] is True
+    assert fetch.call_args.kwargs['timestamp'] is None
+    summary.assert_not_called()
 
 
 def test_partial_track_never_publishes_a_misleading_distance_or_duration():

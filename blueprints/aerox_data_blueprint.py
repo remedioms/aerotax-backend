@@ -6597,7 +6597,11 @@ def ax_flown_track():
             recent_story = 0 <= (_today - _service_day).days <= 3
         except Exception:
             recent_story = False
-    needs_live_trail = (len(points) < 3 or tier1_stale) and is_today
+    # Das ist der bestehende kostenlose Live-Lueckenfueller: auch eine dichte,
+    # aber noch vor dem aktuellen Flieger endende eigene Spur darf vom
+    # anonymen FR24-Live-Trail ersetzt werden. Paid-Summary bleibt ausgeschlossen.
+    needs_live_trail = (len(points) < 3 or tier1_stale
+                        or not current_complete) and is_today
     needs_story_trail = (len(points) < 3 or not current_complete) and recent_story
     if needs_live_trail or needs_story_trail:
         reg_disp = None
