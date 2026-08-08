@@ -6,6 +6,7 @@ and the endpoint must publish provider-ready stats to the app.
 """
 import datetime as dt
 import os
+import time
 from unittest.mock import patch
 
 import pytest
@@ -94,14 +95,14 @@ def _call(trail, live_fid=0x39ABCDEF):
             response = BP.ax_flown_track()
     if isinstance(response, tuple):
         response = response[0]
-    return response.get_json(), fetch, summary, base_ts
+    return response.get_json(), fetch, summary, base_ts, response.headers
 
 
 def test_recent_partial_track_is_replaced_by_complete_fr24_playback():
     service_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
     base_ts = int(dt.datetime.combine(
         service_date, dt.time(10, 0), tzinfo=dt.timezone.utc).timestamp())
-    body, fetch, _, _ = _call(_fr24_trail(base_ts))
+    body, fetch, _, _, _ = _call(_fr24_trail(base_ts))
 
     assert body['source'] == 'fr24_trail'
     assert body['track_complete'] is True
@@ -117,7 +118,7 @@ def test_historical_summary_id_backfills_after_live_snapshot_was_pruned():
     service_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
     base_ts = int(dt.datetime.combine(
         service_date, dt.time(10, 0), tzinfo=dt.timezone.utc).timestamp())
-    body, fetch, summary, _ = _call(_fr24_trail(base_ts), live_fid=None)
+    body, fetch, summary, _, _ = _call(_fr24_trail(base_ts), live_fid=None)
 
     summary.assert_called_once_with('LH780', date=service_date.isoformat())
     assert fetch.call_args.args[0] == '39abcdef'
@@ -128,7 +129,7 @@ def test_historical_summary_id_backfills_after_live_snapshot_was_pruned():
 
 
 def test_partial_track_never_publishes_a_misleading_distance_or_duration():
-    body, _, _, _ = _call(None)
+    body, _, _, _, _ = _call(None)
 
     assert body['source'] == 'aircraft_track'
     assert body['track_complete'] is False
@@ -149,10 +150,10 @@ def test_playback_shape_reads_nested_fr24_actuals_and_identity():
         },
         'flight_info': {'flightid': 0x39ABCDEF},
         'flight_trail_list': [
-            {'latitude': 50.02, 'longitude': 8.56, 'altitude': 0,
-             'ground_speed': 12, 'track': 70, 'timestamp': 1_786_095_000},
-            {'latitude': 1.36, 'longitude': 103.99, 'altitude': 37_000,
-             'ground_speed': 20, 'track': 190, 'timestamp': 1_786_139_100},
+            {'lat': 50.02, 'lon': 8.56, 'heading': 70,
+             'snapshot_id': '1786095000'},
+            {'lat': 1.36, 'lon': 103.99, 'altitude': 37_000,
+             'spd': 20, 'heading': 190, 'snapshot_id': '1786139100'},
         ],
     }})
 
@@ -161,6 +162,26 @@ def test_playback_shape_reads_nested_fr24_actuals_and_identity():
     assert shaped['reg'] == 'D-ABVM'
     assert shaped['duration_min'] == 735
     assert shaped['points'][-1]['alt_ft'] == 37_000
+    assert shaped['points'][-1]['gs_kt'] == 20
+    assert shaped['points'][-1]['track_deg'] == 190
+    assert shaped['points'][-1]['ts'] == '1786139100'
+
+
+def test_cross_midnight_flight_stays_live_and_is_never_cached_as_history():
+    trail = _fr24_trail(int(time.time()) - 6 * 3600)
+    trail['duration_min'] = None
+    trail['points'][-1].update({
+        'lat': 28.82, 'lon': 71.90, 'alt_ft': 35_000,
+        'gs_kt': 495, 'track_deg': 138, 'ts': int(time.time()),
+    })
+    body, _, _, _, headers = _call(trail)
+
+    assert body['source'] == 'fr24_trail'
+    assert body['track_complete'] is False
+    assert body['in_flight'] is True
+    assert body['distance_km'] is None
+    assert body['duration_min'] is None
+    assert headers['Cache-Control'] == 'public, max-age=45'
 
 
 def test_official_summary_keeps_the_playback_flight_id():

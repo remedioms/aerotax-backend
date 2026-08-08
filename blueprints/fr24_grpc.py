@@ -614,15 +614,21 @@ def _shape_trail(td, fallback_reg=None):
 
     pts = []
     for tp in trail:
-        la, lo = tp.get("latitude"), tp.get("longitude")
+        # `flight_details` und `playback_flight` benennen dieselben Felder
+        # unterschiedlich: latitude/longitude/ground_speed/track/timestamp vs.
+        # lat/lon/spd/heading/snapshot_id. Beide sind echte FR24-Fixes.
+        la = tp.get("latitude") if tp.get("latitude") is not None else tp.get("lat")
+        lo = tp.get("longitude") if tp.get("longitude") is not None else tp.get("lon")
         if la is None or lo is None:
             continue
         pts.append({
             "lat": la, "lon": lo,
             "alt_ft": _i(tp.get("altitude")),
-            "gs_kt": _i(tp.get("ground_speed")),
-            "track_deg": _i(tp.get("track")),
-            "ts": tp.get("timestamp"),
+            "gs_kt": _i(tp.get("ground_speed")
+                          if tp.get("ground_speed") is not None else tp.get("spd")),
+            "track_deg": _i(tp.get("track")
+                              if tp.get("track") is not None else tp.get("heading")),
+            "ts": tp.get("timestamp") or tp.get("snapshot_id"),
         })
     if not pts:
         return None

@@ -6766,25 +6766,25 @@ def ax_flown_track():
     # Position → iOS setzt dort einen Flugzeug-Marker (Owner: „end with airplane").
     in_flight = False
     if source in ('aircraft_track', 'fr24_trail') and points:
-        today = time.strftime('%Y-%m-%d', time.gmtime())
-        if (not date) or date >= today:
-            # Auf dem letzten ECHTEN Fix rechnen (Punkt mit ts) — nie auf einem
-            # evtl. angehängten Airport-Punkt (der lag am Ziel → in_flight war für
-            # jeden Anflug fälschlich False, der ✈️-Marker fehlte genau dann).
-            _lp = next((p for p in reversed(points) if p.get('ts')), None)
-            if _lp:
-                fresh = (time.time() - _lp['ts']) < 30 * 60
-                # Boden-Heuristik: Taxi-Crumbs (Airport-Sweep, allow_ground) sind
-                # frisch, aber kein Flug — niedrig UND langsam = am Boden.
-                grounded = (_lp.get('alt') or 0) < 300 and (_lp.get('gs') or 0) < 80
-                bb = _iata_latlon(arr) if arr else None
-                d_arr = (_haversine_km(bb[0], bb[1], _lp['lat'], _lp['lon'])
-                         if bb else None)
-                # In der Luft = frischer, nicht-gegroundeter Fix, der noch nicht am
-                # Ziel angekommen ist (> 8 km ≈ kurz vorm Aufsetzen). Vorher galt
-                # erst > 150 km als „in flight" → im gesamten Anflug fehlte der
-                # Marker (live bestätigt: D-AIUN sinkend, in_flight=False).
-                in_flight = fresh and not grounded and (d_arr is None or d_arr > 8.0)
+        # Auf dem letzten ECHTEN Fix rechnen (Punkt mit ts) — nie auf einem
+        # evtl. angehängten Airport-Punkt. Kein Datums-Gate: Langstrecken wie
+        # LH780 starten am UTC-Vortag und sind nach Mitternacht weiterhin live.
+        _lp = next((p for p in reversed(points) if p.get('ts')), None)
+        if _lp:
+            try:
+                _lp_ts = float(_lp['ts'])
+            except (TypeError, ValueError):
+                _lp_ts = 0
+            fresh = _lp_ts > 0 and (time.time() - _lp_ts) < 30 * 60
+            # Boden-Heuristik: Taxi-Crumbs (Airport-Sweep, allow_ground) sind
+            # frisch, aber kein Flug — niedrig UND langsam = am Boden.
+            grounded = (_lp.get('alt') or 0) < 300 and (_lp.get('gs') or 0) < 80
+            bb = _iata_latlon(arr) if arr else None
+            d_arr = (_haversine_km(bb[0], bb[1], _lp['lat'], _lp['lon'])
+                     if bb else None)
+            # In der Luft = frischer, nicht-gegroundeter Fix, der noch nicht am
+            # Ziel angekommen ist (> 8 km ≈ kurz vorm Aufsetzen).
+            in_flight = fresh and not grounded and (d_arr is None or d_arr > 8.0)
 
     track_complete = (source != 'great_circle'
                       and _flown_track_covers_route(points, dep, arr))
@@ -6806,8 +6806,12 @@ def ax_flown_track():
     resp = jsonify(out)
     # Historische, echte Spur ist unveränderlich → lange Edge-TTL; laufend/approx kurz.
     past = bool(date) and date < time.strftime('%Y-%m-%d', time.gmtime())
-    ttl = 86400 if (past and source in ('aircraft_track', 'track_archive',
-                                        'fr24_trail')) else 45
+    # Ein UTC-Vortagsflug kann noch stundenlang unterwegs sein. Nur wirklich
+    # abgeschlossene, vollstaendige Historie ist fuer 24 h unveraenderlich;
+    # Teilspuren muessen weiterlaufen und werden nach 45 s neu geladen.
+    ttl = 86400 if (past and track_complete and not in_flight
+                    and source in ('aircraft_track', 'track_archive',
+                                   'fr24_trail')) else 45
     resp.headers['Cache-Control'] = 'public, max-age=%d' % ttl
     return resp
 
