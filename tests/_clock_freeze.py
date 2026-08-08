@@ -175,7 +175,16 @@ def apply_frozen_clock(monkeypatch, extra_modules=(), app_module=None):
             monkeypatch.setattr(_A, 'time', _shim)
     for _modname in ('blueprints.leg_status_gate',
                      'blueprints.aerox_data_blueprint',
-                     'blueprints.crew_live_state'):
+                     'blueprints.crew_live_state',
+                     # 2026-08-09 nachgezogen: die FlightState-Engine entscheidet
+                     # AIRBORNE u.a. über das ALTER der Positions-Beobachtung
+                     # (`now = now or time.time()`). Ohne diese Uhr galt jeder
+                     # datierte Snapshot am Tag NACH dem Testtag als stale — die
+                     # Pflicht-Gegenprobe „ein wirklich fliegender Flug bleibt
+                     # airborne" (test_live_pos_instance_binding) kippte darum
+                     # 24 h nach ihrer Entstehung von selbst um. Eine Zeitbombe,
+                     # kein Produktfehler.
+                     'blueprints.flight_state'):
         try:
             _m = __import__(_modname, fromlist=['*'])
         except Exception:

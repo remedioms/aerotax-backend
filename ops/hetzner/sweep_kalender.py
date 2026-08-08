@@ -57,11 +57,16 @@ LANDED   = ('landed', 'gelandet', 'arrived')
 AIRBORNE = ('airborne', 'abgeflogen', 'departed', 'gestartet', 'en route', 'im flug')
 
 # ── Physik-Schranken (Stunden), 1:1 dieselben Zahlen wie im Backend ──────────
-# EARLY: kein Flug geht 6 h VOR Plan raus / landet 6 h vor Plan
-#        (app._DEP_EARLY_MARGIN_H, app._OVERNIGHT_ARR_MARGIN_H).
-# LATE:  jenseits davon ist es keine Schaetzung mehr, sondern eine Umplanung
-#        (app._DEP_LATE_MARGIN_H). Dazwischen bleibt JEDE reale Verspaetung
-#        unbeanstandet — auch eine sehr grosse.
+# EARLY: kein Flug geht 6 h VOR Plan raus / landet 6 h vor Plan.
+# LATE:  jenseits davon ist es keine Schaetzung mehr, sondern eine Umplanung.
+#        Dazwischen bleibt JEDE reale Verspaetung unbeanstandet — auch eine
+#        sehr grosse.
+# Im Backend stehen die beiden Zahlen seit 2026-08-09 an genau EINER Stelle:
+# blueprints/leg_status_gate.INSTANCE_EARLY_MARGIN_H / INSTANCE_LATE_MARGIN_H.
+# `app._DEP_*`, `app._OVERNIGHT_ARR_MARGIN_H` und `app._ARR_LATE_MARGIN_H` sind
+# nur noch Aliase darauf. Der Waechter laeuft bewusst ohne Backend-Import
+# (er soll auch dann urteilen, wenn das Backend kaputt ist) — aendert sich das
+# Paar dort, MUSS es hier mitgezogen werden.
 EARLY_MARGIN_H = 6
 LATE_MARGIN_H  = 20
 # Wie weit muss der Abflug in der Zukunft liegen, damit R2 ueberhaupt urteilt?

@@ -178,14 +178,66 @@ def landed_status_plausible(status, *, now: Optional[float] = None,
 
 # ── INSTANZ-FENSTER EINES LEGS (Sweep-Befund 2026-08-09, LH712 FRA→ICN) ─────
 # EINE Quelle für die beiden Schwellen, die das Projekt für „gehört dieser
-# Beleg zu DIESER Tages-Instanz?" benutzt. app._DEP_EARLY_MARGIN_H /
-# app._DEP_LATE_MARGIN_H lesen sie von hier, damit nicht drei verschiedene
-# Zahlen entstehen.
-#   EARLY 6 h  — kein Linienflug geht 6 h VOR Plan raus.
+# Beleg zu DIESER Tages-Instanz?" benutzt — für BEIDE Seiten des Legs.
+#   EARLY 6 h  — kein Linienflug geht 6 h VOR Plan raus und landet 6 h vor
+#                Plan. Die größte real messbare Frühankunft einer Langstrecke
+#                (Rückenwind + kurzes Taxi) liegt bei gut 1 h; 6 h lassen also
+#                den Faktor 5 Luft und verwerfen trotzdem den 24-h-Nachbarn
+#                sicher (der liegt 4× weiter draußen).
 #   LATE 20 h  — jenseits davon ist es keine Verspätung mehr, sondern eine
 #                Umplanung bzw. der 24-h-Nachbar derselben täglichen Nummer.
-DEP_EARLY_MARGIN_H = 6
-DEP_LATE_MARGIN_H = 20
+#                Bewusst ASYMMETRISCH: Verspätung ist einseitig. 20 h halten
+#                jede reale Irregularität (Technik + Crew-Ruhe + Umleitung)
+#                unangetastet und lassen zum 24-h-Nachbarn genau 4 h Abstand.
+#                Enger zu gehen würde echte Nacht-auf-Nacht-Verspätungen
+#                wegwerfen, weiter zu gehen ließe den Nachbarn durch.
+# app._DEP_EARLY_MARGIN_H / app._DEP_LATE_MARGIN_H / app._OVERNIGHT_ARR_MARGIN_H
+# lesen sie von hier, damit nicht drei verschiedene Zahlenpaare entstehen.
+INSTANCE_EARLY_MARGIN_H = 6
+INSTANCE_LATE_MARGIN_H = 20
+# Historische Namen (die Abflug-Seite hatte den Riegel zuerst). Identisch —
+# NICHT als eigene Zahlen pflegen.
+DEP_EARLY_MARGIN_H = INSTANCE_EARLY_MARGIN_H
+DEP_LATE_MARGIN_H = INSTANCE_LATE_MARGIN_H
+
+
+def _to_epoch(v):
+    """ISO-String / datetime / Epoch(-ms) → Epoch-Sekunden, sonst None."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        d = v if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
+        return d.timestamp()
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if f > 4102444800:                        # ms-Epoch heuristisch
+            f /= 1000.0
+        return f
+    return _parse_iso_utc(v)
+
+
+def est_time_same_instance(est, sched, *,
+                           early_h: float = INSTANCE_EARLY_MARGIN_H,
+                           late_h: float = INSTANCE_LATE_MARGIN_H) -> bool:
+    """Gehört eine beobachtete/geschätzte Zeit (`est`) noch zu DERSELBEN
+    Tages-Instanz wie die Soll-Zeit (`sched`)?
+
+    Fenster: [sched − early_h, sched + late_h]. Dieselbe Regel und dieselben
+    Schwellen wie `live_pos_same_instance` (Positions-Snapshot) und
+    `app._gate_facts_dep_against_leg` (Abflug-Seite) — es gibt im Projekt nur
+    dieses eine Zahlenpaar.
+
+    FAIL-OPEN: fehlt eine der beiden Zeiten oder ist sie unparsbar, True
+    (keine Evidenz ⇒ nichts verwerfen). Pure, wirft nie."""
+    try:
+        e, s = _to_epoch(est), _to_epoch(sched)
+        if e is None or s is None:
+            return True
+        return (s - early_h * 3600.0) <= e <= (s + late_h * 3600.0)
+    except Exception:
+        return True
 
 
 def live_pos_same_instance(seen_ts, sched_dep_iso, *,
@@ -215,27 +267,8 @@ def live_pos_same_instance(seen_ts, sched_dep_iso, *,
 
     FAIL-OPEN: fehlt `seen_ts` ODER `sched_dep_iso` oder ist eins unparsbar,
     True — keine Evidenz ⇒ exakt bisheriges Verhalten. Pure, wirft nie."""
-    try:
-        if seen_ts is None or sched_dep_iso is None:
-            return True
-        if isinstance(seen_ts, (int, float)):
-            seen = float(seen_ts)
-            if seen > 4102444800:                 # ms-Epoch heuristisch
-                seen /= 1000.0
-        else:
-            seen = _parse_iso_utc(seen_ts)
-        if isinstance(sched_dep_iso, datetime):
-            _d = sched_dep_iso
-            if _d.tzinfo is None:                 # naiv = UTC (nie Lokalzeit)
-                _d = _d.replace(tzinfo=timezone.utc)
-            dep = _d.timestamp()
-        else:
-            dep = _parse_iso_utc(sched_dep_iso)
-        if seen is None or dep is None:
-            return True
-        return (dep - early_h * 3600.0) <= seen <= (dep + late_h * 3600.0)
-    except Exception:
-        return True
+    return est_time_same_instance(seen_ts, sched_dep_iso,
+                                  early_h=early_h, late_h=late_h)
 
 
 def gated_leg_status(status, *, now: Optional[float] = None,

@@ -1077,7 +1077,8 @@ def test_build_live_lookup_reg_normalisierung_e2e():
     from blueprints.crew_live_state import build_live_lookup
     seen = {}
 
-    def _fake_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35):
+    def _fake_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35,
+                  sched_dep_iso=None):
         import re as _re
         seen['reg_norm'] = _re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
         if seen['reg_norm'] == 'DABYN':

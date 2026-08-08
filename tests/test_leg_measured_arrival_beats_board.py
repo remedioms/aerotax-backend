@@ -25,11 +25,38 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 os.environ.setdefault('AEROTAX_ALLOW_BOOT_WITHOUT_KEY', '1')
 
 import app as A
 import blueprints.aerox_data_blueprint as ADB
+
+import _clock_freeze as CF
+
+
+# Die Sektor-Zeiten dieser Suite entstehen RELATIV zu „jetzt" (`base -
+# timedelta(hours=2)`), die eingespeisten Beobachtungen sind dagegen die
+# ABSOLUTEN Werte des Vorfalls (01.08.2026, 10:03/10:15 +02:00). Ohne
+# eingefrorene Uhr liegen beide Seiten Tage auseinander — eine Lage, die es in
+# Produktion nicht gibt (kein Board meldet eine Landung eine Woche neben dem
+# Plan). Seit dem Instanz-Riegel auf der Ankunfts-Seite (2026-08-09,
+# `app._gate_sector_est_arr`) faellt genau diese Inkonsistenz auf und die
+# Ist-Zeit wuerde als Fremd-Rotation verworfen. Darum die Uhr auf den
+# Vorfallstag: 10:00 UTC, damit UTC-, Berlin- und Prozess-Datum uebereinstimmen
+# (s. `_clock_freeze`-Docstring). Der geprüfte Pfad bleibt unveraendert.
+_VORFALL_UTC = datetime(2026, 8, 1, 10, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_am_vorfall(monkeypatch):
+    monkeypatch.setattr(CF, 'FROZEN_UTC', _VORFALL_UTC)
+    monkeypatch.setattr(CF, 'FROZEN_EPOCH', _VORFALL_UTC.timestamp())
+    monkeypatch.setattr(CF, 'FROZEN_DATE', _VORFALL_UTC.date())
+    CF.apply_frozen_clock(monkeypatch, app_module=A,
+                          extra_modules=(sys.modules[__name__],))
+    yield
 
 
 _MISSING = object()     # „Feld gibt es in diesen Fakten gar nicht" (Altbestand)

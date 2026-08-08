@@ -43272,42 +43272,60 @@ def _profile_homebase_cached(token):
     return hb or None
 
 
-# Übernacht-ARR-Physik-Marge (Tibor LH455-R4, 2026-07-16): liegt eine
-# facts-materialisierte est_arr mehr als so viele Stunden VOR der Leg-eigenen
-# Soll-Ankunft, gehört sie zu einer FREMDEN Tagesrotation (der datums-agnostische
-# ARR-Match griff die gestrige Ankunft) → verwerfen. 6 h deckt jeden realen
-# Delay/Frühankunft ab, ohne die ~24-h-Fremd-Rotation je durchzulassen.
-_OVERNIGHT_ARR_MARGIN_H = 6
+# INSTANZ-FENSTER — EINE QUELLE FÜR BEIDE SEITEN (2026-08-09).
+# Bis heute standen die Schwellen zweimal im Projekt: `_OVERNIGHT_ARR_MARGIN_H`
+# als nackte 6 für die Ankunfts-Seite und `DEP_*_MARGIN_H` im Gate-Modul für die
+# Abflug-Seite. Beide beantworten dieselbe Frage („gehört dieser Beleg zu DIESER
+# Tages-Instanz?") und müssen darum dieselben Zahlen benutzen. Begründung der
+# Werte steht am Definitionsort (blueprints/leg_status_gate.py).
+from blueprints.leg_status_gate import (            # noqa: E402  (Modul-Mitte)
+    INSTANCE_EARLY_MARGIN_H as _DEP_EARLY_MARGIN_H,
+    INSTANCE_LATE_MARGIN_H as _DEP_LATE_MARGIN_H,
+    est_time_same_instance as _est_time_same_instance,
+)
+# Historischer Name der ARR-Frühschranke (Tibor LH455-R4, 2026-07-16) — jetzt
+# nur noch ein Alias auf dieselbe Zahl, keine zweite Pflegestelle mehr.
+_OVERNIGHT_ARR_MARGIN_H = _DEP_EARLY_MARGIN_H
+_ARR_LATE_MARGIN_H = _DEP_LATE_MARGIN_H
+
+# Felder, die zur ARR-Seite EINER Beobachtung gehören. Wird eine Ist-Ankunft als
+# Fremd-Rotation verworfen, müssen sie ALLE mit weg — sonst stünde eine echte
+# Zahl neben einem fremden Messzeitpunkt.
+_ARR_SIDE_FACT_KEYS = ('est_arr', 'arr_delay_min', 'arr_status',
+                       'arr_gate', 'arr_terminal',
+                       'arr_obs_at', 'arr_esti_changed_at')
 
 
 def _gate_facts_arr_against_leg(facts, leg_arr_iso):
     """PUR: verwirft die ARR-Seite eines `_flight_facts_from_obs`-Ergebnisses,
-    wenn dessen `est_arr` physikalisch unmöglich weit VOR der Soll-Ankunft des
+    wenn dessen `est_arr` außerhalb des Instanz-Fensters um die Soll-Ankunft des
     Legs (`leg_arr_iso`) liegt — das ist die datums-agnostisch gematchte Ankunft
-    einer FREMDEN Tagesrotation (Tibor LH455-R4). Der Rest der Facts (dep-Seite,
-    reg) bleibt unangetastet. Gibt `facts` (evtl. mutiert) zurück. Wirft nie."""
+    einer FREMDEN Tagesrotation. Der Rest der Facts (dep-Seite, reg) bleibt
+    unangetastet. Gibt `facts` (evtl. mutiert) zurück. Wirft nie.
+
+    BEIDSEITIG seit 2026-08-09. Bis dahin gab es NUR die Frühschranke (Tibor
+    LH455-R4, 2026-07-16) — exakt die Asymmetrie, die auf der Abflug-Seite am
+    08.08. behoben wurde. Der 24-h-Nachbar tritt aber in BEIDE Richtungen auf.
+    PROD-BELEG (gelesen 2026-08-08T21:59Z): Leg LH755 BLR→FRA, Soll-Abflug
+    2026-08-04T21:30:00Z, Soll-Ankunft 2026-08-05T07:05:00Z. Sowohl
+    `_flight_obs_merged` als auch `_flight_facts_from_obs` lieferten
+    `est_arr = 2026-08-06T08:51:00+02:00` — die FRA#ARR-Zeile des 06.08. und
+    damit der Lauf des Folgetages, +23,8 h hinter der Soll-Ankunft. Die
+    Frühschranke sah davon nichts."""
     try:
         if not isinstance(facts, dict) or not leg_arr_iso:
             return facts
         _ea = facts.get('est_arr')
         if not _ea:
             return facts
-        _ea_dt = datetime.fromisoformat(str(_ea).replace('Z', '+00:00'))
-        _la_dt = datetime.fromisoformat(str(leg_arr_iso).replace('Z', '+00:00'))
-        if _ea_dt.tzinfo is None:
-            _ea_dt = _ea_dt.replace(tzinfo=timezone.utc)
-        if _la_dt.tzinfo is None:
-            _la_dt = _la_dt.replace(tzinfo=timezone.utc)
-        if _ea_dt < _la_dt - timedelta(hours=_OVERNIGHT_ARR_MARGIN_H):
+        if not _est_time_same_instance(_ea, leg_arr_iso):
             # Fremd-Rotations-Ankunft: arr-Seite verwerfen (dep/reg behalten).
             # Die Beobachtungs-Zeitstempel MÜSSEN mit weg: sie beschreiben die
             # eben verworfene Fremd-est_arr. Bliebe `arr_esti_changed_at`
             # stehen, würde er unten (ARR-Tag-Nachladen, Lücken-Merge) mit der
             # RICHTIGEN Ist-Ankunft gepaart — ein fremder Messzeitpunkt an
             # einem echten Wert.
-            for _k in ('est_arr', 'arr_delay_min', 'arr_status',
-                       'arr_gate', 'arr_terminal',
-                       'arr_obs_at', 'arr_esti_changed_at'):
+            for _k in _ARR_SIDE_FACT_KEYS:
                 facts[_k] = None
         return facts
     except Exception:
@@ -43320,13 +43338,8 @@ def _gate_facts_arr_against_leg(facts, leg_arr_iso):
 #   • später als +20 h ist keine Abflug-Schätzung mehr, sondern Umplanung.
 # Dazwischen bleibt jeder reale (auch sehr große) Delay unangetastet; die
 # 24-h-Nachbarn beider Richtungen fallen sicher heraus.
-# EINE QUELLE (2026-08-09): die Zahlen stehen seit dem Positions-Instanz-Riegel
-# (`leg_status_gate.live_pos_same_instance`, Fall LH712 FRA→ICN) genau einmal im
-# Projekt — sonst hätte dieselbe Regel drei verschiedene Schwellen.
-from blueprints.leg_status_gate import (            # noqa: E402  (Modul-Mitte)
-    DEP_EARLY_MARGIN_H as _DEP_EARLY_MARGIN_H,
-    DEP_LATE_MARGIN_H as _DEP_LATE_MARGIN_H,
-)
+# Die Zahlen kommen aus derselben EINEN Quelle wie die Ankunfts-Seite und der
+# Positions-Riegel (s. Import oben, `blueprints/leg_status_gate.py`).
 
 
 def _gate_facts_dep_against_leg(facts, leg_dep_iso):
@@ -43344,14 +43357,7 @@ def _gate_facts_dep_against_leg(facts, leg_dep_iso):
         _ed = facts.get('est_dep')
         if not _ed:
             return facts
-        _ed_dt = datetime.fromisoformat(str(_ed).replace('Z', '+00:00'))
-        _ld_dt = datetime.fromisoformat(str(leg_dep_iso).replace('Z', '+00:00'))
-        if _ed_dt.tzinfo is None:
-            _ed_dt = _ed_dt.replace(tzinfo=timezone.utc)
-        if _ld_dt.tzinfo is None:
-            _ld_dt = _ld_dt.replace(tzinfo=timezone.utc)
-        if (_ed_dt < _ld_dt - timedelta(hours=_DEP_EARLY_MARGIN_H)
-                or _ed_dt > _ld_dt + timedelta(hours=_DEP_LATE_MARGIN_H)):
+        if not _est_time_same_instance(_ed, leg_dep_iso):
             for _k in ('est_dep', 'dep_delay_min', 'dep_delay_known',
                        'dep_status'):
                 if _k in facts:
@@ -43359,6 +43365,49 @@ def _gate_facts_dep_against_leg(facts, leg_dep_iso):
         return facts
     except Exception:
         return facts
+
+
+def _gate_sector_est_arr(s):
+    """PUR (mutiert `s`): letzter Riegel VOR der Auslieferung — die fertige
+    Ist-Ankunft eines Sektors (`est_arr_iso`) muss im Instanz-Fenster um die
+    Soll-Ankunft des Legs (`arr_iso`) liegen.
+
+    WARUM ZUSÄTZLICH ZU `_gate_facts_arr_against_leg` (Sweep-Befund 2026-08-09):
+    das Facts-Gate sieht nur EINE der drei Quellen, aus denen `est_arr_iso`
+    entsteht. Zwei kamen ungeprüft durch:
+      1. der Live-/Board-Merge `m` → `_board_local_to_utc_iso(m['esti_arr'])`.
+         Er wird NIE gegen die Soll-Ankunft des Legs geprüft. PROD-BELEG
+         (gelesen 2026-08-08T21:59Z): LH755 BLR→FRA, Soll-Ankunft
+         2026-08-05T07:05:00Z, `m['esti_arr'] = 2026-08-06T08:51:00+0200`
+         (FRA#ARR-Zeile des 06.08.) = +23,8 h.
+      2. die FR24-Eskalation weiter unten schreibt ihre Landezeit in `_facts`
+         NACHDEM das Facts-Gate schon gelaufen ist. PROD-BELEG (FR24-Cache
+         `FN|LH499|2026-07-31`, geschrieben 2026-08-08T21:05:48Z):
+         `datetime_landed = 2026-07-31T13:00:02Z` an einem Leg mit
+         Soll-Ankunft 2026-08-01T13:15:00Z = −24,25 h.
+    Ein Riegel am Ausgang deckt alle drei Quellen ab, egal welche gewinnt.
+
+    Fällt die Zeit heraus, geht die GANZE Ankunfts-Seite mit (Zeit + Zahl +
+    Herkunfts-Flag): eine Verspätungs-Minute, die aus einer fremden Rotation
+    stammt, ist genauso falsch wie deren Uhrzeit. Fail-open ohne `arr_iso`
+    bzw. ohne `est_arr_iso`. Wirft nie; gibt True zurück, wenn der Wert bleibt."""
+    try:
+        if not isinstance(s, dict):
+            return True
+        _ea = s.get('est_arr_iso')
+        if not _ea or _est_time_same_instance(_ea, s.get('arr_iso')):
+            return True
+        s['est_arr_iso'] = None
+        s['arr_delay_min'] = None
+        s['arr_measured'] = False
+        s['arr_wrong_instance'] = True     # additiv, für Monitor/Forensik
+        if s.get('delay_side') == 'arr':
+            s['delay_min'] = None
+            s['delay_known'] = False
+            s['delay_side'] = None
+        return False
+    except Exception:
+        return True
 
 
 # Wie viele Minuten VOR der behaupteten Ankunft darf eine Beobachtung
@@ -43844,8 +43893,42 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
             # Leg geprüft, damit nie eine fremde Rotation angehängt wird.
             try:
                 from blueprints.aerox_data_blueprint import _fr24_flight_by_number
-                _f24 = _fr24_flight_by_number(op_fn, leg_date)
+                # WELCHER TAG GEHT AN FR24? (Sweep-Befund 2026-08-09, LH499
+                # MEX→FRA.) `_fr24_flight_by_number` setzt daraus ein
+                # `flight_datetime_from/to`-Fenster `<tag>T00:00:00Z…T23:59:59Z`
+                # — FR24 filtert darin nach der ECHTEN Abflugzeit in UTC.
+                # BELEG aus dem Prod-Cache (`ax_paid_call_cache`, gelesen
+                # 2026-08-08T22:0xZ): `FN|LH499|2026-07-31` → takeoff
+                # 2026-07-31T02:58:03Z, `FN|LH499|2026-08-01` → takeoff
+                # 2026-08-01T02:56:23Z; `FN|LH755|2026-08-04` → takeoff
+                # 2026-08-04T22:29:28Z. Drei Stichproben, alle im UTC-Tag des
+                # Schlüssels. `leg_date` ist seit dem Betriebstag-Fix
+                # (2026-08-08) dagegen der Kalendertag der ABFLUG-STATION —
+                # für MEX (UTC−6) und einen Abflug 2026-08-01T02:31Z ist das
+                # der 31.07. Genau so entstand der gemeldete Wert
+                # `est_arr = 2026-07-31T13:00:02Z` an einem Leg mit
+                # Soll-Ankunft 2026-08-01T13:15:00Z: FR24 lieferte
+                # pflichtgemäß den Lauf des Vortages.
+                # Die Station-Tag-Schlüsselung bleibt für Boards/LH richtig —
+                # NUR dieser eine Konsument rechnet in UTC und bekommt darum
+                # den UTC-Tag des Soll-Abflugs. Fehlt `dep_dt`, bleibt es beim
+                # bisherigen `leg_date` (nie raten).
+                _f24_day = leg_date
+                try:
+                    if dep_dt is not None:
+                        _f24_day = dep_dt.astimezone(timezone.utc).strftime('%Y-%m-%d')
+                except Exception:
+                    _f24_day = leg_date
+                _f24 = _fr24_flight_by_number(op_fn, _f24_day)
                 if (isinstance(_f24, dict) and _f24.get('sched_arr')
+                        # INSTANZ-RIEGEL: `flight-summary` liefert weder
+                        # `dep_iata` noch `arr_iata` (beide null im Prod-Cache)
+                        # — die Routen-Prüfung unten läuft dann LEER. Der
+                        # einzige belastbare Beleg ist die Zeit selbst: die
+                        # Landung muss im Instanz-Fenster um die Soll-Ankunft
+                        # des Legs liegen, sonst ist es eine fremde Rotation.
+                        and _est_time_same_instance(_f24.get('sched_arr'),
+                                                    s.get('arr_iso'))
                         and (not _f24.get('arr_iata') or _f24.get('arr_iata') == to)
                         and (not _f24.get('dep_iata') or _f24.get('dep_iata') == frm)):
                     _facts = dict(_facts or {})
@@ -43984,6 +44067,15 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 and not (_facts or {}).get('est_arr')):
             s['est_arr_iso'] = None
             s['arr_time_announced_only'] = True
+        # ── INSTANZ-RIEGEL AM AUSGANG (2026-08-09) ───────────────────────────
+        # Erst hier steht fest, WELCHE der drei Quellen (Merge `m`, persistente
+        # Facts, FR24-Eskalation) die Ist-Ankunft gestellt hat. Genau darum
+        # sitzt der Riegel hier und nicht an einer der Quellen: zwei von drei
+        # liefen bis heute komplett ungeprüft (s. `_gate_sector_est_arr`).
+        # Ein wirklich verspätetes Leg (bis +20 h) und eine echte
+        # Übernacht-Ankunft am Folgetag bleiben unangetastet — die Schranke
+        # misst gegen die Soll-Ankunft DIESES Legs, nicht gegen einen Kalendertag.
+        _gate_sector_est_arr(s)
         # IST ODER ERWARTET? (additiv — alte Builds ignorieren das Feld.)
         # Nur eine Ankunftszeit mit TERMINALEM Status ist eine Messung. Die App
         # darf ausschliesslich dafür „Ist" schreiben; steht hier False, ist der

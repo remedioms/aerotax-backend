@@ -7697,10 +7697,29 @@ def ax_flight_detail(query):
                 _al = _airline_row(_pfx) or {}
                 if _al.get('icao'):
                     _live_cs = _al['icao'] + _num.lstrip('0')
+        # INSTANZ-BINDUNG STATT NUR VERGANGENHEITS-SPERRE (2026-08-09):
+        # `_live_past` sperrt live NUR für Abfragen in die VERGANGENHEIT. Nach
+        # vorn stand das Tor offen — und genau dort sitzt der Fehler: bei einer
+        # täglich fliegenden Langstrecke ist die Maschine von HEUTE noch in der
+        # Luft, während `?date=morgen` das Leg von morgen zeigt. `aircraft_live`
+        # trägt kein Datum, der Snapshot matcht Flugnummer+Ziel exakt und klebt
+        # als „fliegt gerade" an einem Flug, der noch gar nicht gestartet ist
+        # (Fall LH712 FRA→ICN, 09.08.). Der Soll-Abflug liegt hier vor —
+        # `resolve_flight.sched_dep` ist ein Offset-behafteter ISO-String
+        # (Prod-Probe 2026-08-08T22:0xZ: `/api/ax/resolve-flight/LH712` →
+        # `2026-08-08T15:35:00+02:00`) — und wird durchgereicht. Fehlt er,
+        # bleibt es fail-open beim bisherigen Verhalten.
+        _live_sched_dep = None
+        try:
+            _live_sched_dep = (resolve_flight or {}).get('sched_dep') or None
+        except Exception:
+            _live_sched_dep = None
+
         def _live_call():
             return _aircraft_live_pos(
                 reg=(reg if dest else None), flight=fn_iata,
-                callsign=_live_cs, dep=dest)
+                callsign=_live_cs, dep=dest,
+                sched_dep_iso=_live_sched_dep)
         f_live = (None if _live_past else
                   ex.submit(_detail_executor_task, _live_call))
         if f_route is not None:

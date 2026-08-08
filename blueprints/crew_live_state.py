@@ -940,12 +940,26 @@ def resolve_crew_live_state(sectors, obs_lookup, live_lookup, now,
                     # der Store-Read normalisiert 'D-ABYN' → 'DABYN' selbst und
                     # kann so die Maschine per Reg finden, wenn der Welt-Harvester
                     # den Korridor noch nicht per Flugnummer erfasst hat.
+                    # SOLL-ABFLUG MITGEBEN (2026-08-09): `aircraft_live` trägt
+                    # KEIN Datum — ohne die Soll-Zeit kann der Snapshot der
+                    # GESTRIGEN Instanz derselben täglichen Nummer am Leg von
+                    # MORGEN kleben (Fall LH712 FRA→ICN). `leg['dep']` ist hier
+                    # immer eine aware-UTC-Zeit aus `_norm_legs` — die Evidenz
+                    # liegt also vor und muss nicht geraten werden.
+                    v = live_lookup(leg['flight'], leg['dep_ap'], leg['arr_ap'],
+                                    leg.get('tail'), leg.get('dep'))
+            except TypeError:
+                # Alt-Callsite/Test-Lookup mit kleinerer Signatur → absteigend
+                # zurückfallen (4-arg mit reg, dann 3-arg).
+                try:
                     v = live_lookup(leg['flight'], leg['dep_ap'], leg['arr_ap'],
                                     leg.get('tail'))
-            except TypeError:
-                # Alt-Callsite/Test-Lookup ohne reg-Parameter → 3-arg-Fallback.
-                try:
-                    v = live_lookup(leg['flight'], leg['dep_ap'], leg['arr_ap'])
+                except TypeError:
+                    try:
+                        v = live_lookup(leg['flight'], leg['dep_ap'],
+                                        leg['arr_ap'])
+                    except Exception:
+                        v = None
                 except Exception:
                     v = None
             except Exception:
@@ -1812,16 +1826,26 @@ def build_live_lookup():
     """live_lookup-Adapter um den GRATIS aircraft_live-Store (NAS-Harvester/
     FR24-gRPC → Supabase; reiner Read, kein Paid-Ping). Route-konsistent
     (dest == arr des Legs), on_ground-Nähe zu dep/arr via Referenz-DB. Wirft nie.
-    Signatur (flight_no, dep_iata, arr_iata, reg=None): der optionale Roster-Tail
+    Signatur (flight_no, dep_iata, arr_iata, reg=None, sched_dep_iso=None):
+    der optionale Roster-Tail
     (reg) speist den Reg-Match des Stores (Julien/Tibor 2026-07-16), der die
     Maschine auch über die bindestrich-lose Store-Reg findet, wenn der Harvester
     den Korridor noch nicht per Flugnummer erfasst hat. Alt-Callsites/Tests dürfen
-    3-argig aufrufen (der Resolver fängt den TypeError)."""
-    def _lookup(flight_no, dep_iata, arr_iata, reg=None):
+    3-argig aufrufen (der Resolver fängt den TypeError).
+
+    INSTANZ-BINDUNG (2026-08-09, fünftes Argument `sched_dep_iso`): `aircraft_live`
+    kennt KEIN Datum. Ein Snapshot der gestrigen Instanz derselben täglichen
+    Flugnummer matcht das Leg von morgen exakt (Fall LH712 FRA→ICN) und wurde von
+    der FlightState-Engine als `airborne` gedeutet. Dieser Adapter lief bis heute
+    ohne Soll-Zeit — sowohl im Store-Read als auch im gRPC-Nachschlag. Beide sind
+    jetzt an das Instanz-Fenster gebunden; OHNE `sched_dep_iso` bleibt alles exakt
+    wie bisher (fail-open)."""
+    def _lookup(flight_no, dep_iata, arr_iata, reg=None, sched_dep_iso=None):
         try:
             from blueprints.aerox_data_blueprint import (_aircraft_live_pos,
                                                          _free_crew_live_pos,
                                                          _iata_latlon)
+            from blueprints.leg_status_gate import live_pos_same_instance
         except Exception:
             return None
         try:
@@ -1830,8 +1854,9 @@ def build_live_lookup():
             # zurück, wenn der Welt-Harvester den Korridor per Flugnummer noch
             # nicht erfasst hat. Der Store normalisiert 'D-ABYN' → 'DABYN' intern
             # (re.sub[^A-Z0-9]) und findet so die bindestrich-lose Store-Row.
-            pos, _rt, live_reg, _ty = _aircraft_live_pos(reg=reg, flight=flight_no,
-                                                         dep=arr_iata)
+            pos, _rt, live_reg, _ty = _aircraft_live_pos(
+                reg=reg, flight=flight_no, dep=arr_iata,
+                sched_dep_iso=sched_dep_iso)
             reg = live_reg or reg
             if not pos:
                 # Der Welt-Harvester ist Round-robin und kann genau diesen
@@ -1840,7 +1865,15 @@ def build_live_lookup():
                 # liefert er höchstens den echten, zeitgestempelten LKG-Fix.
                 pos, _rt, _free_reg, _ty = _free_crew_live_pos(
                     flight_no, dep_iata, arr_iata)
-                reg = _free_reg or reg
+                # Derselbe Instanz-Riegel: auch dieser Fill keyt NUR über
+                # Flugnummer/Route, kennt also kein Datum, und liefert im
+                # Zweifel den LKG-Fix der Vor-Instanz mit echter (alter)
+                # `seen_ts`. Ohne Soll-Zeit fail-open wie gehabt.
+                if pos and not live_pos_same_instance(pos.get('seen_ts'),
+                                                      sched_dep_iso):
+                    pos = None
+                else:
+                    reg = _free_reg or reg
             if not pos or pos.get('lat') is None or pos.get('lon') is None:
                 return None
             out = {'lat': float(pos['lat']), 'lon': float(pos['lon']),
