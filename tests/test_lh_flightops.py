@@ -273,7 +273,8 @@ def test_client_methods_build_correct_paths(monkeypatch):
     calls = []
     monkeypatch.setattr(fo, '_api_get',
                         lambda tok, path, params=None, interactive=False,
-                        status_out=None: calls.append((path, params)) or {})
+                        status_out=None, priority=False:
+                        calls.append((path, params)) or {})
     fo.crew_list('T', 'LH400', '2016-10-01', 'FRA', 'JFK', 'AC1')
     fo.crew_rotation('T', '12345')
     fo.landing_report('T', 'LH400', '2016-10-01', 'FRA')
@@ -358,14 +359,20 @@ def test_parse_crew_hotel_real():
 
 def test_service_get_rejects_bad_service(monkeypatch):
     monkeypatch.setattr(fo, '_api_get',
-                        lambda tok, path, params=None, interactive=False:
-                        {'called': path, 'interactive': interactive})
+                        lambda tok, path, params=None, interactive=False,
+                        status_out=None, priority=False:
+                        {'called': path, 'interactive': interactive,
+                         'priority': priority})
     assert fo.service_get('T', 'DROP TABLE') is None
     assert fo.service_get('T', 'common_crewlist') == {
-        'called': '/COMMON_CREWLIST', 'interactive': False}
+        'called': '/COMMON_CREWLIST', 'interactive': False, 'priority': False}
     # Nutzer-Taps dürfen den reservierten Headroom nutzen (2026-07-29).
     assert fo.service_get('T', 'common_crewlist',
                           interactive=True)['interactive'] is True
+    # Dritte Stufe (09.08.): kein Nutzer-Tap, aber eigenes Band — muss bis ins
+    # Gate durchreichen, sonst stirbt der Call wieder am Hintergrund-Deckel.
+    assert fo.service_get('T', 'common_check_in_times',
+                          priority=True)['priority'] is True
 
 
 def test_ping_endpoint(monkeypatch):

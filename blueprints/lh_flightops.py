@@ -1082,6 +1082,30 @@ _LHFO_DAY_BACKGROUND_CEILING = 5000
 # prüfen, wenn drei Folgetage unter 5000 liegen.
 _LHFO_DAY_INTERACTIVE_CEILING = 5900
 
+# ── DRITTE STUFE: PRIORISIERTER HINTERGRUND (Owner-Befund 09.08.2026) ────────
+# MESSUNG, die diese Stufe ausgelöst hat: der Hintergrund-Deckel (5.000) wird
+# an JEDEM Tag gerissen — 05.08.=5.633, 06.08.=5.494, 07.08.=5.576,
+# 08.08.=5.465. Folge: `/COMMON_CHECK_IN_TIMES` (Briefing-Raum, Security,
+# Crewbus, Boarding) ist ein reiner Hintergrund-Call und stirbt damit an den
+# meisten Tagen, bevor das 6-h-Fenster eines Diensttags überhaupt aufgeht.
+# Der Owner sah es an seinem eigenen Dienst (06.08., FRA→SIN): alle vier
+# Marken leer, Grant ok, Flugnummer da, Fenster offen — abgewiesen wurde erst
+# das Budget-Gate. Das Feature war gebaut, deployt und lief faktisch nie.
+#
+# WARUM NICHT `interactive=True`: der Call hängt an keinem Nutzer-Tap. Er
+# würde den Headroom fressen, der Connect-Erstimport und „Jetzt
+# aktualisieren" am Leben hält — genau die sind am 29.07. abends fleet-weit
+# gestorben, als der Deckel riss. Deshalb eine eigene Stufe DAZWISCHEN.
+#
+# WARUM NUR 5.600: 300 Calls über dem Hintergrund-Deckel, 300 unter dem
+# interaktiven. Das Band ist exakt so breit wie der eigene Tagestopf dieses
+# Verbrauchers (`_DM_DAY_CEILING`) — er kann es also im schlimmsten Fall
+# vollständig ausschöpfen und trotzdem keinen interaktiven Call verdrängen.
+# Zwei Bremsen, nicht eine: die Stufe hier schützt die interaktiven Flows,
+# der Topf unten schützt sie voreinander.
+_LHFO_HOUR_PRIORITY_CEILING = 800
+_LHFO_DAY_PRIORITY_CEILING = 5600
+
 # Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
 # Supabase, der Tagesstand ändert sich träge — 120 s reichen für einen
 # Deckel, der erst ab ~87% des Kontingents greift.
@@ -1104,7 +1128,8 @@ def _lhfo_day_used():
     return used
 
 
-def _api_get(user_token, path, params=None, interactive=False, status_out=None):
+def _api_get(user_token, path, params=None, interactive=False, status_out=None,
+             priority=False):
     """LH-Call mit Budget-Gate. Return: Response-Dict oder None.
 
     `status_out` (optionales dict, additiv 2026-07-31): der Aufrufer bekommt
@@ -1126,22 +1151,26 @@ def _api_get(user_token, path, params=None, interactive=False, status_out=None):
     if not access:
         _note('no_access')
         return None
+    # Drei Stufen statt zwei: interaktiv > priorisiert > Hintergrund.
+    # `interactive` gewinnt, falls ein Aufrufer beides setzt.
+    _tier = ('interaktiver' if interactive
+             else 'priorisierter' if priority else 'Hintergrund')
     _used = _rot_hour_used()
     _ceiling = (_LHFO_HOUR_INTERACTIVE_CEILING if interactive
+                else _LHFO_HOUR_PRIORITY_CEILING if priority
                 else _LHFO_HOUR_BACKGROUND_CEILING)
     if _used >= _ceiling:
         log.warning('[lh_flightops] lhfo-Stundenbudget %s >= %s — %s-Call %s '
-                    'übersprungen', _used, _ceiling,
-                    'interaktiver' if interactive else 'Hintergrund', path)
+                    'übersprungen', _used, _ceiling, _tier, path)
         _note('hour_budget')
         return None
     _dused = _lhfo_day_used()
     _dceiling = (_LHFO_DAY_INTERACTIVE_CEILING if interactive
+                 else _LHFO_DAY_PRIORITY_CEILING if priority
                  else _LHFO_DAY_BACKGROUND_CEILING)
     if _dused >= _dceiling:
         log.warning('[lh_flightops] lhfo-Tagesbudget %s >= %s — %s-Call %s '
-                    'übersprungen', _dused, _dceiling,
-                    'interaktiver' if interactive else 'Hintergrund', path)
+                    'übersprungen', _dused, _dceiling, _tier, path)
         _note('day_budget')
         return None
     _flightops_budget_inc(path)
@@ -1503,7 +1532,7 @@ def parse_crew_hotel(resp):
 
 def check_in_times(user_token, flight, date, dep, arr,
                    duty_type='OD', crew_category='COC', interactive=False,
-                   **extra):
+                   priority=False, status_out=None, **extra):
     """COMMON_CHECK_IN_TIMES — Briefing-/Check-in-Zeiten je FLUG (→ Pickup/
     Report). Doku-bestätigte Parameter (Owner 2026-07-22): flightDesignator,
     flightDate, departureAirport, arrivalAirport, dutyType (OD/DH),
@@ -1536,8 +1565,11 @@ def check_in_times(user_token, flight, date, dep, arr,
     # `interactive` ist ein EIGENER Keyword-Parameter (NICHT in **extra): sonst
     # landete er als Query-Param bei LH. Bedeutung wie überall — Nutzer-Tap
     # bekommt den reservierten Headroom im Key-Gate (s. _api_get).
+    # `priority`/`status_out` stehen aus DEMSELBEN Grund explizit hier: über
+    # **extra würden sie als Query-Parameter bei LH landen (409-Klasse).
     return _api_get(user_token, '/COMMON_CHECK_IN_TIMES', params,
-                    interactive=interactive)
+                    interactive=interactive, priority=priority,
+                    status_out=status_out)
 
 
 def airport_weather(user_token, station, **extra):
@@ -1558,19 +1590,25 @@ def simulator_crewlist(user_token, interactive=False, **params):
                     interactive=interactive)
 
 
-def service_get(user_token, service, params=None, interactive=False):
+def service_get(user_token, service, params=None, interactive=False,
+                priority=False, status_out=None):
     """Generischer Service-Call (für Diagnose/Verdrahtung). `service` ist der
     COMMON_*-Name. Nur echte Services zulassen.
 
     `interactive=True` nur setzen, wenn der Aufruf wirklich an einem Nutzer-Tap
     hängt (z.B. Check-in-Zeiten) — sonst frisst Hintergrundarbeit den
-    reservierten Headroom (s. _api_get)."""
+    reservierten Headroom (s. _api_get).
+
+    `priority=True` ist die Stufe DAZWISCHEN: kein Nutzer-Tap, aber ein Call,
+    der ohne eigenes Band an den meisten Tagen gar nicht mehr stattfindet
+    (s. `_LHFO_DAY_PRIORITY_CEILING`). Nur mit eigenem Tagestopf benutzen."""
     s = (service or '').strip().upper()
     if not s.startswith('COMMON_') or not re.fullmatch(r'COMMON_[A-Z_]+', s):
         return None
     return _api_get(user_token, '/' + s,
                     params if isinstance(params, dict) else {},
-                    interactive=interactive)
+                    interactive=interactive, priority=priority,
+                    status_out=status_out)
 
 
 # Das einzige Fenster, für das der MOCK Daten hat (dokumentiertes Beispiel).
@@ -3971,27 +4009,186 @@ def duty_marks_from_times(times):
 
 
 def _boarding_fetch(user_token, flight, date, dep, arr):
-    """EIN COMMON_CHECK_IN_TIMES-Call im HINTERGRUND-Budget → Cache.
+    """EIN COMMON_CHECK_IN_TIMES-Call im PRIORISIERTEN Budget → Cache.
     Wirft nie. Läuft ausschliesslich im Daemon-Thread. Aus DERSELBEN Antwort
     fallen seit Welle 2 alle Marken (`duty_marks_from_times`) — ein Call, ein
-    Cache-Eintrag, mehrere Felder."""
+    Cache-Eintrag, mehrere Felder.
+
+    NEGATIV-CACHE NUR NACH EINER ECHTEN ANTWORT (Owner-Befund 09.08.2026):
+    Ein leeres Ergebnis wird 3 h lang festgeschrieben (`_BOARDING_MISS_TTL_S`)
+    — das ist richtig, wenn LH nichts hat, und falsch, wenn wir gar nicht
+    gefragt haben. Wurde der Call am Budget-Gate abgewiesen, bliebe die halbe
+    Restlaufzeit des 6-h-Fensters tot, obwohl das Band Minuten später wieder
+    offen sein kann. Deshalb: Budget-Block schreibt NICHTS in den Cache, der
+    nächste Roster-Poll fragt erneut."""
     key = _boarding_key(user_token, flight, date, dep)
     marks = {}
+    blocked = False
     try:
+        # EIGENER TOPF ZUERST (s. `_DM_DAY_CEILING`). Ist er leer, gar nicht
+        # erst fragen — sonst nimmt dieser Verbraucher den anderen das Band
+        # weg, das die Prioritäts-Stufe für ihn geöffnet hat.
+        if _dm_day_used() >= _DM_DAY_CEILING:
+            log.warning('[lh_flightops] marks-Tagesdeckel %s >= %s — '
+                        'Dienst-Marken übersprungen (%s %s)',
+                        _dm_day_used(), _DM_DAY_CEILING, flight, date)
+            blocked = True
+            return marks
         p = _resolve_link_params(user_token, 'checkintimes', flight, date,
                                  dep, arr)
+        # GETEILTER FLUG-CACHE VOR DEM CALL. Die Kategorie kommt aus den
+        # Link-Params (die tragen dutyType/crewCategory korrekt); ohne sie
+        # wird NICHT geteilt, s. `_marks_shared_key`.
+        cat = (p or {}).get('crewCategory') if isinstance(p, dict) else None
+        skey = _marks_shared_key(flight, date, dep, cat)
+        shared_hit, shared_marks = _marks_shared_get(skey)
+        if shared_hit:
+            # Ein Kollege desselben Fluges hat die Antwort schon geholt —
+            # kein zweiter LH-Call fuer dieselben Fakten.
+            marks = shared_marks
+            return marks
+        st = {}
         if p:
-            resp = service_get(user_token, 'COMMON_CHECK_IN_TIMES', p)
+            resp = service_get(user_token, 'COMMON_CHECK_IN_TIMES', p,
+                               priority=True, status_out=st)
         else:
-            resp = check_in_times(user_token, flight, date, dep, arr)
+            resp = check_in_times(user_token, flight, date, dep, arr,
+                                  priority=True, status_out=st)
+        kind = st.get('kind')
+        # Nur GESENDETE Calls buchen — exakt wie `_lb_budget_book` es macht:
+        # ein am Gate abgewiesener Call hat LH nie erreicht und darf den
+        # eigenen Topf nicht leeren.
+        if kind in ('hour_budget', 'day_budget'):
+            blocked = True
+            return marks
+        if kind != 'no_access':
+            _dm_budget_book()
         marks = duty_marks_from_times(parse_check_in_times(resp))
+        # Nur eine ECHTE Antwort teilen. Ein `no_access`-Leerergebnis ist eine
+        # Eigenschaft DIESES Users, keine des Fluges — es darf den Kollegen
+        # nicht als Negativ-Treffer im Weg stehen.
+        if kind != 'no_access':
+            _marks_shared_put(skey, marks)
     except Exception as e:
         log.warning('[lh_flightops] boarding_fetch: %s', type(e).__name__)
     finally:
-        _boarding_cache_put(key, marks)
+        if not blocked:
+            _boarding_cache_put(key, marks)
         with _BOARDING_LOCK:
             _BOARDING_INFLIGHT.discard(key)
     return marks
+
+
+# ── EIGENER TAGESTOPF DER DIENST-MARKEN (Muster: `lhfoD-landing:`) ──────────
+# Der Prioritäts-Deckel oben schützt die interaktiven Flows VOR diesem
+# Verbraucher. Dieser Topf hier schützt die anderen HINTERGRUND-Verbraucher
+# vor ihm: ohne ihn könnte ein Fehler in der Fenster-Logik (oder ein Roster
+# mit vielen Sektoren) das 300er-Band in einem Rutsch leerlaufen lassen.
+#
+# WARUM 300 REICHT: es ist genau EIN Call pro Nutzer und Diensttag —
+# `boarding_candidate_index` wählt einen einzigen Sektor, `_BOARDING_INFLIGHT`
+# verhindert Parallelläufe desselben Schlüssels, und der Cache trägt das
+# Ergebnis durch das Fenster. Zum Vergleich: der Landing-Report kommt mit 400
+# aus und verbrauchte gestern 97.
+_DM_BUDGET_PREFIX = 'lhfoD-marks:'
+_DM_DAY_CEILING = 300
+
+# ── GETEILTER FLUG-CACHE DER MARKEN (Owner-Auftrag 09.08.: „smart bleiben") ──
+# Briefing-Raum, Security, Crewbus und Boarding sind FLUG-Fakten, keine
+# persönlichen Werte — auf einem Langstreckenflug fragen sonst ~20 Crew
+# dieselbe Antwort einzeln ab. Bei 1.603 Grants ist das der grösste Hebel,
+# den es ohne jeden Qualitätsverlust gibt: gleiche Daten, ein Call.
+#
+# ⚠️ DIE GRENZE, DIE HIER ZÄHLT: Cockpit und Kabine können VERSCHIEDENE
+# Briefing-Räume haben. Der Schlüssel trägt deshalb die `crewCategory`
+# (COC/CAB), die die Duty-Events-Link-Params schon korrekt mitbringen. Ein
+# geteilter Eintrag ohne diese Trennung schickte die Kabine in den Raum der
+# Piloten — ein falscher Raum ist schlimmer als gar keiner
+# (Keine-Fake-Werte-Regel). Kategorie unbekannt ⇒ eigener Abruf, kein Teilen.
+#
+# KEIN LECK: gelesen wird ausschliesslich für Sektoren, die im EIGENEN Roster
+# des Users stehen (`enrich_sectors_boarding` läuft auf dessen eigenen Legs).
+# Geteilt werden nur die vier Marken-Felder, nichts Personenbezogenes —
+# dasselbe Prinzip wie die Whitelist des Landing-Report-Caches.
+_MARKS_SHARED = {}                       # (flight,date,dep,cat) -> (ts, marks)
+_MARKS_SHARED_MAX = 2000
+
+
+def _marks_shared_key(flight, date, dep, cat):
+    c = (cat or '').strip().upper()
+    if not c:
+        return None                      # unbekannte Kategorie ⇒ nicht teilen
+    return '|'.join([(flight or '').upper().replace(' ', ''),
+                     (date or '')[:10], (dep or '').upper(), c])
+
+
+def _marks_shared_get(key, now=None):
+    """(hit, marks) aus dem geteilten Flug-Cache. Gleiche TTL-Semantik wie der
+    Nutzer-Cache: gefundene Marken 6 h, Negativ-Treffer 3 h."""
+    if not key:
+        return False, {}
+    now = now if now is not None else time.time()
+    with _BOARDING_LOCK:
+        e = _MARKS_SHARED.get(key)
+    if not e:
+        return False, {}
+    ts, payload = e
+    marks = _boarding_marks_normalize(payload)
+    ttl = _BOARDING_HIT_TTL_S if marks else _BOARDING_MISS_TTL_S
+    if (now - ts) > ttl:
+        return False, {}
+    return True, marks
+
+
+def _marks_shared_put(key, marks, now=None):
+    if not key:
+        return
+    now = now if now is not None else time.time()
+    with _BOARDING_LOCK:
+        _MARKS_SHARED[key] = (now, _boarding_marks_normalize(marks))
+        if len(_MARKS_SHARED) > _MARKS_SHARED_MAX:
+            for k in sorted(_MARKS_SHARED,
+                            key=lambda k: _MARKS_SHARED[k][0])[:200]:
+                _MARKS_SHARED.pop(k, None)
+_dm_day_memo = {'ts': 0.0, 'day': '', 'used': 0}
+_DM_DAY_MEMO_S = 60.0
+_dm_day_local = {'day': '', 'n': 0}      # in DIESEM Prozess gebuchte Calls
+
+
+def _dm_budget_key(now=None):
+    return _DM_BUDGET_PREFIX + time.strftime('%Y%m%d', time.gmtime(now))
+
+
+def _dm_day_used(now=None):
+    """Tagesstand des EIGENEN Marken-Zählers (max aus persistiertem Stand und
+    dem, was dieser Prozess seit dem letzten Flush gebucht hat — der Flusher
+    schreibt träge, ein Schub darf den Deckel nicht überrennen). Wirft nie."""
+    day = time.strftime('%Y%m%d', time.gmtime(now))
+    if _dm_day_local['day'] != day:
+        _dm_day_local['day'], _dm_day_local['n'] = day, 0
+    ts = time.time()
+    if _dm_day_memo['day'] != day or (ts - _dm_day_memo['ts']) >= _DM_DAY_MEMO_S:
+        try:
+            from blueprints.aerox_data_blueprint import _budget_key_used
+            used = int(_budget_key_used(_dm_budget_key(now)) or 0)
+        except Exception:
+            used = 0
+        _dm_day_memo['ts'], _dm_day_memo['day'] = ts, day
+        _dm_day_memo['used'] = used
+    return max(_dm_day_memo['used'], _dm_day_local['n'])
+
+
+def _dm_budget_book(now=None):
+    """Einen Marken-Call im Tageszähler buchen. Wirft nie."""
+    day = time.strftime('%Y%m%d', time.gmtime(now))
+    if _dm_day_local['day'] != day:
+        _dm_day_local['day'], _dm_day_local['n'] = day, 0
+    _dm_day_local['n'] += 1
+    try:
+        from blueprints.lh_open_api import budget_inc_key
+        budget_inc_key(_dm_budget_key(now))
+    except Exception:
+        pass
 
 
 def _boarding_warm_async(user_token, flight, date, dep, arr):

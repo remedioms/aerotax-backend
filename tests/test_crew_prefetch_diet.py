@@ -126,7 +126,11 @@ def test_leer_marker_gilt_nur_fuer_den_prefetch(monkeypatch):
 def _capture_api_get(monkeypatch, ret):
     seen = []
 
-    def _fake(tok, path, params=None, interactive=False):
+    # Signatur spiegelt die ECHTE (inkl. `priority`/`status_out` seit der
+    # dritten Budget-Stufe 09.08.) — ein veralteter Mock wäre ein Test-Infra-
+    # Bug und würde hier als Produkt-Fehler missverstanden.
+    def _fake(tok, path, params=None, interactive=False, status_out=None,
+              priority=False):
         seen.append((path, interactive))
         return ret
     monkeypatch.setattr(fo, '_api_get', _fake)
@@ -155,7 +159,8 @@ def test_checkin_ohne_link_cache_ebenfalls_interaktiv(monkeypatch):
     Query-Param bei LH landen (check_in_times hat **extra)."""
     seen = []
 
-    def _fake(tok, path, params=None, interactive=False):
+    def _fake(tok, path, params=None, interactive=False, status_out=None,
+              priority=False):
         seen.append((path, interactive, dict(params or {})))
         return {'x': 1}
     monkeypatch.setattr(fo, '_api_get', _fake)
