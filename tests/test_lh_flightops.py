@@ -3400,6 +3400,117 @@ def test_crewlist_force_bypasses_shared_cache(monkeypatch):
     assert d['crew'][0]['name'] == 'LIVE, LARS'
 
 
+# ── `flight_date`: welchem Tag gehört die gelieferte Liste? (2026-08-09) ────
+# Beide Cache-Pfade lesen mit ±1-Tag-Toleranz und durften bis heute stumm die
+# Besetzung des NACHBARTAGS ausliefern. Der Client schrieb sie als Historie
+# DIESES Legs fest und löschte dabei die echte Crew des Tages. Gemessen an der
+# kompletten Prod-Tabelle (09.08. 02:30 UTC, 6.484 Zeilen): von 1.218
+# Nachbartags-Paaren derselben Flugnummer hatten nur 5 dieselbe Crew.
+# Die Antwort NENNT das bediente Datum jetzt — additiv, kein Feld entfernt.
+
+def test_crewlist_names_neighbour_day_in_flight_date(monkeypatch):
+    """DER Befund: nur der Nachbartag liegt im Cache. Die Liste wird weiter
+    ausgeliefert (die Fläche bleibt gefüllt), aber `flight_date` sagt ehrlich,
+    dass sie zum 23. gehört — der Client schreibt sie damit nicht als Historie
+    des 24. fest."""
+    import time as _t
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-23',
+         'crew': [{'name': 'FREMDTAG, FRIDA'}], 'cached_at': _t.time() - 60}])
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('Nachbartags-Zeile bedient ⇒ kein LH-Call')))
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {})
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': '2026-07-24'}).get_json()
+    assert d['ok'] is True and d['cached'] is True
+    assert d['crew'][0]['name'] == 'FREMDTAG, FRIDA'
+    assert d['flight_date'] == '2026-07-23'          # NICHT das angefragte
+
+
+def test_crewlist_exact_day_reports_requested_flight_date(monkeypatch):
+    """Gegenprobe: liegt der exakte Tag im Cache, meldet `flight_date` genau
+    ihn — der Client darf die Historie festschreiben."""
+    import time as _t
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-23',
+         'crew': [{'name': 'FREMDTAG, FRIDA'}], 'cached_at': _t.time() - 60},
+        {'token': 'AT-KOLLEGE', 'flight': 'LH400', 'flight_date': '2026-07-24',
+         'crew': [{'name': 'ECHT, ERIK'}], 'cached_at': _t.time() - 60}])
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {})
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': '2026-07-24'}).get_json()
+    assert d['crew'][0]['name'] == 'ECHT, ERIK'
+    assert d['flight_date'] == '2026-07-24'
+
+
+def test_crewlist_live_path_reports_requested_flight_date(monkeypatch):
+    """Live-Pfad: LH wird mit GENAU diesem Datum gefragt und `_links_find`
+    vergleicht das Flugdatum exakt — `flight_date` ist per Konstruktion das
+    angefragte Datum."""
+    _shared_setup(monkeypatch, [])
+    monkeypatch.setattr(fo, '_resolve_link_params', lambda *a, **k: {
+        'accessCode': 'S', 'departureAirport': 'FRA', 'arrivalAirport': 'JFK'})
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: {'crewMembers': []})
+    monkeypatch.setattr(fo, 'parse_crew_list', lambda resp: [{'name': 'LIVE, LARS'}])
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {})
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': '2026-07-24'}).get_json()
+    assert d['crew'][0]['name'] == 'LIVE, LARS'
+    assert d['flight_date'] == '2026-07-24' and 'cached' not in d
+
+
+def test_crewlist_own_cache_fallback_names_served_day(monkeypatch):
+    """Auch der EIGEN-Cache-Fallback (toter Grant ⇒ Last-Good statt 401)
+    nennt das bediente Datum."""
+    import app as backend
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_KEY', 'k')
+    monkeypatch.setattr(fo, '_SECRET', 's')
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('dead', None))
+    monkeypatch.setattr(fo, '_crew_cache_get', lambda tok, f, d: {
+        'flight': f, 'date': '2026-07-25', 'crew': [{'name': 'ALT, ANNA'}],
+        'cached_at': 1.0})
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {})
+    r = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': '2026-07-24'})
+    d = r.get_json()
+    assert r.status_code == 200 and d['cached'] is True
+    assert d['crew'][0]['name'] == 'ALT, ANNA'
+    assert d['flight_date'] == '2026-07-25'
+
+
+def test_crewlist_rollover_fallback_still_serves(monkeypatch):
+    """ZWECK DES FALLBACKS BLEIBT: der Red-Eye-Rollover (Roster-Datum LT vs.
+    LH-Flugdatum Z) wird weiterhin bedient — die Fläche bleibt gefüllt, es
+    gibt weiterhin KEINEN zusätzlichen LH-Call. Geändert hat sich nur, dass
+    die Antwort das gelieferte Datum NENNT."""
+    import time as _t
+    _shared_setup(monkeypatch, [
+        {'token': 'AT-ICH', 'flight': 'LH400', 'flight_date': '2026-07-25',
+         'crew': [{'name': 'REDEYE, RITA'}], 'cached_at': _t.time() - 60}])
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('Rollover-Fallback muss den LH-Call weiter sparen')))
+    monkeypatch.setattr(fo, '_match_aerox_profiles', lambda members, **_kw: {})
+    import app as backend
+    d = backend.app.test_client().post(
+        '/api/lh/flightops/crewlist/AT-ICH',
+        headers={'Authorization': 'Bearer AT-ICH'},
+        json={'flight': 'LH400', 'date': '2026-07-24'}).get_json()
+    assert d['ok'] is True and d['crew'][0]['name'] == 'REDEYE, RITA'
+    assert d['flight_date'] == '2026-07-25'
+
+
 def test_crewlist_solo_paths_unchanged_without_table(monkeypatch):
     """REGRESSION: ohne Cache-Tabelle (SB weg / Migration fehlt) verhält sich
     der Endpoint exakt wie vorher — toter Grant + kein Cache = 401."""

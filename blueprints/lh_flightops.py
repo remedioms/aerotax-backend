@@ -5143,8 +5143,24 @@ def _crew_shared_serve(token, flight, date, dep=None, arr=None, now=None):
         if shared:
             log.info('[lh_flightops] crewlist %s/%s aus GETEILTEM Cache '
                      '(kein LH-Call)', flight, str(date or '')[:10])
+        served = str(best.get('flight_date') or '')[:10]
+        if served and served != str(date or '')[:10]:
+            # NACHBARTAG bedient (±1-Slack). Auf WARNING, nicht INFO: bis
+            # 2026-08-09 nannte die Antwort das bediente Datum NICHT, der
+            # Client schrieb sie als Historie DIESES Legs fest und
+            # `replacingCrew` löschte dabei die echte Besetzung des Tages.
+            # Messung 2026-08-09 (02:30 UTC, ganze `flightops_crew_cache`,
+            # 6.484 Zeilen): von 1.218 Nachbartags-Paaren derselben Flugnummer
+            # hatten nur 5 (0,4 %) dieselbe Crew, Median-Namensüberlappung
+            # 0,000 — die Nachbartags-Liste ist praktisch IMMER eine fremde
+            # Besetzung. Diese Zeile macht die Trefferquote ab jetzt messbar.
+            log.warning('[lh_flightops] crewlist %s: Nachbartag bedient '
+                        '(angefragt %s, geliefert %s) — Client entscheidet '
+                        'per flight_date', flight, str(date or '')[:10], served)
         return jsonify({'ok': True, 'crew': crew, 'cached': True,
-                        'shared': shared, 'cached_at': best.get('cached_at')})
+                        'shared': shared, 'cached_at': best.get('cached_at'),
+                        # ADDITIV seit 2026-08-09 — siehe Banner am Endpoint.
+                        'flight_date': served or str(date or '')[:10]})
     except Exception as e:
         log.warning('[lh_flightops] shared_serve: %s', type(e).__name__)
         return None
@@ -5477,6 +5493,30 @@ def flightops_crewlist(token):
     TTL-Staffel siehe Banner über _crew_shared_serve; `force:true` im Body
     erzwingt den Live-Abruf.
 
+    `flight_date` — ADDITIVES ANTWORT-FELD SEIT 2026-08-09 (Pflicht-Lektüre):
+    beide Cache-Pfade lesen mit `_CREW_CACHE_DATE_SLACK = (0, -1, 1)`, dürfen
+    also die Zeile des NACHBARTAGS ausliefern (gedacht als Rollover-Hilfe für
+    Red-Eyes, wo Roster-Datum (LT) und LH-Flugdatum (Z) auseinanderfallen).
+    Bis heute NANNTE die Antwort das bediente Datum nicht — der Client konnte
+    eine Fremdtags-Besetzung nicht erkennen, schrieb sie als Crew-Historie
+    DIESES Legs fest, und `CrewLogbookStore.replacingCrew` löschte dabei die
+    echten Kolleginnen und Kollegen des Tages.
+    Gemessen 2026-08-09 02:30 UTC über die komplette `flightops_crew_cache`
+    (6.484 Zeilen · 5.797 (Flug,Datum) · 1.191 Flugnummern · 2026-05-08 bis
+    2026-09-04): 1.218 Nachbartags-Paare derselben Flugnummer, davon nur 5
+    (0,4 %) mit identischer Crew; Median-Namensüberlappung 0,000; 1.169 Paare
+    ohne EINEN gemeinsamen Namen. In den Datums-Spannen der Flugnummern gibt
+    es 5.919 Kalendertage ohne eigene Zeile, aber MIT Nachbar-Zeile — genau
+    die Fälle, in denen der Fallback greift. Also Alltag, kein Randfall.
+    `flight_date` nennt deshalb das Datum, zu dem die gelieferte Liste
+    WIRKLICH gehört. Es wird auf JEDEM ok-Pfad gesetzt (live, leer, eigener
+    Cache, geteilter Cache). Der Fallback selbst bleibt unangetastet — er
+    füllt weiter die Fläche; nur der Client entscheidet jetzt anhand des
+    Feldes, ob er die Liste auch als Historie festschreiben darf.
+    RÜCKWÄRTSKOMPATIBEL: rein additiv, kein Feld entfernt, kein Typ geändert.
+    Alte Clients dekodieren `{ok, crew}` unverändert; neue Clients behandeln
+    ein FEHLENDES `flight_date` (altes Backend) wie „Datum stimmt".
+
     STATUS-CODES (die App unterscheidet sie, siehe FlightCrewSheet):
       401 not_connected          — Grant tot/nie da ⇒ App bietet „Mit
                                    Lufthansa verbinden" an. NUR hier!
@@ -5498,6 +5538,11 @@ def flightops_crewlist(token):
     def _cached():
         e = _crew_cache_get(token, flight, date)
         if e and e.get('crew'):
+            served = str(e.get('date') or '')[:10]
+            if served and served != str(date or '')[:10]:
+                log.warning('[lh_flightops] crewlist %s: Nachbartag aus '
+                            'EIGENEM Cache bedient (angefragt %s, geliefert '
+                            '%s)', flight, str(date or '')[:10], served)
             # AEROX-VERKNÜPFUNG NACHZIEHEN (Owner-Regression 2026-07-29:
             # „Crew lädt jetzt instant, aber es steht nicht mehr, wer bei
             # AeroX ist"): der Prefetch schreibt bewusst die ROHE Liste
@@ -5509,7 +5554,9 @@ def flightops_crewlist(token):
             return jsonify({'ok': True,
                             'crew': _crew_reenrich(e['crew'], flight=flight,
                                                    date=date),
-                            'cached': True, 'cached_at': e.get('cached_at')})
+                            'cached': True, 'cached_at': e.get('cached_at'),
+                            # ADDITIV seit 2026-08-09 — siehe Banner oben.
+                            'flight_date': served or str(date or '')[:10]})
         return None
 
     _st, _acc = _access_state(token)
@@ -5545,7 +5592,8 @@ def flightops_crewlist(token):
         # wieder weg. Eine LEERE Live-Antwort darf die letzte gute nicht
         # verdrängen — sonst steht die Fläche ausgerechnet dann leer, wenn man
         # nach dem Flug nachschlägt „mit wem war ich unterwegs".
-        return _cached() or jsonify({'ok': True, 'crew': []})
+        return _cached() or jsonify({'ok': True, 'crew': [],
+                                     'flight_date': str(date or '')[:10]})
     # AeroX-Profil-Verknüpfung (Owner 2026-07-23): wer aus der Crew ist selbst
     # auf AeroX? → Avatar/Profil direkt aus der Liste öffnen.
     matches = _match_aerox_profiles(crew, flight=flight, date=date)
@@ -5554,7 +5602,12 @@ def flightops_crewlist(token):
         if p:
             m['aerox'] = p
     _crew_cache_put(token, flight, date, crew)
-    return jsonify({'ok': True, 'crew': crew})
+    # LIVE-Pfad: `crew_list` fragt LH mit GENAU diesem Datum, und der
+    # accessCode kommt aus `_links_find`, das das Flugdatum EXAKT vergleicht
+    # (`startswith(dt_)`) — hier gibt es keine Datums-Toleranz, `flight_date`
+    # ist per Konstruktion das angefragte Datum.
+    return jsonify({'ok': True, 'crew': crew,
+                    'flight_date': str(date or '')[:10]})
 
 
 @lh_flightops_bp.route('/api/lh/flightops/checkin/<token>', methods=['POST'])
