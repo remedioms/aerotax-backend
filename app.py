@@ -121,6 +121,7 @@ for _bp_path, _bp_name in [
     ('blueprints.calendar_sweep',            'calendar_sweep_bp'),  # periodischer Nachlauf gespeicherter iCal-Links (NUR Nicht-LH-Hosts)
     ('blueprints.flight_checkins',           'flight_checkins_bp'),  # für einen Flug einchecken → Ereignis-Pushes (abgeflogen/landet in 1h/gelandet)
     ('blueprints.smp_user_cards_blueprint',  'smp_user_cards_bp'),  # User-erstellte SMP-Flashcards + Review-Queue + anonymisiertes Community-Deck
+    ('blueprints.rest_assignments',          'rest_assignments_bp'),  # eingeteilte Ruhezeiten, geteilt mit der Crew DESSELBEN Legs (Pausenrechner)
 ]:
     try:
         _mod = __import__(_bp_path, fromlist=[_bp_name])
@@ -681,6 +682,12 @@ _BUG004_GET_PII_PREFIXES = (
                             #   im Auftrag des Users; owner-scoped wie jede
                             #   andere /api/user/-Route (kein Public-Discovery-
                             #   Zweck wie /profile/<other>).
+    '/api/rest-assignment/',  # /<token>/<flight>/<date>/<bereich> → die
+                            #   eingeteilten Ruhezeiten der eigenen Crew-Gruppe.
+                            #   Der Blueprint prüft Bearer==Pfad-Token selbst
+                            #   (_bearer_ok) + Roster-Beleg + Bereich; das
+                            #   globale Gate ergänzt die Existenz-Prüfung des
+                            #   Tokens (wie bei /api/layover-group/).
 )
 
 
@@ -37760,6 +37767,11 @@ def auth_delete_account():
             # Crew-Mitglieder) — vorher im Profil-Blob, der mit user_profiles
             # mitging; als eigene Tabelle braucht sie einen eigenen Eintrag.
             ('flightops_crew_cache',    'token'),              # PK token,flight,flight_date
+            # 2026-08-09: eingeteilte Ruhezeiten (Pausenrechner). Die Zeile
+            # enthält nur Zeiten, aber sie ist über `author_token` diesem
+            # Konto zugeordnet und muss mit ihm verschwinden — sonst bliebe
+            # eine „von X eingeteilt"-Zuschreibung ohne X zurück.
+            ('rest_assignments',        'author_token'),       # PK flight,flight_date,bereich
         ]
         for _tbl, _col in _cascade:
             try:
