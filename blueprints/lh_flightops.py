@@ -3883,6 +3883,7 @@ _BOARDING_CACHE = {}                     # key -> (ts, marks-dict)
 _BOARDING_LOCK = threading.Lock()
 _BOARDING_HIT_TTL_S = 6 * 3600           # gefundene Zeit
 _BOARDING_MISS_TTL_S = 3 * 3600          # NEGATIV-Cache (LH trägt spät nach)
+_BOARDING_LATE_REFRESH_S = 2 * 3600       # Teilantwort einmal vor Abflug erneuern
 _BOARDING_CACHE_MAX = 500
 _BOARDING_LEAD_MAX_S = 6 * 3600          # so früh interessiert Boarding
 _BOARDING_LEAD_MIN_S = -3600             # bis 1 h nach dem Plan-Abflug
@@ -3910,9 +3911,31 @@ def _boarding_marks_normalize(payload):
     return {}
 
 
-def _boarding_cache_get(key, now=None):
-    """(hit, marks) — `hit=False` heisst „noch nie gefragt bzw. TTL abgelaufen".
-    Ein Treffer mit leerem `marks` ist der NEGATIV-Cache und zählt als hit."""
+def _marks_cache_state(ts, marks, now, departure_epoch=None):
+    """Eine LH-Teilantwort genau einmal kurz vor Abflug erneuern.
+
+    `COMMON_CHECK_IN_TIMES` nennt Security/Crewbus oft schon beim Eintritt ins
+    6-h-Fenster, `boardingBegin` aber erst später. Der normale 6-h-Hit-TTL
+    würde dann die frühe Teilantwort bis nach STD festhalten. Sobald noch kein
+    echtes Boarding vorliegt, wird deshalb ein VOR der 2-h-Schwelle geholter
+    Treffer beim ersten Request NACH der Schwelle stale. Der neue Treffer trägt
+    einen Zeitstempel nach der Schwelle und wird nicht erneut angefragt: maximal
+    ein zusätzlicher LH-Call je Flug/Kategorie, durch den Shared Cache geteilt.
+    """
+    ttl = _BOARDING_HIT_TTL_S if marks else _BOARDING_MISS_TTL_S
+    if (now - ts) > ttl:
+        return 'expired'
+    if marks and 'boarding_iso' not in marks and departure_epoch is not None:
+        refresh_at = departure_epoch - _BOARDING_LATE_REFRESH_S
+        if now >= refresh_at and ts < refresh_at:
+            return 'refresh'
+    return 'hit'
+
+
+def _boarding_cache_get(key, now=None, departure_epoch=None):
+    """(hit, marks). Bei später Nachabfrage bleibt die Teilantwort sichtbar:
+    `(False, marks)` bedeutet stale-while-refresh; ein echter Miss/TTL-Ablauf
+    bleibt `(False, {})`. Ein leerer Negativ-Treffer zählt innerhalb TTL als hit."""
     now = now if now is not None else time.time()
     with _BOARDING_LOCK:
         e = _BOARDING_CACHE.get(key)
@@ -3920,9 +3943,11 @@ def _boarding_cache_get(key, now=None):
         return False, {}
     ts, payload = e
     marks = _boarding_marks_normalize(payload)
-    ttl = _BOARDING_HIT_TTL_S if marks else _BOARDING_MISS_TTL_S
-    if (now - ts) > ttl:
+    state = _marks_cache_state(ts, marks, now, departure_epoch)
+    if state == 'expired':
         return False, {}
+    if state == 'refresh':
+        return False, marks
     return True, marks
 
 
@@ -4008,7 +4033,7 @@ def duty_marks_from_times(times):
     return out
 
 
-def _boarding_fetch(user_token, flight, date, dep, arr):
+def _boarding_fetch(user_token, flight, date, dep, arr, departure_epoch=None):
     """EIN COMMON_CHECK_IN_TIMES-Call im PRIORISIERTEN Budget → Cache.
     Wirft nie. Läuft ausschliesslich im Daemon-Thread. Aus DERSELBEN Antwort
     fallen seit Welle 2 alle Marken (`duty_marks_from_times`) — ein Call, ein
@@ -4041,7 +4066,8 @@ def _boarding_fetch(user_token, flight, date, dep, arr):
         # wird NICHT geteilt, s. `_marks_shared_key`.
         cat = (p or {}).get('crewCategory') if isinstance(p, dict) else None
         skey = _marks_shared_key(flight, date, dep, cat)
-        shared_hit, shared_marks = _marks_shared_get(skey)
+        shared_hit, shared_marks = _marks_shared_get(
+            skey, departure_epoch=departure_epoch)
         if shared_hit:
             # Ein Kollege desselben Fluges hat die Antwort schon geholt —
             # kein zweiter LH-Call fuer dieselben Fakten.
@@ -4122,7 +4148,7 @@ def _marks_shared_key(flight, date, dep, cat):
                      (date or '')[:10], (dep or '').upper(), c])
 
 
-def _marks_shared_get(key, now=None):
+def _marks_shared_get(key, now=None, departure_epoch=None):
     """(hit, marks) aus dem geteilten Flug-Cache. Gleiche TTL-Semantik wie der
     Nutzer-Cache: gefundene Marken 6 h, Negativ-Treffer 3 h."""
     if not key:
@@ -4134,9 +4160,11 @@ def _marks_shared_get(key, now=None):
         return False, {}
     ts, payload = e
     marks = _boarding_marks_normalize(payload)
-    ttl = _BOARDING_HIT_TTL_S if marks else _BOARDING_MISS_TTL_S
-    if (now - ts) > ttl:
+    state = _marks_cache_state(ts, marks, now, departure_epoch)
+    if state == 'expired':
         return False, {}
+    if state == 'refresh':
+        return False, marks
     return True, marks
 
 
@@ -4191,7 +4219,8 @@ def _dm_budget_book(now=None):
         pass
 
 
-def _boarding_warm_async(user_token, flight, date, dep, arr):
+def _boarding_warm_async(user_token, flight, date, dep, arr,
+                          departure_epoch=None):
     """Wärmt den Cache im Daemon-Thread. Pro Schlüssel höchstens ein Lauf."""
     key = _boarding_key(user_token, flight, date, dep)
     with _BOARDING_LOCK:
@@ -4200,7 +4229,8 @@ def _boarding_warm_async(user_token, flight, date, dep, arr):
         _BOARDING_INFLIGHT.add(key)
     try:
         threading.Thread(target=_boarding_fetch,
-                         args=(user_token, flight, date, dep, arr),
+                         args=(user_token, flight, date, dep, arr,
+                               departure_epoch),
                          daemon=True).start()
         return True
     except Exception:
@@ -4276,10 +4306,16 @@ def enrich_sectors_boarding(user_token, sectors, now_ts=None):
         if _access_state(user_token)[0] != 'ok':
             return False
         key = _boarding_key(user_token, flight, date, dep)
-        hit, marks = _boarding_cache_get(key, now=now_ts)
+        dep_epoch = _boarding_dep_epoch(sec.get('dep_iso'))
+        hit, marks = _boarding_cache_get(
+            key, now=now_ts, departure_epoch=dep_epoch)
         if not hit:
-            _boarding_warm_async(user_token, flight, date, dep, arr)
-            return False
+            _boarding_warm_async(user_token, flight, date, dep, arr,
+                                  dep_epoch)
+            # Stale-while-refresh: eine frühe echte Security-Marke darf beim
+            # gezielten Boarding-Nachabruf nicht für einen Poll verschwinden.
+            if not marks:
+                return False
         wrote = False
         for field in _SECTOR_MARK_FIELDS:
             v = marks.get(field)

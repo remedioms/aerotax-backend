@@ -1217,6 +1217,72 @@ def test_enrich_sectors_boarding_sets_only_present_fields(monkeypatch):
     assert 'boarding_iso' not in sec and 'briefing_room' not in sec
 
 
+def test_partial_marks_refresh_once_inside_two_hour_window():
+    """Frühe Security/Crewbus-Teilantwort blockiert spätes Boarding nicht 6 h."""
+    _reset_boarding_cache()
+    dep = 1785000000.0 + 6 * 3600
+    fetched = dep - 5 * 3600
+    key = fo._boarding_key('AT-U', 'LH123', '2026-07-26', 'MUC')
+    partial = fo.duty_marks_from_times(CHECKIN_BOM)
+    fo._boarding_cache_put(key, partial, now=fetched)
+
+    # Vor der 2-h-Schwelle bleibt der frühe Treffer gültig.
+    hit, marks = fo._boarding_cache_get(
+        key, now=dep - 2 * 3600 - 1, departure_epoch=dep)
+    assert hit is True and marks == partial
+
+    # Danach genau ein Miss: der Serve-Pfad darf einen späten Refresh starten.
+    hit, marks = fo._boarding_cache_get(
+        key, now=dep - 2 * 3600, departure_epoch=dep)
+    assert hit is False and marks == partial
+
+    # Eine weiterhin partielle Antwort NACH der Schwelle ist wieder ein Hit;
+    # dadurch entsteht kein Poll-Sturm bis zum Abflug.
+    fo._boarding_cache_put(key, partial, now=dep - 2 * 3600 + 1)
+    hit, marks = fo._boarding_cache_get(
+        key, now=dep - 30 * 60, departure_epoch=dep)
+    assert hit is True and marks == partial
+
+
+def test_late_refresh_keeps_partial_marks_visible(monkeypatch):
+    """Beim Hintergrund-Refresh verschwinden Security/Crewbus nicht kurz."""
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    warmed = []
+    monkeypatch.setattr(fo, '_boarding_warm_async',
+                        lambda *a: warmed.append(a) or True)
+    now = 1785000000.0
+    dep = now + 90 * 60
+    dep_iso = _dtmod.datetime.utcfromtimestamp(dep).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+    sec = _sector(dep_iso)
+    key = fo._boarding_key('AT-U', 'LH123', dep_iso[:10], 'MUC')
+    partial = fo.duty_marks_from_times(CHECKIN_BOM)
+    fo._boarding_cache_put(key, partial, now=dep - 5 * 3600)
+
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is True
+    assert len(warmed) == 1
+    assert sec['security_iso'] == partial['security_iso']
+    assert sec['crewbus_iso'] == partial['crewbus_iso']
+    assert 'boarding_iso' not in sec
+
+
+def test_shared_partial_marks_use_same_single_late_refresh():
+    """Der Flug-Cache darf die gezielte Nachabfrage nicht wieder verhindern."""
+    fo._MARKS_SHARED.clear()
+    dep = 1785000000.0 + 6 * 3600
+    key = fo._marks_shared_key('LH123', '2026-07-26', 'MUC', 'COC')
+    partial = fo.duty_marks_from_times(CHECKIN_BOM)
+    fo._marks_shared_put(key, partial, now=dep - 5 * 3600)
+    assert fo._marks_shared_get(
+        key, now=dep - 90 * 60, departure_epoch=dep) == (False, partial)
+
+    full = fo.duty_marks_from_times(CHECKIN_MUC)
+    fo._marks_shared_put(key, full, now=dep - 90 * 60)
+    assert fo._marks_shared_get(
+        key, now=dep - 30 * 60, departure_epoch=dep) == (True, full)
+
+
 def test_enrich_sectors_boarding_legacy_tuple_cache(monkeypatch):
     """Alt-Format `(ts, iso)` aus einem laufenden Prozess bleibt lesbar."""
     _reset_boarding_cache()
