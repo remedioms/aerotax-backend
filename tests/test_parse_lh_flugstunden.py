@@ -22,10 +22,28 @@ def test_sap_decimal_hours_round_to_minutes():
     assert PARSER.decimal_hours_minutes(None) == 0
 
 
-def test_sap_month_control_accepts_only_verified_two_minute_rounding_drift():
+def test_sap_month_control_accepts_only_verified_three_minute_rounding_drift():
     assert PARSER.control_minutes_match(2211, 2213)
-    assert PARSER.control_minutes_match(3973, 3971)
-    assert not PARSER.control_minutes_match(2210, 2213)
+    assert PARSER.control_minutes_match(4474, 4477)
+    assert not PARSER.control_minutes_match(4473, 4477)
+
+
+def test_summary_month_anchor_ignores_equal_landing_count():
+    class Page:
+        @staticmethod
+        def extract_words(**_kwargs):
+            return [
+                {"text": "11", "x0": 65.9, "top": 771.8},
+                {"text": "11", "x0": 169.6, "top": 771.8},
+                {"text": "41,73", "x0": 195.0, "top": 771.8},
+                {"text": "1,18", "x0": 315.0, "top": 771.8},
+            ]
+
+    assert PARSER._summary(Page(), 11) == {
+        "landings": 11,
+        "effective_min": 2504,
+        "deadhead_min": 71,
+    }
 
 
 def test_sap_flight_padding_matches_existing_import_convention():
