@@ -609,6 +609,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/history/',
     '/api/user/voice-note/',
     '/api/user/flight-notes/',
+    '/api/user/destination-notes/',  # private Ortsnotiz (nur Token-Owner)
     '/api/user/flight-ops/',
     '/api/user/briefing/',
     '/api/user/roster-changes/',
@@ -19106,7 +19107,11 @@ def get_metar(icao):
                     'flight_category': r.get('fltCat'),
                 } for r in raw[:5]
             ]}
-        _aviation_cache_set(f'metar:{icao}', result, 600)
+        # Leeres Ergebnis nur KURZ cachen (Lehre aus dem Kurs-Ausfall 2026-08-09:
+        # ein leeres Resultat mit voller TTL macht aus einer Delle einen
+        # Dauerzustand). Echte Reports behalten die volle TTL.
+        _aviation_cache_set(f'metar:{icao}', result,
+                            600 if result['reports'] else 120)
         return jsonify(result)
     except Exception as e:
         print(f'[get_metar] error: {type(e).__name__}: {str(e)[:300]}')
@@ -19130,35 +19135,177 @@ def get_taf(icao):
         with ur.urlopen(req, timeout=10) as r:
             raw = json.loads(r.read().decode('utf-8'))
         result = {'icao': icao, 'forecasts': raw[:3] if raw else []}
-        _aviation_cache_set(f'taf:{icao}', result, 1800)
+        # Leeres Ergebnis nur kurz cachen — siehe Kommentar bei /metar.
+        _aviation_cache_set(f'taf:{icao}', result,
+                            1800 if result['forecasts'] else 120)
         return jsonify(result)
     except Exception as e:
         print(f'[get_taf] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'icao': icao, 'forecasts': [], 'error': 'upstream_error'}), 502
 
 
+# ─── Wechselkurse ──────────────────────────────────────────────────────────
+# VORFALL 2026-08-09 (Owner-Screenshot JFK: „Richtwert · offline" obwohl online):
+# Die alte Quelle `api.exchangerate.host/latest` ist NICHT mehr frei nutzbar.
+# Sie antwortet seit Monaten mit **HTTP 200** und dem Body
+#   {"success":false,"error":{"code":101,"type":"missing_access_key",...}}
+# Damit lief der alte Code in KEINEN except-Zweig: `data.get('rates', {})` war
+# schlicht `{}`, `data.get('date')` war `None` — und dieses LEERE Ergebnis wurde
+# 12 h lang gecacht. Prod-Probe: GET /api/aviation/currency →
+#   {"base":"EUR","date":null,"rates":{}}
+# Der iOS-Client fiel deshalb dauerhaft auf seine eingebaute Tabelle zurück.
+#
+# REGEL, die aus diesem Vorfall folgt (gilt für jeden Upstream-Proxy hier):
+#   Ein leeres/unplausibles Ergebnis wird NIE gecacht und NIE als Erfolg
+#   gewertet. HTTP 200 allein ist kein Beleg dafür, dass Daten geliefert wurden.
+#
+# Neue Quellen — beide frei und OHNE Client-/Server-Schlüssel (free-first):
+#   1. open.er-api.com (exchangerate-api.com Open-Endpoint), tagesaktuell,
+#      liefert `time_last_update_utc` → wir können echtes Alter ausweisen.
+#   2. jsDelivr @fawazahmed0/currency-api (Fallback), liefert `date`.
+# Kein Anbieter verlangt einen Schlüssel — es ist also KEINE Owner-Entscheidung
+# über einen kostenpflichtigen Zugang nötig.
+
+_CURRENCY_SYMBOL_RE = re.compile(r'^[A-Z]{3}$')
+
+
+def _currency_rates_plausible(rates):
+    """True nur wenn `rates` ein nicht-leeres Dict mit ausschliesslich
+    endlichen, positiven Zahlen ist. Ein leeres Dict ist KEIN Erfolg —
+    genau daran ist die alte Quelle still gestorben."""
+    if not isinstance(rates, dict) or not rates:
+        return False
+    for code, val in rates.items():
+        if not _CURRENCY_SYMBOL_RE.match(str(code or '')):
+            return False
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return False
+        # 0 / negativ / NaN / absurd gross = kaputter Upstream, kein Kurs.
+        if not (f == f) or f <= 0 or f > 1e9:
+            return False
+    return True
+
+
+def _currency_fetch_er_api(base):
+    """open.er-api.com — frei, ohne Schlüssel. Liefert ALLE Kurse zur Basis.
+    Returns (rates_upper, as_of_iso, source) oder None."""
+    import urllib.request as ur
+    url = f'https://open.er-api.com/v6/latest/{base}'
+    req = ur.Request(url, headers={'User-Agent': 'AeroX/1.0 (+https://aerosteuer.de)'})
+    with ur.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode('utf-8'))
+    if not isinstance(data, dict) or data.get('result') != 'success':
+        return None
+    raw = data.get('rates')
+    if not isinstance(raw, dict) or not raw:
+        return None
+    as_of = None
+    ts = data.get('time_last_update_unix')
+    try:
+        if ts:
+            as_of = datetime.fromtimestamp(
+                float(ts), tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+    except Exception:
+        as_of = None
+    return ({str(k).upper(): v for k, v in raw.items()}, as_of, 'open.er-api.com')
+
+
+def _currency_fetch_jsdelivr(base):
+    """jsDelivr-Spiegel der @fawazahmed0/currency-api — frei, ohne Schlüssel.
+    Fallback wenn der Primär-Anbieter ausfällt.
+    Returns (rates_upper, as_of_iso, source) oder None."""
+    import urllib.request as ur
+    low = base.lower()
+    url = ('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest'
+           f'/v1/currencies/{low}.json')
+    req = ur.Request(url, headers={'User-Agent': 'AeroX/1.0 (+https://aerosteuer.de)'})
+    with ur.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode('utf-8'))
+    if not isinstance(data, dict):
+        return None
+    raw = data.get(low)
+    if not isinstance(raw, dict) or not raw:
+        return None
+    day = data.get('date')
+    as_of = f'{day}T00:00:00Z' if isinstance(day, str) and len(day) == 10 else None
+    return ({str(k).upper(): v for k, v in raw.items()}, as_of,
+            'jsdelivr/currency-api')
+
+
 @app.route('/api/aviation/currency', methods=['GET'])
 def get_currency_rates():
-    """Wechselkurse via exchangerate.host (frei).
+    """Wechselkurse aus freien Quellen ohne API-Schlüssel.
     Query: ?base=EUR&symbols=USD,GBP,CHF
+
+    Antwort-Form ist RÜCKWÄRTSKOMPATIBEL: `base`, `date`, `rates` heissen und
+    bedeuten dasselbe wie vorher. Neu (additiv, alte Builds ignorieren sie):
+    `as_of` (ISO-Zeitpunkt des Kursstands beim Anbieter), `source`,
+    `missing` (angefragte Symbole die der Anbieter nicht kennt).
     """
     base = (request.args.get('base') or 'EUR').upper()[:3]
+    if not _CURRENCY_SYMBOL_RE.match(base):
+        return jsonify({'base': base, 'date': None, 'rates': {},
+                        'error': 'invalid_base'}), 400
     symbols = (request.args.get('symbols') or 'USD,GBP,CHF,JPY,CNY,CAD,AUD,SGD,AED').upper()
+    wanted = [s for s in (p.strip() for p in symbols.split(','))
+              if _CURRENCY_SYMBOL_RE.match(s)]
     cache_key = f'cur:{base}:{symbols}'
     cached = _aviation_cache_get(cache_key, 3600 * 12)
     if cached is not None:
         return jsonify(cached)
-    try:
-        import urllib.request as ur
-        url = f'https://api.exchangerate.host/latest?base={base}&symbols={symbols}'
-        with ur.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read().decode('utf-8'))
-        result = {'base': base, 'date': data.get('date'), 'rates': data.get('rates', {})}
-        _aviation_cache_set(cache_key, result, 3600 * 12)
-        return jsonify(result)
-    except Exception as e:
-        print(f'[get_currency_rates] error: {type(e).__name__}: {str(e)[:300]}')
-        return jsonify({'base': base, 'rates': {}, 'error': 'upstream_error'}), 502
+
+    fetched = None
+    for fetch in (_currency_fetch_er_api, _currency_fetch_jsdelivr):
+        try:
+            fetched = fetch(base)
+        except Exception as e:
+            print(f"[get_currency_rates] {getattr(fetch, '__name__', 'fetch')} "
+                  f'failed: {type(e).__name__}: {str(e)[:200]}')
+            fetched = None
+        if fetched:
+            break
+
+    if not fetched:
+        # KEIN Cache-Write: sonst friert ein Anbieter-Ausfall 12 h lang ein.
+        return jsonify({'base': base, 'date': None, 'rates': {},
+                        'error': 'upstream_unavailable'}), 502
+
+    all_rates, as_of, source = fetched
+    rates = {}
+    missing = []
+    for sym in wanted:
+        if sym == base:
+            rates[sym] = 1.0
+            continue
+        val = all_rates.get(sym)
+        if val is None:
+            missing.append(sym)
+            continue
+        try:
+            rates[sym] = float(val)
+        except (TypeError, ValueError):
+            missing.append(sym)
+
+    if not _currency_rates_plausible(rates):
+        # Anbieter hat formal geantwortet, aber nichts Brauchbares geliefert.
+        # Wie ein Fehler behandeln — und NICHT cachen.
+        print(f'[get_currency_rates] implausible rates from {source} '
+              f'base={base} n={len(rates)}')
+        return jsonify({'base': base, 'date': None, 'rates': {},
+                        'error': 'upstream_empty'}), 502
+
+    result = {
+        'base': base,
+        'date': as_of[:10] if isinstance(as_of, str) and len(as_of) >= 10 else None,
+        'rates': rates,
+        'as_of': as_of,
+        'source': source,
+        'missing': missing,
+    }
+    _aviation_cache_set(cache_key, result, 3600 * 12)
+    return jsonify(result)
 
 
 @app.route('/api/aviation/aircraft/<icao24>', methods=['GET'])
@@ -19433,7 +19580,9 @@ def get_metar_by_iata(iata):
                   'raw': None, 'temp_c': None, 'wind_kt': None,
                   'visibility_km': None, 'conditions': None,
                   'time_iso': None, 'decoded': None}
-        _aviation_cache_set(cache_key, result, 900)
+        # „Kein METAR" ist ein Negativ-Ergebnis — kurz cachen statt 15 min,
+        # sonst bleibt ein kurzer Upstream-Aussetzer eine Viertelstunde stehen.
+        _aviation_cache_set(cache_key, result, 120)
         return jsonify(result)
 
     first = raw[0] if isinstance(raw, list) else raw
@@ -26356,6 +26505,140 @@ def get_flight_note(token, datum):
     except Exception as e:
         print(f'[get_flight_note] error: {type(e).__name__}: {str(e)[:300]}')
         return jsonify({'error': 'internal_error'}), 500
+
+
+# ─── Destination-Notes (Private Ortsnotiz pro IATA) ─────────────────────────
+# Owner-Entscheidung 2026-08-09: die Notiz auf dem Ort-Detailscreen („PRIVATE
+# NOTIZEN ZU JFK") lag bisher NUR lokal (UserDefaults `destinationnote::<IATA>`
+# mit einem TODO(sync)). Sie gehört ins Backend — für den EIGENEN User, privat.
+#
+# Bewusst derselbe Weg wie `flight-notes`, kein neues Verfahren:
+#   · Storage: profile.metadata.destination_notes[IATA] = {text, updated_at}
+#     → _profile_load/_profile_save schreiben das in das bestehende
+#       `user_profiles.metadata`-jsonb. KEIN Schema-Change nötig.
+#   · Owner-only: Prefix `/api/user/destination-notes/` steht in
+#     `_BUG004_GET_PII_PREFIXES`; das Gate erzwingt Bearer == Pfad-Token per
+#     `hmac.compare_digest`. Ein fremdes Token kommt nicht an die Notiz.
+#   · DSGVO: `user_profiles` steht in der Delete-Cascade von
+#     `/api/auth/delete-account` (Spalte `token`) — die Notiz geht mit dem
+#     Konto unter, ohne eigenen Löschpfad. Der Art.-15-Export enthält sie über
+#     denselben `profile`-Block.
+#
+# Der `updated_at`-Stempel ist NICHT Deko: der Client mergt damit, ohne je eine
+# lokale Notiz zu verlieren (Lehre aus der Crew-Historie 2026-08-05, wo ein
+# Server-Stand lokal Erfasstes überschrieb). Neuerer Stempel gewinnt.
+
+_DESTINATION_NOTE_MAX_CHARS = 500
+_DESTINATION_NOTE_IATA_RE = re.compile(r'^[A-Z]{3}$')
+
+
+def _destination_notes_read(token):
+    """Liefert das normalisierte {IATA: {text, updated_at}}-Dict des Users.
+
+    Toleriert Alt-/Fremdformate: ein blanker String wird als `{text}` ohne
+    Stempel gelesen. Unbrauchbare Einträge fallen still raus, statt den
+    kompletten Block zu killen.
+    """
+    full = _profile_load(token) or {}
+    prof = full.get('profile') or {}
+    raw = prof.get('destination_notes')
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for code, rec in raw.items():
+        code_up = str(code or '').upper()
+        if not _DESTINATION_NOTE_IATA_RE.match(code_up):
+            continue
+        if isinstance(rec, str):
+            text, updated = rec, None
+        elif isinstance(rec, dict):
+            text = rec.get('text')
+            updated = rec.get('updated_at')
+        else:
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        out[code_up] = {
+            'text': text[:_DESTINATION_NOTE_MAX_CHARS],
+            'updated_at': updated if isinstance(updated, str) else None,
+        }
+    return out
+
+
+@app.route('/api/user/destination-notes/<token>', methods=['GET'])
+def list_destination_notes(token):
+    """Alle privaten Ortsnotizen des Users: {IATA: {text, updated_at}}."""
+    if not token:
+        return jsonify({'error': 'invalid token'}), 400
+    try:
+        notes = _destination_notes_read(token)
+        return jsonify({'notes': notes, 'count': len(notes)})
+    except Exception as e:
+        print(f'[list_destination_notes] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
+
+
+@app.route('/api/user/destination-notes/<token>/<iata>', methods=['GET'])
+def get_destination_note(token, iata):
+    """Eine einzelne private Ortsnotiz."""
+    if not token:
+        return jsonify({'error': 'invalid token'}), 400
+    code = (iata or '').strip().upper()
+    if not _DESTINATION_NOTE_IATA_RE.match(code):
+        return jsonify({'error': 'invalid iata'}), 400
+    try:
+        rec = _destination_notes_read(token).get(code)
+        return jsonify({'iata': code,
+                        'note': (rec or {}).get('text', ''),
+                        'updated_at': (rec or {}).get('updated_at')})
+    except Exception as e:
+        print(f'[get_destination_note] error: {type(e).__name__}: {str(e)[:300]}')
+        return jsonify({'error': 'internal_error'}), 500
+
+
+@app.route('/api/user/destination-notes/<token>/<iata>', methods=['PUT'])
+def put_destination_note(token, iata):
+    """Speichert/Updated eine private Ortsnotiz.
+
+    Body: {note: "...", updated_at: "<ISO8601>"}. `updated_at` ist optional —
+    fehlt es, stempelt der Server. Leerer String = der User hat die Notiz
+    gelöscht → Eintrag verschwindet (bewusst dieselbe Regel wie flight-notes).
+    """
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    code = (iata or '').strip().upper()
+    if not _DESTINATION_NOTE_IATA_RE.match(code):
+        return jsonify({'ok': False, 'error': 'invalid iata'}), 400
+    body = request.get_json(silent=True) or {}
+    raw = body.get('note') if isinstance(body.get('note'), str) else ''
+    if len(raw) > _DESTINATION_NOTE_MAX_CHARS * 4:
+        return jsonify({'ok': False, 'error': 'note_too_long'}), 413
+    # Gleicher Sanitizer wie die Tagesnotiz — plain text, kein HTML.
+    note = _sanitize_flight_note(raw)[:_DESTINATION_NOTE_MAX_CHARS]
+    stamp = body.get('updated_at')
+    if not isinstance(stamp, str) or not (10 <= len(stamp) <= 40):
+        stamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    try:
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        full = _profile_load(token) or {}
+        prof = dict(full.get('profile') or {})
+        notes = _destination_notes_read(token)
+        if note:
+            notes[code] = {'text': note, 'updated_at': stamp}
+        else:
+            notes.pop(code, None)
+        prof['destination_notes'] = notes
+        disk_full['token'] = token
+        disk_full['profile'] = prof
+        disk_full['_updated_at'] = datetime.now().isoformat()
+        if not _profile_save(token, prof, full_disk_payload=disk_full):
+            return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+        return jsonify({'ok': True, 'iata': code, 'note': note,
+                        'updated_at': stamp if note else None,
+                        'len': len(note)})
+    except Exception:
+        app.logger.exception('[destination-notes] put_failed')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
 
 
 # ─── Crew Chat Messages (HTTP-Polling-Fallback; WebSocket optional) ─────────
