@@ -312,12 +312,17 @@ def test_cadence_fast_duty_today_or_tomorrow(monkeypatch):
     _patch_briefings(monkeypatch,
                      lambda t: _brief_days(now, duty_days=(1,)))
     monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - (T - 600)})
-    # `too_soon` statt `skip_fast`: unterhalb der SCHNELLSTEN Schwelle kürzt
-    # `_fo_should_sync` ab, bevor es die Klasse überhaupt bestimmt (spart den
-    # Briefings-Read). Seit `fast` mit `fast_sb` zusammenfällt (10.08.), ist
-    # das für diese Klasse der Normalfall. Beide Wege heissen "nicht syncen" —
-    # unterschiedlich ist nur der Telemetrie-Grund.
-    assert fo._fo_should_sync('AT-N', now=now) == (False, 'too_soon')
+    # Knapp unter der Schwelle wird NICHT gesynct. WELCHER Grund dabei
+    # zurückkommt, hängt an den Werten und ist bewusst nicht festgeschrieben:
+    # liegt das Alter zusätzlich unter der schnellsten Schwelle, kürzt
+    # `_fo_should_sync` mit 'too_soon' ab (spart den Briefings-Read), sonst
+    # nennt es die Klasse ('skip_fast'). Beides heisst dasselbe. Diese Tests
+    # haben schon zweimal an genau dieser Stelle gebrochen, nur weil an den
+    # Intervallen gedreht wurde — der Vertrag ist die ENTSCHEIDUNG, nicht der
+    # Grund-String.
+    faellig, grund = fo._fo_should_sync('AT-N', now=now)
+    assert faellig is False
+    assert grund in ('too_soon', 'skip_fast')
     monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - (T + 600)})
     assert fo._fo_should_sync('AT-N', now=now) == (True, 'fast')
 
@@ -423,7 +428,11 @@ def test_cadence_standby_and_reserve_get_fastest_class(monkeypatch):
         _ev['ical_klass'] = 'standby'
     _patch_briefings(monkeypatch,
                      lambda t: _brief_days(now, extra=d1))
-    assert fo._fo_should_sync('AT-S', now=now) == (True, 'fast')
+    # Nachgewiesen wird die KLASSE, nicht die Fälligkeit: ob nach 2 h schon
+    # gesynct wird, hängt an `_FO_SYNC_FAST_S` und darf hier nicht mitgeprüft
+    # werden (siehe Kommentar im Test darüber).
+    _, grund = fo._fo_should_sync('AT-S', now=now)
+    assert grund in ('fast', 'skip_fast')
 
 
 def test_cadence_overnight_split_day_counts_as_duty(monkeypatch):

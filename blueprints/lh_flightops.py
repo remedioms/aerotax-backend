@@ -1095,6 +1095,12 @@ _LHFO_HOUR_INTERACTIVE_CEILING = 18000    # 90 % — Taps zuletzt sterben
 # 60.000/Tag = gut das Zehnfache des heutigen Verbrauchs und immer noch nur
 # ein Achtel dessen, was 20.000/h theoretisch pro Tag hergäben. Wer diese
 # Marke reißt, hat einen Bug, kein Wachstum.
+# TAGESDECKEL BLEIBEN WEIT (Nachtrag 10.08. abends): der Portal-Screenshot des
+# Owners zeigt für den PROD-Key ausschliesslich 20/Sekunde und 20.000/Stunde —
+# KEIN Tageslimit. Mein erster Verdacht („LH 403t wegen des Tagesverbrauchs")
+# war damit falsch; der Deckel war nie die Ursache und hat wochenlang nur die
+# Hintergrund-Features erschlagen (Briefing-Raum). Er bleibt als NOTBREMSE
+# gegen Endlosschleifen, nicht als Ration.
 _LHFO_DAY_BACKGROUND_CEILING = 60000
 _LHFO_DAY_INTERACTIVE_CEILING = 72000
 
@@ -6836,10 +6842,22 @@ def _connected_tokens(limit=2000):
 # aus dem GESPEICHERTEN Roster, kostet also keinen LH-Call, und wird bei jedem
 # Lauf neu berechnet — wer von langsam auf schnell wechselt, merkt es beim
 # nächsten Lauf selbst.
-_FO_SYNC_FAST_SB_S = 1.9 * 3600     # Standby heute/morgen — jeder Lauf (2 h)
-_FO_SYNC_FAST_S = 1.9 * 3600        # war 3,5 h ⇒ Dienst-Tage jetzt jeder Lauf
-_FO_SYNC_MID_S = 3.9 * 3600         # war 11,5 h ⇒ alle 4 h statt alle 12
-_FO_SYNC_SLOW_S = 11.9 * 3600       # war 21,5 h ⇒ 2×/Tag statt 1×
+# ⚠️ ZURÜCKGENOMMEN 10.08.2026 ABENDS — VORFALL. Die oben gerechnete
+# Verschärfung (1,9/1,9/3,9/11,9) verdoppelte den Tagesverbrauch von ~5.500 auf
+# 10.025, und ab 20:00 UTC antwortete LH auf JEDEN Duty-Events-Call mit HTTP 403
+# — auch auf interaktive, auch für den Owner selbst. Die STUNDE lag dabei bei 52
+# von 20.000. Es gibt also sehr wahrscheinlich doch eine Tagesgrenze, die in
+# Alex' Mail nicht vorkam (sie nannte nur 20.000/h und 20/s).
+#
+# Lehre, schon wieder dieselbe: eine Limit-Zusage ist eine Aussage über EINE
+# Dimension. Dass die anderen unbegrenzt sind, folgt daraus nicht — und der
+# Beweis kostete eine Nacht ohne Roster-Sync für die ganze Flotte.
+#
+# Zurück auf die Werte, die nachweislich vier Wochen ohne 403 liefen.
+_FO_SYNC_FAST_SB_S = 1.9 * 3600
+_FO_SYNC_FAST_S = 3.5 * 3600
+_FO_SYNC_MID_S = 11.5 * 3600
+_FO_SYNC_SLOW_S = 21.5 * 3600
 _FO_FAST_MAX_D = 1               # Diensttag heute/morgen (Homebase-Kalender)
 _FO_MID_MAX_D = 7                # Dienst in 2–7 Tagen
 _FO_ROSTER_END_GUARD_D = 7       # Abdeckung endet in ≤7 Tagen → mind. mid
