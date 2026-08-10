@@ -26950,7 +26950,11 @@ def get_flight_note(token, datum):
 # lokale Notiz zu verlieren (Lehre aus der Crew-Historie 2026-08-05, wo ein
 # Server-Stand lokal Erfasstes überschrieb). Neuerer Stempel gewinnt.
 
-_DESTINATION_NOTE_MAX_CHARS = 500
+# 500 → 2000 (Owner 10.08.: „viel mehr bitte", Anlass war Bals Frage). Die App
+# zieht mit derselben Zahl nach (SearchView.destinationNoteMaxChars +
+# DestinationNotesStore.maxChars) — Alt-Builds kappen clientseitig weiter bei
+# 500, verlieren aber nichts: der Server akzeptiert mehr, nie weniger.
+_DESTINATION_NOTE_MAX_CHARS = 2000
 _DESTINATION_NOTE_IATA_RE = re.compile(r'^[A-Z]{3}$')
 
 
