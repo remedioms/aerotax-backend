@@ -1,8 +1,8 @@
-"""Flugbuch-Import-Upload (Owner-Wunsch 2026-07-22, Thomas-Rust-Anfrage).
+"""Durable manual logbook import job contract.
 
-User lädt den Export seiner bisherigen Logbuch-App hoch; die Datei geht als
-Resend-Mail-Anhang an den Owner. Ehrlichkeit: angenommen NUR wenn die Mail
-raus ist (Disk ist ephemer — die Mail IST der Transportweg).
+The Supabase inbox row is the client-visible source of truth. Owner mail is
+only redundant operator notification and can never turn an ephemeral upload
+into a successful, trackable job.
 """
 import base64
 import os
@@ -22,7 +22,7 @@ def _client():
     return A.app.test_client()
 
 
-def _post(client, token, filename, blob, mail_ok=True, store_ok=False,
+def _post(client, token, filename, blob, mail_ok=True, store_ok=101,
           monkeypatch=None):
     sent = {}
 
@@ -47,6 +47,8 @@ def test_upload_csv_sends_mail_and_acks(monkeypatch):
                     b'Date,From,To\n2019-01-01,FRA,JFK\n', monkeypatch=monkeypatch)
     assert r.status_code == 200, r.get_json()
     assert r.get_json()['ok'] is True
+    assert r.get_json()['job_id'] == 101
+    assert r.get_json()['status'] == 'pending'
     assert sent['filename'] == 'LogTenExport.csv'
     assert sent['bytes'] > 0
 
@@ -55,16 +57,25 @@ def test_upload_ok_when_only_sb_store_succeeds(monkeypatch):
     # Mail down, aber SB-Upload-Store hat die Datei → Upload gilt (durabel).
     A._LOGBOOK_IMPORT_TS.clear()
     r, sent = _post(_client(), 'tok_upload_sb', 'Export.csv', b'a,b,c',
-                    mail_ok=False, store_ok=True, monkeypatch=monkeypatch)
+                    mail_ok=False, store_ok=202, monkeypatch=monkeypatch)
     assert r.status_code == 200 and r.get_json()['ok'] is True
+    assert r.get_json()['job_id'] == 202
     assert sent['stored_flag'] is True     # Mail weiss vom SB-Store
 
 
-def test_upload_rejected_when_mail_fails(monkeypatch):
-    """Mail nicht raus → KEIN ok (kein stilles Schlucken der Datei)."""
+def test_upload_ok_when_mail_fails_but_durable_job_exists(monkeypatch):
+    """Mail is only operator notification; the durable job is the contract."""
     A._LOGBOOK_IMPORT_TS.clear()
     r, _ = _post(_client(), 'tok_upload_2', 'export.csv', b'x,y\n',
                  mail_ok=False, monkeypatch=monkeypatch)
+    assert r.status_code == 200
+    assert r.get_json()['job_id'] == 101
+
+
+def test_upload_rejected_without_durable_job_id(monkeypatch):
+    A._LOGBOOK_IMPORT_TS.clear()
+    r, _ = _post(_client(), 'tok_upload_nojob', 'export.csv', b'x,y\n',
+                 mail_ok=True, store_ok=None, monkeypatch=monkeypatch)
     assert r.status_code == 502
     assert r.get_json()['ok'] is False
 
@@ -103,3 +114,54 @@ def test_upload_no_file_400(monkeypatch):
     r = _client().post('/api/user/logbook/tok_upload_6/import-upload',
                        json={'filename': 'x.csv', 'data_b64': ''})
     assert r.status_code == 400
+
+
+class _StatusQuery:
+    def __init__(self, row):
+        self.row = row
+        self.filters = []
+
+    def select(self, _fields):
+        return self
+
+    def eq(self, field, value):
+        self.filters.append((field, value))
+        return self
+
+    def limit(self, _count):
+        return self
+
+    def execute(self):
+        return type('Result', (), {'data': [self.row] if self.row else []})()
+
+
+def test_upload_status_is_owner_scoped_and_returns_durable_fields(monkeypatch):
+    row = {'id': 44, 'status': 'completed', 'filename': 'old.csv',
+           'created_at': '2026-08-10T10:00:00Z',
+           'completed_at': '2026-08-10T10:02:00Z'}
+    monkeypatch.setattr(A, 'SB_AVAILABLE', True)
+    query = _StatusQuery(row)
+    monkeypatch.setattr(A, 'sb', type('SB', (), {
+        'table': staticmethod(lambda _name: query),
+    })())
+    monkeypatch.setattr(A, '_supabase_execute_with_timeout',
+                        lambda _name, fn, timeout_s=8: (fn(), False))
+    r = _client().get('/api/user/logbook/tok_upload_status/import-upload/44')
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json() == {'ok': True, 'job_id': 44, 'status': 'completed',
+                            'filename': 'old.csv',
+                            'created_at': '2026-08-10T10:00:00Z',
+                            'completed_at': '2026-08-10T10:02:00Z'}
+    assert query.filters == [('id', 44), ('token', 'tok_upload_status')]
+
+
+def test_upload_status_hides_foreign_or_missing_job(monkeypatch):
+    monkeypatch.setattr(A, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(A, 'sb', type('SB', (), {
+        'table': staticmethod(lambda _name: _StatusQuery(None)),
+    })())
+    monkeypatch.setattr(A, '_supabase_execute_with_timeout',
+                        lambda _name, fn, timeout_s=8: (fn(), False))
+    r = _client().get('/api/user/logbook/tok_upload_status/import-upload/999')
+    assert r.status_code == 404
+    assert r.get_json()['error'] == 'not_found'

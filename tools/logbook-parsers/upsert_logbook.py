@@ -13,13 +13,64 @@ import sys
 import psycopg2
 
 ENV = os.path.expanduser('~/Developer/flight-warehouse/.env.nas')
-URL = [l.split('=', 1)[1].strip() for l in open(ENV)
-       if l.startswith('DATABASE_URL=')][0]
+
+
+def _database_url():
+    with open(ENV, encoding='utf-8') as fh:
+        return [line.split('=', 1)[1].strip() for line in fh
+                if line.startswith('DATABASE_URL=')][0]
+
+
+def _args(argv):
+    args = list(argv[1:])
+    upload_id = None
+    if '--upload-id' in args:
+        i = args.index('--upload-id')
+        try:
+            upload_id = int(args[i + 1])
+        except (IndexError, ValueError):
+            raise SystemExit('--upload-id braucht eine positive numerische Upload-ID')
+        del args[i:i + 2]
+        if upload_id < 1:
+            raise SystemExit('--upload-id muss positiv sein')
+    if len(args) not in (3, 4):
+        raise SystemExit('usage: upsert_logbook.py parsed.json token label [meta-json] [--upload-id ID]')
+    return args[0], args[1], args[2], (json.loads(args[3]) if len(args) == 4 else {}), upload_id
+
+
+def _complete_upload_after_verified(cur, upload_id, token):
+    """Atomically terminalize an operator upload and enqueue exactly one push."""
+    cur.execute('select token, status from public.ax_logbook_upload where id=%s for update',
+                (upload_id,))
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f'Upload #{upload_id} nicht gefunden')
+    if row[0] != token:
+        raise RuntimeError(f'Upload #{upload_id} gehört nicht zum angegebenen Token')
+    if row[1] == 'completed':
+        return False
+    cur.execute("""
+        update public.ax_logbook_upload
+        set processed=true, status='completed', completed_at=now(),
+            push_enqueued_at=now()
+        where id=%s and token=%s and status <> 'completed'
+        returning id
+    """, (upload_id, token))
+    if not cur.fetchone():
+        return False
+    payload = json.dumps({
+        'title': 'Flugbuch-Import fertig',
+        'body': 'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.',
+        'data': {'type': 'logbook_import_completed', 'job_id': upload_id,
+                 'deep_link': 'aerox://more/logbook'},
+    }, ensure_ascii=False)
+    cur.execute('select * from public.enqueue_push_outbox(%s, %s, %s::jsonb)',
+                (f'logbook-import-completed:{upload_id}', token, payload))
+    return True
 
 
 def main():
-    path, token, label = sys.argv[1], sys.argv[2], sys.argv[3]
-    extra = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
+    path, token, label, extra, upload_id = _args(sys.argv)
 
     data = json.load(open(path))
     legs, sims = data['legs'], data.get('sim', [])
@@ -38,13 +89,11 @@ def main():
     }
     meta.update(extra)
 
-    conn = psycopg2.connect(URL)
+    conn = psycopg2.connect(_database_url())
     conn.autocommit = True
     cur = conn.cursor()
-    # GOTCHA Supavisor-Pooler (:6543 in .env.nas): liefert Sessions mit
-    # `default_transaction_read_only=on` → Writes brechen sonst zufaellig mit
-    # ReadOnlySqlTransaction ab (traf Upload #21 mitten im Import).
     cur.execute('SET default_transaction_read_only = off')
+    conn.autocommit = False
     cur.execute("""
         insert into public.ax_logbook_import
             (token, filename, imported_at, legs, sim, meta)
@@ -66,12 +115,18 @@ def main():
                 'from public.ax_logbook_import where token=%s', (token,))
     n_legs, n_sim, size, m = cur.fetchone()
     ok = (n_legs == len(legs) and n_sim == len(sims))
+    if not ok:
+        conn.rollback()
+        raise RuntimeError('Rücklese-Verifikation von ax_logbook_import fehlgeschlagen')
+    completed = (_complete_upload_after_verified(cur, upload_id, token)
+                 if upload_id is not None else False)
+    conn.commit()
     print(f'{token}  {label}')
     print(f'  gespeichert: legs={n_legs} sim={n_sim} ({size // 1024} KB) '
           f'{"OK" if ok else "ABWEICHUNG!"}')
     print(f'  meta: {json.dumps(m, ensure_ascii=False)}')
-    if not ok:
-        sys.exit(1)
+    if upload_id is not None:
+        print(f'  upload #{upload_id}: {"completed + push outbox" if completed else "bereits completed"}')
 
 
 if __name__ == '__main__':

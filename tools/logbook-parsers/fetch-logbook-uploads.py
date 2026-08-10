@@ -7,11 +7,12 @@ nach /tmp/logbook-uploads/<id>-<name>-<filename>.
 
   python3 ~/aerox-oracle-prep/fetch-logbook-uploads.py            # listen
   python3 ~/aerox-oracle-prep/fetch-logbook-uploads.py --save     # + Dateien
-  python3 ~/aerox-oracle-prep/fetch-logbook-uploads.py --done 3   # id als verarbeitet markieren
+  python3 ~/aerox-oracle-prep/fetch-logbook-uploads.py --done 3   # rejected: use upsert --upload-id
 
 DB-Zugang: flight-warehouse .env.nas (direkter Prod-Postgres-Pooler).
-Nach dem Einspielen ins Flugbuch (ax_logbook_import) die Zeile mit --done
-markieren — Aufräumen (delete alter processed-Zeilen) bewusst manuell.
+Completion must go through upsert_logbook.py --upload-id: it verifies the
+import row, then atomically completes the job and enqueues one push. Cleanup
+of processed rows remains manual.
 """
 import base64
 import os
@@ -32,14 +33,13 @@ def main():
     cur = conn.cursor()
     if '--done' in sys.argv:
         uid = int(sys.argv[sys.argv.index('--done') + 1])
-        cur.execute('update public.ax_logbook_upload set processed=true '
-                    'where id=%s', (uid,))
-        print(f'id {uid} → processed ({cur.rowcount} Zeile)')
-        return
+        raise SystemExit(
+            f'Upload #{uid} nicht direkt abschließen. Nach verifiziertem Upsert: '
+            f'upsert_logbook.py <parsed.json> <token> <label> --upload-id {uid}')
     # The same private inbox also carries roster PDFs.  The exact marker keeps
     # those rows out of the logbook parser pipeline.
     cur.execute('select id, token, name, airline, homebase, filename, '
-                'sha256, size_bytes, note, created_at '
+                'sha256, size_bytes, note, created_at, status '
                 'from public.ax_logbook_upload where not processed '
                 "and coalesce(note, '') <> 'AEROX_ROSTER_PDF_V1' "
                 'order by id')
@@ -52,7 +52,7 @@ def main():
         print(f'#{r[0]} {r[9]:%Y-%m-%d %H:%M}Z  {r[2] or "?"} · {r[3] or "?"}'
               f' · {r[4] or "?"}  tok={token_prefix}...  '
               f'{r[5]} ({r[7] // 1024} KB)'
-              f'  sha256 {r[6][:16]}' + (f'  Notiz: {r[8]}' if r[8] else ''))
+              f'  status={r[10] or "pending"} sha256 {r[6][:16]}' + (f'  Notiz: {r[8]}' if r[8] else ''))
     if '--save' in sys.argv:
         os.makedirs(OUT, exist_ok=True)
         for r in rows:

@@ -23183,9 +23183,10 @@ def _logbook_upload_store(token, filename, blob, note):
     """Upload durabel in SB `ax_logbook_upload` ablegen (data_b64 als Text —
     PostgREST-bytea-Encoding vermeiden). Primärer Transportweg seit 07-24:
     der Owner zieht die Datei direkt aus der Tabelle statt aus dem
-    Mail-Anhang. RLS an ohne Policies — nur Service-Key. True bei Erfolg."""
+    Mail-Anhang. RLS an ohne Policies — nur Service-Key. Returns the durable
+    upload row id (the client-visible import job id), or None."""
     if not SB_AVAILABLE:
-        return False
+        return None
     try:
         import base64 as _b64
         import hashlib as _hl
@@ -23209,15 +23210,18 @@ def _logbook_upload_store(token, filename, blob, note):
         def _do():
             return sb.table('ax_logbook_upload').insert(row).execute()
         # 20-MB-Base64-Payload braucht Luft — 30s statt Default-5s.
-        _, failed = _supabase_execute_with_timeout('logbook_upload_store',
-                                                   _do, timeout_s=30)
-        if not failed:
+        result, failed = _supabase_execute_with_timeout('logbook_upload_store',
+                                                        _do, timeout_s=30)
+        rows = getattr(result, 'data', None) or []
+        job_id = rows[0].get('id') if rows and isinstance(rows[0], dict) else None
+        if not failed and job_id is not None:
             print(f'[logbook-import] sb-store ok tok={token[:8]} '
-                  f'file={filename} {len(blob)}B')
-        return not failed
+                  f'job={job_id} file={filename} {len(blob)}B')
+            return int(job_id)
+        return None
     except Exception as ex:
         print(f'[logbook-import] sb-store fail: {type(ex).__name__}: {str(ex)[:200]}')
-        return False
+        return None
 
 
 def _logbook_import_mail(token, filename, blob, note, stored=False):
@@ -23348,19 +23352,51 @@ def upload_logbook_import(token):
             fh.write(blob)
     except Exception:
         pass
-    # Zwei durable Wege: SB-Upload-Store (primär, Owner zieht direkt aus der
-    # Tabelle) + Owner-Mail mit Anhang (Redundanz/Benachrichtigung). Ehrlich
-    # angenommen nur, wenn MINDESTENS EINER durchkam — die Container-Disk
-    # allein ist ephemer.
-    stored = _logbook_upload_store(token, filename, blob, note)
-    mailed = _logbook_import_mail(token, filename, blob, note, stored=stored)
-    if not (stored or mailed):
+    # A mail is only operator notification. Without a durable row id the app
+    # cannot poll and the upload must not pretend to be a trackable job.
+    job_id = _logbook_upload_store(token, filename, blob, note)
+    if job_id is None:
         return jsonify({'ok': False, 'error': 'delivery_failed',
                         'message': 'Übertragung fehlgeschlagen — bitte später '
                                    'erneut versuchen.'}), 502
+    _logbook_import_mail(token, filename, blob, note, stored=True)
     return jsonify({'ok': True,
-                    'message': 'Import eingereicht — deine Einträge werden '
-                               'übernommen.'})
+                    'job_id': job_id,
+                    'status': 'pending',
+                    'message': 'Upload gespeichert — Verarbeitung steht noch aus.'})
+
+
+@app.route('/api/user/logbook/<token>/import-upload/<int:job_id>', methods=['GET'])
+def get_logbook_import_upload_status(token, job_id):
+    """Durable, owner-bound import job status. The global owner-token gate
+    requires Bearer == path token; a foreign id receives the same 404 as an
+    unknown id, so the route cannot be used as an IDOR oracle."""
+    if not token or job_id < 1:
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'status_unavailable'}), 503
+    try:
+        def _load():
+            return (sb.table('ax_logbook_upload')
+                    .select('id,status,filename,created_at,completed_at')
+                    .eq('id', job_id).eq('token', token).limit(1).execute())
+        result, failed = _supabase_execute_with_timeout(
+            'logbook_upload_status', _load, timeout_s=8)
+        if failed:
+            return jsonify({'ok': False, 'error': 'status_unavailable'}), 503
+        rows = getattr(result, 'data', None) or []
+        if not rows:
+            return jsonify({'ok': False, 'error': 'not_found'}), 404
+        row = rows[0]
+        return jsonify({'ok': True, 'job_id': row.get('id'),
+                        'status': row.get('status') or 'pending',
+                        'filename': row.get('filename'),
+                        'created_at': row.get('created_at'),
+                        'completed_at': row.get('completed_at')})
+    except Exception as ex:
+        app.logger.warning('[logbook-import] status fail tok=%s job=%s err=%s',
+                           token[:8], job_id, type(ex).__name__)
+        return jsonify({'ok': False, 'error': 'status_unavailable'}), 503
 
 
 # ── Crew-Logbuch (Privat-Persistenz) ────────────────────────────────────────
@@ -57765,7 +57801,7 @@ def _roster_ai_learn_store(token, capped_text, valid_items, model, src_sha):
     level(f'[roster-ai] learn-queue-{"ok" if stored else "fail"} '
           f'tok={token[:8]} sha={src_sha[:16]} '
           f'chars={len(capped_text or "")} events={len(valid_items or [])}')
-    return stored
+    return bool(stored)
 
 
 def _roster_ai_fallback_ics(text, token, det_error):
@@ -57884,7 +57920,7 @@ def _roster_pdf_upload_store(token, filename, blob):
     level = app.logger.info if stored else app.logger.warning
     level(f'[roster-pdf] queue-store-{"ok" if stored else "fail"} '
           f'tok={token[:8]} sha={sha} bytes={len(blob)}')
-    return stored
+    return bool(stored)
 
 
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])

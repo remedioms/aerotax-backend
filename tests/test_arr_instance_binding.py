@@ -510,6 +510,13 @@ def test_flug_detail_aggregat_bindet_live_an_die_sollzeit(monkeypatch):
     sitzt der Fehler (die Maschine von HEUTE haengt am Leg von MORGEN).
     `resolve_flight.sched_dep` liegt vor (Prod-Probe: '2026-08-08T15:35:00+02:00')
     und muss durchgereicht werden."""
+    # Zeitstabil: der Test wurde ursprünglich mit dem nahen Datum 09.08.2026
+    # geschrieben. Ab 10.08. wurde daraus eine absichtliche Vergangenheits-
+    # Abfrage, für die das Produkt Live-Daten korrekt komplett überspringt.
+    # Ein fernes Zukunftsdatum hält genau die eigentlich geprüfte Vorwärts-
+    # Instanzbindung dauerhaft aktiv.
+    future_date = '2099-08-09'
+    future_sched = '2099-08-09T15:35:00+02:00'
     gesehen = {}
 
     def _fake_live(reg=None, flight=None, callsign=None, dep=None,
@@ -524,8 +531,8 @@ def test_flug_detail_aggregat_bindet_live_an_die_sollzeit(monkeypatch):
             return {'ok': True, 'flight': {
                 'flight': 'LH712', 'callsign': 'DLH712',
                 'dep_iata': 'FRA', 'arr_iata': 'ICN', 'reg': 'D-AIXB',
-                'sched_dep': '2026-08-09T15:35:00+02:00',
-                'sched_arr': '2026-08-10T09:55:00+09:00'}}
+                'sched_dep': future_sched,
+                'sched_arr': '2099-08-10T09:55:00+09:00'}}
         return None
 
     monkeypatch.setattr(AXD, '_aircraft_live_pos', _fake_live)
@@ -536,9 +543,9 @@ def test_flug_detail_aggregat_bindet_live_an_die_sollzeit(monkeypatch):
                         raising=False)
 
     with A.app.test_request_context('/api/ax/flight-detail/LH712'
-                                    '?date=2026-08-09&fresh=1'):
+                                    f'?date={future_date}&fresh=1'):
         AXD.ax_flight_detail('LH712')
     # Der Soll-Abflug des ANGEFRAGTEN Tages kommt am Store an …
-    assert gesehen.get('sched') == '2026-08-09T15:35:00+02:00'
+    assert gesehen.get('sched') == future_sched
     # … und der Snapshot der heutigen Maschine faellt damit heraus.
     assert G.live_pos_same_instance(LH712_SEEN, gesehen['sched']) is False
