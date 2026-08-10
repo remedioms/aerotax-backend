@@ -1006,12 +1006,13 @@ def _flightops_budget_inc(path, api=True):
     `lhfo:`; zweiter Schlüssel je Service für die Verbraucher-Aufschlüsselung.
     Wirft nie und darf den API-Pfad niemals blockieren.
 
-    ZUSÄTZLICH seit 2026-07-28 (Quota-Diät): derselbe Call wird in einem
-    TAGES-Zähler `lhfoD:<YYYYMMDD>` gebucht. Der FlightOps-Key hat neben dem
-    Stundenlimit ein Tageskontingent (6.000 lt. Owner) — ohne Tages-Sicht ist
-    ein Dauerlauf knapp unter der Stundengrenze rechnerisch bei 16.800/Tag und
-    reißt das Tageslimit lange vor der Stunde. budget_inc hängt die STUNDE
-    automatisch an, deshalb hier der Key-genaue Zwilling budget_inc_key.
+    ZUSÄTZLICH seit 2026-07-28: derselbe Call wird in einem TAGES-Zähler
+    `lhfoD:<YYYYMMDD>` gebucht. KORREKTUR 10.08.2026: das dabei angenommene
+    „Tageskontingent von 6.000" gibt es nicht — LH nennt für den PROD-Key
+    20.000/Stunde und 20/Sekunde, kein Tageslimit (Mail Alex). Der Tageszähler
+    bleibt als NOTBREMSE gegen Endlosschleifen, die unter beiden echten Grenzen
+    durchrutschen. budget_inc hängt die STUNDE automatisch an, deshalb hier der
+    Key-genaue Zwilling budget_inc_key.
 
     `api=False` (seit 2026-07-28 abends, Owner „refresh token without using
     APIs?"): der TOKEN-Endpoint ist `oauth.lufthansa.com` — ein ANDERER Host
@@ -1053,34 +1054,49 @@ def _flightops_budget_inc(path, api=True):
 # um die frühere Refresher-Marge gesenkt: die Gates messen jetzt NUR echte
 # Gateway-Calls, schützen aber dieselbe 1.000/h-Grenze inkl. Sicherheitsband,
 # falls LH Token-Calls wider Erwarten doch mitzählt.
-_LHFO_HOUR_BACKGROUND_CEILING = 650
-_LHFO_HOUR_INTERACTIVE_CEILING = 900
-
-# ── TAGES-DECKEL (Quota-Diät 2026-07-28) ────────────────────────────────────
-# Der Key hat zusätzlich ein TAGESkontingent von 6.000 Calls (Owner). Das
-# Stunden-Gate allein schützt davor NICHT: 700/h Hintergrund sind 16.800/Tag.
-# Gleiche Zwei-Stufen-Logik wie stündlich — Hintergrund stoppt früher und
-# lässt den Rest als Headroom für interaktive Flows (Connect-Erstimport,
-# „Jetzt aktualisieren", Re-Login-Heilung). Auch hier gilt: VORHER stoppen,
-# denn die 403s des Gateways zählen selbst aufs Kontingent und verlängern
-# die Sperre nur.
-# Analog zum Stunden-Gate um die Refresher-Marge gesenkt (Tageslimit 6.000;
-# Lazy-Rotation-Refreshes ≈ wenige hundert/Tag laufen separat in lhfoRD:).
-_LHFO_DAY_BACKGROUND_CEILING = 5000
-# TEMP-ANHEBUNG 2026-07-29 abends: Der Tagesdeckel war um ~15:00Z gerissen
-# (5601 >= 5600) → interaktive User-Imports fleet-weit tot (502→CF-404) für
-# die restlichen ~6 h bis zum UTC-Mitternacht-Reset, mitten in der Abend-
-# Primetime. 5900 lässt interaktive Flows wieder durch und hält 100 Calls
-# Sicherheitsband unter dem echten LH-Tageskontingent von 6.000; Hintergrund
-# bleibt bei 5000 voll gestoppt. Nach Wirkungsnachweis der Quota-Diät
-# (Verbrauch < 5000/Tag) zurück auf 5600 senken.
 #
-# RÜCKBAU-CHECK 01.08. (ax_api_budget, lhfoD:*): 28.07=6684, 29.07=5705,
-# 30.07=5203, 31.07=5167, 01.08 bereits 4500 um 13Z (Projektion >6000).
-# Der Beweis „<5000/Tag" ist NICHT erbracht — Deckel bleibt bewusst auf
-# 5900, sonst sterben abends wieder die interaktiven Imports. Erneut
-# prüfen, wenn drei Folgetage unter 5000 liegen.
-_LHFO_DAY_INTERACTIVE_CEILING = 5900
+# ══ KORREKTUR 10.08.2026 — DIE ECHTEN LIMITS, VON LH SCHRIFTLICH ═══════════
+# Alex (LH) per Mail: „Bei dem PROD Key hast Du eine Quota von 20.000 Calls
+# pro Stunde und ein Rate Limit von 20 Calls pro Sekunde."
+#
+# Damit ist ALLES darüber Makulatur. Die 1.000/h stammten aus einer Annahme,
+# die nie an der Quelle geprüft wurde; der 403-Vorfall vom 27.07. war
+# höchstwahrscheinlich das SEKUNDEN-Rate-Limit (20/s) während eines Bursts,
+# nicht ein Stunden-Kontingent. Ein Tages-Kontingent gibt es GAR NICHT.
+#
+# Was uns diese Fehlannahme gekostet hat, ist messbar: wir liefen auf 3 % der
+# erlaubten Rate. Der Tagesdeckel riss dadurch an JEDEM Tag (05.–10.08. je
+# ~5.500), und jedes Mal starben zuerst die Hintergrund-Features — zuletzt
+# Briefing-Raum/Security/Crewbus/Boarding, die deshalb wochenlang bei ALLEN
+# Nutzern leer blieben.
+#
+# ⚠️ DIE GRENZE, DIE WIRKLICH ZÄHLT, IST DIE SEKUNDE. 20 Calls/s lassen sich
+# mit einem einzigen ungebremsten Loop reißen, während die Stunde noch fast
+# leer ist. Der 0,7-s-Takt der Massen-Verbraucher (`_LB_SPACING_S`) hält
+# 1,4 Calls/s — Faktor 14 Sicherheitsabstand. Wer hier künftig parallelisiert,
+# muss diese Zahl anfassen, NICHT die Stundenwerte.
+#
+# LEHRE, teuer bezahlt: eine Limit-Zahl, die im eigenen Kommentar steht, ist
+# keine Quelle. Beim Anbieter nachfragen kostet eine Mail.
+_LHFO_HOUR_BACKGROUND_CEILING = 12000     # 60 % der echten 20.000/h
+_LHFO_HOUR_INTERACTIVE_CEILING = 18000    # 90 % — Taps zuletzt sterben
+
+# ── TAGES-DECKEL — jetzt NOTBREMSE, nicht mehr Kontingent-Abbild ─────────────
+# Bis 10.08.2026 bildeten diese Zahlen ein „Tageskontingent von 6.000" ab, das
+# es NIE GAB (s. Korrektur oben — LH kennt nur 20.000/Stunde und 20/Sekunde).
+# Sie waren damit die schärfste Bremse im System und rissen an jedem Tag.
+#
+# Weg können sie trotzdem nicht: ein Tageszähler ist die einzige Stelle, die
+# eine Endlosschleife bemerkt, die brav 1,4 Calls/s macht und damit weder das
+# Sekunden- noch das Stunden-Gate auslöst. Er bleibt also — aber als
+# NOTBREMSE, eine Größenordnung über dem realen Verbrauch (~5.500/Tag), nicht
+# als tägliche Ration.
+#
+# 60.000/Tag = gut das Zehnfache des heutigen Verbrauchs und immer noch nur
+# ein Achtel dessen, was 20.000/h theoretisch pro Tag hergäben. Wer diese
+# Marke reißt, hat einen Bug, kein Wachstum.
+_LHFO_DAY_BACKGROUND_CEILING = 60000
+_LHFO_DAY_INTERACTIVE_CEILING = 72000
 
 # ── DRITTE STUFE: PRIORISIERTER HINTERGRUND (Owner-Befund 09.08.2026) ────────
 # MESSUNG, die diese Stufe ausgelöst hat: der Hintergrund-Deckel (5.000) wird
@@ -1097,14 +1113,14 @@ _LHFO_DAY_INTERACTIVE_CEILING = 5900
 # aktualisieren" am Leben hält — genau die sind am 29.07. abends fleet-weit
 # gestorben, als der Deckel riss. Deshalb eine eigene Stufe DAZWISCHEN.
 #
-# WARUM NUR 5.600: 300 Calls über dem Hintergrund-Deckel, 300 unter dem
-# interaktiven. Das Band ist exakt so breit wie der eigene Tagestopf dieses
-# Verbrauchers (`_DM_DAY_CEILING`) — er kann es also im schlimmsten Fall
-# vollständig ausschöpfen und trotzdem keinen interaktiven Call verdrängen.
-# Zwei Bremsen, nicht eine: die Stufe hier schützt die interaktiven Flows,
-# der Topf unten schützt sie voreinander.
-_LHFO_HOUR_PRIORITY_CEILING = 800
-_LHFO_DAY_PRIORITY_CEILING = 5600
+# NACHTRAG 10.08.2026: Mit den ECHTEN Limits (20.000/h, kein Tageskontingent)
+# ist die Knappheit weg, für die diese Stufe erfunden wurde. Sie bleibt
+# trotzdem — die Rangfolge ist unabhängig von der Menge richtig: geht je etwas
+# schief und ein Gate greift, sollen Nutzer-Taps zuletzt sterben, dann die
+# Dienst-Marken, dann der Rest. Die Werte liegen jetzt einfach zwischen den
+# neuen Stufen statt zwischen den alten.
+_LHFO_HOUR_PRIORITY_CEILING = 15000
+_LHFO_DAY_PRIORITY_CEILING = 66000
 
 # Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
 # Supabase, der Tagesstand ändert sich träge — 120 s reichen für einen
@@ -4109,15 +4125,20 @@ def _boarding_fetch(user_token, flight, date, dep, arr, departure_epoch=None):
 # Der Prioritäts-Deckel oben schützt die interaktiven Flows VOR diesem
 # Verbraucher. Dieser Topf hier schützt die anderen HINTERGRUND-Verbraucher
 # vor ihm: ohne ihn könnte ein Fehler in der Fenster-Logik (oder ein Roster
-# mit vielen Sektoren) das 300er-Band in einem Rutsch leerlaufen lassen.
+# mit vielen Sektoren) das Band in einem Rutsch leerlaufen lassen.
 #
-# WARUM 300 REICHT: es ist genau EIN Call pro Nutzer und Diensttag —
-# `boarding_candidate_index` wählt einen einzigen Sektor, `_BOARDING_INFLIGHT`
-# verhindert Parallelläufe desselben Schlüssels, und der Cache trägt das
-# Ergebnis durch das Fenster. Zum Vergleich: der Landing-Report kommt mit 400
-# aus und verbrauchte gestern 97.
+# 3.000 (10.08.2026): Es ist EIN Call pro FLUG und Diensttag, nicht pro Nutzer
+# — der geteilte Flug-Cache unten fasst die ~20 Crew einer Langstrecke zu
+# einer Abfrage zusammen, `boarding_candidate_index` wählt einen einzigen
+# Sektor, `_BOARDING_INFLIGHT` verhindert Parallelläufe. Bei ~1.600 Grants
+# sind das ein paar hundert Flüge pro Tag.
+#
+# Der ursprüngliche Wert war 300 — bemessen gegen ein Tageskontingent von
+# 6.000, das es nie gab (s. Korrektur oben). Er wäre bei diesem Nutzerstand
+# selbst zur Bremse geworden: das Feature hätte mittags aufgehört zu
+# funktionieren, diesmal an unserem eigenen Topf statt am Haupt-Gate.
 _DM_BUDGET_PREFIX = 'lhfoD-marks:'
-_DM_DAY_CEILING = 300
+_DM_DAY_CEILING = 3000
 
 # ── GETEILTER FLUG-CACHE DER MARKEN (Owner-Auftrag 09.08.: „smart bleiben") ──
 # Briefing-Raum, Security, Crewbus und Boarding sind FLUG-Fakten, keine
@@ -5209,7 +5230,7 @@ def _crew_shared_serve(token, flight, date, dep=None, arr=None, now=None):
 # OHNEHIN schon stecken (accessCode/dep/arr fertig) — der Prefetch kostet also
 # KEINEN Duty-Events-Call extra, nur den COMMON_CREWLIST je Leg.
 #
-# QUOTA-RECHNUNG (ehrlich, Key: 1.000/h · ~6.000/Tag):
+# QUOTA-RECHNUNG (Key laut LH 10.08.2026: 20.000/h · 20/s · kein Tageslimit):
 #   • ~130 verbundene User. Bestandslast heute: refresh-all alle 2 h mit
 #     Kadenz-Gate (3,5 h / 11,5 h) ⇒ ~4 Duty-Events-Calls pro User und Tag
 #     (~520) + Rotations-Pickups (~300–400) + interaktive Flows.

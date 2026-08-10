@@ -84,10 +84,41 @@ def test_day_gate_blocks_interactive_at_hard_day_ceiling():
         assert fo._api_get('tok', '/COMMON_DUTY_EVENTS',
                            interactive=True) is None
     assert sent == []
-    # Die Deckel müssen unter dem LH-Tageslimit (6.000) bleiben — die 403s des
-    # Gateways zählen selbst aufs Kontingent, wir stoppen VORHER.
+    # KORREKTUR 10.08.2026: hier stand `< 6000` — ein "LH-Tageslimit", das es
+    # nie gab. LH nennt für den PROD-Key 20.000/Stunde und 20/Sekunde, KEIN
+    # Tageskontingent (Mail Alex). Die Zahl stammte aus einer Annahme und war
+    # über Wochen die schärfste Bremse im System.
+    #
+    # Was hier trotzdem geprüft gehört, ist die RANGFOLGE: wenn ein Gate
+    # greift, sterben Nutzer-Taps zuletzt. Die ist von der Menge unabhängig
+    # und gilt auch, wenn die Deckel morgen wieder anders liegen.
     assert (fo._LHFO_DAY_BACKGROUND_CEILING
-            < fo._LHFO_DAY_INTERACTIVE_CEILING < 6000)
+            < fo._LHFO_DAY_PRIORITY_CEILING
+            < fo._LHFO_DAY_INTERACTIVE_CEILING)
+
+
+def test_stundendeckel_bleiben_unter_dem_echten_lh_limit():
+    """Die Stunde ist die Grenze, die LH wirklich zieht: 20.000 Calls/h für den
+    PROD-Key. Unsere Deckel müssen darunter bleiben — mit Luft, denn die 403s
+    des Gateways zählen selbst mit und verlängern eine Sperre nur.
+
+    Ebenfalls geprüft: dieselbe Rangfolge wie am Tag."""
+    LH_STUNDE = 20000
+    assert (fo._LHFO_HOUR_BACKGROUND_CEILING
+            < fo._LHFO_HOUR_PRIORITY_CEILING
+            < fo._LHFO_HOUR_INTERACTIVE_CEILING < LH_STUNDE)
+
+
+def test_sekundentakt_haelt_das_echte_rate_limit_ein():
+    """**Die Grenze, die man versehentlich reisst.** 20 Calls/Sekunde lassen
+    sich mit einem ungebremsten Loop sprengen, während die Stunde noch fast
+    leer ist — der 403-Vorfall vom 27.07. war hoechstwahrscheinlich genau das.
+    Der Abstand der Massen-Verbraucher muss deshalb mit Sicherheitsfaktor
+    unter 20/s bleiben."""
+    LH_PRO_SEKUNDE = 20
+    calls_pro_sekunde = 1.0 / fo._LB_SPACING_S
+    assert calls_pro_sekunde < LH_PRO_SEKUNDE / 5, (
+        f"{calls_pro_sekunde:.1f} Calls/s lassen zu wenig Abstand zu {LH_PRO_SEKUNDE}/s")
 
 
 def test_budget_inc_books_hour_and_day_key():
