@@ -12880,6 +12880,171 @@ def _push_normalized_environment(value):
     return value if value in ('prod', 'sandbox') else 'unknown'
 
 
+_PUSH_LANGUAGES = frozenset(('de', 'en', 'it', 'es', 'fr', 'pt'))
+_PUSH_USER_CONTENT_TYPES = frozenset((
+    'dm', 'group_message', 'chat', 'message', 'forum', 'forum_reply',
+    'forum_mention', 'comment', 'reply', 'mention', 'wall_comment',
+    'wall_comment_reply', 'family_message', 'family_reply', 'goodflight',
+))
+_PUSH_SYSTEM_COPY = {
+    'logbook_import_completed': {
+        'de': ('Flugbuch-Import fertig',
+               'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.'),
+        'en': ('Logbook import complete',
+               'Your imported flights and hours are now in your logbook.'),
+        'it': ('Importazione del registro completata',
+               'I voli e le ore importati sono ora nel tuo registro di volo.'),
+        'es': ('Importación del libro de vuelo completada',
+               'Tus vuelos y horas importados ya están en tu libro de vuelo.'),
+        'fr': ('Import du carnet de vol terminé',
+               'Vos vols et heures importés sont maintenant dans votre carnet de vol.'),
+        'pt': ('Importação do diário de voo concluída',
+               'Os seus voos e horas importados já estão no seu diário de voo.'),
+    },
+    'roster_change': {
+        'de': ('Dienstplan-Änderung', 'Dein Dienstplan wurde geändert. Details in AeroX.'),
+        'en': ('Roster update', 'Your roster has changed. View the details in AeroX.'),
+        'it': ('Aggiornamento del turno', 'Il tuo turno è cambiato. Vedi i dettagli in AeroX.'),
+        'es': ('Actualización del servicio', 'Tu programación ha cambiado. Consulta los detalles en AeroX.'),
+        'fr': ('Mise à jour du planning', 'Votre planning a changé. Consultez les détails dans AeroX.'),
+        'pt': ('Atualização da escala', 'A sua escala foi alterada. Veja os detalhes no AeroX.'),
+    },
+    'crew_dm_request': {
+        'de': ('Neue Nachrichtenanfrage', '{sender} möchte dir eine Nachricht senden.'),
+        'en': ('New message request', '{sender} wants to send you a message.'),
+        'it': ('Nuova richiesta di messaggio', '{sender} desidera inviarti un messaggio.'),
+        'es': ('Nueva solicitud de mensaje', '{sender} quiere enviarte un mensaje.'),
+        'fr': ('Nouvelle demande de message', '{sender} souhaite vous envoyer un message.'),
+        'pt': ('Novo pedido de mensagem', '{sender} quer enviar-lhe uma mensagem.'),
+    },
+    'crew_dm_request_accepted': {
+        'de': ('Crew-Chat angenommen', 'Ihr könnt jetzt schreiben.'),
+        'en': ('Crew chat accepted', 'You can now chat.'),
+        'it': ('Chat equipaggio accettata', 'Ora potete scrivervi.'),
+        'es': ('Chat de tripulación aceptado', 'Ya podéis chatear.'),
+        'fr': ('Discussion équipage acceptée', 'Vous pouvez maintenant discuter.'),
+        'pt': ('Chat de tripulação aceite', 'Agora podem conversar.'),
+    },
+    'crew_dm_request_declined': {
+        'de': ('Crew-Chat nicht angenommen', 'Deine Nachrichtenanfrage wurde abgelehnt.'),
+        'en': ('Crew chat declined', 'Your message request was declined.'),
+        'it': ('Chat equipaggio rifiutata', 'La tua richiesta di messaggio è stata rifiutata.'),
+        'es': ('Chat de tripulación rechazado', 'Tu solicitud de mensaje fue rechazada.'),
+        'fr': ('Discussion équipage refusée', 'Votre demande de message a été refusée.'),
+        'pt': ('Chat de tripulação recusado', 'O seu pedido de mensagem foi recusado.'),
+    },
+    'friend_request': {
+        'de': ('Neue Folge-Anfrage', '{who} möchte dir folgen.'),
+        'en': ('New follow request', '{who} wants to follow you.'),
+        'it': ('Nuova richiesta di follow', '{who} vuole seguirti.'),
+        'es': ('Nueva solicitud para seguirte', '{who} quiere seguirte.'),
+        'fr': ('Nouvelle demande de suivi', '{who} souhaite vous suivre.'),
+        'pt': ('Novo pedido para seguir', '{who} quer seguir-lhe.'),
+    },
+    'friend_accept_connected': {
+        'de': ('Neue Crew-Verbindung', '{who} ist jetzt mit dir verbunden.'),
+        'en': ('New crew connection', '{who} is now connected with you.'),
+        'it': ('Nuovo contatto equipaggio', '{who} ora è connesso con te.'),
+        'es': ('Nueva conexión de tripulación', '{who} ya está conectado contigo.'),
+        'fr': ('Nouvelle connexion équipage', '{who} est maintenant connecté avec vous.'),
+        'pt': ('Nova ligação de tripulação', '{who} está agora ligado a si.'),
+    },
+    'friend_accept_accepted': {
+        'de': ('Neue Crew-Verbindung', '{who} hat deine Anfrage angenommen.'),
+        'en': ('New crew connection', '{who} accepted your request.'),
+        'it': ('Nuovo contatto equipaggio', '{who} ha accettato la tua richiesta.'),
+        'es': ('Nueva conexión de tripulación', '{who} aceptó tu solicitud.'),
+        'fr': ('Nouvelle connexion équipage', '{who} a accepté votre demande.'),
+        'pt': ('Nova ligação de tripulação', '{who} aceitou o seu pedido.'),
+    },
+    'friend_remind': {
+        'de': ('Erinnerung', 'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.'),
+        'en': ('Reminder', 'A crew buddy asked you to import your roster.'),
+        'it': ('Promemoria', 'Un collega ti chiede di importare il tuo turno.'),
+        'es': ('Recordatorio', 'Un compañero te pide que importes tu programación.'),
+        'fr': ('Rappel', 'Un collègue vous demande d’importer votre planning.'),
+        'pt': ('Lembrete', 'Um colega pediu-lhe para importar a sua escala.'),
+    },
+    'flight_departed': {
+        'de': ('Flug-Update · {flight}', '{flight} ist gestartet{route}.'),
+        'en': ('Flight update · {flight}', '{flight} has departed{route}.'),
+        'it': ('Aggiornamento volo · {flight}', '{flight} è partito{route}.'),
+        'es': ('Actualización de vuelo · {flight}', '{flight} ha despegado{route}.'),
+        'fr': ('Mise à jour du vol · {flight}', '{flight} est parti{route}.'),
+        'pt': ('Atualização do voo · {flight}', '{flight} partiu{route}.'),
+    },
+    'flight_eta_1h': {
+        'de': ('Flug-Update · {flight}', '{flight} landet voraussichtlich in etwa einer Stunde{destination}.'),
+        'en': ('Flight update · {flight}', '{flight} is expected to land in about one hour{destination}.'),
+        'it': ('Aggiornamento volo · {flight}', '{flight} dovrebbe atterrare tra circa un’ora{destination}.'),
+        'es': ('Actualización de vuelo · {flight}', '{flight} aterrizará aproximadamente en una hora{destination}.'),
+        'fr': ('Mise à jour du vol · {flight}', '{flight} devrait atterrir dans environ une heure{destination}.'),
+        'pt': ('Atualização do voo · {flight}', '{flight} deverá aterrar dentro de cerca de uma hora{destination}.'),
+    },
+    'flight_landed': {
+        'de': ('Flug-Update · {flight}', '{flight} ist gelandet{destination}.'),
+        'en': ('Flight update · {flight}', '{flight} has landed{destination}.'),
+        'it': ('Aggiornamento volo · {flight}', '{flight} è atterrato{destination}.'),
+        'es': ('Actualización de vuelo · {flight}', '{flight} ha aterrizado{destination}.'),
+        'fr': ('Mise à jour du vol · {flight}', '{flight} a atterri{destination}.'),
+        'pt': ('Atualização do voo · {flight}', '{flight} aterrou{destination}.'),
+    },
+    'flight_update': {
+        'de': ('Flug-Update · {flight}', 'Es gibt ein neues Update zu deinem Flug. Details in AeroX.'),
+        'en': ('Flight update · {flight}', 'There is a new update for your flight. View the details in AeroX.'),
+        'it': ('Aggiornamento volo · {flight}', 'C’è un nuovo aggiornamento per il tuo volo. Dettagli in AeroX.'),
+        'es': ('Actualización de vuelo · {flight}', 'Hay una nueva actualización de tu vuelo. Consulta los detalles en AeroX.'),
+        'fr': ('Mise à jour du vol · {flight}', 'Une nouvelle information est disponible pour votre vol. Détails dans AeroX.'),
+        'pt': ('Atualização do voo · {flight}', 'Há uma nova atualização do seu voo. Veja os detalhes no AeroX.'),
+    },
+    'family_reaction': {
+        'de': ('Antwort von der Crew', '{emoji} auf deine Nachricht'),
+        'en': ('Reply from your crew', '{emoji} to your message'),
+        'it': ('Risposta dal tuo equipaggio', '{emoji} al tuo messaggio'),
+        'es': ('Respuesta de tu tripulación', '{emoji} a tu mensaje'),
+        'fr': ('Réponse de votre équipage', '{emoji} à votre message'),
+        'pt': ('Resposta da sua tripulação', '{emoji} à sua mensagem'),
+    },
+    'family_message_title': {
+        'de': ('Nachricht von {sender}', None), 'en': ('Message from {sender}', None),
+        'it': ('Messaggio da {sender}', None), 'es': ('Mensaje de {sender}', None),
+        'fr': ('Message de {sender}', None), 'pt': ('Mensagem de {sender}', None),
+    },
+    'family_reply_title': {
+        'de': ('Antwort von {name}', None), 'en': ('Reply from {name}', None),
+        'it': ('Risposta da {name}', None), 'es': ('Respuesta de {name}', None),
+        'fr': ('Réponse de {name}', None), 'pt': ('Resposta de {name}', None),
+    },
+}
+
+
+def _push_language(value):
+    language = str(value or '').strip().lower().split('-', 1)[0]
+    return language if language in _PUSH_LANGUAGES else 'de'
+
+
+def _push_localize_system_copy(title, body, data, language):
+    """Translate only registered system templates, never user-authored copy."""
+    push_type = str((data or {}).get('type') or '').strip().lower()
+    is_user_content = push_type in _PUSH_USER_CONTENT_TYPES
+    key_field = ('title_localization_key' if is_user_content
+                 else 'localization_key')
+    key = str((data or {}).get(key_field) or '').strip()
+    translations = _PUSH_SYSTEM_COPY.get(key)
+    if not translations:
+        return title, body
+    translated_title, translated_body = translations.get(
+        _push_language(language), translations['de'])
+    args = (data or {}).get('localization_args') or {}
+    try:
+        translated_title = translated_title.format(**args)
+        translated_body = (translated_body.format(**args)
+                           if translated_body is not None else body)
+    except (KeyError, ValueError, AttributeError):
+        return title, body
+    return translated_title, translated_body
+
+
 def _push_installation_register(user_token, registry, unregister_token=None):
     """Atomically bind one APNs installation to an account.
 
@@ -12903,6 +13068,7 @@ def _push_installation_register(user_token, registry, unregister_token=None):
         'p_metadata': {
             'environment_source': reg.get('apns_env_source') or 'server',
             'registered_via': reg.get('registered_via') or 'legacy',
+            'language': _push_language(reg.get('language')),
         },
         'p_unregister_secret_hash': (
             _hashlib.sha256(str(unregister_token).encode('utf-8')).hexdigest()
@@ -12957,6 +13123,7 @@ def _push_fcm_installation_register(user_token, registry,
         'p_device_id': (reg.get('device_id') or '').strip() or None,
         'p_metadata': {
             'registered_via': reg.get('registered_via') or 'native_fcm',
+            'language': _push_language(reg.get('language')),
         },
         'p_unregister_secret_hash': (
             _hashlib.sha256(str(unregister_token).encode('utf-8')).hexdigest()
@@ -13005,6 +13172,7 @@ def _push_installations_for_user(user_token):
                 'apns_env': _push_normalized_environment(row.get('environment')),
                 'device_id': row.get('device_id') or '',
                 'platform': row.get('platform') or 'ios',
+                'language': _push_language((row.get('metadata') or {}).get('language')),
             })
         return rows
     except Exception as e:
@@ -25084,7 +25252,8 @@ def take_roster_snapshot(token):
             if n:
                 _push_notify_async(token, 'Dienstplan-Änderung', body,
                                    data={'type': 'roster_change',
-                                         'roster_change_id': str(change_id)},
+                                         'roster_change_id': str(change_id),
+                                         'localization_key': 'roster_change'},
                                    category='DUTY_CHANGE',
                                    idempotency_key=(
                                        f'roster-change:{token}:{change_id}:'
@@ -28388,7 +28557,9 @@ def send_crew_dm_request(token, target_token):
         _push_notify_async(
             target_token, 'Neue Nachrichtenanfrage',
             f'{sender_name} möchte dir eine Nachricht senden.',
-            data={'type': 'crew_dm_request', 'from': token},
+            data={'type': 'crew_dm_request', 'from': token,
+                  'localization_key': 'crew_dm_request',
+                  'localization_args': {'sender': sender_name}},
             idempotency_key=f'crew-dm-request:{token}:{target_token}',
             actor_token=token)
     except Exception:
@@ -28438,7 +28609,10 @@ def decide_crew_dm_request(token, sender_token):
             ('Ihr könnt jetzt schreiben.' if status == 'accepted'
              else 'Deine Nachrichtenanfrage wurde abgelehnt.'),
             data={'type': 'crew_dm_request_decision', 'from': token,
-                  'status': status},
+                  'status': status,
+                  'localization_key': (
+                      'crew_dm_request_accepted' if status == 'accepted'
+                      else 'crew_dm_request_declined')},
             idempotency_key=(
                 f'crew-dm-request-decision:{sender_token}:{token}:{status}'),
             actor_token=token)
@@ -35249,6 +35423,9 @@ def register_push_apns():
     if not _request_bearer_matches(user_token):
         return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     existing = _push_load(user_token) or {}
+    language = (body.get('language') or existing.get('language') or 'de').strip().lower()
+    if language not in ('de', 'en', 'it', 'es', 'fr', 'pt'):
+        language = 'de'
     merged = {
         'token': user_token,
         'push_token': existing.get('push_token') or '',  # Expo nicht überschreiben
@@ -35261,6 +35438,7 @@ def register_push_apns():
                       or ''),
         'registered_at': datetime.now().isoformat(),
         'registered_via': 'native_apns',
+        'language': language,
     }
     # Preference-Filter (2026-07-03): User-Prefs überleben eine Re-Registrierung
     # (der Save überschreibt die metadata-jsonb komplett — ohne Carry-over wären
@@ -35307,7 +35485,7 @@ def register_push_apns():
 def register_push_fcm():
     """Native Android push registration.
 
-    Body: {token, fcm_token, platform, bundle_id, device_id}. The durable
+    Body: {token, fcm_token, platform, bundle_id, device_id, language}. The durable
     installation registry is authoritative; the legacy row remains a
     compatibility fallback.
     """
@@ -35321,6 +35499,7 @@ def register_push_fcm():
     if not _request_bearer_matches(user_token):
         return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     existing = _push_load(user_token) or {}
+    language = _push_language(body.get('language') or existing.get('language'))
     merged = {
         **existing,
         'token': user_token,
@@ -35329,6 +35508,7 @@ def register_push_fcm():
         'bundle_id': ((body.get('bundle_id') or '').strip()
                       or 'de.aerosteuer.aerox'),
         'device_id': (body.get('device_id') or existing.get('device_id') or ''),
+        'language': language,
         'registered_at': datetime.now().isoformat(),
         'registered_via': 'native_fcm',
     }
@@ -35339,6 +35519,7 @@ def register_push_fcm():
             'fcm_token': fcm_token,
             'bundle_id': merged['bundle_id'],
             'device_id': merged['device_id'],
+            'language': language,
             'registered_via': 'native_fcm',
         },
         unregister_token=unregister_token,
@@ -35916,16 +36097,18 @@ def _send_push_notification(token, title, body, data=None,
             reasons.append('no_jwt')
             continue
 
+        localized_title, localized_body = _push_localize_system_copy(
+            title, body, data, reg.get('language'))
         attempted += 1
         ok, reason = _send_apns(
-            apns_token, title, body, data=data, topic=topic,
+            apns_token, localized_title, localized_body, data=data, topic=topic,
             thread_id=thread_id, badge=badge, use_sandbox=first_sandbox,
             retry_env_planned=True, category=category)
         used_env = 'sandbox' if first_sandbox else 'prod'
         if not ok and reason in dead_reasons:
             alt_sandbox = not first_sandbox
             ok2, reason2 = _send_apns(
-                apns_token, title, body, data=data, topic=topic,
+                apns_token, localized_title, localized_body, data=data, topic=topic,
                 thread_id=thread_id, badge=badge, use_sandbox=alt_sandbox,
                 category=category)
             if ok2:
@@ -35971,9 +36154,11 @@ def _send_push_notification(token, title, body, data=None,
         if not fcm_endpoint or fcm_endpoint in seen_fcm:
             continue
         seen_fcm.add(fcm_endpoint)
+        localized_title, localized_body = _push_localize_system_copy(
+            title, body, data, reg.get('language'))
         attempted += 1
         ok, reason = _send_fcm(
-            fcm_endpoint, title, body, data=data, thread_id=thread_id)
+            fcm_endpoint, localized_title, localized_body, data=data, thread_id=thread_id)
         if ok:
             delivered += 1
             _push_installation_delivery_update(reg, True)
@@ -35998,8 +36183,10 @@ def _send_push_notification(token, title, body, data=None,
         else ''
     )
     if fcm_token:
+        localized_title, localized_body = _push_localize_system_copy(
+            title, body, data, (legacy or {}).get('language'))
         attempted += 1
-        ok, reason = _send_fcm(fcm_token, title, body, data=data,
+        ok, reason = _send_fcm(fcm_token, localized_title, localized_body, data=data,
                                thread_id=thread_id)
         if ok:
             delivered += 1
@@ -36020,8 +36207,10 @@ def _send_push_notification(token, title, body, data=None,
         attempted += 1
         try:
             import urllib.request
+            localized_title, localized_body = _push_localize_system_copy(
+                title, body, data, (legacy or {}).get('language'))
             payload = json.dumps({
-                'to': expo_token, 'title': title, 'body': body,
+                'to': expo_token, 'title': localized_title, 'body': localized_body,
                 'sound': 'default', 'priority': 'high',
                 **({'data': data} if data else {}),
             }).encode('utf-8')
@@ -51573,7 +51762,9 @@ def _send_friend_request_core(token, target, notify=True):
             who = my_name.strip() or 'Jemand'
             _push_notify_async(target, 'Neue Folge-Anfrage',
                                f'{who} möchte dir folgen.',
-                               data={'type': 'friend_request', 'from': token},
+                               data={'type': 'friend_request', 'from': token,
+                                     'localization_key': 'friend_request',
+                                     'localization_args': {'who': who}},
                                idempotency_key=f'friend-request:{token}:{target}',
                                actor_token=token)
         except Exception:
@@ -51705,7 +51896,9 @@ def redeem_friend_invite(token):
         who = my_name.strip() or 'Jemand'
         _push_notify_async(issuer, 'Neue Crew-Verbindung',
                            f'{who} ist jetzt mit dir verbunden.',
-                           data={'type': 'friend_accept', 'from': token},
+                           data={'type': 'friend_accept', 'from': token,
+                                 'localization_key': 'friend_accept_connected',
+                                 'localization_args': {'who': who}},
                            idempotency_key=f'friend-connect:{token}:{issuer}',
                            actor_token=token)
     except Exception:
@@ -51762,7 +51955,9 @@ def accept_friend_request(token):
         who = my_name.strip() or 'Jemand'
         _push_notify_async(from_token, 'Neue Crew-Verbindung',
                            f'{who} hat deine Anfrage angenommen.',
-                           data={'type': 'friend_accept', 'from': token},
+                           data={'type': 'friend_accept', 'from': token,
+                                 'localization_key': 'friend_accept_accepted',
+                                 'localization_args': {'who': who}},
                            idempotency_key=f'friend-accept:{token}:{from_token}',
                            actor_token=token)
     except Exception:
@@ -51841,7 +52036,8 @@ def friend_remind(token):
                            'Ein Crew-Buddy bittet dich, deinen Dienstplan zu importieren.',
                            # Audit 2026-07-12: ohne data.type war der Push
                            # unfilterbar (verstiess gegen die eigene Checkliste).
-                           data={'type': 'friend_remind'},
+                           data={'type': 'friend_remind',
+                                 'localization_key': 'friend_remind'},
                            actor_token=token)
     except Exception:
         pass

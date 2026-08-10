@@ -504,11 +504,23 @@ def _push_for_row(row, kind, now_utc):
     key = (f"fcheck:{row.get('flight_no')}:{row.get('flight_date')}:"
            f'{kind}:{tok}')
     try:
+        destination = (f' in {row.get("arr_iata").strip().upper()}'
+                       if kind in ('eta_1h', 'arrived')
+                       and len((row.get('arr_iata') or '').strip()) == 3 else '')
+        route = (f' · {(row.get("dep_iata") or "").strip().upper()}–'
+                 f'{(row.get("arr_iata") or "").strip().upper()}'
+                 if kind == 'departed'
+                 and len((row.get('dep_iata') or '').strip()) == 3
+                 and len((row.get('arr_iata') or '').strip()) == 3 else '')
         _do_push(tok, title, body,
                  data={'type': _PUSH_TYPE[kind],
                        'flight': row.get('flight_no'),
                        'date': str(row.get('flight_date')),
-                       'kind': kind},
+                       'kind': kind,
+                       'localization_key': _PUSH_TYPE[kind],
+                       'localization_args': {
+                           'flight': row.get('flight_no') or '',
+                           'route': route, 'destination': destination}},
                  idempotency_key=key)
     except Exception as e:
         log.warning('[fcheck] push fail %s %s: %s', row.get('flight_no'),

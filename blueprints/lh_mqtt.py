@@ -1476,7 +1476,9 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
                      data={'type': ptype, 'flight': user_flight,
                            'date': dep.date().isoformat(),
                            'inbound_flight': event_flight, 'reg': str(reg),
-                           'kind': kind},
+                           'kind': kind,
+                           'localization_key': 'flight_update',
+                           'localization_args': {'flight': user_flight}},
                      idempotency_key=key)
             pushed += 1
             seen.add(tok)
@@ -1560,7 +1562,9 @@ def lh_mqtt_event():
                 _do_push(tok, title, text,
                          data={'type': 'flight_update', 'flight': flight_disp,
                                'date': topic_date, 'kind': kind,
-                               'event_ts': ev_ts},
+                               'event_ts': ev_ts,
+                               'localization_key': 'flight_update',
+                               'localization_args': {'flight': flight_disp}},
                          idempotency_key=key)
                 pushed += 1
             except Exception as e:

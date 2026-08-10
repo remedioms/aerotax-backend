@@ -155,6 +155,92 @@ def test_send_push_fans_out_to_all_active_installations():
     assert health.call_count == 2
 
 
+def test_system_push_is_localized_per_device_language():
+    regs = [
+        {'installation_id': 'de', 'apns_token': 'a1', 'bundle_id': 'bundle',
+         'apns_env': 'prod', 'language': 'de'},
+        {'installation_id': 'en', 'apns_token': 'a2', 'bundle_id': 'bundle',
+         'apns_env': 'prod', 'language': 'en'},
+    ]
+    with patch.object(A, '_push_delivery_registrations',
+                      return_value=(regs, {'prefs': {}})), \
+            patch.dict(A.os.environ, {'APNS_AUTH_KEY': 'configured'}), \
+            patch.object(A, '_send_apns', return_value=(True, None)) as send, \
+            patch.object(A, '_push_installation_delivery_update'):
+        A._send_push_notification(
+            USER, 'Flugbuch-Import fertig',
+            'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.',
+            data={'type': 'logbook_import_completed',
+                  'localization_key': 'logbook_import_completed'})
+    assert send.call_args_list[0].args[1:3] == (
+        'Flugbuch-Import fertig',
+        'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.')
+    assert send.call_args_list[1].args[1:3] == (
+        'Logbook import complete',
+        'Your imported flights and hours are now in your logbook.')
+
+
+def test_user_generated_dm_text_is_never_localized():
+    reg = {'installation_id': 'it', 'apns_token': 'a1', 'bundle_id': 'bundle',
+           'apns_env': 'prod', 'language': 'it'}
+    with patch.object(A, '_push_delivery_registrations',
+                      return_value=([reg], {'prefs': {}})), \
+            patch.dict(A.os.environ, {'APNS_AUTH_KEY': 'configured'}), \
+            patch.object(A, '_send_apns', return_value=(True, None)) as send, \
+            patch.object(A, '_push_installation_delivery_update'):
+        A._send_push_notification(USER, 'Miguel', 'See you at 20:00!',
+                                  data={'type': 'dm',
+                                        'localization_key': 'logbook_import_completed'})
+    assert send.call_args.args[1:3] == ('Miguel', 'See you at 20:00!')
+
+
+def test_user_generated_family_reply_is_never_localized():
+    reg = {'installation_id': 'fr', 'apns_token': 'a1', 'bundle_id': 'bundle',
+           'apns_env': 'prod', 'language': 'fr'}
+    with patch.object(A, '_push_delivery_registrations',
+                      return_value=([reg], {'prefs': {}})), \
+            patch.dict(A.os.environ, {'APNS_AUTH_KEY': 'configured'}), \
+            patch.object(A, '_send_apns', return_value=(True, None)) as send, \
+            patch.object(A, '_push_installation_delivery_update'):
+        A._send_push_notification(
+            USER, 'Antwort von Miguel', 'Je suis déjà à la porte.',
+            data={'type': 'family_reply',
+                  'localization_key': 'logbook_import_completed'})
+    assert send.call_args.args[1:3] == (
+        'Antwort von Miguel', 'Je suis déjà à la porte.')
+
+
+def test_system_template_families_localize_with_safe_arguments():
+    checks = (
+        ('roster_change', {}, 'en', 'Roster update'),
+        ('crew_dm_request', {'sender': 'Miguel'}, 'it',
+         'Nuova richiesta di messaggio'),
+        ('friend_accept_accepted', {'who': 'Miguel'}, 'es',
+         'Nueva conexión de tripulación'),
+        ('flight_departed', {'flight': 'LH780', 'route': ' · FRA–SIN'},
+         'fr', 'Mise à jour du vol · LH780'),
+        ('flight_update', {'flight': 'LH780'}, 'pt',
+         'Atualização do voo · LH780'),
+        ('family_reaction', {'emoji': '❤️'}, 'en', 'Reply from your crew'),
+    )
+    for key, args, language, expected_title in checks:
+        title, _ = A._push_localize_system_copy(
+            'German title', 'German body',
+            {'type': 'system', 'localization_key': key,
+             'localization_args': args}, language)
+        assert title == expected_title
+
+
+def test_user_content_can_only_localize_its_surrounding_title():
+    title, body = A._push_localize_system_copy(
+        'Nachricht von Miguel', 'Mein selbst geschriebener Text',
+        {'type': 'family_message',
+         'title_localization_key': 'family_message_title',
+         'localization_args': {'sender': 'Miguel'}}, 'en')
+    assert title == 'Message from Miguel'
+    assert body == 'Mein selbst geschriebener Text'
+
+
 def test_dead_device_is_tombstoned_without_disabling_other_device():
     regs = [
         {'installation_id': 'dead-id', 'apns_token': 'dead',

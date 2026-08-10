@@ -56,6 +56,23 @@ def test_durable_fcm_registration_uses_atomic_rpc():
     assert calls[0][1]['p_unregister_secret_hash'] != 'logout-secret'
 
 
+def test_fcm_registration_persists_normalized_device_language():
+    calls = []
+
+    class SB:
+        def rpc(self, name, params):
+            calls.append((name, params))
+            return _RPC('22222222-2222-2222-2222-222222222222')
+
+    with patch.object(A, 'SB_AVAILABLE', True), patch.object(A, 'sb', SB()):
+        A._push_fcm_installation_register(USER, {
+            'fcm_token': 'fcm-one',
+            'language': 'fr-CA',
+        })
+
+    assert calls[0][1]['p_metadata']['language'] == 'fr'
+
+
 def test_register_fcm_requires_owner_and_preserves_preferences():
     client = A.app.test_client()
     existing = {
@@ -80,6 +97,7 @@ def test_register_fcm_requires_owner_and_preserves_preferences():
             'fcm_token': 'fcm-android-token',
             'device_id': 'android-installation-1',
             'bundle_id': 'de.aerosteuer.aerox',
+            'language': 'it-IT',
         }, headers=HEADERS)
 
     assert denied.status_code == 401
@@ -90,6 +108,7 @@ def test_register_fcm_requires_owner_and_preserves_preferences():
     assert registry['prefs'] == {'dm': False}
     assert registry['friend_prefs']['AT-FRIEND']['level'] == 'none'
     assert registry['apns_token'] == 'ios-stays-intact'
+    assert registry['language'] == 'it'
 
 
 def test_unregister_fcm_only_clears_matching_android_installation():

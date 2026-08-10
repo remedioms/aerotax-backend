@@ -439,7 +439,11 @@ def _notify_crew_of_family_message(crew_token, rec):
             crew_token,
             f'Nachricht von {sender}',
             text[:140],
-            data={'type': 'family_message', 'created_at': rec.get('created_at')},
+            data={'type': 'family_message', 'created_at': rec.get('created_at'),
+                  'title_localization_key': 'family_message_title',
+                  'localization_args': {'sender': sender}},
+            # Text is user-authored and remains untouched; only the title is
+            # a server template.
             idempotency_key=f'family-message:{crew_token}:{message_id}')
     except Exception as e:
         _log().info(f'[feed-status] message_push_skip {type(e).__name__}')
@@ -462,7 +466,9 @@ def _notify_family_of_reaction(family_token, emoji, created_at=None):
             recipient,
             'Antwort von der Crew',
             f'{emoji} auf deine Nachricht',
-            data={'type': 'family_reaction', 'emoji': emoji},
+            data={'type': 'family_reaction', 'emoji': emoji,
+                  'localization_key': 'family_reaction',
+                  'localization_args': {'emoji': emoji}},
             idempotency_key=(
                 f'family-reaction:{family_token}:{created_at or "current"}:{emoji}'))
     except Exception as e:
@@ -583,7 +589,9 @@ def _notify_family_of_reply(family_token, crew_token, rec):
             reply_text[:140],
             data={'type': 'family_reply',
                   'reply_created_at': rec.get('reply_created_at'),
-                  'reply_expires_at': rec.get('reply_expires_at')},
+                  'reply_expires_at': rec.get('reply_expires_at'),
+                  'title_localization_key': 'family_reply_title',
+                  'localization_args': {'name': crew_name}},
             idempotency_key=f'family-reply:{family_token}:{key}')
     except Exception as e:
         _log().info(f'[feed-status] reply_push_skip {type(e).__name__}')
