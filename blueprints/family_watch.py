@@ -573,6 +573,49 @@ def _parse_roster_day(row):
             'is_flight': is_flight, 'sectors': secs}
 
 
+# „Layover [ICN]" / „Layover [ICN] (Tag 1/3)" — die myTime-/FlightOps-Prosa für
+# einen LEG-LOSEN Aufenthaltstag (blueprints/lh_flightops.py mintet exakt dieses
+# Muster, siehe `summary = f'Layover [{_hiata}]'`). Der geteilte Nightstop-Helfer
+# `app._feed_nightstop_ort` kennt das Muster NICHT — er leitet aus `ical_sectors`
+# ab und fällt sonst auf `reader_facts.layover_ort` zurück. Genau diese
+# Fallback-Spalte füttern wir mit dem Summary-Beleg (keine Doppel-Logik: die
+# Sektor-Ableitung, der Red-Eye-Zweig und der Turnaround-Guard bleiben beim
+# Helfer, wir liefern nur die Wahrheit für den leg-losen Fall nach).
+_FW_LAYOVER_TAG_RE = re.compile(r'\bLAYOVER\s*\[\s*([A-Z]{3})\s*\]')
+
+
+def _summary_layover_iata(summary):
+    """`Layover [ICN] (Tag 1/3)` im (ggf. gemergten) Tages-Summary → 'ICN'.
+    None wenn kein expliziter Layover-Beleg drinsteht. Wirft nie."""
+    try:
+        m = _FW_LAYOVER_TAG_RE.search(str(summary or '').upper())
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _nightstop_day_shape(row):
+    """user_ical_briefings-Row → Tages-Form für `app._feed_nightstop_ort`.
+
+    Der Helfer erwartet die Kalender-/Feed-Tagesform (`datum`, `ical_sectors`,
+    `reader_facts`); der Family-Status liest dagegen ROHE Briefing-Rows. Diese
+    Brücke ist der einzige Unterschied — die Ableitung selbst bleibt geteilt.
+    None wenn die Row unbrauchbar ist."""
+    if not isinstance(row, dict) or not row.get('datum'):
+        return None
+    try:
+        parsed = _parse_roster_day(row)
+    except Exception:
+        return None
+    return {
+        'datum': parsed.get('datum'),
+        'ical_sectors': parsed.get('sectors') or [],
+        'reader_facts': {
+            'layover_ort': _summary_layover_iata(row.get('ical_summary')),
+        },
+    }
+
+
 def _family_duty_times(row):
     """Explizite (Briefing, Pick-up)-Ortszeiten eines Roster-Tags.
 
@@ -1318,8 +1361,13 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
         try:
             now = _dt.datetime.now(_dt.timezone.utc)
             today_d = _fw_today()
+            # days[2] = MORGEN (2026-08-10): rein für den Nacht-Turnaround-Guard
+            # in `_feed_nightstop_ort` (Ankunft spätabends + Rückabflug <8h
+            # später = KEIN Hotel-Layover). Die Fall-Kette unten liest nur
+            # days[0]/days[1] — Reihenfolge bewusst additiv ANGEHÄNGT.
             days = [today_d.isoformat(),
-                    (today_d - _dt.timedelta(days=1)).isoformat()]
+                    (today_d - _dt.timedelta(days=1)).isoformat(),
+                    (today_d + _dt.timedelta(days=1)).isoformat()]
             # raw_event trägt die Pro-Leg-Sektoren (ical_sectors, echt-UTC-
             # Zeiten je Leg) — Grundlage der kohärenten Aktuell-Leg-Wahl.
             r = (sb.table('user_ical_briefings')
@@ -1422,6 +1470,51 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                     roster_today_home = True
                 elif dest:
                     roster_layover = dest
+
+            # ── LÜCKEN-FALLBACK: leg-loser Layover-Tag (Bug 2026-08-10) ──────
+            # Tibor, mitten in einer ICN-Rotation: Summary „LH 712: FRA-ICN
+            # (Tag 2/2) · X · Layover [ICN] (Tag 1/3)", KEINE ical_sectors (der
+            # Cross-Date-Leg hängt am Vortag, Landung 00:33Z). Ergebnis: keiner
+            # der Zweige oben greift — `is_flight` ist wegen der „LH 712:
+            # FRA-ICN"-Prosa True, aber ohne ical_start/ical_end gibt es weder
+            # ein Dienst-Fenster noch `en_eff`/`landed_obs`, also wird weder
+            # `roster_layover` noch `roster_today_home` gesetzt. Der Resolver
+            # bekam dann `layover_iata=None` und fiel im leg-losen Zweig auf
+            # „Basis Frankfurt" zurück — die Family sah „zuhause", während die
+            # Crew in Seoul war.
+            #
+            # Der KALENDER-Pfad (`_load_crew_roster_days`) war längst auf den
+            # geteilten Helfer `app._feed_nightstop_ort` umgestellt (Commit
+            # 0492005) — die Status-Karte NIE. Deshalb las sich der Fix wie
+            # „wurde angeblich gefixt, sieht noch genauso aus". Jetzt nutzen
+            # BEIDE Flächen dieselbe Ableitung.
+            #
+            # STRENG ADDITIV: greift nur, wenn die Kette oben GAR NICHTS
+            # gesetzt hat. Ein positiver Home-Beweis (roster_today_home) oder
+            # ein laufendes Dienst-Fenster (flying_now) wird nie überschrieben,
+            # und ohne belastbaren Beleg (weder Sektoren noch „Layover [XXX]")
+            # bleibt es beim bisherigen ehrlichen Verhalten — wir RATEN keinen
+            # Layover.
+            if not (roster_layover or roster_today_home or flying_now):
+                _ns_fn = _app_attr('_feed_nightstop_ort')
+                _gap_day = _nightstop_day_shape(by_date.get(days[0]))
+                if callable(_ns_fn) and _gap_day is not None:
+                    _gap_next = _nightstop_day_shape(
+                        by_date.get(days[2]) if len(days) > 2 else None)
+                    # OHNE homebase-Argument — exakt wie der Kalender-Pfad
+                    # (Z. ~2470). Den Homebase-Vergleich macht die Zeile
+                    # darunter selbst, damit ein Heimat-Tag als POSITIVES
+                    # `roster_today_home` durchkommt statt still zu verpuffen.
+                    try:
+                        _gap = _ns_fn(_gap_day, next_day=_gap_next)
+                    except Exception:
+                        _gap = None
+                    _gap = str(_gap or '').strip().upper()
+                    if len(_gap) == 3 and _gap.isalpha():
+                        if hb and _gap == hb:
+                            roster_today_home = True
+                        else:
+                            roster_layover = _gap
         except Exception as e:
             # Vorher stumm (bare pass) — DER Zweig produzierte bei SB-Flakes
             # den All-None-„Status unbekannt" ohne jede Log-Spur.
