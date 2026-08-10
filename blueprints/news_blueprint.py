@@ -1176,12 +1176,15 @@ def _pull_avherald(src):
 # ──────────────────────────────────────────────────────────────────
 
 def _dedupe_articles(articles):
-    """Dedupliziert anhand (a) canonical-URL-hash und (b) Title-Similarity
-    via Jaccard auf Token-Sets.
+    """Dedupliziert anhand (a) canonical-URL-hash, (b) Title-Similarity
+    via Jaccard auf Token-Sets und (c) Story-Clustering auf Kern-Tokens.
 
     Strategie:
       - Pass 1: gleiche URL (oder gleiche id) → killen.
       - Pass 2: title-token-set Jaccard >= 0.85 → killen.
+      - Pass 3: gleiche STORY (vier Verlage, vier Wortlaute) → killen.
+        Siehe `_story_dedupe_indices`. Spart zusätzlich die KI-Rewrites in
+        der Redaktion, weil die Dubletten gar nicht erst in den Store kommen.
       Wir behalten den jeweils ÄLTEREN Eintrag (lower published_at) wenn beide
       gleich alt sind, sonst den mit längerem Summary (mehr Kontext).
     """
@@ -1230,7 +1233,16 @@ def _dedupe_articles(articles):
                 kept[dup_idx] = art
                 kept_token_sets[dup_idx] = tokens
 
-    return kept
+    # Pass 3: Story-Clustering (Owner 10.08.: 4× „Lufthansa Starlink-WLAN").
+    entries = [_story_entry(a.get('title'), a.get('mentioned_airlines'),
+                            a.get('published_at'),
+                            fallback_text=a.get('summary'))
+               for a in kept]
+    winners = _story_dedupe_indices(entries)
+    if len(winners) < len(kept):
+        _log_warn(f'[news] story-dedupe: {len(kept) - len(winners)} Dubletten '
+                  f'derselben Story entfernt')
+    return [kept[i] for i in winners]
 
 
 _STOPWORDS = {
@@ -1260,6 +1272,202 @@ def _jaccard(a, b):
     if union == 0:
         return 0.0
     return inter / union
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Story-Clustering (geteilt: Ingest-Dedupe UND Redaktions-Ausspielung)
+# ──────────────────────────────────────────────────────────────────
+#
+# FEHLERKLASSE (Owner 10.08.): Vier Verlage schreiben DIESELBE Meldung in vier
+# Wortlauten —
+#   „Lufthansa führt Starlink-WLAN ab August 2026 ein"
+#   „Lufthansa führt Starlink-Internet in der nächsten Woche ein"
+#   „Lufthansa startet Starlink-WLAN auf Airbus A320neo am 19. August"
+#   „Lufthansa führt Starlink-Wifi in ihrer Flotte ein"
+# Der Roh-Titel-Jaccard liegt dabei WEIT unter 0,85, also überlebten alle vier,
+# wurden vier Mal einzeln KI-umgeschrieben und erschienen vier Mal in der
+# Feed-Sektion „Deine Airline".
+#
+# Konsequenz: Ähnlichkeit NICHT auf ganzen Titeln messen, sondern auf dem
+# KERN — Verben, Füllwörter, Datums-/Zeitangaben und Zahlen raus, technische
+# Synonyme gefaltet (WLAN/Wifi/Internet → „wifi"). Was übrig bleibt, ist bei
+# derselben Story nahezu identisch ({lufthansa, starlink, wifi}), bei zwei
+# ECHT verschiedenen Stories derselben Airline aber fast disjunkt
+# („Streik angekündigt" vs. „neue Lounge München").
+
+# Schwellen — bewusst benannt statt als Magic Number im Code.
+_STORY_SIM_THRESHOLD = 0.5      # Kern-Token-Jaccard ab hier = dieselbe Story
+_STORY_WINDOW_SECONDS = 72 * 3600   # nur Meldungen innerhalb 72 h clustern
+_STORY_MIN_TOKENS = 2           # weniger Kern-Tokens = zu wenig Substanz
+_STORY_MIN_SHARED = 2           # ein einzelnes gemeinsames Wort reicht nie
+
+# Zusätzliche Stopwörter (deutsch + englisch): Verben und Funktionswörter, die
+# bei „X führt Y ein" / „X startet Y" den Kern nur verwässern.
+_STORY_STOPWORDS = _STOPWORDS | {
+    'führt', 'fuehrt', 'führen', 'fuehren', 'einführung', 'einfuehrung',
+    'einführen', 'einfuehren', 'startet', 'starten', 'gestartet',
+    'bringt', 'bringen', 'kommt', 'kommen', 'plant', 'planen', 'geplant',
+    'setzt', 'setzen', 'bietet', 'bieten', 'stattet', 'ausgestattet',
+    'will', 'wird', 'werden', 'wurde', 'wurden', 'hat', 'haben', 'hatte',
+    'gibt', 'geben', 'macht', 'machen', 'soll', 'sollen', 'kann', 'können',
+    'neue', 'neuer', 'neues', 'neuen', 'neu', 'erste', 'ersten', 'erster',
+    'ihre', 'ihrer', 'ihrem', 'ihren', 'sein', 'seine', 'seiner', 'seinen',
+    'sich', 'auch', 'schon', 'bereits', 'jetzt', 'nun', 'mehr', 'wieder',
+    'new', 'now', 'first', 'their', 'his', 'her', 'will', 'plans', 'plan',
+    'launch', 'launches', 'launched', 'introduce', 'introduces',
+    'introducing', 'start', 'starts', 'starting', 'begins', 'begin',
+    'says', 'said', 'sets', 'set', 'adds', 'add', 'gets', 'get', 'more',
+    'across', 'all', 'has', 'have', 'had', 'will', 'would', 'can',
+}
+
+# Datums-, Zeit- und Mengenangaben. „ab August 2026" vs. „nächste Woche" vs.
+# „am 19. August" beschreibt DENSELBEN Rollout — das Datum darf die Story
+# nicht auseinanderreißen.
+_STORY_TIME_TOKENS = {
+    'januar', 'februar', 'märz', 'maerz', 'april', 'mai', 'juni', 'juli',
+    'august', 'september', 'oktober', 'november', 'dezember',
+    'january', 'february', 'march', 'may', 'june', 'july',
+    'october', 'december',
+    'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'okt',
+    'oct', 'nov', 'dez', 'dec',
+    'montag', 'dienstag', 'mittwoch', 'donnerstag', 'freitag', 'samstag',
+    'sonntag', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+    'saturday', 'sunday', 'wochenende', 'weekend',
+    'woche', 'wochen', 'week', 'weeks', 'monat', 'monate', 'monaten',
+    'month', 'months', 'jahr', 'jahre', 'jahren', 'year', 'years',
+    'tag', 'tage', 'tagen', 'day', 'days', 'stunde', 'stunden', 'hour',
+    'hours', 'quartal', 'quarter',
+    'heute', 'morgen', 'gestern', 'today', 'tomorrow', 'yesterday',
+    'bald', 'soon', 'demnächst', 'demnaechst', 'künftig', 'kuenftig',
+    'nächste', 'naechste', 'nächsten', 'naechsten', 'nächster', 'naechster',
+    'nächstes', 'naechstes', 'kommende', 'kommenden', 'kommender', 'next',
+    'ende', 'anfang', 'mitte', 'beginn', 'later', 'early', 'late',
+}
+
+# Synonym-Faltung: derselbe Sachverhalt, anderes Verlags-Vokabular.
+_STORY_SYNONYMS = {
+    'wlan': 'wifi',
+    'wifi': 'wifi',
+    'internet': 'wifi',
+    'onlinezugang': 'wifi',
+    'breitband': 'wifi',
+    'broadband': 'wifi',
+    'konnektivität': 'wifi',
+    'konnektivitaet': 'wifi',
+    'connectivity': 'wifi',
+    'bordinternet': 'wifi',
+    'flugzeuge': 'flotte',
+    'flugzeug': 'flotte',
+    'fleet': 'flotte',
+    'jets': 'flotte',
+    'aircraft': 'flotte',
+    'streiks': 'streik',
+    'strike': 'streik',
+    'strikes': 'streik',
+    'walkout': 'streik',
+    'lounges': 'lounge',
+}
+
+# „Wi-Fi" / „Wi Fi" zerfällt sonst in zwei Zwei-Zeichen-Tokens und fällt aus
+# dem Kern raus — vor dem Tokenisieren zu einem Wort zusammenziehen.
+_STORY_WIFI_RE = re.compile(r'\bwi[\s\-.]?fi\b', re.IGNORECASE)
+_STORY_DIGITS_RE = re.compile(r'^\d+$')
+
+
+def _story_tokens(text):
+    """Kern-Tokens einer Schlagzeile: lowercase, Bindestriche/Punkte trennen,
+    Stopwörter + Datums-/Zahl-Tokens raus, Synonyme gefaltet."""
+    if not text:
+        return set()
+    t = _STORY_WIFI_RE.sub('wifi', str(text).lower())
+    out = set()
+    for part in re.findall(r'[a-zäöüß0-9]+', t):
+        if len(part) < 3:
+            continue
+        if _STORY_DIGITS_RE.match(part):
+            continue          # „2026", „19" — reine Zahlen tragen keine Story
+        if part in _STORY_STOPWORDS or part in _STORY_TIME_TOKENS:
+            continue
+        out.add(_STORY_SYNONYMS.get(part, part))
+    return out
+
+
+def _story_ts(raw):
+    """published_at → float-Epoche. Der Store trägt int-Epochen UND ISO-
+    Strings (Alt-/Testbestand). 0.0 = unbekannt."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return datetime.fromisoformat(raw.strip().replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _story_airlines(mentioned, title='', summary=''):
+    """Menge der belastbaren Airline-Codes. Stopwort-Codes ('AM', 'DE', 'TO' …)
+    zählen nicht — sie matchen jedes deutsche „am" bzw. jede .de-Domain und
+    würden fremde Stories künstlich zusammenziehen. Ist `mentioned` leer
+    (im Aggregator-Pfad wird das Feld erst NACH dem Dedupe gefüllt), extrahieren
+    wir selbst."""
+    codes = list(mentioned or [])
+    if not codes and (title or summary):
+        codes = _extract_mentioned_airlines(title, summary)
+    return {str(c).upper() for c in codes
+            if str(c).upper() not in _REDAKTION_MENTION_STOPCODES}
+
+
+def _story_entry(text, mentioned, published_at, fallback_text=''):
+    """(tokens, airlines, ts) — ein Vergleichs-Tupel für `_story_dedupe_indices`."""
+    return (_story_tokens(text),
+            _story_airlines(mentioned, text or '', fallback_text or ''),
+            _story_ts(published_at))
+
+
+def _story_dedupe_indices(entries):
+    """Indizes der Cluster-GEWINNER, in Eingabe-Reihenfolge.
+
+    Zwei Einträge gehören zur selben Story, wenn ALLE drei Bedingungen halten:
+      1. Airline-Bezug passt — beide nennen dieselbe Airline, oder BEIDE nennen
+         gar keine. Nennt nur einer eine Airline, wird NICHT geclustert
+         (konservativ: lieber eine Dublette zu viel als eine echte Meldung weg).
+      2. Kern-Token-Jaccard >= `_STORY_SIM_THRESHOLD` (0,5) UND mindestens
+         `_STORY_MIN_SHARED` gemeinsame Kern-Tokens.
+      3. Zeitabstand <= `_STORY_WINDOW_SECONDS` (72 h). Dieselbe Schlagzeile
+         fünf Tage später ist eine NEUE Entwicklung, keine Dublette.
+
+    Gewinner ist der ZUERST gesehene Eintrag — dadurch bleibt die ausgelieferte
+    ID über Builds hinweg stabil (kein Flapping in der App).
+    """
+    winners = []
+    seen = []          # Vergleichs-Tupel der bisherigen Gewinner
+    for idx, (tokens, airlines, ts) in enumerate(entries):
+        if len(tokens) < _STORY_MIN_TOKENS:
+            # Zu wenig Substanz für einen Story-Vergleich → nie clustern.
+            winners.append(idx)
+            seen.append((tokens, airlines, ts))
+            continue
+        is_dup = False
+        for kept_tokens, kept_airlines, kept_ts in seen:
+            if len(kept_tokens) < _STORY_MIN_TOKENS:
+                continue
+            if airlines and kept_airlines:
+                if not (airlines & kept_airlines):
+                    continue
+            elif airlines or kept_airlines:
+                continue
+            if ts and kept_ts and abs(ts - kept_ts) > _STORY_WINDOW_SECONDS:
+                continue
+            if len(tokens & kept_tokens) < _STORY_MIN_SHARED:
+                continue
+            if _jaccard(tokens, kept_tokens) >= _STORY_SIM_THRESHOLD:
+                is_dup = True
+                break
+        if not is_dup:
+            winners.append(idx)
+            seen.append((tokens, airlines, ts))
+    return winners
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -3233,12 +3441,26 @@ def get_news_redaktion():
     #     gespeicherte Airline-Erwähnung gewinnt weiterhin.
     # (2) Höchstens _REDAKTION_SOURCE_CAP Artikel je Quelle, neueste zuerst —
     #     eine fleißige Quelle dominiert die Liste nicht mehr.
+    # (3) Story-Dedupe (Owner 10.08.: 4× „Lufthansa Starlink-WLAN" in „Deine
+    #     Airline"). Der Ingest-Pass verhindert NEUE Dubletten, heilt aber den
+    #     schon gefüllten Store nicht — deshalb hier dieselbe Cluster-Funktion
+    #     noch einmal über die Ausspiel-Liste. Wirkt sofort nach dem Deploy,
+    #     ohne Re-Ingest und ohne Store-Wipe.
+    candidates = [it for it in sorted(snapshot.values(), key=_redaktion_sort_ts,
+                                      reverse=True)
+                  if not _redaktion_offtopic(it.get('headline', ''),
+                                             it.get('body', ''),
+                                             it.get('mentioned_airlines'))]
+    story_entries = [_story_entry(it.get('headline'),
+                                  it.get('mentioned_airlines'),
+                                  it.get('published_at'),
+                                  fallback_text=it.get('body'))
+                     for it in candidates]
+    candidates = [candidates[i] for i in _story_dedupe_indices(story_entries)]
+
     items = []
     per_source = {}
-    for it in sorted(snapshot.values(), key=_redaktion_sort_ts, reverse=True):
-        if _redaktion_offtopic(it.get('headline', ''), it.get('body', ''),
-                               it.get('mentioned_airlines')):
-            continue
+    for it in candidates:
         src = (it.get('source_name') or '?')
         if per_source.get(src, 0) >= _REDAKTION_SOURCE_CAP:
             continue
