@@ -1095,14 +1095,30 @@ _LHFO_HOUR_INTERACTIVE_CEILING = 18000    # 90 % — Taps zuletzt sterben
 # 60.000/Tag = gut das Zehnfache des heutigen Verbrauchs und immer noch nur
 # ein Achtel dessen, was 20.000/h theoretisch pro Tag hergäben. Wer diese
 # Marke reißt, hat einen Bug, kein Wachstum.
-# TAGESDECKEL BLEIBEN WEIT (Nachtrag 10.08. abends): der Portal-Screenshot des
-# Owners zeigt für den PROD-Key ausschliesslich 20/Sekunde und 20.000/Stunde —
-# KEIN Tageslimit. Mein erster Verdacht („LH 403t wegen des Tagesverbrauchs")
-# war damit falsch; der Deckel war nie die Ursache und hat wochenlang nur die
-# Hintergrund-Features erschlagen (Briefing-Raum). Er bleibt als NOTBREMSE
-# gegen Endlosschleifen, nicht als Ration.
-_LHFO_DAY_BACKGROUND_CEILING = 60000
-_LHFO_DAY_INTERACTIVE_CEILING = 72000
+# ══ DIE TAGESGRENZE IST REAL: ~10.000 — GEMESSEN, NICHT BEHAUPTET ═══════════
+# (Vorfall 10.08. abends, dritte und letzte Revision dieser Kommentar-Kette.)
+#
+# Die Beweiskette:
+#   · Erster 403 (ERR_403_DEVELOPER_OVER_RATE) um 20:17Z — Tageszähler stand
+#     bei 10.025. Die Stunde stand bei 52 von 20.000, der Takt bei 1,4/s von
+#     erlaubten 20. Weder Stunde noch Sekunde können es gewesen sein.
+#   · 28.07. liefen 6.684 Calls OHNE einen einzigen 403 durch.
+#   · Der Vorfall vom 27.07. erholte sich dokumentiert am UTC-Mitternacht-Reset.
+#   ⇒ Tagesquote ≈ 10.000, Reset 00:00 UTC.
+#
+# WARUM DAS PORTAL SIE NICHT ZEIGT: die Key-Seite listet nur „Rate Limits"
+# (20/s, 20.000/h). Mashery führt QUOTEN als getrennte Einstellung am Plan —
+# und ERR_403_DEVELOPER_OVER_RATE ist genau der Quoten-Fehler, nicht der
+# Sekunden-Drossel-Fehler (der hiesse OVER_QPS). Der Portal-Key IST der
+# FlightOps-Key (verglichen, nicht geraten). Alex' Mail und der Screenshot
+# waren also beide korrekt — nur unvollständig.
+#
+# DIE STAFFELUNG: Hintergrund stoppt bei 8.000, damit interaktive Flows
+# (Erstimport der Neuen — gerade läuft eine ZRH-Welle) bis 9.500 IMMER noch
+# durchkommen, auch spätabends. 500 Band je Stufe, 500 Sicherheitsabstand zur
+# Quote — denn die 403s zählen selbst mit.
+_LHFO_DAY_BACKGROUND_CEILING = 8000
+_LHFO_DAY_INTERACTIVE_CEILING = 9500
 
 # ── DRITTE STUFE: PRIORISIERTER HINTERGRUND (Owner-Befund 09.08.2026) ────────
 # MESSUNG, die diese Stufe ausgelöst hat: der Hintergrund-Deckel (5.000) wird
@@ -1126,7 +1142,7 @@ _LHFO_DAY_INTERACTIVE_CEILING = 72000
 # Dienst-Marken, dann der Rest. Die Werte liegen jetzt einfach zwischen den
 # neuen Stufen statt zwischen den alten.
 _LHFO_HOUR_PRIORITY_CEILING = 15000
-_LHFO_DAY_PRIORITY_CEILING = 66000
+_LHFO_DAY_PRIORITY_CEILING = 8500
 
 # Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
 # Supabase, der Tagesstand ändert sich träge — 120 s reichen für einen
@@ -4144,7 +4160,7 @@ def _boarding_fetch(user_token, flight, date, dep, arr, departure_epoch=None):
 # selbst zur Bremse geworden: das Feature hätte mittags aufgehört zu
 # funktionieren, diesmal an unserem eigenen Topf statt am Haupt-Gate.
 _DM_BUDGET_PREFIX = 'lhfoD-marks:'
-_DM_DAY_CEILING = 3000
+_DM_DAY_CEILING = 500
 
 # ── GETEILTER FLUG-CACHE DER MARKEN (Owner-Auftrag 09.08.: „smart bleiben") ──
 # Briefing-Raum, Security, Crewbus und Boarding sind FLUG-Fakten, keine
