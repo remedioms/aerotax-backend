@@ -6816,10 +6816,30 @@ def _connected_tokens(limit=2000):
 # Roster NEUER naher Dienst auf, sollen die Zugaben sofort mitlaufen —
 # ein Gate auf der (dann veralteten) Klasse würde genau das verhindern.
 # `pickup_last_good` bleibt unangetastet (Pickup-Löschbug 29.07.).
-_FO_SYNC_FAST_SB_S = 1.9 * 3600
-_FO_SYNC_FAST_S = 3.5 * 3600
-_FO_SYNC_MID_S = 11.5 * 3600
-_FO_SYNC_SLOW_S = 21.5 * 3600
+# ══ NACHGEZOGEN 10.08.2026 — die Sparsamkeit war gegen ein Phantom ═════════
+# Diese vier Zahlen wurden am 28./31.07. immer weiter gestreckt, um einen
+# Tagesdeckel von 6.000 zu halten, den es nie gab (s. Korrektur oben: LH nennt
+# 20.000/Stunde und 20/Sekunde, kein Tageslimit). Die Kosten trug der Nutzer:
+# ein Kollege ohne Dienst im 7-Tage-Horizont sah seinen Roster nur noch
+# EINMAL AM TAG frisch.
+#
+# GERECHNET, nicht geschätzt (1.603 Grants, Cron alle 2 h):
+#   Extremfall „jeder bei JEDEM Lauf" = 19.236 Calls/Tag = 802/Stunde
+#     → 4 % der erlaubten 20.000/h
+#   Burst eines Laufs @0,7-s-Takt = 1,4 Calls/s
+#     → 7 % des erlaubten 20/s, Faktor 14 Abstand
+# Selbst das Maximum bliebe also zweistellig unter beiden Grenzen. Die Werte
+# unten sind bewusst NICHT das Maximum — sie halten den Abstand, den Alex'
+# „mit den optimierten Requests" verdient, und lassen Raum fürs Wachstum.
+#
+# Die Klassen-LOGIK bleibt unverändert (sie war nie das Problem): abgeleitet
+# aus dem GESPEICHERTEN Roster, kostet also keinen LH-Call, und wird bei jedem
+# Lauf neu berechnet — wer von langsam auf schnell wechselt, merkt es beim
+# nächsten Lauf selbst.
+_FO_SYNC_FAST_SB_S = 1.9 * 3600     # Standby heute/morgen — jeder Lauf (2 h)
+_FO_SYNC_FAST_S = 1.9 * 3600        # war 3,5 h ⇒ Dienst-Tage jetzt jeder Lauf
+_FO_SYNC_MID_S = 3.9 * 3600         # war 11,5 h ⇒ alle 4 h statt alle 12
+_FO_SYNC_SLOW_S = 11.9 * 3600       # war 21,5 h ⇒ 2×/Tag statt 1×
 _FO_FAST_MAX_D = 1               # Diensttag heute/morgen (Homebase-Kalender)
 _FO_MID_MAX_D = 7                # Dienst in 2–7 Tagen
 _FO_ROSTER_END_GUARD_D = 7       # Abdeckung endet in ≤7 Tagen → mind. mid

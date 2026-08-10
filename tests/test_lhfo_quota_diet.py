@@ -1,10 +1,22 @@
-"""FlightOps-Quota-Diät (2026-07-28) — ~30 → ~10 Calls/User/Tag.
+"""FlightOps-Budget-Gates und Sync-Kadenz.
 
-Drei Bausteine, alle hier abgesichert:
-  1. TAGES-Deckel im Key-Gate (der Key hat neben 1.000/h auch 6.000/Tag).
-  2. LAZY ROTATION: der Ein-Refresher rotiert nur noch bei Bedarf (Demand)
-     oder Keepalive (>18 h) statt ~32×/Tag pro Grant.
-  3. ADAPTIVE SYNC-KADENZ im 2-h-Cron: 3,5 h bei Dienst in Sicht, sonst 11,5 h.
+⚠️ STAND 10.08.2026 — DIE PRÄMISSE DIESER DATEI WAR FALSCH. Sie hiess
+"Quota-Diät" und sicherte eine Sparsamkeit ab, die einem Tageskontingent von
+6.000 Calls dienen sollte. Das gibt es nicht: LH nennt für den PROD-Key
+20.000 Calls/STUNDE und 20/Sekunde, kein Tageslimit (Mail Alex). Wir liefen
+damit auf 3 % der erlaubten Rate, und der Tagesdeckel riss trotzdem an jedem
+Tag — er tötete zuerst die Hintergrund-Features (Briefing-Raum & Co. blieben
+wochenlang bei ALLEN leer).
+
+Was hier weiterhin abgesichert wird:
+  1. RANGFOLGE der Gates: greift ein Deckel, sterben Nutzer-Taps zuletzt.
+     Die Beträge sind Stellschrauben, die Reihenfolge ist der Vertrag.
+  2. Die Grenzen, die WIRKLICH gelten: Stundendeckel unter 20.000, und der
+     Sekundentakt mit Abstand zu 20/s (die reisst man versehentlich).
+  3. LAZY ROTATION: der Ein-Refresher rotiert nur bei Bedarf oder Keepalive.
+  4. ADAPTIVE SYNC-KADENZ im 2-h-Cron — Klassifikation gegen die KONSTANTEN
+     geprüft, nicht gegen Stundenzahlen: die Intervalle wandern (10.08. auf
+     1,9 / 1,9 / 3,9 / 11,9 h nachgezogen), die Klassenzuordnung nicht.
 
 Die Grant-Burn-Schutzarchitektur ist bewusst NICHT Gegenstand dieser Diät:
 rotiert wird weiterhin ausschließlich im Refresher-Thread (Choke-Point-Gate
@@ -288,38 +300,51 @@ def _brief_days(now, duty_days=(), free_until=30, extra=None):
 
 
 def test_cadence_fast_duty_today_or_tomorrow(monkeypatch):
-    """Dienst morgen ⇒ fast (3,5 h): nach 3 h noch nicht, nach 4 h ja."""
+    """Dienst morgen ⇒ Klasse `fast`, Schwelle `_FO_SYNC_FAST_S`.
+
+    Gegen die KONSTANTE geprüft, nicht gegen eine Stundenzahl: die Intervalle
+    sind Stellschrauben (zuletzt 10.08. nachgezogen, als sich das
+    Tageskontingent als Phantom herausstellte), die KLASSIFIKATION ist der
+    Vertrag. Ein Test, der beides vermischt, bricht bei jeder Justierung."""
     now = 1000000.0
+    T = fo._FO_SYNC_FAST_S
     monkeypatch.setattr(fo, '_fo_homebase', {})
     _patch_briefings(monkeypatch,
                      lambda t: _brief_days(now, duty_days=(1,)))
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - 3 * 3600})
-    assert fo._fo_should_sync('AT-N', now=now) == (False, 'skip_fast')
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - 4 * 3600})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - (T - 600)})
+    # `too_soon` statt `skip_fast`: unterhalb der SCHNELLSTEN Schwelle kürzt
+    # `_fo_should_sync` ab, bevor es die Klasse überhaupt bestimmt (spart den
+    # Briefings-Read). Seit `fast` mit `fast_sb` zusammenfällt (10.08.), ist
+    # das für diese Klasse der Normalfall. Beide Wege heissen "nicht syncen" —
+    # unterschiedlich ist nur der Telemetrie-Grund.
+    assert fo._fo_should_sync('AT-N', now=now) == (False, 'too_soon')
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-N': now - (T + 600)})
     assert fo._fo_should_sync('AT-N', now=now) == (True, 'fast')
 
 
 def test_cadence_mid_duty_in_2_to_7_days(monkeypatch):
-    """Dienst in 3 Tagen ⇒ mid (11,5 h): nach 8 h nein, nach 12 h ja."""
+    """Dienst in 3 Tagen ⇒ Klasse `mid`, Schwelle `_FO_SYNC_MID_S`."""
     now = 1000000.0
+    T = fo._FO_SYNC_MID_S
     monkeypatch.setattr(fo, '_fo_homebase', {})
     _patch_briefings(monkeypatch,
                      lambda t: _brief_days(now, duty_days=(3,)))
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-M': now - 8 * 3600})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-M': now - (T - 600)})
     assert fo._fo_should_sync('AT-M', now=now) == (False, 'skip_mid')
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-M': now - 12 * 3600})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-M': now - (T + 600)})
     assert fo._fo_should_sync('AT-M', now=now) == (True, 'mid')
 
 
 def test_cadence_slow_no_duty_in_horizon(monkeypatch):
-    """Nächster Dienst erst in 10 Tagen ⇒ slow (21,5 h, 1×/Tag)."""
+    """Nächster Dienst erst in 10 Tagen ⇒ Klasse `slow`."""
     now = 1000000.0
+    T = fo._FO_SYNC_SLOW_S
     monkeypatch.setattr(fo, '_fo_homebase', {})
     _patch_briefings(monkeypatch,
                      lambda t: _brief_days(now, duty_days=(10,)))
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - 12 * 3600})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - (T - 600)})
     assert fo._fo_should_sync('AT-F', now=now) == (False, 'skip_slow')
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - 22 * 3600})
+    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-F': now - (T + 600)})
     assert fo._fo_should_sync('AT-F', now=now) == (True, 'slow')
 
 
@@ -331,7 +356,8 @@ def test_cadence_vacation_only_is_slow(monkeypatch):
         monkeypatch,
         lambda t: {_day_str(i, now): {'ical_summary': 'URLAUB'}
                    for i in range(0, 25)})
-    monkeypatch.setattr(fo, '_fo_last_sync', {'AT-V': now - 12 * 3600})
+    monkeypatch.setattr(fo, '_fo_last_sync',
+                        {'AT-V': now - (fo._FO_SYNC_SLOW_S - 600)})
     assert fo._fo_should_sync('AT-V', now=now) == (False, 'skip_slow')
 
 
@@ -355,11 +381,19 @@ def test_cadence_empty_store_is_failsafe_fast(monkeypatch):
 
 
 def test_cadence_standby_and_reserve_get_fastest_class(monkeypatch):
-    """Standby/Reserve heute-morgen ohne Legs ⇒ fast_sb (1,9 h = jeder
-    Cron-Lauf). RB zählt als Reserve; LISBOA (SB-Substring-Falle) NICHT."""
+    """Standby/Reserve heute-morgen ohne Legs ⇒ Klasse `fast_sb`. RB zählt als
+    Reserve; LISBOA (SB-Substring-Falle) NICHT.
+
+    Geprüft wird die KLASSIFIKATION, nicht mehr ein zeitlicher Vorsprung:
+    seit 10.08. synct auch die `fast`-Klasse bei jedem Cron-Lauf, die beiden
+    Schwellen sind also gleich. Die Klasse bleibt trotzdem eigenständig — sie
+    ist die Stellschraube, falls Standby je wieder öfter laufen soll als ein
+    normaler Diensttag."""
     now = 1000000.0
     monkeypatch.setattr(fo, '_fo_homebase', {})
-    # Standby morgen: nach 2 h fällig (fast wäre erst bei 3,5 h)
+    assert fo._FO_SYNC_FAST_SB_S <= fo._FO_SYNC_FAST_S <= fo._FO_SYNC_MID_S \
+        <= fo._FO_SYNC_SLOW_S, "Kadenz-Schwellen müssen monoton bleiben."
+    # Standby morgen: nach 2 h fällig
     _patch_briefings(
         monkeypatch,
         lambda t: _brief_days(now, extra={
@@ -380,14 +414,16 @@ def test_cadence_standby_and_reserve_get_fastest_class(monkeypatch):
         lambda t: _brief_days(now, extra={
             _day_str(0, now): {'ical_summary': 'HOTAC LISBOA'}}))
     assert fo._fo_should_sync('AT-S', now=now) == (False, 'skip_slow')
-    # Standby MIT schon zugewiesenen Legs = normaler Dienst ⇒ fast, nicht
-    # fast_sb (der Abruf ist passiert, der Tag ist ein Flugtag)
+    # Standby MIT schon zugewiesenen Legs = normaler Dienst ⇒ Klasse `fast`,
+    # nicht `fast_sb` (der Abruf ist passiert, der Tag ist ein Flugtag).
+    # Nachgewiesen über den ZURÜCKGEGEBENEN KLASSENNAMEN — der zeitliche
+    # Unterschied taugt dafür nicht mehr, seit beide Schwellen gleich sind.
     d1 = _brief_flight(1, now)
     for _ev in d1.values():
         _ev['ical_klass'] = 'standby'
     _patch_briefings(monkeypatch,
                      lambda t: _brief_days(now, extra=d1))
-    assert fo._fo_should_sync('AT-S', now=now) == (False, 'skip_fast')
+    assert fo._fo_should_sync('AT-S', now=now) == (True, 'fast')
 
 
 def test_cadence_overnight_split_day_counts_as_duty(monkeypatch):
@@ -459,7 +495,10 @@ def test_cadence_today_anchors_on_homebase_timezone(monkeypatch):
                        for d in range(8, 31)})
         _patch_briefings(monkeypatch, lambda t: dict(briefs))
         monkeypatch.setattr(fo, '_fo_homebase', {'AT-TZ': 'FRA'})
-        monkeypatch.setattr(fo, '_fo_last_sync', {'AT-TZ': now - 4 * 3600})
+        # Alter ZWISCHEN den Schwellen: fast ist fällig, mid noch nicht.
+        # Gegen die Konstanten statt gegen feste Stunden (s. oben).
+        zwischen = (fo._FO_SYNC_FAST_S + fo._FO_SYNC_MID_S) / 2
+        monkeypatch.setattr(fo, '_fo_last_sync', {'AT-TZ': now - zwischen})
         assert fo._fo_should_sync('AT-TZ', now=now) == (True, 'fast')
         # Ohne Homebase-Eintrag: Fallback Europe/Berlin — gleiches Ergebnis
         monkeypatch.setattr(fo, '_fo_homebase', {})
@@ -468,7 +507,8 @@ def test_cadence_today_anchors_on_homebase_timezone(monkeypatch):
         # übermorgen ⇒ mid, kein fast
         monkeypatch.setattr(fo, '_fo_homebase', {'AT-TZ': 'JFK'})
         assert fo._fo_should_sync('AT-TZ', now=now) == (False, 'skip_mid')
-        monkeypatch.setattr(fo, '_fo_last_sync', {'AT-TZ': now - 12 * 3600})
+        monkeypatch.setattr(fo, '_fo_last_sync',
+                            {'AT-TZ': now - (fo._FO_SYNC_MID_S + 600)})
         assert fo._fo_should_sync('AT-TZ', now=now) == (True, 'mid')
     finally:
         if old_tz is None:
