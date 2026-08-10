@@ -59,6 +59,26 @@ _FREE_CREW_LIVE_LOCK = threading.Lock()
 _FREE_CREW_LIVE_HIT_TTL = 45.0
 _FREE_CREW_LIVE_MISS_TTL = 15.0
 
+# Lese-Memo für den `aircraft_track`-Rückfall von `_aircraft_live_pos`
+# (Owner-Befund 10.08.2026, „Live-Position nur für die LH-Gruppe").
+# WARUM ein eigenes Memo: der NAS-Harvester schreibt JEDE FR24-Zeile zweimal —
+# nach `aircraft_live` nur gefiltert auf die LH-Gruppen-/DE-Carrier-Präfixe
+# (`_DEFAULT_PREFIXES` in nas_harvester/ingest.py: DLH/CLH/GEC/EWG/EWE/OCN/AUA/
+# SWR/EDW/BEL/DLA/SXS/BOX/CFG/TUI/TFL), nach `aircraft_track` dagegen
+# UNGEFILTERT. Für jede andere Airline (Beleg: DL107 FRA→JFK, N855NW, lückenlos
+# in aircraft_track) ist der aircraft_live-Read also ein SICHERER Miss, und der
+# Rückfall läuft danach bei JEDEM Poll erneut. Misses sind damit der Normalfall
+# und müssen genauso hart memoisiert werden wie Treffer — sonst kostet die
+# Ehrlichkeit („keine Position") pro Poll einen zusätzlichen Supabase-Read.
+# Gecacht wird die ROHZEILE, nicht das fertige Ergebnis: Frische-, Route-,
+# Taxi- und Instanz-Gate hängen am Aufrufer (`sched_dep_iso`) und müssen pro
+# Call neu greifen. Kein Nutzer-/Token-Key im Cache.
+_TRACK_POS_MEMO = {}            # (flight, callsign, dep, max_age_min) -> (stored_at, row|None)
+_TRACK_POS_LOCK = threading.Lock()
+_TRACK_POS_HIT_TTL = 45.0       # s — ein iOS-Poll-Zyklus (30–60 s)
+_TRACK_POS_MISS_TTL = 60.0      # s — Miss ist der Dauerzustand fremder Airlines
+_TRACK_POS_MEMO_MAX = 512
+
 # Board-Fakten-Memo (Owner „Detail lädt langsam", Latenz-Sweep): _flight_facts_
 # from_obs macht einen Supabase-Read + spürbare CPU-Row-Selektion und wird auf dem
 # KRITISCHEN (seriellen) resolve-Pfad des Detail-Aggregats MEHRFACH mit identischem
@@ -486,6 +506,155 @@ def _live_pos_instance_ok(pos, sched_dep_iso):
         return True
 
 
+def _track_pos_row(sb, fn, cs, dep_n, max_age_min):
+    """Jüngster frischer `aircraft_track`-Breadcrumb zu Flugnummer `fn`.
+
+    Reiner I/O-Teil des Rückfalls — memoisiert, gatet NICHT (Frische/Route/Taxi/
+    Instanz macht der Aufrufer, s. `_aircraft_track_live_pos`). Der Frische-
+    Cutoff steht trotzdem schon IN der Query, damit der Index
+    `idx_aircraft_track_flt_ts (flight, seen_ts)` die Zeitspanne serverseitig
+    beschneidet — `aircraft_track` hat ~19,4 Mio Zeilen, ein ungefilterter
+    Flugnummern-Scan über die volle 60-Tage-Retention wäre der teuerste Read der
+    App. Wirft nie; jeder Fehler ⇒ None (der Rückfall ist eine Zugabe, er darf
+    den Hauptpfad nie zum Fehler bringen).
+
+    ZWEITER SCHLÜSSEL FUNKNAME: `aircraft_track.flight` trägt die IATA- ODER die
+    ICAO-Schreibweise (im Repo bereits belegt, s. `app._route_entry_track_keys`).
+    Prod-Stichprobe 10.08.2026 im 35-min-Fenster: die Spalte enthielt sowohl
+    `AC847` als auch `ACA847`. Es gibt hier also KEINE eigene `callsign`-Spalte
+    als zweiten Tier — der Funkname wird gegen dieselbe Spalte probiert, erst
+    NACHDEM alle Flugnummer-Kandidaten leer blieben."""
+    key = (fn, cs, dep_n, int(max_age_min))
+    now = time.time()
+    with _TRACK_POS_LOCK:
+        hit = _TRACK_POS_MEMO.get(key)
+        if hit is not None:
+            ttl = _TRACK_POS_HIT_TTL if hit[1] is not None else _TRACK_POS_MISS_TTL
+            if now - hit[0] <= ttl:
+                return dict(hit[1]) if hit[1] else None
+
+    cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - max_age_min * 60))
+    # `aircraft_track` hat KEIN `updated_at` und KEIN `track`/`callsign`/
+    # `reg_display`/`ac_type` — nur diese Spalten existieren (Migration
+    # 20260709_aircraft_track.sql). `track_deg` heißt hier anders als das
+    # `track` in `aircraft_live`.
+    sel = 'reg,seen_ts,flight,origin,dest,lat,lon,alt_ft,gs_kt,track_deg,on_ground'
+    # Zero-Padding-robust wie im Hauptpfad (LH043 vs LH43): der Harvester
+    # schreibt die ROHE FR24-Nummer, das Roster die gepaddete Form. Flugnummer
+    # ZUERST, Funkname nur als Nachzügler (Reihenfolge wie im Hauptpfad).
+    cands, _seen_c = [], set()
+    for c in _callsign_zero_variants(fn) + (_callsign_zero_variants(cs) if cs else []):
+        if c not in _seen_c:
+            _seen_c.add(c)
+            cands.append(c)
+    row = None
+    try:
+        for cand in cands:
+            q = (sb.table('aircraft_track').select(sel)
+                   .eq('flight', cand).gt('seen_ts', cutoff))
+            if dep_n:
+                q = q.eq('dest', dep_n)      # Route-Konsistenz serverseitig
+            rows = (q.order('seen_ts', desc=True).limit(1).execute()).data or []
+            if rows:
+                row = rows[0]
+                break
+    except Exception:
+        row = None
+
+    with _TRACK_POS_LOCK:
+        _TRACK_POS_MEMO[key] = (now, dict(row) if row else None)
+        if len(_TRACK_POS_MEMO) > _TRACK_POS_MEMO_MAX:
+            try:
+                items = sorted(_TRACK_POS_MEMO.items(), key=lambda kv: kv[1][0])
+                for k, _v in items[:len(items) // 4 or 1]:
+                    _TRACK_POS_MEMO.pop(k, None)
+            except Exception:
+                _TRACK_POS_MEMO.clear()
+    return dict(row) if row else None
+
+
+def _aircraft_track_live_pos(sb, flight, callsign, dep_n, max_age_min, sched_dep_iso):
+    """LESE-RÜCKFALL auf `aircraft_track`, wenn `aircraft_live` nichts liefert.
+
+    WARUM (Owner-Befund 10.08.2026 „Live-Positionen nur für die LH-Gruppe"):
+    der NAS-Harvester schreibt jede FR24-Zeile ZWEIMAL — nach `aircraft_live`
+    nur GEFILTERT (`_flight_to_snapshot(fl, prefixes)`, LH-Gruppe + deutsche
+    Carrier), nach `aircraft_track` UNGEFILTERT (`_append_track`). `_aircraft_
+    live_pos` las bisher nur `aircraft_live`. Ergebnis: `/api/ax/flight-detail/
+    DL107` lieferte `live: null`, obwohl derselbe Flug (N855NW, FRA→JFK) in
+    `aircraft_track` lückenlos alle ~16 min vorliegt. Die Daten waren also da —
+    nur nie gelesen. Der Rückfall macht daraus Live-Positionen für JEDE Airline,
+    ohne eine einzige neue Datenquelle und ohne einen Cent FR24-Spend.
+
+    DIESELBEN GATES WIE DER HAUPTPFAD — sonst entstünden Falschanzeigen statt
+    fehlender Anzeigen, und das wäre schlechter als der Status quo:
+      * Frische — identisches `max_age_min` (Default 35), keine eigene Konstante.
+      * Route — `dest == dep` (in der Query UND danach noch einmal geprüft,
+        weil die memoisierte Rohzeile am Gate vorbeikommen könnte).
+      * Taxi — `_apply_taxi_gate` (alt_ft/gs_kt/on_ground liegen in
+        `aircraft_track` vor, das Gate greift also vollständig).
+      * Instanz — `_live_pos_instance_ok`. Das ist hier NOCH wichtiger als beim
+        Hauptpfad: `aircraft_track` ist append-only mit 60 Tagen Retention, ein
+        Flug DERSELBEN Nummer von gestern liegt garantiert in der Tabelle. Ohne
+        dieses Gate wäre der Rückfall eine Cross-Date-Bindung mit Ansage — die
+        in diesem Projekt teuer gelernte Fehlerklasse (LH712 FRA→ICN, 16,6 h
+        VOR dem Abflug als „airborne" gemeldet).
+
+    WAS IM RÜCKFALL FEHLT (ehrlich leer statt geraten — Keine-Fake-Werte-Regel):
+      * `callsign` → None. `aircraft_track` hat die Spalte nicht. Aus der
+        Flugnummer ableiten wäre geraten (LH1131 = DLH08F, alphanumerisch) und
+        würde iOS bei adsb.lol ins Leere pollen lassen.
+      * `ac_type` → None. Spalte existiert nicht; ein Muster-Rateschluss über
+        die Reg wäre eine Erfindung.
+      * `reg_display` → None. `aircraft_track` führt die Reg NUR normalisiert
+        (`FGSPA`, Teil des Primärschlüssels) — die Anzeige-Schreibweise
+        (`F-GSPA`) steht ausschließlich in `aircraft_live`, und wo der
+        Bindestrich hingehört, ist aus der normalisierten Form nicht ableitbar.
+        Die normalisierte Form trotzdem als Anzeigewert zurückzugeben wäre
+        AKTIV schädlich: `crew_live_state` macht `reg = live_reg or reg` und
+        würde damit den korrekten Roster-Tail durch die bindestrich-lose
+        Variante ERSETZEN. Lieber kein Kennzeichen als ein entstelltes.
+      * `origin` kann in alten Breadcrumbs leer sein → dann bleibt `src` None,
+        statt den Abflughafen aus dem Roster hineinzuschreiben.
+
+    Rückgabe wie `_aircraft_live_pos`: (pos, (src,dst), reg_display, ac_type)
+    oder (None, None, None, None)."""
+    fn = (flight or '').strip().upper()
+    cs = (callsign or '').strip().upper() or None
+    if not (sb is not None and fn):
+        return None, None, None, None
+    r = _track_pos_row(sb, fn, cs, dep_n, max_age_min)
+    if not r or r.get('lat') is None or r.get('lon') is None:
+        return None, None, None, None
+
+    # Frische ein zweites Mal — die Query hat serverseitig gegatet, aber die
+    # Rohzeile kommt aus dem Memo und könnte inzwischen aus dem Fenster gelaufen
+    # sein. Unparsbare `seen_ts` ⇒ durchlassen (das Server-Gate stand bereits).
+    try:
+        from blueprints.leg_status_gate import _parse_iso_utc as _p
+        _seen = _p(r.get('seen_ts'))
+    except Exception:
+        _seen = None
+    if _seen is not None and (time.time() - _seen) > max_age_min * 60:
+        return None, None, None, None
+
+    src = (r.get('origin') or '').strip().upper() or None
+    dst = (r.get('dest') or '').strip().upper() or None
+    if dep_n and dst != dep_n:
+        return None, None, None, None            # anderer Leg → verwerfen
+    pos = _apply_taxi_gate({
+        'lat': r.get('lat'), 'lon': r.get('lon'),
+        'track': r.get('track_deg'), 'gs': r.get('gs_kt'), 'alt': r.get('alt_ft'),
+        'on_ground': bool(r.get('on_ground')),
+        'source': 'aircraft_track', 'seen_ts': r.get('seen_ts'),
+        'callsign': None,                        # Spalte existiert nicht (s.o.)
+    })
+    if not _live_pos_instance_ok(pos, sched_dep_iso):
+        return None, None, None, None            # 24-h-Nachbar → verwerfen
+    # reg_display + ac_type: Spalten existieren nicht ⇒ ehrlich None (s.o.).
+    return pos, (src, dst), None, None
+
+
 def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_min=35,
                        sched_dep_iso=None):
     """Positions-Snapshot aus dem NAS-Harvester-Store (Supabase `aircraft_live`,
@@ -503,6 +672,14 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
 
     Rückgabe: (pos, (src,dst), reg_display, ac_type) | (None, None, None, None).
     pos-Keys wie iOS AXLifecycleLive (lat/lon/track/gs/alt/on_ground).
+
+    RÜCKFALL `aircraft_track` (Owner-Befund 10.08.2026, „Live nur für die
+    LH-Gruppe"): `aircraft_live` bekommt vom NAS-Harvester nur die LH-Gruppen-/
+    DE-Carrier-Callsigns, `aircraft_track` bekommt ALLES. Bleibt der aircraft_live-Read
+    ergebnislos, liest `_aircraft_track_live_pos` den jüngsten Breadcrumb zur
+    Flugnummer nach — mit denselben Gates. Damit sind Live-Positionen nicht mehr
+    auf die LH-Gruppe beschränkt (Beleg DL107 FRA→JFK). Der Rückfall ist
+    memoisiert, weil er bei fremden Airlines strukturell nach JEDEM Miss läuft.
 
     INSTANZ-BINDUNG (Sweep-Befund 2026-08-09, LH712 FRA→ICN): `aircraft_live`
     trägt KEIN Datum — die Zeile identifiziert nur „welche Maschine fliegt diese
@@ -576,15 +753,28 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
                 break
     if not rows and rn:
         rows = _query('reg', rn)
+
+    def _fallback():
+        """`aircraft_live` hat nichts Brauchbares → ungefilterte Breadcrumbs
+        lesen (Owner-Befund 10.08.2026: der Harvester filtert NUR die
+        aircraft_live-Schreibung auf die LH-Gruppen-/DE-Carrier-Präfixe). Wird
+        NUR bei einem echten Miss des Hauptpfads erreicht — ein Treffer kehrt
+        vorher zurück, der Rückfall wird dann gar nicht erst befragt (kein
+        Extra-Read). Auch die Gate-Verwürfe (Route/Instanz) landen hier: der
+        Rückfall fährt DIESELBEN Gates, ein 24-h-Nachbar fällt also erneut
+        durch — er kann nie durch die Hintertür wieder hereinkommen."""
+        return _aircraft_track_live_pos(sb, fn, cs, dep_n, max_age_min,
+                                        sched_dep_iso)
+
     if not rows:
-        return None, None, None, None
+        return _fallback()
     r = rows[0]
     if r.get('lat') is None or r.get('lon') is None:
-        return None, None, None, None
+        return _fallback()
     src = (r.get('origin') or '').strip().upper() or None
     dst = (r.get('dest') or '').strip().upper() or None
     if dep_n and dst and dst != dep_n:
-        return None, None, None, None            # anderer Leg → verwerfen
+        return _fallback()                       # anderer Leg → verwerfen
     pos = _apply_taxi_gate({
         'lat': r.get('lat'), 'lon': r.get('lon'),
         'track': r.get('track'), 'gs': r.get('gs_kt'), 'alt': r.get('alt_ft'),
@@ -598,7 +788,7 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
         'callsign': (r.get('callsign') or '').strip().upper() or None,
     })
     if not _live_pos_instance_ok(pos, sched_dep_iso):
-        return None, None, None, None            # 24-h-Nachbar → verwerfen
+        return _fallback()                       # 24-h-Nachbar → verwerfen
     reg_disp = (r.get('reg_display') or r.get('reg') or '').strip().upper() or None
     ac_type = (r.get('ac_type') or '').strip().upper() or None
     return pos, (src, dst), reg_disp, ac_type
