@@ -626,6 +626,71 @@ def _next_timestamp(row):
     return max(int(time.time()), max(local, stored) + 1)
 
 
+# ── Push-to-Start: die EINE Bremse gegen Start-Spam (2026-08-11) ─────────────
+#
+# DIE GEFAHR, die diese Konstante abwendet: ein Push-to-Start ERZEUGT jedes Mal
+# eine NEUE Activity — ActivityKit dedupliziert nichts, weder über die
+# `attributes` noch sonstwie. Der einzige Grund, warum das im Normalfall nicht
+# passiert, ist die Reihenfolge in `push_live_activity`: existiert eine aktive
+# `update`-Zeile, gewinnt sie IMMER, und dann wird nur aktualisiert.
+#
+# Das Loch dazwischen ist real und dauert Sekunden bis Minuten: iOS startet die
+# Activity, weckt die App im Hintergrund, die App beobachtet
+# `Activity.activityUpdates` und lädt ERST DANN den Update-Token hoch. Trifft in
+# diesem Fenster das nächste MQTT-Event ein (LH schickt bei einer Verspätung
+# gern mehrere `est_dep` hintereinander), sähe der Server weiterhin keine
+# `update`-Zeile — und würde eine ZWEITE Karte starten. Der Tester hätte dann
+# zwei Live Activities für denselben Flug.
+#
+# Deshalb: eine `start`-Zeile, die KÜRZLICH ERFOLGREICH gestartet hat, ist für
+# `_LA_START_COOLDOWN_S` gesperrt. Nur der Erfolg zählt (`content_digest` wird
+# vom RPC ausschliesslich bei `p_ok` geschrieben) — ein gescheiterter Versuch
+# darf den nächsten nicht blockieren, sonst reicht ein einzelner APNs-Aussetzer,
+# um den ganzen Dienst ohne Karte zu lassen.
+#
+# 20 min ist bewusst grosszügig: das Nachreichen des Update-Tokens braucht
+# Sekunden, und wenn es NICHT klappt (App vom User beendet, Gerät offline),
+# hilft ein schneller zweiter Start auch nicht — er erzeugte nur die zweite
+# Karte. `force=True` übersteuert (Operator-Pfad).
+_LA_START_COOLDOWN_S = 20 * 60
+
+
+def _start_cooldown_active(row, now_ts=None):
+    """True ⇒ diese `start`-Zeile hat innerhalb des Cooldowns schon ERFOLGREICH
+    eine Activity erzeugt. Pure genug: liest nur Zeile + In-Process-Spiegel.
+
+    Zwei Quellen, weil beide für sich Lücken haben:
+      • In-Process (`_LAST_SENT[id]['start_ts']`) — überlebt keinen Neustart.
+      • DB (`content_digest` gesetzt ⇒ es gab einen erfolgreichen Push;
+        `last_timestamp` sagt wann) — überlebt ihn, ist aber nur so frisch wie
+        der letzte RPC.
+    """
+    if not row:
+        return False
+    now_ts = time.time() if now_ts is None else now_ts
+    with _state_lock:
+        slot = _LAST_SENT.get(row.get('id')) or {}
+        local = int(slot.get('start_ts') or 0)
+    stored = 0
+    if row.get('content_digest'):
+        try:
+            stored = int(row.get('last_timestamp') or 0)
+        except (TypeError, ValueError):
+            stored = 0
+    last = max(local, stored)
+    return last > 0 and (now_ts - last) < _LA_START_COOLDOWN_S
+
+
+def _note_started(row, timestamp):
+    """Erfolgreichen Push-to-Start im In-Process-Spiegel vermerken."""
+    row_id = (row or {}).get('id')
+    if not row_id:
+        return
+    with _state_lock:
+        slot = _LAST_SENT.setdefault(row_id, {})
+        slot['start_ts'] = max(int(timestamp or 0), int(slot.get('start_ts') or 0))
+
+
 # ── APNs-Sender (Live-Activity-eigen) ───────────────────────────────────────
 #
 # app.py `_send_apns` ist hier NICHT benutzbar: es hardcodet
@@ -773,6 +838,9 @@ def _push_row(row, state, event='update', attributes=None, stale_after_s=None,
                  reason=('apns_' + str(reason).lower()) if dead else reason,
                  environment=used_env if ok else None)
     if ok:
+        if event == 'start':
+            # NUR der Erfolg sperrt den Cooldown (s. `_start_cooldown_active`).
+            _note_started(row, timestamp)
         log.info('[live-activity] push ok user_ref=%s kind=%s event=%s env=%s '
                  'token_ref=%s', _token_ref(row.get('user_token')),
                  row.get('kind'), event, used_env, _token_ref(la_token))
@@ -797,6 +865,14 @@ def push_live_activity(user_token, content_state, event='update',
     `start`-Zeile UND `attributes`, wird per Push-to-Start eine Activity
     ERZEUGT (der Fall „App war nie offen, Dienst beginnt").
 
+    `event='start'` ist ausdrücklich KEIN „starte auf jeden Fall": es heisst
+    „diese Karte darf auch entstehen, wenn noch keine läuft". Läuft schon eine,
+    gewinnt sie weiterhin und bekommt ein Update — genau die Regel „EINE Live
+    Activity pro Dienst" aus der Feature-Doku. Deshalb ist `start` hier
+    gleichbedeutend mit `update` + `attributes`; die Unterscheidung existiert
+    nur, damit ein Aufrufer die Absicht ausdrücken (und der Endpoint fehlende
+    `attributes` melden) kann.
+
     Returns dict {'ok', 'sent', 'unchanged', 'failed', 'dead', 'event', ...}.
     Wirft nie.
     """
@@ -815,8 +891,20 @@ def push_live_activity(user_token, content_state, event='update',
         if attr_fatal:
             return {'ok': False, 'error': 'invalid_attributes',
                     'problems': attr_fatal}
-        rows = _active_rows(user_token, 'start')
-        if rows:
+        start_rows = _active_rows(user_token, 'start')
+        if start_rows and not force:
+            now_ts = time.time()
+            open_rows = [r for r in start_rows
+                         if not _start_cooldown_active(r, now_ts)]
+            if not open_rows:
+                # Wir HABEN ein Ziel, dürfen es nur gerade nicht benutzen.
+                # Das ist kein Fehler und kein `no_target` — ein zweiter Start
+                # wäre die zweite Karte für denselben Flug.
+                return {'ok': True, 'sent': 0, 'skipped': 'start_cooldown',
+                        'event': 'start', 'targets': len(start_rows)}
+            start_rows = open_rows
+        if start_rows:
+            rows = start_rows
             used_event = 'start'
     if not rows:
         return {'ok': True, 'sent': 0, 'skipped': 'no_target',
@@ -981,8 +1069,21 @@ def internal_live_activity_push():
     if not user_token or not isinstance(content_state, dict):
         return jsonify({'ok': False, 'error': 'missing_fields'}), 400
     event = (body.get('event') or 'update').strip().lower()
-    if event not in ('update', 'end'):
+    # `start` war bis 2026-08-11 hier VERBOTEN — und damit war der ganze
+    # Push-to-Start-Pfad über diesen Endpoint unerreichbar, obwohl
+    # `push_live_activity` ihn seit P6 kann. Genau daran hing der Tester-Befund
+    # „nächster Flug erscheint erst nach App-Öffnen": ohne laufende Activity
+    # gab es kein Ziel, und niemand durfte eines erzeugen.
+    #
+    # Es bleibt bei der Bedeutung aus `push_live_activity`: „darf entstehen",
+    # nicht „starte auf jeden Fall" — eine laufende Activity gewinnt weiterhin.
+    if event not in ('update', 'end', 'start'):
         return jsonify({'ok': False, 'error': 'bad_event'}), 400
+    if event == 'start' and not isinstance(body.get('attributes'), dict):
+        # Ohne `attributes` kann ActivityKit nichts starten (`attributes-type`
+        # + `attributes` sind Pflicht im aps-Block). Lieber ein ehrliches 400
+        # als ein stiller Fallback auf `update`, der nie ein Ziel findet.
+        return jsonify({'ok': False, 'error': 'missing_attributes'}), 400
 
     result = push_live_activity(
         user_token, content_state, event=event,
@@ -1143,6 +1244,70 @@ def _stale_after_s(target, now_ts=None):
     return max(_LA_STALE_MIN_S, min(_LA_STALE_MAX_S, secs))
 
 
+# ── DER FANOUT DARF DIE KARTE JETZT AUCH ERZEUGEN (2026-08-11) ──────────────
+#
+# DER BEFUND (Tester): „Live Activities aktualisieren sich nicht selbstständig —
+# der nächste Flug erscheint erst nach App-Öffnen."
+#
+# DIE URSACHE, nachgelesen und nicht vermutet: der Push-Weg war komplett gebaut
+# (`push_live_activity` kennt Push-to-Start seit P6), aber sein EINZIGER
+# Produzent — dieser Fanout — rief ihn immer OHNE `attributes`. Ohne
+# `attributes` nimmt `push_live_activity` die `start`-Zeile gar nicht erst in
+# die Hand. Lief also gerade keine Activity (App seit der letzten Landung
+# beendet, Gerät neu gestartet, Karte weggewischt), gab es schlicht kein
+# Push-Ziel, und die Karte entstand erst wieder beim nächsten App-Start über
+# `DutyActivityController.sync`. Der interne Endpoint verbot `start` sogar
+# ausdrücklich — der Pfad war doppelt zu.
+#
+# ZWEI GATES, damit daraus keine Karten-Flut wird:
+#
+#  1. EVENT-ART. `arrived` startet NICHTS. Eine Karte, die als „GELANDET"
+#     entsteht, hätte nie einen Flug gezeigt und wäre binnen Minuten wieder weg
+#     (der Sweep beendet sie) — das ist Rauschen auf dem Sperrbildschirm, keine
+#     Information. Aktualisieren tut `arrived` weiterhin: eine LAUFENDE Karte
+#     muss die Landung sehen.
+#
+#  2. ZEITFENSTER. Gestartet wird frühestens `_LA_SWEEP_LEAD_S` (4 h) vor dem
+#     Abflug — exakt der Beginn des Fensters, in dem `_plausible_sectors` eine
+#     Live Activity überhaupt für plausibel hält. Ein früher Start (die
+#     MQTT-Topics stehen bis zu 48 h im Voraus) würde vom eigenen Sweep binnen
+#     5 min wieder beendet: eine Karte, die kommt und geht, ist schlimmer als
+#     keine. Ohne bekannten Abflug wird NICHT gestartet — kein geratenes
+#     Fenster.
+#
+# Die dritte Bremse sitzt eine Ebene tiefer und gilt für alle Aufrufer:
+# `_start_cooldown_active` (kein zweiter Start, solange der Update-Token der
+# ersten Karte noch unterwegs ist).
+_MQTT_NO_START_KINDS = ('arrived',)
+
+
+def _mqtt_start_attributes(kind, flight_disp, frm, to, dep, now_utc,
+                           now_ts=None):
+    """`attributes` für den Push-to-Start — oder None (dann bleibt es beim
+    reinen Update). Pure, wirft nie.
+
+    Feldnamen und Typen spiegeln `DutyActivityAttributes` in
+    `ios/AeroTax/Shared/DutyActivityAttributes.swift` 1:1:
+    `flightNo: String?`, `from: String?`, `to: String?`, `startedAt: Date`
+    (nicht-optional ⇒ Pflichtfeld, siehe `_REQUIRED_ATTRIBUTE_KEYS`).
+    `None`-Werte wirft `_normalize_attributes` weg; in Swift bleiben die
+    Optionals dann `nil` und der Renderer fällt auf den `ContentState` zurück
+    (`flightNo(fallback:)`).
+    """
+    if kind in _MQTT_NO_START_KINDS:
+        return None
+    dep_unix = _to_unix(dep)
+    if dep_unix is None:
+        return None
+    now_ts = time.time() if now_ts is None else now_ts
+    if now_ts < dep_unix - _LA_SWEEP_LEAD_S:
+        return None
+    return {'flightNo': flight_disp or None,
+            'from': frm,
+            'to': to,
+            'startedAt': now_utc}
+
+
 def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
     """Live-Activity-Fanout für ein LH-MQTT-Event. Returns Anzahl gesendeter
     Pushes (unverändert/skip zählt NICHT).
@@ -1193,6 +1358,14 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             'mainTime': est_arr if shows_arrival else est_dep,
             'countdownTarget': est_arr if shows_arrival else est_dep,
             'route': f'{frm}–{to}' if frm and to else None,
+            # Flugnummer des AKTIVEN Legs. Bis 2026-08-11 schickte dieser
+            # Fanout sie NICHT — die Pille auf dem Sperrbildschirm hing damit
+            # an den beim Start eingefrorenen `attributes` und zeigte nach
+            # einem Turnaround weiter den Hinflug (`flightNo(fallback:)`).
+            # Seit der Server die Karte auch ERZEUGEN darf, ist das doppelt
+            # relevant: bei einer per Push-to-Start entstandenen Karte ist der
+            # ContentState die einzige Quelle, die mit der Phase mitwandert.
+            'flightNo': flight_disp or None,
             'deltaMin': delta if isinstance(delta, int) else None,
             'generatedAt': now_iso,
             'fromIATA': frm,
@@ -1256,13 +1429,21 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
                         max(0.0, min(1.0, _p)) * 20) / 20
             except Exception:
                 pass
+        # PUSH-TO-START: `attributes` heisst „die Karte darf auch ENTSTEHEN",
+        # nicht „starte auf jeden Fall". Läuft eine Activity, gewinnt ihre
+        # `update`-Zeile weiterhin (`push_live_activity`) — es bleibt bei EINER
+        # Karte pro Dienst. `None` ⇒ exakt das Verhalten von vor dem 11.08.
+        attributes = _mqtt_start_attributes(kind, flight_disp, frm, to,
+                                            est_dep or sector.get('dep_iso'),
+                                            now_iso)
         try:
             # stale-date bei JEDEM Update nachschieben: solange Events kommen,
             # wandert die Verfallsmarke mit der aktuellen Schätzung mit. Bleiben
             # sie aus, läuft genau diese zuletzt gesetzte Marke ab — und die
             # Karte sagt selbst, dass sie nichts Neues mehr weiß.
             res = push_live_activity(
-                user_token, state, event='update', priority='10',
+                user_token, state, event='update', attributes=attributes,
+                priority='10',
                 stale_after_s=_stale_after_s(state['mainTime']))
             sent += int(res.get('sent') or 0)
         except Exception as exc:

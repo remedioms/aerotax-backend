@@ -894,8 +894,88 @@ def test_internal_push_secret_gate(client, sb, auth, apns, monkeypatch):
 
 def test_internal_push_bad_event_400(client, sb, auth, apns):
     _register(client, la_token=LA_TOKEN_A)
-    r = _push(client, event='start')   # 'start' wird abgeleitet, nie gefordert
+    r = _push(client, event='reboot')
     assert r.status_code == 400 and r.get_json()['error'] == 'bad_event'
+
+
+def test_internal_push_start_ohne_attributes_400(client, sb, auth, apns):
+    """`start` OHNE `attributes` ist nicht ausführbar (ActivityKit verlangt
+    `attributes-type` + `attributes`). Ehrliches 400 statt stillem Fallback."""
+    _register(client, kind='start', la_token=LA_TOKEN_A, activity_id=None)
+    r = _push(client, event='start')
+    assert r.status_code == 400
+    assert r.get_json()['error'] == 'missing_attributes'
+    assert apns['client'].sent == []
+
+
+def test_internal_push_start_ist_jetzt_erlaubt(client, sb, auth, apns):
+    """Der `start`-Verbots-Zweig ist am 2026-08-11 gefallen: OHNE ihn war der
+    Push-to-Start-Pfad über diesen Endpoint unerreichbar — genau der
+    Tester-Befund „nächster Flug erscheint erst nach App-Öffnen"."""
+    _register(client, kind='start', la_token=LA_TOKEN_A, activity_id=None)
+    r = _push(client, event='start',
+              attributes={'flightNo': 'LH400', 'from': 'FRA', 'to': 'JFK',
+                          'startedAt': '2026-07-27T09:00:00Z'})
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body['event'] == 'start' and body['sent'] == 1
+    aps = apns['client'].sent[0]['payload']['aps']
+    assert aps['event'] == 'start'
+    assert aps['attributes-type'] == 'DutyActivityAttributes'
+    assert aps['attributes'] == {'flightNo': 'LH400', 'from': 'FRA',
+                                 'to': 'JFK',
+                                 'startedAt': LA._to_apple_date(
+                                     '2026-07-27T09:00:00Z')}
+
+
+def test_internal_push_start_startet_keine_zweite_karte(client, sb, auth,
+                                                        apns):
+    """Läuft schon eine Activity, gewinnt sie — `start` heisst „darf
+    entstehen", nicht „starte auf jeden Fall" (EINE Karte pro Dienst)."""
+    _register(client, kind='start', la_token=LA_TOKEN_A, activity_id=None)
+    _register(client, kind='update', la_token=LA_TOKEN_B)
+    r = _push(client, event='start',
+              attributes={'startedAt': '2026-07-27T09:00:00Z'})
+    assert r.status_code == 200
+    assert r.get_json()['event'] == 'update'
+    assert apns['client'].sent[0]['token'] == LA_TOKEN_B
+    assert 'attributes' not in apns['client'].sent[0]['payload']['aps']
+
+
+def test_start_cooldown_verhindert_die_zweite_karte(client, sb, auth, apns):
+    """DAS START-SPAM-LOCH: zwischen Push-to-Start und dem Hochladen des
+    Update-Tokens sieht der Server weiterhin keine `update`-Zeile. Ein zweites
+    Event in diesem Fenster darf keine ZWEITE Karte erzeugen."""
+    _register(client, kind='start', la_token=LA_TOKEN_A, activity_id=None)
+    attrs = {'flightNo': 'LH400', 'from': 'FRA', 'to': 'JFK',
+             'startedAt': '2026-07-27T09:00:00Z'}
+    r1 = _push(client, event='start', attributes=attrs)
+    assert r1.get_json()['sent'] == 1
+
+    # Inhaltlich ANDERER State (sonst griffe schon der Digest-Dedupe) —
+    # es muss der Cooldown sein, der bremst.
+    r2 = _push(client, state=_state(kicker='ABFLUG'), event='start',
+               attributes=attrs)
+    assert r2.status_code == 200
+    assert r2.get_json()['skipped'] == 'start_cooldown'
+    assert r2.get_json()['sent'] == 0
+    assert len(apns['client'].sent) == 1
+
+
+def test_start_cooldown_greift_nach_einem_fehlschlag_nicht(client, sb, auth,
+                                                           apns):
+    """Ein GESCHEITERTER Start darf den nächsten nicht sperren — sonst reicht
+    ein einzelner APNs-Aussetzer für einen Dienst ohne Karte."""
+    _register(client, kind='start', la_token=LA_TOKEN_A, activity_id=None)
+    attrs = {'startedAt': '2026-07-27T09:00:00Z'}
+    apns['script'](lambda host, idx: (500, None) if idx == 0 else (200, None))
+    r1 = _push(client, event='start', attributes=attrs)
+    assert r1.get_json()['sent'] == 0 and r1.get_json()['failed'] == 1
+
+    r2 = _push(client, state=_state(kicker='ABFLUG'), event='start',
+               attributes=attrs)
+    assert r2.get_json()['sent'] == 1
+    assert len(apns['client'].sent) == 2
 
 
 def test_internal_push_missing_fields_400(client, sb, auth, apns):
@@ -1037,6 +1117,150 @@ def test_push_for_affected_skips_sector_without_times(sb, auth, apns):
     sent = LA.push_for_affected([(TOKEN, {'from': 'FRA', 'to': 'JFK'})],
                                 'est_dep', 'LH400', '2026-07-27')
     assert sent == 0 and apns['client'].sent == []
+
+
+def test_push_for_affected_traegt_die_flugnummer_im_state(sb, auth, apns):
+    """Die Pille darf nicht an den beim Start eingefrorenen `attributes`
+    hängen — nach einem Turnaround stünde dort sonst weiter der Hinflug."""
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    LA.push_for_affected([(TOKEN, _mqtt_sector())], 'est_dep', 'LH400',
+                         '2026-07-27')
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['flightNo'] == 'LH400'
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8b) PUSH-TO-START AUS DEM FANOUT (2026-08-11)
+#
+#     Tester-Befund: „Live Activities aktualisieren sich nicht selbstständig —
+#     der nächste Flug erscheint erst nach App-Öffnen." Ursache war NICHT der
+#     fehlende Push-Weg (der war gebaut), sondern der einzige Produzent, der
+#     ihn ohne `attributes` aufrief: ohne die nimmt `push_live_activity` die
+#     `start`-Zeile gar nicht erst in die Hand.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _mqtt_sector(dep_in_h=1.0, block_h=8.0, now=None):
+    """Sektor mit Abflug relativ zu JETZT — der Start-Gate hängt am Fenster."""
+    from datetime import timedelta
+    now = now or datetime.now(timezone.utc)
+    dep = now + timedelta(hours=dep_in_h)
+    return {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
+            'dep_iso': dep.isoformat().replace('+00:00', 'Z'),
+            'arr_iso': (dep + timedelta(hours=block_h)).isoformat()
+                       .replace('+00:00', 'Z')}
+
+
+def _start_row(sb):
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'start',
+                'p_activity_id': None, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+
+
+def test_fanout_erzeugt_die_karte_per_push_to_start(sb, auth, apns):
+    """DER FIX. Nur ein push-to-start-Token registriert (App war seit der
+    letzten Landung nicht offen) — der Fanout muss die Karte ERZEUGEN."""
+    _start_row(sb)
+    sent = LA.push_for_affected([(TOKEN, _mqtt_sector())], 'est_dep', 'LH400',
+                                '2026-07-27')
+    assert sent == 1
+    aps = apns['client'].sent[0]['payload']['aps']
+    assert aps['event'] == 'start'
+    assert aps['attributes-type'] == 'DutyActivityAttributes'
+    attrs = aps['attributes']
+    # Feldnamen/Typen 1:1 gegen Swift `DutyActivityAttributes`.
+    assert set(attrs) == {'flightNo', 'from', 'to', 'startedAt'}
+    assert attrs['flightNo'] == 'LH400'
+    assert attrs['from'] == 'FRA' and attrs['to'] == 'JFK'
+    assert isinstance(attrs['startedAt'], float)
+    # Apple-Referenzdatum, nicht Unix — dieselbe Epoche wie die content-state-
+    # Dates (aps.timestamp dagegen ist Unix).
+    now_unix = datetime.now(timezone.utc).timestamp()
+    assert abs((attrs['startedAt'] + APPLE_EPOCH) - now_unix) < 60
+
+
+def test_fanout_startet_keine_zweite_karte_wenn_eine_laeuft(sb, auth, apns):
+    """EINE Live Activity pro Dienst: die laufende `update`-Zeile gewinnt."""
+    _start_row(sb)
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_B,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    LA.push_for_affected([(TOKEN, _mqtt_sector())], 'est_dep', 'LH400',
+                         '2026-07-27')
+    assert len(apns['client'].sent) == 1
+    assert apns['client'].sent[0]['token'] == LA_TOKEN_B
+    assert apns['client'].sent[0]['payload']['aps']['event'] == 'update'
+
+
+def test_fanout_startet_nicht_zweimal_hintereinander(sb, auth, apns):
+    """Zwischen Start und dem Hochladen des Update-Tokens sieht der Server
+    weiter keine `update`-Zeile. Ohne Cooldown wären das zwei Karten."""
+    _start_row(sb)
+    LA.push_for_affected([(TOKEN, _mqtt_sector())], 'est_dep', 'LH400',
+                         '2026-07-27')
+    LA.push_for_affected([(TOKEN, _mqtt_sector(dep_in_h=1.5))], 'est_dep',
+                         'LH400', '2026-07-27')
+    assert len(apns['client'].sent) == 1
+
+
+def test_fanout_startet_nicht_lange_vor_dem_abflug(sb, auth, apns):
+    """MQTT-Topics stehen bis 48 h im Voraus. Eine Karte, die 30 h vor Abflug
+    entsteht, würde der eigene Sweep binnen 5 min wieder beenden."""
+    _start_row(sb)
+    sent = LA.push_for_affected([(TOKEN, _mqtt_sector(dep_in_h=30))],
+                                'est_dep', 'LH400', '2026-07-27')
+    assert sent == 0 and apns['client'].sent == []
+
+
+def test_fanout_startet_nicht_auf_arrived(sb, auth, apns):
+    """Eine Karte, die als „GELANDET" entsteht, hat nie einen Flug gezeigt."""
+    _start_row(sb)
+    sent = LA.push_for_affected([(TOKEN, _mqtt_sector(dep_in_h=-8))],
+                                'arrived', 'LH400', '2026-07-27')
+    assert sent == 0 and apns['client'].sent == []
+
+
+def test_fanout_aktualisiert_arrived_weiterhin(sb, auth, apns):
+    """Kein Start ≠ kein Update: eine LAUFENDE Karte muss die Landung sehen."""
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    sent = LA.push_for_affected([(TOKEN, _mqtt_sector(dep_in_h=-8))],
+                                'arrived', 'LH400', '2026-07-27')
+    assert sent == 1
+    assert apns['client'].sent[0]['payload']['aps']['event'] == 'update'
+
+
+def test_fanout_startet_nicht_ohne_bekannten_abflug(sb, auth, apns):
+    """Kein Abflug ⇒ kein Fenster ⇒ kein Start. Geraten wird nichts."""
+    _start_row(sb)
+    from datetime import timedelta
+    arr = (datetime.now(timezone.utc) + timedelta(hours=3))
+    sector = {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK',
+              'arr_iso': arr.isoformat().replace('+00:00', 'Z')}
+    sent = LA.push_for_affected([(TOKEN, sector)], 'est_arr', 'LH400',
+                                '2026-07-27',
+                                facts={'est_arr': sector['arr_iso'],
+                                       'dep_status': 'Flight Departed'})
+    assert sent == 0 and apns['client'].sent == []
+
+
+def test_start_attributes_spiegeln_den_swift_vertrag():
+    """`_ATTRIBUTE_FIELDS` IST der Wire-Contract gegen
+    `ios/AeroTax/Shared/DutyActivityAttributes.swift`. Wer dort ein Feld
+    hinzufügt, muss es hier eintragen — sonst wirft der Normalizer es weg."""
+    assert LA._ATTRIBUTE_FIELDS == {'flightNo': 'str', 'from': 'str',
+                                    'to': 'str', 'startedAt': 'date'}
+    assert LA._REQUIRED_ATTRIBUTE_KEYS == ('startedAt',)
+    attrs = LA._mqtt_start_attributes('est_dep', 'LH400', 'FRA', 'JFK',
+                                      datetime.now(timezone.utc),
+                                      datetime.now(timezone.utc))
+    assert set(attrs) <= set(LA._ATTRIBUTE_FIELDS)
 
 
 # ════════════════════════════════════════════════════════════════════════════
