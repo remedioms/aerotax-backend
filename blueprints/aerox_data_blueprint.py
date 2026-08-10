@@ -10233,6 +10233,84 @@ def _local_to_utc(s, iata):
             return None
 
 
+def _recap_roster_leg(token, flight_no, date, dep, arr):
+    """Der EIGENE Roster-Sektor zu diesem Leg — oder None.
+
+    ⚠️ WARUM ES DEN ÜBERHAUPT BRAUCHT (Owner-Befund 10.08.2026, LH781 SIN→FRA):
+    Der Rückblick zeigte „7:57 h Flugzeit" für einen 12:20-h-Flug und eine
+    Ankunft, die es nie gab. Zwei Ursachen griffen ineinander:
+
+      1. `_flight_obs_merged` sucht die Beobachtung auf DEM ANGEFRAGTEN TAG.
+         Der Flug ging am 09.08. um 23:54 Ortszeit Singapur und landete am
+         10.08. — auf dem 09.08. fand der Resolver deshalb die Ankunft der
+         Instanz von VORGESTERN (06:35 statt 06:14) und gar keinen Abflug.
+      2. Ohne `block_time_min` fällt die App auf die Dauer der aufgezeichneten
+         Spur zurück. Über Asien hat die Lücken — daraus wurden 7:57.
+
+    Der Roster des Nutzers trägt die Wahrheit längst: `dep_iso`/`arr_iso` sind
+    UTC-Instants und beim gelandeten Flug mit `arr_measured` als BEOBACHTET
+    markiert. Das ist keine Schätzung, sondern dieselbe Messung, die auch der
+    Kalender zeigt — und sie kennt den Tageswechsel, weil sie Instants sind
+    statt Uhrzeiten.
+
+    CROSS-DATE: der Leg kann am Roster-Tag des Abflugs ODER des Folgetags
+    hängen (LH keyt Nachtflüge auf beide). Deshalb beide Tage durchsuchen.
+
+    Wirft nie; None heisst schlicht „kein eigener Beleg" — dann bleibt alles
+    wie bisher.
+    """
+    loader = _life_app('_ical_briefings_load')
+    if not loader or not token or not date:
+        return None
+    try:
+        briefs = loader(token) or {}
+    except Exception:
+        return None
+    if not isinstance(briefs, dict):
+        return None
+    try:
+        from datetime import date as _d, timedelta as _td
+        y, m, d = (int(x) for x in date.split('-')[:3])
+        tage = [date, (_d(y, m, d) + _td(days=1)).isoformat(),
+                (_d(y, m, d) - _td(days=1)).isoformat()]
+    except Exception:
+        tage = [date]
+    fn = re.sub(r'[^A-Z0-9]', '', (flight_no or '').upper())
+    for tag in tage:
+        tagdaten = briefs.get(tag)
+        if not isinstance(tagdaten, dict):
+            continue
+        for s in (tagdaten.get('ical_sectors') or []):
+            if not isinstance(s, dict):
+                continue
+            if re.sub(r'[^A-Z0-9]', '', (s.get('flight') or '').upper()) != fn:
+                continue
+            # Strecke muss passen, sonst bindet ein gleichnamiger Folgesektor.
+            if dep and _norm_iata(s.get('from')) != dep:
+                continue
+            if arr and _norm_iata(s.get('to')) != arr:
+                continue
+            return s
+    return None
+
+
+def _recap_utc(iso):
+    """ISO-Instant (mit Zonen-Suffix) → aware UTC-datetime, sonst None. Ein
+    NAIVER String wird bewusst abgelehnt: ohne Zone wäre die Umrechnung geraten,
+    und geraten wird hier nichts."""
+    from datetime import datetime as _datetime, timezone
+    s = (iso or '').strip()
+    if not s or 'T' not in s:
+        return None
+    try:
+        dt = _datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
+
+
 @aerox_data_bp.route('/api/ax/flight-recap/<token>', methods=['GET'])
 def ax_flight_recap(token):
     """#5 Post-Flight-Recap. Query: flight_no, date, dep_iata, arr_iata (die
@@ -10248,13 +10326,37 @@ def ax_flight_recap(token):
     q_arr = _norm_iata(request.args.get('arr_iata'))
     if len(flight_no) < 3:
         return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
-    mkey = ('recap', flight_no, date or '', q_dep or '', q_arr or '')
+    # ⚠️ TOKEN IM MEMO-KEY (seit 10.08.2026 PFLICHT): die Antwort hängt jetzt am
+    # EIGENEN Roster des Nutzers (`_recap_roster_leg`). Ohne Token im Schlüssel
+    # bekäme der Kollege auf demselben Flug die Zeiten eines anderen serviert —
+    # der Memo-Cache ist prozessweit geteilt.
+    mkey = ('recap', (token or '')[:64], flight_no, date or '',
+            q_dep or '', q_arr or '')
     memo = _memo_get(mkey)
     if memo is not None:
         return jsonify(memo)
+    # ── ANKUNFTSTAG MITGEBEN (Owner-Befund 10.08.2026) ────────────────────
+    # `_flight_obs_merged` hat seit dem 16.07. den Parameter `arr_date` — gebaut
+    # für genau diese Lage (Nico, LH423 BOS→FRA über Nacht). Sein Docstring
+    # beschreibt das Symptom wörtlich: ohne ihn keyt der ganze Merge am
+    # ABFLUGTAG, und die Ankunfts-Seite greift die gleichnamige, aber FALSCHE
+    # Zeile der gestrigen Rotation.
+    #
+    # Der Rückblick hat ihn nie übergeben. Deshalb stand bei LH781 SIN→FRA die
+    # Ankunft der Instanz von vorgestern (06:35 statt 06:14) in der Karte. Den
+    # richtigen Tag kennt der eigene Roster-Leg — der wird hier ohnehin
+    # geladen, kostet also nichts extra.
+    leg = _recap_roster_leg(token, flight_no, date, q_dep, q_arr)
+    arr_date = None
+    if isinstance(leg, dict):
+        _ra = _recap_utc(leg.get('arr_iso'))
+        if _ra is not None:
+            _rd = _ra.date().isoformat()
+            if _rd != date:
+                arr_date = _rd
     merged_fn = _life_app('_flight_obs_merged')
     m = (merged_fn(flight_no, date=date, dep_iata=q_dep, arr_iata=q_arr,
-                   free_only=True) if merged_fn else None)
+                   free_only=True, arr_date=arr_date) if merged_fn else None)
     thr = _life_app('_DELAY_THRESHOLD_MIN', 15)
     if not m:
         payload = {'ok': True, 'flight': flight_no, 'date': date,
@@ -10282,6 +10384,33 @@ def ax_flight_recap(token):
         bm = int(round((au - du).total_seconds() / 60.0))
         if 0 < bm <= 20 * 60:
             block_min = bm
+
+    # ── DER EIGENE ROSTER SCHLÄGT DIE BOARD-BEOBACHTUNG ────────────────────
+    # (Owner-Befund 10.08.2026 — Begründung ausführlich an `_recap_roster_leg`.)
+    #
+    # Nicht weil Boards schlecht wären, sondern weil sie hier auf dem FALSCHEN
+    # TAG gesucht werden: ein Flug, der über Mitternacht geht, hat seine Ankunft
+    # am Folgetag. Der Roster-Sektor trägt dagegen echte UTC-Instants, kennt den
+    # Tageswechsel also von sich aus — und beim gelandeten Flug sind sie
+    # gemessen, nicht geplant.
+    #
+    # Reihenfolge bewusst so: erst die Board-Rechnung oben (sie liefert weiter
+    # den Normalfall), dann diese Korrektur. Sie greift NUR mit echtem eigenem
+    # Beleg; fehlt der Sektor oder seine Instants, bleibt alles wie zuvor.
+    # `leg` ist oben schon geladen (für `arr_date`) — nicht zweimal lesen.
+    if isinstance(leg, dict):
+        rdep = _recap_utc(leg.get('dep_iso'))
+        rarr = _recap_utc(leg.get('arr_iso'))
+        if rdep is not None and rarr is not None:
+            bm = int(round((rarr - rdep).total_seconds() / 60.0))
+            if 0 < bm <= 20 * 60:
+                block_min = bm
+                # Die Zeiten, aus denen die Blockzeit stammt, müssen auch die
+                # angezeigten sein — sonst steht eine Dauer über zwei Uhrzeiten,
+                # die sie nicht ergeben (genau der Owner-Screenshot: 7:57 h
+                # zwischen zwei Zeiten, die 12:20 auseinanderliegen).
+                actual_dep = rdep.isoformat()
+                actual_arr = rarr.isoformat()
     payload = {
         'ok': True, 'flight': flight_no, 'date': date,
         'dep': _airport_brief(dep), 'dest': _airport_brief(dest),
