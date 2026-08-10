@@ -587,3 +587,62 @@ def test_enrich_worker_runs_once_per_token(monkeypatch):
         assert seen == []
     finally:
         backend._LOGBOOK_ENRICH_RUNNING.discard('AT-BUSY')
+
+
+# ── Ist-Blockzeit statt BLZ68-Durchschnitt (Tester-Meldung 2026-08-10) ──────
+# Die Spalte „BLOCK ZEIT" der LH-Flugstundenübersicht ist die
+# BLZ68-DURCHSCHNITTSZEIT. iOS rechnet seit 10.08. clientseitig die Differenz
+# der Ist-Zeiten (`FlugbuchPresentation.effectiveBlockMinutes`); der Server
+# muss dieselbe Regel fahren, sonst widersprechen sich App-Summen und Export.
+
+BLZ68_BLOB = {'legs': [
+    # BLZ68 235 min, tatsächlich geflogen 4:12 = 252 min
+    {'date': '2026-06-01', 'flight': 'LH620', 'from': 'FRA', 'to': 'TLV',
+     'dep_iso': '2026-06-01T09:00:00+00:00',
+     'arr_iso': '2026-06-01T13:12:00+00:00',
+     'block_min': 235, 'type': 'A21N'},
+    # Mitternachts-Wrap über die Offsets: 20:40Z → 01:05Z = 265 min
+    {'date': '2026-06-02', 'flight': 'LH777', 'from': 'TLV', 'to': 'FRA',
+     'dep_iso': '2026-06-02T23:40:00+03:00',
+     'arr_iso': '2026-06-03T03:05:00+02:00',
+     'block_min': 235, 'type': 'A21N'},
+    # keine Ist-Zeiten → gespeicherter Wert bleibt stehen (nichts erfunden)
+    {'date': '2026-06-04', 'flight': 'LH999', 'from': 'FRA', 'to': 'MUC',
+     'block_min': 60, 'type': 'A21N'},
+], 'sim': []}
+
+
+def test_effective_block_min_matches_ios_rule():
+    f = backend._logbook_effective_block_min
+    # Ist-Differenz schlägt die importierte Durchschnittszahl (gleicher Fall
+    # wie FlugbuchPresentationTests.testEffectiveBlockUsesRealOutInDifference…)
+    assert f('2026-08-03T16:55:00Z', '2026-08-04T02:05:00Z', 999) == 550
+    # Mitternachts-Wrap über Offsets
+    assert f('2026-05-03T18:00:00-04:00', '2026-05-04T07:30:00+02:00', 1) == 450
+    # fehlende/kaputte/negative Zeiten → Fallback unverändert (auch None)
+    assert f(None, '2026-08-04T02:05:00Z', 77) == 77
+    assert f('quatsch', 'auch quatsch', 77) == 77
+    assert f('2026-08-04T03:05:00Z', '2026-08-04T02:05:00Z', 88) == 88
+    assert f('2026-08-04T03:05:00Z', '2026-08-04T03:05:00Z', None) is None
+    # NAIVE Zeiten sind nicht sicher als Instant lesbar → Fallback (iOS
+    # ISO8601DateFormatter scheitert an ihnen ebenfalls)
+    assert f('2026-08-03T16:55:00', '2026-08-03T18:55:00', 42) == 42
+    # genau 24h zählt noch, mehr nicht
+    assert f('2026-08-03T00:00:00Z', '2026-08-04T00:00:00Z', 5) == 1440
+    assert f('2026-08-03T00:00:00Z', '2026-08-04T00:01:00Z', 5) == 5
+
+
+def test_blz68_average_never_wins_over_measured_times():
+    _seed()
+    _seed_import(BLZ68_BLOB)
+    r = _get()
+    e = {x['flight']: x for x in r['entries']}
+    assert e['LH620']['block_min'] == 252      # nicht 235 (BLZ68)
+    assert e['LH777']['block_min'] == 265      # Mitternachts-Wrap
+    assert e['LH999']['block_min'] == 60       # ohne Zeiten: Fallback
+    # Summen ziehen dieselbe Zahl: Roster-Legs (520+450+60) + Import
+    assert r['totals']['block_min'] == 1030 + 252 + 265 + 60
+    bt = {t['type']: t for t in r['by_type']}
+    assert bt['A21N']['legs'] == 3 and bt['A21N']['block_min'] == 577
+    by_year = {y['year']: y for y in r['by_year']}
+    assert by_year['2026']['block_min'] == 1030 + 577

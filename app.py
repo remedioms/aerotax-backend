@@ -21433,9 +21433,117 @@ def _flight_ops_load(token):
 
 
 def _build_logbook_html(token, standard='EASA'):
-    """Erzeugt HTML-Logbuch — EASA-Format (AMC1 FCL.050 Felder) oder FAA (FAR 61.51).
-    Tage werden aus der jüngsten Auswertung (tage_detail) + FlightOps zusammengeführt.
+    """HTML-Logbuch — EASA-Format (AMC1 FCL.050) oder FAA (FAR 61.51).
+
+    **Alte Route, bewusst erhalten** (ausgelieferte Builds rufen
+    `/api/user/logbook-html/<token>` weiter auf) — seit 2026-08-11 liefert
+    sie aber dieselben Zahlen wie Flugbuch-Ansicht und PDF-Export:
+
+    * Quelle sind die Flugbuch-Legs aus `get_logbook` — EINE Merge-/Summen-
+      Implementierung (Passport-Lehre 2026-07-28: die Zweit-Kopie verlor
+      still den kompletten Import). Damit stehen jetzt Blockzeit
+      (`_logbook_effective_block_min`, identisch zu App und PDF),
+      Kennzeichen/Muster, Landungen und Starts Tag/Nacht, Nachtflugzeit und
+      PIC in der Tabelle. Vorher: 9 Spalten, weder Block noch Landungen.
+    * Tage aus der Steuer-Auswertung (`_tage_detail`) bzw. dem
+      Roster-Snapshot, zu denen es KEINEN Flugbuch-Leg gibt, bleiben als
+      Zusatzzeilen erhalten (nichts verschwindet gegenüber der alten
+      Fassung). Sie füllen aber nur Spalten, die sie belegen können: ihre
+      Dienstzeiten sind Ortszeit-Strings und wandern als Text in die
+      Bemerkung, NIE in die UTC-Spalten (Zeitzonen-Fehlerklasse).
+    * FlightOps (PAX/Bemerkung) liegt pro TAG, nicht pro Leg — es wird nur
+      dem Leg zugeordnet, dessen Flugnummer wirklich passt.
+
+    **Wurzel des falschen „[SBY-ACT]" (Tester ohne jeden Standby-Einsatz):**
+    die alte Zeile `tag = f'[{klass or "SBY-ACT"}] '` feuerte für JEDEN Tag
+    mit FlightOps-Daten, dessen `klass` nicht Z72/Z73/Z74/Z76 war — und
+    Crew-Tage aus dem AeroX-Roster-Snapshot tragen überhaupt keine
+    Steuer-Klasse (`DayDetail.klass` ist dort nil, die Tax-Pipeline läuft
+    für sie nie). Ein FEHLENDER Wert wurde also als Beleg für „Standby
+    aktiviert" gelesen. Jetzt wird Standby nur vermerkt, wenn Klasse/Marker/
+    Routing des Tages ein Standby-Signal tragen (`_friend_day_is_standby`);
+    eine leere Klasse behauptet gar nichts.
     """
+    import html as _html_escape
+
+    def _esc(v, maxlen=200):
+        s = '' if v is None else str(v)
+        if maxlen and len(s) > maxlen:
+            s = s[:maxlen]
+        return _html_escape.escape(s, quote=True)
+
+    def _norm_flight(v):
+        return re.sub(r'[^A-Z0-9]', '', str(v or '').upper())
+
+    def _hhmm(minutes):
+        if not isinstance(minutes, int) or minutes <= 0:
+            return ''
+        return f'{minutes // 60}:{minutes % 60:02d}'
+
+    def _num(v):
+        return str(v) if isinstance(v, int) and v > 0 else ''
+
+    # ── 1) Flugbuch-Legs (Roster + Alt-Import), exakt wie App und PDF ──────
+    entries = []
+    try:
+        with app.test_request_context():
+            _resp = get_logbook(token)
+        _payload = (_resp.get_json(silent=True)
+                    if hasattr(_resp, 'get_json') else None)
+        if isinstance(_payload, dict) and _payload.get('ok'):
+            entries = [e for e in (_payload.get('entries') or [])
+                       if isinstance(e, dict)]
+    except Exception as _e:
+        app.logger.warning('[logbook-html] logbook_unavailable '
+                           f'{type(_e).__name__}: {str(_e)[:120]}')
+
+    ops_by_date = _flight_ops_load(token) or {}
+
+    def _ops_for(datum, flight_norm):
+        o = ops_by_date.get(datum)
+        if not isinstance(o, dict) or not flight_norm:
+            return {}
+        return o if _norm_flight(o.get('flightNumber')) == flight_norm else {}
+
+    rows = []
+    entry_keys = set()
+    dates_with_entries = set()
+    for e in entries:
+        datum = str(e.get('date') or '')[:10]
+        nf = _norm_flight(e.get('flight'))
+        entry_keys.add((datum, nf))
+        dates_with_entries.add(datum)
+        ops = _ops_for(datum, nf)
+        pax = sum(int(ops.get(k) or 0) for k in
+                  ('pax_adults', 'pax_children', 'pax_infants')) if ops else 0
+        note = []
+        if e.get('pf'):
+            note.append('PF')
+        for extra in ((e.get('remarks') or '').strip(),
+                      (ops.get('remarks') or '').strip()):
+            if extra:
+                note.append(extra)
+        frm, to = (e.get('from') or ''), (e.get('to') or '')
+        rows.append({
+            'date': datum,
+            'flight': e.get('flight') or '',
+            'type': e.get('type') or '',
+            'reg': e.get('reg') or '',
+            'routing': (f'{frm} → {to}' if (frm and to) else (frm or to)),
+            'dep': _lb_pdf_utc_hhmm(e.get('dep_iso')),
+            'arr': _lb_pdf_utc_hhmm(e.get('arr_iso')),
+            'block': _logbook_effective_block_min(
+                e.get('dep_iso'), e.get('arr_iso'), e.get('block_min')),
+            'to_day': e.get('to_day'), 'to_night': e.get('to_night'),
+            'ldg_day': e.get('ldg_day'), 'ldg_night': e.get('ldg_night'),
+            'night_min': e.get('night_min'),
+            'pax': pax or None,
+            'pic': e.get('pic_name') or '',
+            'remarks': ' · '.join(note),
+            'sort': (datum, str(e.get('dep_iso') or '')),
+        })
+
+    # ── 2) Alt-Tage ohne Flugbuch-Leg (Steuer-Auswertung/Roster-Snapshot) ──
     sess = _store.get(token) or {}
     rd = sess.get('result_data') or {}
     tage = rd.get('_tage_detail') or []
@@ -21443,66 +21551,113 @@ def _build_logbook_html(token, standard='EASA'):
         # _store ist in-memory/per-Instanz → persistenter Snapshot-Fallback
         # (2026-07-01, Muster wie get_friend_roster).
         tage = (_roster_snapshot_read(token) or {}).get('tage') or []
-    ops_by_date = _flight_ops_load(token)
+    _FLUG_KLASSEN = ('Z72', 'Z73', 'Z74', 'Z76')
+    seen_legacy = set()
+    for t in tage:
+        if not isinstance(t, dict):
+            continue
+        datum = str(t.get('datum') or '')[:10]
+        if not datum:
+            continue
+        klass = (t.get('klass') or '').strip().upper()
+        ops = ops_by_date.get(datum)
+        ops = ops if isinstance(ops, dict) else {}
+        nf = _norm_flight(ops.get('flightNumber'))
+        # EASA AMC1 FCL.050 / FAR 61.51: auch Ferry/Training/aktivierter
+        # Standby gehört ins Logbuch — deshalb zählt eine FlightOps-Flugnummer
+        # genauso wie eine Flug-Steuerklasse.
+        if not (klass in _FLUG_KLASSEN or nf):
+            continue
+        if (datum, nf) in entry_keys or (datum, nf) in seen_legacy:
+            continue
+        if not nf and datum in dates_with_entries:
+            continue      # dieser Tag steht bereits mit seinen Legs in rows
+        seen_legacy.add((datum, nf))
+        rf = t.get('reader_facts') or {}
+        note = []
+        if nf and _friend_day_is_standby(t):
+            # NUR mit Beleg im Tag selbst (Klasse/Marker/Routing).
+            note.append('Standby aktiviert')
+        elif klass and klass not in _FLUG_KLASSEN:
+            note.append(klass)          # gespeicherte Klasse, keine Deutung
+        st, en = (rf.get('start_time') or ''), (rf.get('end_time') or '')
+        if st or en:
+            note.append(f'Dienst {st or "?"}–{en or "?"} Ortszeit')
+        if (ops.get('remarks') or '').strip():
+            note.append(ops['remarks'].strip())
+        pax = sum(int(ops.get(k) or 0) for k in
+                  ('pax_adults', 'pax_children', 'pax_infants'))
+        rows.append({
+            'date': datum,
+            'flight': ops.get('flightNumber') or '',
+            'type': ops.get('aircraftType') or '',
+            'reg': ops.get('aircraftReg') or '',
+            'routing': (t.get('routing') or '').replace('-', ' → '),
+            # Block/UTC-Zeiten bleiben LEER: die Dienstzeiten dieses Pfads
+            # sind Ortszeit-Strings ohne Offset — daraus eine UTC-Spalte oder
+            # eine Blockzeit zu rechnen wäre geraten.
+            'dep': '', 'arr': '', 'block': None,
+            'to_day': None, 'to_night': None,
+            'ldg_day': None, 'ldg_night': None, 'night_min': None,
+            'pax': pax or None,
+            'pic': '',
+            'remarks': ' · '.join(note),
+            'sort': (datum, ''),
+        })
+
+    rows.sort(key=lambda r: r['sort'])
+
+    def _total(field):
+        return sum(v for v in (r.get(field) for r in rows)
+                   if isinstance(v, int) and v > 0)
+
+    cols = (['Datum', 'Flugnr', 'Muster', 'Kennz.', 'Routing', 'Ab (UTC)',
+             'An (UTC)', 'Block', 'Start T', 'Start N', 'Ldg T', 'Ldg N',
+             'Nacht', 'PAX', 'PIC', 'Bemerkungen']
+            if standard == 'EASA' else
+            ['Date', 'Flight', 'Type', 'Reg', 'Route', 'Out (UTC)',
+             'In (UTC)', 'Block', 'TO Day', 'TO Night', 'Ldg Day', 'Ldg Night',
+             'Night', 'PAX', 'PIC', 'Remarks'])
+
+    rows_html = []
+    for r in rows:
+        cells = [
+            _esc(r['date'], 10), _esc(r['flight'], 20), _esc(r['type'], 20),
+            _esc(r['reg'], 20), _esc(r['routing'], 120), _esc(r['dep'], 5),
+            _esc(r['arr'], 5), _hhmm(r['block']),
+            _num(r['to_day']), _num(r['to_night']),
+            _num(r['ldg_day']), _num(r['ldg_night']), _hhmm(r['night_min']),
+            _num(r['pax']), _esc(r['pic'], 60), _esc(r['remarks'], 200),
+        ]
+        rows_html.append('<tr>' + ''.join(f'<td>{c}</td>' for c in cells)
+                         + '</tr>')
+
+    sum_label = 'Summe' if standard == 'EASA' else 'Total'
+    sum_cells = ['', '', '', '', '', '',
+                 _hhmm(_total('block')),
+                 _num(_total('to_day')), _num(_total('to_night')),
+                 _num(_total('ldg_day')), _num(_total('ldg_night')),
+                 _hhmm(_total('night_min')), '', '', '']
+    sum_html = (f'<tr class="sum"><td>{_esc(sum_label, 20)}</td>'
+                + ''.join(f'<td>{c}</td>' for c in sum_cells) + '</tr>')
+
     profile = {}
     try:
         with open(_user_profile_path(token)) as f:
             profile = json.load(f).get('profile', {}) or {}
     except Exception:
         pass
-
-    import html as _html_escape
-    def _esc(v, maxlen=200):
-        s = '' if v is None else str(v)
-        if maxlen and len(s) > maxlen: s = s[:maxlen]
-        return _html_escape.escape(s, quote=True)
-
-    rows_html = []
-    # EASA AMC1 FCL.050 / FAR 61.51: PIC-Zeiten auch für Standby-with-Activation,
-    # Ferry, Training → wenn FlightOps eine flightNumber kennt, zeige den Tag
-    # auch wenn klass nicht Z72/73/74/76 ist. Sonst fehlen activated-SBY-Flights.
-    seen_dates = set()
-    for t in tage:
-        if not isinstance(t, dict): continue
-        klass = (t.get('klass') or '').upper()
-        datum = t.get('datum') or ''
-        rf = t.get('reader_facts') or {}
-        ops = ops_by_date.get(datum, {}) or {}
-        is_flight_klass = klass in ('Z72','Z73','Z74','Z76')
-        has_flight_ops = bool(ops.get('flightNumber'))
-        if not (is_flight_klass or has_flight_ops):
-            continue
-        if datum in seen_dates: continue
-        seen_dates.add(datum)
-        routing = (t.get('routing') or '').replace('-', ' → ')
-        flight_no = ops.get('flightNumber') or ''
-        reg = ops.get('aircraftReg') or ''
-        atype = ops.get('aircraftType') or ''
-        start = rf.get('start_time') or ''
-        end = rf.get('end_time') or ''
-        pax = (ops.get('pax_adults') or 0) + (ops.get('pax_children') or 0) + (ops.get('pax_infants') or 0)
-        remarks = (ops.get('remarks') or '')[:60]
-        if has_flight_ops and not is_flight_klass:
-            tag = f'[{klass or "SBY-ACT"}] '
-            remarks = (tag + remarks)[:60]
-        rows_html.append(
-            f'<tr><td>{_esc(datum, 10)}</td><td>{_esc(flight_no, 20)}</td>'
-            f'<td>{_esc(atype, 20)}</td><td>{_esc(reg, 20)}</td>'
-            f'<td>{_esc(routing, 120)}</td><td>{_esc(start, 10)}</td>'
-            f'<td>{_esc(end, 10)}</td><td>{_esc(pax or "", 10)}</td>'
-            f'<td>{_esc(remarks, 60)}</td></tr>'
-        )
-
     name = _esc(profile.get('name') or '', 80)
     position = _esc(profile.get('position') or '', 60)
     airline = _esc(profile.get('airline') or '', 80)
     homebase = _esc(profile.get('homebase') or '', 10)
-    title = 'AMC1 FCL.050 Logbook' if standard == 'EASA' else 'FAR 61.51 Pilot Logbook'
-    cols = ('Datum | Flugnr | Type | Reg | Routing | OffBl | OnBl | PAX | Bemerkungen'
-            if standard == 'EASA'
-            else 'Date | Flight | Type | Reg | Route | Off | On | PAX | Remarks')
-    head = ''.join(f'<th>{_esc(c.strip(), 30)}</th>' for c in cols.split('|'))
+    title = ('AMC1 FCL.050 Logbook' if standard == 'EASA'
+             else 'FAR 61.51 Pilot Logbook')
+    head = ''.join(f'<th>{_esc(c, 30)}</th>' for c in cols)
     std_esc = _esc(standard, 10)
+    empty_row = (f'<tr><td colspan="{len(cols)}" style="text-align:center;'
+                 'color:#5e6679;padding:30px">Keine Flugtage vorhanden.'
+                 '</td></tr>')
 
     html = f"""<!doctype html>
 <html lang="de"><head><meta charset="utf-8"><title>{title} — {name}</title>
@@ -21510,20 +21665,22 @@ def _build_logbook_html(token, standard='EASA'):
   body{{font-family:-apple-system,system-ui,sans-serif;background:#0b0e1a;color:#dde2ee;margin:0;padding:24px}}
   h1{{font-weight:800;letter-spacing:-0.5px;margin:0 0 4px 0;font-size:22px}}
   .sub{{color:#8a93a6;font-size:13px;margin-bottom:18px}}
+  .wrap{{overflow-x:auto}}
   table{{width:100%;border-collapse:collapse;font-size:11px}}
-  th,td{{padding:6px 8px;border-bottom:1px solid #1d2235;text-align:left;vertical-align:top}}
+  th,td{{padding:6px 8px;border-bottom:1px solid #1d2235;text-align:left;vertical-align:top;white-space:nowrap}}
   th{{background:#11162a;color:#c0c6d4;font-weight:600;text-transform:uppercase;letter-spacing:1px;font-size:9px}}
   tr:nth-child(even) td{{background:#0d1124}}
+  tr.sum td{{font-weight:700;border-top:2px solid #2b3350;background:#11162a}}
   .foot{{margin-top:24px;color:#5e6679;font-size:10px}}
   .sig{{margin-top:50px;border-top:1px solid #1d2235;padding-top:8px;color:#8a93a6;font-size:10px}}
-  @media print{{body{{background:white;color:black}} th{{background:#eee;color:#000}} tr:nth-child(even) td{{background:#fafafa}}}}
+  @media print{{body{{background:white;color:black}} th{{background:#eee;color:#000}} tr:nth-child(even) td{{background:#fafafa}} tr.sum td{{background:#eee}}}}
 </style></head><body>
 <h1>{title}</h1>
 <div class="sub">{name} · {position} · {airline} · Homebase {homebase}</div>
-<table><thead><tr>{head}</tr></thead><tbody>
-{''.join(rows_html) if rows_html else '<tr><td colspan="9" style="text-align:center;color:#5e6679;padding:30px">Keine Flugtage vorhanden.</td></tr>'}
-</tbody></table>
-<div class="foot">Erzeugt: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC · Standard: {std_esc} · Tage gesamt: {len(rows_html)}</div>
+<div class="wrap"><table><thead><tr>{head}</tr></thead><tbody>
+{''.join(rows_html) if rows_html else empty_row}
+</tbody><tfoot>{sum_html if rows_html else ''}</tfoot></table></div>
+<div class="foot">Erzeugt: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC · Standard: {std_esc} · Zeilen: {len(rows_html)} · Blockzeit gesamt: {_hhmm(_total('block')) or '—'} · Landungen: {_total('ldg_day') + _total('ldg_night')}</div>
 <div class="sig">Unterschrift: ____________________________ Datum: ______________</div>
 </body></html>"""
     return html
@@ -22447,6 +22604,40 @@ def _logbook_block_min(dep_iso, arr_iso):
         return None
 
 
+def _logbook_effective_block_min(dep_iso, arr_iso, fallback=None):
+    """Ist-Blockzeit eines Legs = Differenz der GESPEICHERTEN Ist-Zeiten.
+
+    Hintergrund (Tester-Meldung 10.08.2026): die Spalte „BLOCK ZEIT" der
+    LH-Flugstundenübersicht ist die BLZ68-**Durchschnittszeit**, nicht die
+    geflogene Blockzeit. Ein Import, der diese Spalte nach `block_min`
+    schreibt, trägt also eine Tarif-Zahl. Wo OUT/IN belegt sind, gewinnt
+    deshalb ihre Differenz; nur wenn sie fehlen oder unplausibel sind,
+    bleibt der gespeicherte Wert stehen (nichts wird erfunden).
+
+    **Semantik 1:1 wie iOS `FlugbuchPresentation.effectiveBlockMinutes`**
+    (`Mehr/FlugbuchView.swift`, seit 10.08.) — sonst widersprächen sich
+    App-Summen und Server-Export:
+      * beide Zeiten müssen parsebar sein UND einen Offset tragen
+        (`ISO8601DateFormatter` scheitert an naiven Zeiten → Fallback;
+        eine naive Zeit ist nicht sicher als Instant zu lesen),
+      * nur positive Intervalle bis einschliesslich 24 h zählen
+        (Mitternachts-Wrap über den Offset ist damit korrekt erfasst),
+      * sonst: `fallback` unverändert (auch `None`).
+    """
+    try:
+        d = datetime.fromisoformat(str(dep_iso or '').replace('Z', '+00:00'))
+        a = datetime.fromisoformat(str(arr_iso or '').replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return fallback
+    if d.tzinfo is None or a.tzinfo is None:
+        return fallback
+    secs = (a - d).total_seconds()
+    if not (0 < secs <= 24 * 3600):
+        return fallback
+    # Swift `.rounded()` = half away from zero; secs ist hier immer positiv.
+    return int(secs / 60.0 + 0.5)
+
+
 def _logbook_type_group(raw_type):
     """Flugzeugmuster für die Flugbuch-Statistik vereinheitlichen.
 
@@ -22949,8 +23140,15 @@ def get_logbook(token):
             'key': key, 'date': lg['date'], 'flight': lg['flight'],
             'from': lg['from'], 'to': lg['to'],
             'dep_iso': lg['dep_iso'], 'arr_iso': lg['arr_iso'],
-            'block_min': (lg.get('block_min') if is_import
-                          else _logbook_block_min(lg['dep_iso'], lg['arr_iso'])),
+            # Ist-Differenz der gespeicherten OUT/IN-Zeiten schlägt den
+            # gespeicherten Wert (BLZ68-Durchschnitt in LH-Flugstunden-
+            # Exporten); ohne belegbare Zeiten bleibt der bisherige Wert.
+            # Damit rechnen totals/by_type/by_year, der PDF-Export (der
+            # get_logbook wiederverwendet) und die App dieselbe Zahl.
+            'block_min': _logbook_effective_block_min(
+                lg['dep_iso'], lg['arr_iso'],
+                lg.get('block_min') if is_import
+                else _logbook_block_min(lg['dep_iso'], lg['arr_iso'])),
             'reg': reg or None, 'type': actype or None,
             'ldg_day': ldg_day,
             'ldg_night': ldg_night,
@@ -23345,6 +23543,12 @@ _LOGBOOK_IMPORT_EXTS = ('.csv', '.txt', '.tsv', '.xls', '.xlsx', '.numbers',
                         '.pdf', '.json', '.zip')
 _LOGBOOK_IMPORT_TS = {}            # token -> [epoch, ...] (in-memory Throttle)
 _LOGBOOK_IMPORT_TS_LOCK = _req_threading.Lock()
+# Uploads pro Token und 24 h. 5 war für das Nachtragen alter Monate zu knapp:
+# jede Flugstundenübersicht ist eine eigene Datei, der Client bricht beim
+# ersten 429 fail-fast ab (Tester 10.08.2026: „musste jede Übersicht einzeln
+# laden"). 30 deckt ein volles Jahr Monatsberichte in einer Sitzung ab und
+# bleibt weit unter dem, was den Mail-/Store-Weg belasten würde.
+_LOGBOOK_IMPORT_MAX_PER_DAY = 30
 
 
 def _logbook_upload_store(token, filename, blob, note):
@@ -23472,15 +23676,28 @@ def upload_logbook_import(token):
     import time as _time
     if not token or not re.sub(r'[^A-Za-z0-9_-]', '', token)[:64]:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
-    # Throttle: max 5 Uploads/24h pro Token (in-memory reicht — der 50MB-
-    # Flask-Cap begrenzt den Einzel-Request, hier geht's um Mail-Spam).
+    # Throttle: max _LOGBOOK_IMPORT_MAX_PER_DAY Uploads/24h pro Token
+    # (in-memory reicht — der 50MB-Flask-Cap begrenzt den Einzel-Request,
+    # hier geht's um Mail-Spam).
     now = _time.time()
     with _LOGBOOK_IMPORT_TS_LOCK:
         ts = [t for t in _LOGBOOK_IMPORT_TS.get(token, []) if now - t < 86400]
-        if len(ts) >= 5:
-            return jsonify({'ok': False, 'error': 'too_many_uploads',
-                            'message': 'Maximal 5 Importe pro Tag — bitte '
-                                       'morgen erneut versuchen.'}), 429
+        if len(ts) >= _LOGBOOK_IMPORT_MAX_PER_DAY:
+            # Ehrliche Wartezeit statt „morgen": der älteste noch zählende
+            # Upload fällt nach 24 h aus dem Fenster und gibt den Platz frei.
+            # Der Client kann damit gezielt weitermachen statt abzubrechen.
+            retry_after = max(1, int(86400 - (now - min(ts))))
+            _mins = (retry_after + 59) // 60
+            _wait = (f'{_mins} Minuten' if _mins < 90
+                     else f'{(_mins + 59) // 60} Stunden')
+            return jsonify({
+                'ok': False, 'error': 'too_many_uploads',
+                'limit': _LOGBOOK_IMPORT_MAX_PER_DAY,
+                'retry_after_s': retry_after,
+                'retry_after_min': _mins,
+                'message': (f'Maximal {_LOGBOOK_IMPORT_MAX_PER_DAY} Importe '
+                            f'pro Tag — bitte in {_wait} erneut versuchen.'),
+            }), 429, {'Retry-After': str(retry_after)}
         ts.append(now)
         _LOGBOOK_IMPORT_TS[token] = ts
     filename, blob, note = None, None, None

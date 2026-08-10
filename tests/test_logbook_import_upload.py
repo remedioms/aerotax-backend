@@ -97,16 +97,29 @@ def test_upload_rejects_oversize(monkeypatch):
     assert not sent
 
 
-def test_upload_throttle_5_per_day(monkeypatch):
+def test_upload_throttle_per_day_and_honest_wait(monkeypatch):
+    """Deckel 30/24h (5 war fürs Nachtragen alter Monate zu knapp) und der
+    429 sagt, WIE LANGE zu warten ist — der Client bricht sonst fail-fast ab,
+    ohne dem User eine Wiedervorlage nennen zu können."""
+    assert A._LOGBOOK_IMPORT_MAX_PER_DAY == 30
     A._LOGBOOK_IMPORT_TS.clear()
     c = _client()
-    for i in range(5):
+    for i in range(A._LOGBOOK_IMPORT_MAX_PER_DAY):
         r, _ = _post(c, 'tok_upload_5', f'e{i}.csv', b'a,b\n',
                      monkeypatch=monkeypatch)
         assert r.status_code == 200, (i, r.get_json())
-    r, sent = _post(c, 'tok_upload_5', 'e6.csv', b'a,b\n',
-                    monkeypatch=monkeypatch)
+    r, _sent = _post(c, 'tok_upload_5', 'e31.csv', b'a,b\n',
+                     monkeypatch=monkeypatch)
     assert r.status_code == 429
+    body = r.get_json()
+    assert body['error'] == 'too_many_uploads'
+    assert body['limit'] == 30
+    # Wartezeit ist echt (der älteste Upload fällt nach 24h aus dem Fenster)
+    # und steht auch als Standard-Header drin.
+    assert 0 < body['retry_after_s'] <= 86400
+    assert body['retry_after_min'] >= 1
+    assert r.headers['Retry-After'] == str(body['retry_after_s'])
+    assert '30' in body['message']
 
 
 def test_upload_no_file_400(monkeypatch):

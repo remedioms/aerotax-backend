@@ -84,3 +84,19 @@ def test_pdf_fmt_faa_wird_ehrlich_abgelehnt():
     body = resp[0].get_json() if isinstance(resp, tuple) else resp.get_json()
     code = resp[1] if isinstance(resp, tuple) else resp.status_code
     assert code == 400 and body['error'] == 'fmt_unsupported'
+
+
+def test_pdf_blockzeit_ist_die_ist_differenz_nicht_blz68():
+    """Der EASA-Export darf der App nicht widersprechen: eine importierte
+    BLZ68-Durchschnittszahl verliert gegen die gemessenen Ist-Zeiten
+    (Tester-Meldung 10.08.2026, gleiche Regel wie iOS)."""
+    from tests.test_logbook import BLZ68_BLOB
+    _seed()
+    _seed_import(BLZ68_BLOB)
+    r = _get()
+    text = _pdf_text(_pdf('range=2026-06'))
+    assert 'LH620' in text and 'LH777' in text
+    assert _hhmm(252) in text and _hhmm(265) in text
+    assert _hhmm(235) not in text                  # BLZ68-Durchschnitt
+    # Gesamt im PDF == totals der API (EINE Quelle).
+    assert _hhmm(r['totals']['block_min']) in _pdf_text(_pdf())
