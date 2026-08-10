@@ -1099,12 +1099,16 @@ _LHFO_HOUR_INTERACTIVE_CEILING = 18000    # 90 % — Taps zuletzt sterben
 # (Vorfall 10.08. abends, dritte und letzte Revision dieser Kommentar-Kette.)
 #
 # Die Beweiskette:
-#   · Erster 403 (ERR_403_DEVELOPER_OVER_RATE) um 20:17Z — Tageszähler stand
-#     bei 10.025. Die Stunde stand bei 52 von 20.000, der Takt bei 1,4/s von
-#     erlaubten 20. Weder Stunde noch Sekunde können es gewesen sein.
-#   · 28.07. liefen 6.684 Calls OHNE einen einzigen 403 durch.
-#   · Der Vorfall vom 27.07. erholte sich dokumentiert am UTC-Mitternacht-Reset.
-#   ⇒ Tagesquote ≈ 10.000, Reset 00:00 UTC.
+#   · LHs EIGENE Portal-CSVs (10.08., Owner-Export) sind die Quelle — nicht
+#     mehr unser Zähler, der auch geblockte VERSUCHE bucht (stand 10.155):
+#       04.–09.08.: 5.378–6.104 erfolgreich, 0× „Over Limit".
+#       10.08.: erfolgreich EINGEFROREN bei 7.389, danach 2.372× Over Limit.
+#     ⇒ Quote zwischen 6.150 (05.08. lief durch) und 7.430 (Einfrierpunkt).
+#       Planungsgrösse: ~7.400 durchgelassene Calls/Tag.
+#   · Die Stunde stand beim Block bei 52 von 20.000, der Takt bei 1,4/s von
+#     20 — beides scheidet aus. Reset am UTC-Mitternacht (Vorfall 27.07.).
+#   · Treiber heute: COMMON_DUTY_EVENTS 7.460 statt üblich ~3.600 — exakt die
+#     Verdopplung durch die (zurückgenommene) Kadenz-Verschärfung.
 #
 # WARUM DAS PORTAL SIE NICHT ZEIGT: die Key-Seite listet nur „Rate Limits"
 # (20/s, 20.000/h). Mashery führt QUOTEN als getrennte Einstellung am Plan —
@@ -1113,12 +1117,13 @@ _LHFO_HOUR_INTERACTIVE_CEILING = 18000    # 90 % — Taps zuletzt sterben
 # FlightOps-Key (verglichen, nicht geraten). Alex' Mail und der Screenshot
 # waren also beide korrekt — nur unvollständig.
 #
-# DIE STAFFELUNG: Hintergrund stoppt bei 8.000, damit interaktive Flows
-# (Erstimport der Neuen — gerade läuft eine ZRH-Welle) bis 9.500 IMMER noch
-# durchkommen, auch spätabends. 500 Band je Stufe, 500 Sicherheitsabstand zur
-# Quote — denn die 403s zählen selbst mit.
-_LHFO_DAY_BACKGROUND_CEILING = 8000
-_LHFO_DAY_INTERACTIVE_CEILING = 9500
+# DIE STAFFELUNG, kalibriert an der UNTEREN plausiblen Wand (7.389 beobachtet):
+# Hintergrund stoppt bei 6.200, die Dienst-Marken bei 6.500, interaktive Flows
+# (Erstimport der Neuen — gerade läuft eine ZRH-Welle) dürfen bis 7.000. Der
+# Hintergrund stirbt zuerst, der neue Nutzer zuletzt — und alles bleibt unter
+# dem Punkt, an dem LH ALLE sperrt.
+_LHFO_DAY_BACKGROUND_CEILING = 6200
+_LHFO_DAY_INTERACTIVE_CEILING = 7000
 
 # ── DRITTE STUFE: PRIORISIERTER HINTERGRUND (Owner-Befund 09.08.2026) ────────
 # MESSUNG, die diese Stufe ausgelöst hat: der Hintergrund-Deckel (5.000) wird
@@ -1142,7 +1147,7 @@ _LHFO_DAY_INTERACTIVE_CEILING = 9500
 # Dienst-Marken, dann der Rest. Die Werte liegen jetzt einfach zwischen den
 # neuen Stufen statt zwischen den alten.
 _LHFO_HOUR_PRIORITY_CEILING = 15000
-_LHFO_DAY_PRIORITY_CEILING = 8500
+_LHFO_DAY_PRIORITY_CEILING = 6500
 
 # Tagesstand-Memo (analog _rot_budget_memo): _budget_key_used geht auf
 # Supabase, der Tagesstand ändert sich träge — 120 s reichen für einen
