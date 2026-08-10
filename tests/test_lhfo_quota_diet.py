@@ -821,3 +821,37 @@ def test_demand_cap_ignores_overflow():
     finally:
         fo._refresher_demand.clear()
         fo._refresher_demand.update(saved)
+
+
+# ── 4. SEKUNDEN-TAKT (LH-Portal-CSVs 10.08.: 40–96× Over-QPS an JEDEM Tag) ──
+
+def test_takt_gate_erzwingt_mindestabstand():
+    """Zwei Sende-Slots direkt hintereinander: der zweite muss warten. Mit
+    injizierter Uhr statt Echtzeit — die Suite darf nicht an Millisekunden
+    hängen."""
+    fo._api_pace_last[0] = 0.0
+    geschlafen = []
+    uhr = [100.0]
+    def now(): return uhr[0]
+    def schlafe(s):
+        geschlafen.append(s)
+        uhr[0] += s
+    fo._api_pace(now_fn=now, sleep_fn=schlafe)      # erster Slot: frei
+    fo._api_pace(now_fn=now, sleep_fn=schlafe)      # zweiter: muss warten
+    assert geschlafen and abs(geschlafen[0] - fo._API_PACE_MIN_S) < 0.001
+
+
+def test_takt_gate_bremst_nicht_nach_pause():
+    """Liegt der letzte Versand länger zurück als der Mindestabstand, wird
+    NICHT geschlafen — ein interaktiver Tap zahlt im Normalfall nichts."""
+    fo._api_pace_last[0] = 0.0
+    geschlafen = []
+    fo._api_pace(now_fn=lambda: 500.0, sleep_fn=geschlafen.append)
+    assert geschlafen == []
+
+
+def test_takt_haelt_abstand_zur_lh_drossel():
+    """8/s pro Origin × 2 Origins < 20/s. Wer den Abstand verkleinert, muss
+    hier vorbei."""
+    pro_origin = 1.0 / fo._API_PACE_MIN_S
+    assert pro_origin * 2 < 20, f"{pro_origin:.1f}/s pro Origin ist zu schnell"

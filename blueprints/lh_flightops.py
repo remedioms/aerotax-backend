@@ -1171,6 +1171,34 @@ def _lhfo_day_used():
     return used
 
 
+# ── GEMEINSAME SCHRITTWEITE VOR DEM VERSAND (10.08.2026) ────────────────────
+# LHs Portal-CSVs zeigen 40–96× „Developer Over QPS" an JEDEM Tag — wir reissen
+# die 20/s-Drossel regelmässig in kleinen Bursts. Der Grund ist nicht EIN
+# schneller Loop (die Massen-Verbraucher schlafen brav 0,7 s), sondern dass
+# MEHRERE Verbraucher parallel feuern, ohne voneinander zu wissen: refresh-all,
+# Marken-Wärmer, Crew-Prefetch, interaktive Taps — und der NAS-Zweitorigin
+# macht dasselbe nochmal.
+#
+# Deshalb EIN Takt-Gate für alle Sender DIESES Prozesses, direkt vor dem
+# Request: 0,12 s Mindestabstand ≈ 8/s pro Origin. Zwei Origins zusammen
+# bleiben damit unter 17/s — Luft zur 20er-Drossel, deren 403s sonst selbst
+# auf die Tagesquote zahlen. Warten unter gehaltenem Lock ist Absicht: die
+# Wartenden bilden eine Schlange und verlassen sie im Takt.
+_API_PACE_LOCK = threading.Lock()
+_api_pace_last = [0.0]
+_API_PACE_MIN_S = 0.12
+
+
+def _api_pace(now_fn=time.time, sleep_fn=time.sleep):
+    """Blockiert, bis der nächste Sende-Slot frei ist. Injektierbare Uhren
+    NUR für die Tests — Produktion ruft ohne Argumente."""
+    with _API_PACE_LOCK:
+        wartezeit = _api_pace_last[0] + _API_PACE_MIN_S - now_fn()
+        if wartezeit > 0:
+            sleep_fn(wartezeit)
+        _api_pace_last[0] = now_fn()
+
+
 def _api_get(user_token, path, params=None, interactive=False, status_out=None,
              priority=False):
     """LH-Call mit Budget-Gate. Return: Response-Dict oder None.
@@ -1216,6 +1244,9 @@ def _api_get(user_token, path, params=None, interactive=False, status_out=None,
                     'übersprungen', _dused, _dceiling, _tier, path)
         _note('day_budget')
         return None
+    # Takt NACH den Budget-Gates (abgewiesene Calls brauchen keinen Slot),
+    # VOR der Buchung — gebucht wird nur, was wirklich gesendet wird.
+    _api_pace()
     _flightops_budget_inc(path)
     url = _BASE + path
     if params:
