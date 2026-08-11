@@ -39,6 +39,41 @@ def _pin_app():
         sys.modules['app'] = prev
 
 
+TIBOR_RAW_EVENT = {
+    'legs': [{'from': 'ICN', 'to': 'FRA', 'dep': '12:20', 'arr': '18:40',
+              'flight': 'LH 713'}],
+    'ical_sectors': [{'from': 'ICN', 'to': 'FRA', 'flight': 'LH713',
+                      'dep_iso': '2026-08-12T03:20:00Z',
+                      'arr_iso': '2026-08-12T16:40:00Z'}],
+}
+
+
+def test_roster_sektor_schlaegt_alles(monkeypatch):
+    """Tibors echter Row: der Import trägt die Leg-Abflugzeit als Instant
+    (12:20 LT ICN = 03:20Z) — kein Resolver-Call nötig."""
+    def boom(*a, **k):
+        raise AssertionError('Resolver darf bei Sektor-Treffer nicht laufen')
+
+    monkeypatch.setattr(A, '_flight_obs_merged', boom, raising=False)
+    out = FW._next_flight_etd_refined(TIBOR_SUMMARY, '2026-08-12',
+                                      'ICN', 'FRA', TAGESSTART,
+                                      raw_event=TIBOR_RAW_EVENT)
+    assert out == '2026-08-12T03:20:00Z'
+
+
+def test_sektor_fremdes_legpaar_zaehlt_nicht(monkeypatch):
+    """Ein Sektor eines ANDEREN Legs (z.B. Vortags-Anreise) darf die ETD nicht
+    stellen — dann entscheidet die restliche Kaskade."""
+    monkeypatch.setattr(A, '_flight_obs_merged', lambda *a, **k: None,
+                        raising=False)
+    fremd = {'ical_sectors': [{'from': 'FRA', 'to': 'ICN',
+                               'dep_iso': '2026-08-09T10:00:00Z'}]}
+    out = FW._next_flight_etd_refined(TIBOR_SUMMARY, '2026-08-12',
+                                      'ICN', 'FRA', TAGESSTART,
+                                      raw_event=fremd)
+    assert out == '2026-08-12T00:50:00Z'
+
+
 def test_resolver_abflug_schlaegt_tagesstart(monkeypatch):
     calls = {}
 

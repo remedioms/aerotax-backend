@@ -480,14 +480,31 @@ def _status_has_signal(status):
     return False
 
 
-def _next_flight_etd_refined(summ, datum, dep, arr, fallback_iso):
+def _next_flight_etd_refined(summ, datum, dep, arr, fallback_iso,
+                             raw_event=None):
     """ETD des ERSTEN Legs statt Tagesbeginn (Owner 11.08.: „family sagt tibor
     fliegt um 12 aber er fliegt um 04"). `ical_start` ist der DIENST-Beginn —
-    bei Tibors ICN-Rückflug der Pickup 09:50 LT, fast 3 h vor dem Abflug. Wenn
-    die Flugnummer im Summary steht („LH 713: ICN-FRA"), holt der zentrale
-    Dual-Side-Resolver (free-only, memoisiert — derselbe wie today_*) die
-    echte Plan-/Est-Abflugzeit. Ohne Treffer bleibt der bisherige Tagesstart —
-    keine erfundenen Zeiten."""
+    bei Tibors ICN-Rückflug der Pickup 09:50 LT, fast 3 h vor dem Abflug
+    12:20 LT (den die Familie unbeschriftet als „12" las).
+
+    Kaskade, nur Belegtes:
+      1. ROSTER-Sektor (`raw_event.ical_sectors[].dep_iso`) — der Import trägt
+         die Leg-Abflugzeit als Instant; immer verfügbar, exakt.
+      2. Zentraler Dual-Side-Resolver (free-only, memoisiert — derselbe wie
+         today_*), Est vor Plan. Greift z.B. wenn Sektoren fehlen.
+      3. Bisheriger Tagesstart — keine erfundenen Zeiten."""
+    try:
+        sectors = (raw_event or {}).get('ical_sectors') \
+            if isinstance(raw_event, dict) else None
+        for sec in sectors or []:
+            if not isinstance(sec, dict):
+                continue
+            if (str(sec.get('from') or '').upper() == dep
+                    and str(sec.get('to') or '').upper() == arr
+                    and sec.get('dep_iso')):
+                return _iso_utc_z(sec['dep_iso'])
+    except Exception as e:
+        _log().info(f'[family-watch] next_etd_sector_skip {type(e).__name__}')
     try:
         resolver = _app_attr('_flight_obs_merged')
         if callable(resolver) and summ and dep and arr:
@@ -553,7 +570,8 @@ def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
         status['today_route_label'] = _route_label_cities('-'.join(chain))
         # ETD = Abflug des ERSTEN Legs, wenn auflösbar — sonst Tagesstart.
         etd = _next_flight_etd_refined(summ, datum, legs[0][0], legs[0][1],
-                                       ev.get('ical_start_iso'))
+                                       ev.get('ical_start_iso'),
+                                       raw_event=ev.get('raw_event'))
         if etd:
             status['next_flight_etd_iso'] = etd
         return True
@@ -1253,7 +1271,7 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                     # ETD = Abflug des ERSTEN Legs (Resolver), sonst Tagesstart.
                     etd = _next_flight_etd_refined(
                         summ, br.get('datum'), _legs2[0][0], _legs2[0][1],
-                        br.get('ical_start'))
+                        br.get('ical_start'), raw_event=br.get('raw_event'))
                     if etd:
                         status['next_flight_etd_iso'] = etd
                     found_next_flight = True
