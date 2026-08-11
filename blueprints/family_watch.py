@@ -480,6 +480,31 @@ def _status_has_signal(status):
     return False
 
 
+def _next_flight_etd_refined(summ, datum, dep, arr, fallback_iso):
+    """ETD des ERSTEN Legs statt Tagesbeginn (Owner 11.08.: „family sagt tibor
+    fliegt um 12 aber er fliegt um 04"). `ical_start` ist der DIENST-Beginn —
+    bei Tibors ICN-Rückflug der Pickup 09:50 LT, fast 3 h vor dem Abflug. Wenn
+    die Flugnummer im Summary steht („LH 713: ICN-FRA"), holt der zentrale
+    Dual-Side-Resolver (free-only, memoisiert — derselbe wie today_*) die
+    echte Plan-/Est-Abflugzeit. Ohne Treffer bleibt der bisherige Tagesstart —
+    keine erfundenen Zeiten."""
+    try:
+        resolver = _app_attr('_flight_obs_merged')
+        if callable(resolver) and summ and dep and arr:
+            m = re.search(r'\b([A-Z0-9]{2}\s?\d{1,4})\s*:\s*'
+                          + re.escape(dep) + '-' + re.escape(arr), summ)
+            if m:
+                fno = m.group(1).replace(' ', '').upper()
+                obs = resolver(fno, date=datum, dep_iata=dep, arr_iata=arr,
+                               free_only=True)
+                st = (obs or {}).get('esti_dep') or (obs or {}).get('sched_dep')
+                if st:
+                    return _iso_utc_z(st)
+    except Exception as e:
+        _log().info(f'[family-watch] next_etd_refine_skip {type(e).__name__}')
+    return _iso_utc_z(fallback_iso) if fallback_iso else None
+
+
 def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
     """Aller-letzter Fallback ('es gibt immer eine Info'): SB unlesbar UND kein
     Cache → nächste Tour aus dem Disk-Mirror der iCal-Briefings (app.py
@@ -526,9 +551,11 @@ def _fallback_next_tour_from_disk(status, crew_token, allowed_fields):
         # alte Clients behalten dep→arr (arr = Reiseziel-Ende, s.o.).
         status['next_flight_chain'] = chain
         status['today_route_label'] = _route_label_cities('-'.join(chain))
-        st = ev.get('ical_start_iso')
-        if st:
-            status['next_flight_etd_iso'] = _iso_utc_z(st)
+        # ETD = Abflug des ERSTEN Legs, wenn auflösbar — sonst Tagesstart.
+        etd = _next_flight_etd_refined(summ, datum, legs[0][0], legs[0][1],
+                                       ev.get('ical_start_iso'))
+        if etd:
+            status['next_flight_etd_iso'] = etd
         return True
     return False
 
@@ -1223,9 +1250,12 @@ def _load_crew_status_for_family(crew_token, allowed_fields):
                     status['next_flight_dep_city'] = _iata_city_name(_legs2[0][0])
                     status['next_flight_arr_city'] = _iata_city_name(_arr2)
                     status['next_flight_chain'] = _chain2
-                    st = br.get('ical_start')
-                    if st:
-                        status['next_flight_etd_iso'] = _iso_utc_z(st)
+                    # ETD = Abflug des ERSTEN Legs (Resolver), sonst Tagesstart.
+                    etd = _next_flight_etd_refined(
+                        summ, br.get('datum'), _legs2[0][0], _legs2[0][1],
+                        br.get('ical_start'))
+                    if etd:
+                        status['next_flight_etd_iso'] = etd
                     found_next_flight = True
                 if found_next_flight and found_duty_times:
                     break
