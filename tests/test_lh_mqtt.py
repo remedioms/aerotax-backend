@@ -349,6 +349,79 @@ def test_inbound_early_rotation_is_filtered(client, monkeypatch):
     assert d['pushed'] == 0
 
 
+def test_inbound_far_departure_without_board_is_silent(client, monkeypatch):
+    """Florian/FO 11.08.: „Meldungen meines Fliegers deutlich vor meinem Flug
+    (z.B. morgens, obwohl ich erst abends fliege)". OHNE Board-Bestätigung des
+    direkten Zubringers (Boards sehen ihn erst Stunden vorher) ist jedes
+    Maschinen-Event >6h vor dem eigenen Abflug potenziell eine fremde
+    Früh-Rotation → kein Push."""
+    from datetime import datetime as dt, timezone as tz, timedelta
+    now = dt.now(tz.utc)
+    leg = {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK', 'tail': 'D-AIKP',
+           'dep_iso': (now + timedelta(hours=8)).isoformat()}
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([leg]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda *a, **k: pytest.fail(
+                            'Früh-Event ohne Board-Beleg pusht nicht'))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed', flight='LH123')).get_json()
+    assert d['pushed'] == 0
+
+
+def test_inbound_far_departure_with_confirmed_feeder_pushes(client, monkeypatch):
+    """Gegenprobe: bestätigt das Board GENAU dieses Event als direkten
+    Zubringer (Langstrecke im Layover), pusht er auch >6h vor dem Abflug."""
+    from datetime import datetime as dt, timezone as tz, timedelta
+    from zoneinfo import ZoneInfo
+    now = dt.now(tz.utc)
+    leg = {'flight': 'LH400', 'from': 'FRA', 'to': 'JFK', 'tail': 'D-AIKP',
+           'dep_iso': (now + timedelta(hours=8)).isoformat()}
+    arr_local = now.astimezone(ZoneInfo('Europe/Berlin')) + timedelta(hours=2)
+    board = [{'airport': 'FRA#ARR', 'flight': 'LH123', 'reg': 'D-AIKP',
+              'sched': arr_local.strftime('%H:%M'), 'esti': None,
+              'date': arr_local.date().isoformat()}]
+    pushes = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([leg]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: board)
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, title, body, data=None, idempotency_key=None:
+                        pushes.append(title))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed', flight='LH123')).get_json()
+    assert d['pushed'] == 1 and 'gestartet' in pushes[0]
+
+
+def test_inbound_push_keeps_rich_body_no_localization_key(client, monkeypatch):
+    """Florian/FO 11.08.: „seit neuestem ist die Meldung geheimnisvoll" — der
+    localization_key 'flight_update' ließ den faktenreichen Text durch die
+    generische Vorlage ersetzen. Die reichen Pushes tragen KEINEN Schlüssel."""
+    from datetime import datetime as dt, timezone as tz
+    now = dt.now(tz.utc)
+    pushes = []
+    monkeypatch.setattr(lh_mqtt, '_rows_for_flight', lambda dates, c, n: [])
+    monkeypatch.setattr(lh_mqtt, 'lh_flight_facts',
+                        lambda *a, **k: dict(INBOUND_FACTS))
+    monkeypatch.setattr(lh_mqtt, '_rows_from_station',
+                        lambda dates, st: _rows([_layover_leg(now, tail='D-AIKP')]))
+    monkeypatch.setattr(lh_mqtt, '_arr_board_rows', lambda *a, **k: [])
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, title, body, data=None, idempotency_key=None:
+                        pushes.append(data))
+    d = client.post('/api/internal/lh-mqtt/event',
+                    json=_event_body('Departed', flight='LH123')).get_json()
+    assert d['pushed'] == 1
+    assert 'localization_key' not in (pushes[0] or {})
+
+
 def test_inbound_reg_mismatch_no_push(client, monkeypatch):
     from datetime import datetime as dt, timezone as tz
     now = dt.now(tz.utc)

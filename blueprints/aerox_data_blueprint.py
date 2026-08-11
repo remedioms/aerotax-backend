@@ -9195,6 +9195,26 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         ac_type = ac_type or _sb_tc
     if not reg:
         reg = (str(reg_hint or '').strip().upper() or None)
+    if not reg and arr_iata:
+        #   3b) MQTT-Leg-Reg-Cache (Florian/FO 11.08.: „im Feed wird die Karte
+        #   des Inbounds nicht mehr angezeigt" — während die Inbound-PUSHES die
+        #   Maschine sehr wohl kannten): der MQTT-Watch löst die Reg jedes
+        #   User-Legs über den geteilten Cache/LH auf. Hier NUR Cache lesen —
+        #   deadline in der Vergangenheit heißt in _legs_regs „keine weiteren
+        #   LH-Calls" (User-getriebener Endpoint darf kein Kontingent ziehen).
+        try:
+            from blueprints.lh_mqtt import (_reg_cache_key, _reg_cache_read,
+                                            _reg_memo_get)
+            import time as _time
+            _ckey = _reg_cache_key(flight_no.replace(' ', '').upper(), date,
+                                   dep, _norm_iata(arr_iata))
+            _found, _creg = _reg_memo_get(_ckey, _time.time())
+            if not _found:
+                _creg = _reg_cache_read([_ckey]).get(_ckey)
+            if _creg:
+                reg = str(_creg).strip().upper() or None
+        except Exception:
+            pass
     #   4) Außenstations-Rotation (Owner 2026-07-07): Abflughafen ungepollt +
     #      Roster ohne Tail → die Gegenroute der Homebase kennt die Maschine
     #      (heutige LH716 FRA→HND = mein LH717-Flieger morgen). Nur mit

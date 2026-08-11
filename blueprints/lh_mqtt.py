@@ -1436,6 +1436,16 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
             bn = _norm_flight(best.get('flight'))
             if bn and (bn[0] + bn[1]) != event_flight:
                 continue  # Event ist eine frühere Rotation der Maschine
+        elif dep - now_utc > timedelta(hours=6):
+            # OHNE Board-Bestätigung des direkten Zubringers keine Früh-
+            # Rotationen pushen (Florian/FO 11.08.: „Meldungen meines Fliegers
+            # deutlich vor meinem Flug — z.B. morgens, obwohl ich erst abends
+            # fliege. Auf das Leg vor dem eigenen Flug begrenzen?"). Die
+            # Boards sehen den Zubringer erst wenige Stunden vorher — bis
+            # dahin ist jedes Maschinen-Event potenziell eine fremde
+            # Früh-Rotation. Bestätigte direkte Zubringer (best != None,
+            # z.B. Langstrecke im Layover) pushen weiterhin ohne Zeitlimit.
+            continue
         tz = _station_tz(frm)
         dep_local = dep.astimezone(tz).strftime('%H:%M') if tz else None
         if kind == 'departed':
@@ -1476,9 +1486,15 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
                      data={'type': ptype, 'flight': user_flight,
                            'date': dep.date().isoformat(),
                            'inbound_flight': event_flight, 'reg': str(reg),
-                           'kind': kind,
-                           'localization_key': 'flight_update',
-                           'localization_args': {'flight': user_flight}},
+                           # KEIN localization_key mehr (Florian/FO 11.08.:
+                           # „seit neuestem ist die Meldung geheimnisvoll und
+                           # verrät keine direkten Details"): der Schlüssel
+                           # 'flight_update' ließ _push_localize_system_copy
+                           # den hier komponierten, faktenreichen Text durch
+                           # die generische Vorlage ERSETZEN — auch für
+                           # Deutsch. Mehrsprachigkeit braucht eigene
+                           # per-Kind-Vorlagen mit Args, nicht die Generik.
+                           'kind': kind},
                      idempotency_key=key)
             pushed += 1
             seen.add(tok)
@@ -1562,9 +1578,10 @@ def lh_mqtt_event():
                 _do_push(tok, title, text,
                          data={'type': 'flight_update', 'flight': flight_disp,
                                'date': topic_date, 'kind': kind,
-                               'event_ts': ev_ts,
-                               'localization_key': 'flight_update',
-                               'localization_args': {'flight': flight_disp}},
+                               # KEIN localization_key (s. Inbound-Push oben):
+                               # die Generik überschrieb die konkreten
+                               # Verspätungs-/Annullierungs-Texte.
+                               'event_ts': ev_ts},
                          idempotency_key=key)
                 pushed += 1
             except Exception as e:
