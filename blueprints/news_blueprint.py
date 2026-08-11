@@ -1428,6 +1428,15 @@ def _story_entry(text, mentioned, published_at, fallback_text=''):
 def _story_dedupe_indices(entries):
     """Indizes der Cluster-GEWINNER, in Eingabe-Reihenfolge.
 
+    Dünne Hülle um `_story_dedupe_groups` — der etablierte Aufrufvertrag
+    (nur die Gewinner) bleibt unverändert.
+    """
+    return [winner for winner, _members in _story_dedupe_groups(entries)]
+
+
+def _story_dedupe_groups(entries):
+    """[(gewinner_idx, [alle_idx_des_clusters])] in Eingabe-Reihenfolge.
+
     Zwei Einträge gehören zur selben Story, wenn ALLE drei Bedingungen halten:
       1. Airline-Bezug passt — beide nennen dieselbe Airline, oder BEIDE nennen
          gar keine. Nennt nur einer eine Airline, wird NICHT geclustert
@@ -1437,19 +1446,25 @@ def _story_dedupe_indices(entries):
       3. Zeitabstand <= `_STORY_WINDOW_SECONDS` (72 h). Dieselbe Schlagzeile
          fünf Tage später ist eine NEUE Entwicklung, keine Dublette.
 
-    Gewinner ist der ZUERST gesehene Eintrag — dadurch bleibt die ausgelieferte
-    ID über Builds hinweg stabil (kein Flapping in der App).
+    Gewinner ist der ZUERST gesehene Eintrag der Eingabe-Reihenfolge.
+
+    ACHTUNG (Likes/Kommentare, 2026-08-11): „stabil" gilt nur, solange keine
+    NEUERE Quelle dieselbe Story nachliefert. Die Ausspiel-Liste ist nach
+    published_at absteigend sortiert — ein Nachzügler steht damit VOR dem
+    bisherigen Gewinner und übernimmt den Cluster. Deshalb liefert diese
+    Funktion die vollständige Cluster-Mitgliedschaft: Interaktionen werden
+    über ALLE IDs des Clusters aggregiert und überleben den Wechsel.
     """
-    winners = []
-    seen = []          # Vergleichs-Tupel der bisherigen Gewinner
+    groups = []        # [(winner_idx, [member_idx, ...]), ...]
+    seen = []          # (tokens, airlines, ts, group_pos) der bisherigen Gewinner
     for idx, (tokens, airlines, ts) in enumerate(entries):
         if len(tokens) < _STORY_MIN_TOKENS:
             # Zu wenig Substanz für einen Story-Vergleich → nie clustern.
-            winners.append(idx)
-            seen.append((tokens, airlines, ts))
+            seen.append((tokens, airlines, ts, len(groups)))
+            groups.append((idx, [idx]))
             continue
-        is_dup = False
-        for kept_tokens, kept_airlines, kept_ts in seen:
+        hit = None
+        for kept_tokens, kept_airlines, kept_ts, group_pos in seen:
             if len(kept_tokens) < _STORY_MIN_TOKENS:
                 continue
             if airlines and kept_airlines:
@@ -1462,12 +1477,14 @@ def _story_dedupe_indices(entries):
             if len(tokens & kept_tokens) < _STORY_MIN_SHARED:
                 continue
             if _jaccard(tokens, kept_tokens) >= _STORY_SIM_THRESHOLD:
-                is_dup = True
+                hit = group_pos
                 break
-        if not is_dup:
-            winners.append(idx)
-            seen.append((tokens, airlines, ts))
-    return winners
+        if hit is None:
+            seen.append((tokens, airlines, ts, len(groups)))
+            groups.append((idx, [idx]))
+        else:
+            groups[hit][1].append(idx)
+    return groups
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -3418,15 +3435,527 @@ def _redaktion_kick_build_if_stale():
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIKES + KOMMENTARE für Redaktions-Artikel (Owner 2026-08-11:
+#  „option zum komentieren und liken")
+#
+#  WORAN HÄNGEN DIE INTERAKTIONEN?
+#  Die Artikel-ID ist sha256(canonical_url)[:16] (`_parse_entry`) — sie hängt
+#  ausschließlich an der kanonischen Quell-URL und ist damit über Re-Ingest,
+#  Worker-Recycling und Container-Restart STABIL. Sie ist der Schreibschlüssel.
+#
+#  ABER: die Ausspiel-Liste clustert Stories (`_story_dedupe_groups`) und der
+#  Cluster-GEWINNER kann wechseln, sobald eine neuere Quelle dieselbe Meldung
+#  nachliefert (die Liste ist nach published_at absteigend sortiert). Ohne
+#  Gegenmaßnahme wären die Likes der bisherigen Karte über Nacht „weg".
+#  Deshalb wird beim LESEN wie beim TOGGELN über ALLE IDs des Clusters
+#  aggregiert — der Zähler folgt der Story, nicht dem Wortlaut einer Quelle.
+#
+#  AUTOR-REFERENZEN: nach außen ausschließlich AXU-Public-Refs
+#  (`app._public_user_ref`, Migration 04.08.). Ein AT-Token IST das Bearer-
+#  Credential; ein fremdes Token im Response-Body wäre eine Account-Übernahme.
+#  Schlägt die Ref-Erzeugung fehl, wird der Kommentar NICHT ausgeliefert —
+#  lieber eine Zeile weniger als ein geleaktes Credential.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Der Feed führt IDs als Hex-Digest ('9f2c…'), Tests/Altbestand auch als
+# sprechende Kürzel. Alles außerhalb dieser Zeichenklasse ist kein Artikel.
+_NEWS_ARTICLE_ID_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,64}$')
+_NEWS_COMMENT_MAX = 2000              # Owner-Vorgabe: Länge deckeln
+_NEWS_COMMENTS_PAGE_DEFAULT = 30
+_NEWS_COMMENTS_PAGE_MAX = 100
+_NEWS_LIKE_RATE = (120, 3600)         # Toggles/Stunde — Doppel-Tap ist normal
+_NEWS_COMMENT_RATE = (20, 3600)       # wie forum_create_reply
+# Ein einziger Warn-Log, wenn die Migration auf einem Origin noch nicht durch
+# ist (Lehre fcm_token 01.08.: eine fehlende Spalte darf nicht still alles töten).
+_NEWS_COUNTS_RPC_OK = {'ok': True, 'warned': False}
+
+
+def _app_attr(name, default=None):
+    """Lazy-Zugriff auf app.py (der Blueprint wird VOR app.py fertig geladen —
+    ein Modulebene-Import wäre zirkulär). Gleiches Muster wie
+    blueprints/smp_user_cards_blueprint.py:_app_attr."""
+    try:
+        import app as _app_mod
+        return getattr(_app_mod, name, default)
+    except Exception:
+        return default
+
+
+def _news_sb():
+    """(client, ok) — Supabase-Client oder (None, False)."""
+    sb = _app_attr('sb')
+    return sb, bool(_app_attr('SB_AVAILABLE', False)) and sb is not None
+
+
+def _news_authed_token():
+    """(token, None) bei gültigem Bearer, sonst (None, (response, status)).
+
+    Tri-State wie app._validate_token: ein Store-Ausfall wird als 503
+    beantwortet, NIE als 401 — ein transienter Supabase-Hickup darf keinen
+    Client-Logout auslösen.
+    """
+    bearer_fn = _app_attr('_request_bearer_token')
+    validate_fn = _app_attr('_validate_token')
+    if not callable(bearer_fn) or not callable(validate_fn):
+        # app.py nicht vollständig geladen → fail-closed, nie fail-open.
+        return None, (jsonify({'ok': False, 'error': 'auth_unavailable'}), 503)
+    bearer = bearer_fn()
+    if not bearer:
+        return None, (jsonify({'ok': False, 'error': 'auth_required'}), 401)
+    if bearer.startswith('AT-GUEST-'):
+        return None, (jsonify({'ok': False,
+                               'error': 'demo_mode_cannot_post'}), 403)
+    validation = validate_fn(bearer)
+    state = getattr(getattr(validation, 'state', None), 'value', None)
+    if state == 'unavailable':
+        unavailable_fn = _app_attr('_auth_store_unavailable_response')
+        if callable(unavailable_fn):
+            return None, unavailable_fn()
+        return None, (jsonify({'ok': False,
+                               'error': 'auth_store_unavailable'}), 503)
+    if state != 'valid':
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    return bearer, None
+
+
+def _news_viewer_token():
+    """Optionaler Betrachter für `liked_by_me` auf dem OFFENEN Redaktion-GET.
+
+    /api/news/redaktion war und bleibt ohne Auth abrufbar (alte Builds!). Liegt
+    ein gültiger Bearer an, wird er nur für das eigene Like-Flag benutzt; alles
+    andere bleibt unverändert. Kein Bearer / ungültig / Store weg ⇒ None, NIE
+    ein Fehler — der News-Feed darf an dieser Zusatzinfo nicht scheitern.
+    """
+    token, err = _news_authed_token()
+    return None if err else token
+
+
+def _news_article_id(raw):
+    value = str(raw or '').strip()
+    return value if _NEWS_ARTICLE_ID_RE.match(value) else None
+
+
+def _news_rate_limited(token, endpoint, limit_window):
+    fn = _app_attr('_token_rate_limited')
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(token, endpoint, limit_window[0], limit_window[1]))
+    except Exception:
+        return False
+
+
+def _news_public_ref(token):
+    """Internes AT-Token → AXU-Public-Ref. '' wenn nicht darstellbar."""
+    fn = _app_attr('_public_user_ref')
+    if not callable(fn):
+        return ''
+    try:
+        ref = fn(token)
+    except Exception:
+        return ''
+    ref = str(ref or '')
+    # Fail-closed: alles was noch nach einem internen Credential aussieht,
+    # verlässt diesen Blueprint nicht.
+    return '' if ref.startswith('AT-') else ref
+
+
+def _news_blocked_by(token):
+    fn = _app_attr('_blocked_by')
+    if not callable(fn):
+        return set()
+    try:
+        return set(fn(token) or ())
+    except Exception:
+        return set()
+
+
+def _news_author_name(token):
+    fn = _app_attr('_forum_author_snapshot')
+    if not callable(fn):
+        return ''
+    try:
+        return (fn(token) or {}).get('author_name') or ''
+    except Exception:
+        return ''
+
+
+def _news_sanitize(text):
+    fn = _app_attr('_sanitize_user_text')
+    if callable(fn):
+        try:
+            return fn(text, max_len=_NEWS_COMMENT_MAX)
+        except Exception:
+            pass
+    return str(text or '').strip()[:_NEWS_COMMENT_MAX]
+
+
+def _redaktion_clusters(snapshot=None):
+    """(candidates, groups) — Ausspiel-Kandidaten + Story-Cluster-Gruppen.
+
+    Genau die Liste, die `get_news_redaktion` ausspielt (Off-Topic-Gate +
+    Sortierung), damit Like-/Kommentar-Endpunkte denselben Cluster sehen wie
+    die Karte, auf die der Nutzer getippt hat.
+    """
+    if snapshot is None:
+        snapshot = _redaktion_store_snapshot()
+    candidates = [it for it in sorted(snapshot.values(), key=_redaktion_sort_ts,
+                                      reverse=True)
+                  if not _redaktion_offtopic(it.get('headline', ''),
+                                             it.get('body', ''),
+                                             it.get('mentioned_airlines'))]
+    entries = [_story_entry(it.get('headline'), it.get('mentioned_airlines'),
+                            it.get('published_at'),
+                            fallback_text=it.get('body'))
+               for it in candidates]
+    return candidates, _story_dedupe_groups(entries)
+
+
+def _news_story_ids(article_id):
+    """Alle Artikel-IDs des Story-Clusters, zu dem `article_id` gehört.
+
+    Der angefragte Artikel steht IMMER an erster Stelle (er ist der
+    Schreibschlüssel für neue Likes/Kommentare). Ist er nicht im Store
+    (ausgealtert, Restart, unbekannt), bleibt es bei ihm allein — die ID ist
+    URL-gebunden und damit für sich schon ein tragfähiger Schlüssel.
+    """
+    try:
+        candidates, groups = _redaktion_clusters()
+    except Exception:
+        return [article_id]
+    for _winner, members in groups:
+        ids = [candidates[i].get('id') for i in members
+               if candidates[i].get('id')]
+        if article_id in ids:
+            return [article_id] + [i for i in ids if i != article_id]
+    return [article_id]
+
+
+def _news_counts(id_groups, viewer_token=None):
+    """({key: {like_count, comment_count, liked_by_me}}, ok).
+
+    `id_groups` ist {key: [artikel_ids...]} — die Zählung aggregiert über den
+    ganzen Story-Cluster. `ok=False` heißt: die Zahlen konnten NICHT ermittelt
+    werden. Der Aufrufer meldet das ehrlich, statt eine 0 zu erfinden.
+    """
+    empty = {k: {'like_count': 0, 'comment_count': 0, 'liked_by_me': False}
+             for k in id_groups}
+    if not id_groups:
+        return empty, True
+    sb, ok = _news_sb()
+    if not ok:
+        return empty, False
+    all_ids = sorted({i for ids in id_groups.values() for i in ids if i})
+    if not all_ids:
+        return empty, True
+    per_id = None
+    if _NEWS_COUNTS_RPC_OK['ok']:
+        per_id = _news_counts_rpc(sb, all_ids, viewer_token)
+    if per_id is None:
+        per_id = _news_counts_select(sb, all_ids, viewer_token)
+    if per_id is None:
+        return empty, False
+    out = {}
+    for key, ids in id_groups.items():
+        rows = [per_id.get(i) or {} for i in ids]
+        out[key] = {
+            'like_count': sum(int(r.get('like_count') or 0) for r in rows),
+            'comment_count': sum(int(r.get('comment_count') or 0) for r in rows),
+            'liked_by_me': any(bool(r.get('liked_by_me')) for r in rows),
+        }
+    return out, True
+
+
+def _news_counts_rpc(sb, all_ids, viewer_token):
+    """Exaktes Aggregat in Postgres. None ⇒ Funktion (noch) nicht vorhanden."""
+    try:
+        res = sb.rpc('ax_news_interaction_counts',
+                     {'p_article_ids': all_ids,
+                      'p_viewer_token': viewer_token}).execute()
+    except Exception as exc:
+        _NEWS_COUNTS_RPC_OK['ok'] = False
+        if not _NEWS_COUNTS_RPC_OK['warned']:
+            _NEWS_COUNTS_RPC_OK['warned'] = True
+            _log_warn('[news-interactions] RPC ax_news_interaction_counts nicht '
+                      f'verfügbar ({type(exc).__name__}) — SELECT-Fallback aktiv, '
+                      'Migration 20260812_news_interactions.sql einspielen')
+        return None
+    out = {}
+    for row in (getattr(res, 'data', None) or []):
+        aid = row.get('article_id')
+        if aid:
+            out[aid] = row
+    return out
+
+
+def _news_counts_select(sb, all_ids, viewer_token):
+    """Fallback ohne RPC. Bewusst mit hartem Limit: PostgREST liefert sonst
+    still nur 1000 Zeilen und der Zähler wäre ZU KLEIN, ohne dass es jemand
+    merkt. Wird das Limit erreicht, gilt die Zählung als NICHT ermittelbar."""
+    cap = 5000
+    out = {i: {'article_id': i, 'like_count': 0, 'comment_count': 0,
+               'liked_by_me': False} for i in all_ids}
+    try:
+        likes = (sb.table('ax_news_likes').select('article_id,user_token')
+                 .in_('article_id', all_ids).limit(cap).execute())
+        rows = getattr(likes, 'data', None) or []
+        if len(rows) >= cap:
+            return None
+        for row in rows:
+            slot = out.get(row.get('article_id'))
+            if slot is None:
+                continue
+            slot['like_count'] += 1
+            if viewer_token and row.get('user_token') == viewer_token:
+                slot['liked_by_me'] = True
+        comments = (sb.table('ax_news_comments').select('article_id')
+                    .in_('article_id', all_ids).limit(cap).execute())
+        crows = getattr(comments, 'data', None) or []
+        if len(crows) >= cap:
+            return None
+        for row in crows:
+            slot = out.get(row.get('article_id'))
+            if slot is not None:
+                slot['comment_count'] += 1
+    except Exception as exc:
+        _log_warn(f'[news-interactions] count select failed: {exc!r}')
+        return None
+    return out
+
+
+@news_bp.route('/api/news/<article_id>/like', methods=['POST'])
+def news_toggle_like(article_id):
+    """Like an/aus. Antwort: {ok, likes, liked_by_me}.
+
+    IDEMPOTENT über den Primärschlüssel (article_id, user_token): ein zweites
+    POST derselben Richtung kann keinen zweiten Like erzeugen. Der Toggle
+    arbeitet auf dem ganzen Story-Cluster — wer über Karte A geliked hat und
+    später Karte B derselben Story sieht, sieht sein eigenes Like und kann es
+    dort auch wieder wegnehmen.
+    """
+    token, err = _news_authed_token()
+    if err:
+        return err
+    aid = _news_article_id(article_id)
+    if not aid:
+        return jsonify({'ok': False, 'error': 'invalid_article_id'}), 400
+    if _news_rate_limited(token, 'news_like', _NEWS_LIKE_RATE):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    sb, ok = _news_sb()
+    if not ok:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+
+    ids = _news_story_ids(aid)
+    try:
+        existing = (sb.table('ax_news_likes').select('article_id')
+                    .in_('article_id', ids).eq('user_token', token)
+                    .limit(len(ids)).execute())
+        mine = [r.get('article_id') for r in (getattr(existing, 'data', None) or [])
+                if r.get('article_id')]
+        if mine:
+            # Alle Cluster-Zeilen dieses Users weg — sonst bliebe nach einem
+            # Gewinner-Wechsel ein Geister-Like auf einer Schwester-ID stehen.
+            for one in mine:
+                (sb.table('ax_news_likes').delete()
+                 .eq('article_id', one).eq('user_token', token).execute())
+            liked_by_me = False
+        else:
+            (sb.table('ax_news_likes')
+             .upsert({'article_id': aid, 'user_token': token,
+                      'created_at': datetime.now(timezone.utc).isoformat()},
+                     on_conflict='article_id,user_token')
+             .execute())
+            liked_by_me = True
+    except Exception as exc:
+        _log_warn(f'[news-interactions] like toggle failed: {exc!r}')
+        return jsonify({'ok': False, 'error': 'store_failed'}), 503
+
+    counts, counts_ok = _news_counts({aid: ids}, viewer_token=token)
+    stats = counts.get(aid) or {}
+    return jsonify({
+        'ok': True,
+        'article_id': aid,
+        'likes': int(stats.get('like_count') or 0) if counts_ok else None,
+        'liked_by_me': liked_by_me,
+        'counts_available': counts_ok,
+    })
+
+
+def _news_comment_view(row, viewer_token):
+    """Öffentliche Kommentar-Form. None ⇒ nicht auslieferbar (kein AXU)."""
+    author = row.get('author_token') or ''
+    ref = _news_public_ref(author)
+    if not ref:
+        return None
+    return {
+        'id': str(row.get('id') or ''),
+        'article_id': row.get('article_id') or '',
+        'author_public_ref': ref,
+        'author_name': row.get('author_name') or '',
+        'body': row.get('body') or '',
+        'created_at': row.get('created_at') or '',
+        'is_mine': bool(viewer_token) and author == viewer_token,
+    }
+
+
+@news_bp.route('/api/news/<article_id>/comments', methods=['GET'])
+def news_list_comments(article_id):
+    """Kommentare einer Story, neueste zuerst.
+
+    Query: ?limit=30&before=<ISO-created_at> (Keyset — kein OFFSET, damit ein
+    neuer Kommentar während des Blätterns keine Zeile doppelt/verschluckt).
+    Antwort: {items:[{id, author_public_ref, author_name, body, created_at}]}.
+    """
+    token, err = _news_authed_token()
+    if err:
+        return err
+    aid = _news_article_id(article_id)
+    if not aid:
+        return jsonify({'ok': False, 'error': 'invalid_article_id'}), 400
+    try:
+        limit = int(request.args.get('limit') or _NEWS_COMMENTS_PAGE_DEFAULT)
+    except (TypeError, ValueError):
+        limit = _NEWS_COMMENTS_PAGE_DEFAULT
+    limit = max(1, min(limit, _NEWS_COMMENTS_PAGE_MAX))
+    before = (request.args.get('before') or '').strip()
+
+    sb, ok = _news_sb()
+    if not ok:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    ids = _news_story_ids(aid)
+    try:
+        q = (sb.table('ax_news_comments')
+             .select('id,article_id,author_token,body,created_at')
+             .in_('article_id', ids)
+             .order('created_at', desc=True)
+             .limit(limit))
+        if before:
+            q = q.lt('created_at', before)
+        rows = getattr(q.execute(), 'data', None) or []
+    except Exception as exc:
+        _log_warn(f'[news-interactions] comment list failed: {exc!r}')
+        return jsonify({'ok': False, 'error': 'store_failed'}), 503
+
+    # Moderations-Minimum wie im Forum (Apple 1.4.1): geblockte Autoren sind
+    # weg. Melden läuft über den BESTEHENDEN Endpoint
+    # POST /api/moderation/<token>/report mit kind='news_comment'.
+    blocked = _news_blocked_by(token)
+    names = {}          # author_name LIVE auflösen (wie im Forum): ein am
+    items = []          # Kommentar gespeicherter Snapshot wäre nach einer
+    for row in rows:    # Namensänderung falsch.
+        author = row.get('author_token')
+        if author in blocked:
+            continue
+        view = _news_comment_view(row, token)
+        if view is None:
+            continue
+        if author not in names:
+            names[author] = _news_author_name(author)
+        view['author_name'] = names.get(author) or ''
+        items.append(view)
+    return jsonify({'ok': True, 'article_id': aid, 'items': items,
+                    'count': len(items)})
+
+
+@news_bp.route('/api/news/<article_id>/comments', methods=['POST'])
+def news_create_comment(article_id):
+    """Body: {body}. Länge auf 2000 Zeichen gedeckelt, HTML-escaped."""
+    token, err = _news_authed_token()
+    if err:
+        return err
+    aid = _news_article_id(article_id)
+    if not aid:
+        return jsonify({'ok': False, 'error': 'invalid_article_id'}), 400
+    if _news_rate_limited(token, 'news_comment', _NEWS_COMMENT_RATE):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    payload = request.get_json(silent=True) or {}
+    raw = payload.get('body')
+    if len(str(raw or '')) > _NEWS_COMMENT_MAX:
+        return jsonify({'ok': False, 'error': 'too_long'}), 413
+    text = _news_sanitize(raw)
+    if not text:
+        return jsonify({'ok': False, 'error': 'empty_comment'}), 400
+
+    sb, ok = _news_sb()
+    if not ok:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    row = {
+        'id': str(uuid.uuid4()),
+        'article_id': aid,
+        'author_token': token,
+        'body': text,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        sb.table('ax_news_comments').insert(row).execute()
+    except Exception as exc:
+        _log_warn(f'[news-interactions] comment insert failed: {exc!r}')
+        return jsonify({'ok': False, 'error': 'store_failed'}), 503
+    view = _news_comment_view(row, token)
+    if view is None:
+        # Kein AXU darstellbar ⇒ der Kommentar ist gespeichert, aber wir
+        # liefern KEIN internes Token als Ersatz aus.
+        return jsonify({'ok': False, 'error': 'public_ref_unavailable'}), 503
+    view['author_name'] = _news_author_name(token)
+    return jsonify({'ok': True, 'comment': view})
+
+
+@news_bp.route('/api/news/<article_id>/comments/<comment_id>',
+               methods=['DELETE'])
+def news_delete_comment(article_id, comment_id):
+    """Nur der eigene Kommentar. Fremd ⇒ 403, unbekannt ⇒ 404."""
+    token, err = _news_authed_token()
+    if err:
+        return err
+    aid = _news_article_id(article_id)
+    if not aid:
+        return jsonify({'ok': False, 'error': 'invalid_article_id'}), 400
+    cid = str(comment_id or '').strip()
+    if not cid:
+        return jsonify({'ok': False, 'error': 'invalid_comment_id'}), 400
+    sb, ok = _news_sb()
+    if not ok:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    try:
+        res = (sb.table('ax_news_comments').select('id,author_token')
+               .eq('id', cid).limit(1).execute())
+        rows = getattr(res, 'data', None) or []
+    except Exception as exc:
+        _log_warn(f'[news-interactions] comment lookup failed: {exc!r}')
+        return jsonify({'ok': False, 'error': 'store_failed'}), 503
+    if not rows:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    if rows[0].get('author_token') != token:
+        return jsonify({'ok': False, 'error': 'not_author'}), 403
+    try:
+        sb.table('ax_news_comments').delete().eq('id', cid).execute()
+    except Exception as exc:
+        _log_warn(f'[news-interactions] comment delete failed: {exc!r}')
+        return jsonify({'ok': False, 'error': 'store_failed'}), 503
+    return jsonify({'ok': True, 'id': cid})
+
+
 @news_bp.route('/api/news/redaktion', methods=['GET'])
 def get_news_redaktion():
     """AeroX-eigene, KI-umgeschriebene Kurzartikel (deutsch, faktenbasiert).
 
     Antwort: {ok, items:[{id, headline, body, category, source_name,
-    source_url, published_at, mentioned_airlines, rev}], count, warming,
+    source_url, published_at, mentioned_airlines, rev, like_count,
+    liked_by_me, comment_count}], count, warming, interactions_available,
     generated_at}. Bewusst OHNE Bild-Felder und OHNE Original-Wortlaut.
     `warming=true` = Store noch leer und ein Build läuft — App zeigt dann
     weiter ihre bisherige Quelle statt einer leeren Sektion.
+
+    ADDITIV (2026-08-11): like_count/liked_by_me/comment_count kommen NEU dazu,
+    kein bestehendes Feld ändert Typ oder Bedeutung — alte Builds decodieren
+    unverändert weiter (Lehre published_at-Vorfall 05.08.: EIN umgetyptes Feld
+    killt das gesamte Swift-Decoding still).
+    `liked_by_me` braucht einen Bearer; ohne Auth bleibt es false, der Endpoint
+    selbst bleibt wie bisher OHNE Auth abrufbar.
+    `interactions_available=false` heißt: die Zähler konnten NICHT ermittelt
+    werden (Store weg) — die App soll sie dann ausblenden statt eine 0 zu
+    zeigen, die wie „niemand hat geliked" aussieht.
     """
     try:
         limit = int(request.args.get('limit') or '40')
@@ -3446,29 +3975,38 @@ def get_news_redaktion():
     #     schon gefüllten Store nicht — deshalb hier dieselbe Cluster-Funktion
     #     noch einmal über die Ausspiel-Liste. Wirkt sofort nach dem Deploy,
     #     ohne Re-Ingest und ohne Store-Wipe.
-    candidates = [it for it in sorted(snapshot.values(), key=_redaktion_sort_ts,
-                                      reverse=True)
-                  if not _redaktion_offtopic(it.get('headline', ''),
-                                             it.get('body', ''),
-                                             it.get('mentioned_airlines'))]
-    story_entries = [_story_entry(it.get('headline'),
-                                  it.get('mentioned_airlines'),
-                                  it.get('published_at'),
-                                  fallback_text=it.get('body'))
-                     for it in candidates]
-    candidates = [candidates[i] for i in _story_dedupe_indices(story_entries)]
+    all_candidates, groups = _redaktion_clusters(snapshot)
 
     items = []
+    story_ids = {}          # ausgespielte ID -> alle IDs ihres Story-Clusters
     per_source = {}
-    for it in candidates:
+    for winner, members in groups:
+        it = all_candidates[winner]
         src = (it.get('source_name') or '?')
         if per_source.get(src, 0) >= _REDAKTION_SOURCE_CAP:
             continue
         per_source[src] = per_source.get(src, 0) + 1
         items.append(it)
+        aid = it.get('id')
+        if aid:
+            story_ids[aid] = [aid] + [all_candidates[i].get('id')
+                                      for i in members
+                                      if all_candidates[i].get('id') != aid
+                                      and all_candidates[i].get('id')]
         if len(items) >= limit:
             break
-    items = [{**it, 'published_at': _redaktion_published_iso(it.get('published_at'))}
+    # Likes/Kommentare aggregiert über den ganzen Story-Cluster: wechselt der
+    # Cluster-Gewinner (neuere Quelle zur selben Meldung), wandern die Zähler
+    # mit der Story mit statt auf 0 zurückzufallen.
+    counts, counts_ok = _news_counts(story_ids, viewer_token=_news_viewer_token())
+    items = [{**it,
+              'published_at': _redaktion_published_iso(it.get('published_at')),
+              'like_count': int((counts.get(it.get('id')) or {})
+                                .get('like_count') or 0),
+              'liked_by_me': bool((counts.get(it.get('id')) or {})
+                                  .get('liked_by_me')),
+              'comment_count': int((counts.get(it.get('id')) or {})
+                                   .get('comment_count') or 0)}
              for it in items]
     with _REDAKTION_LOCK:
         running = _REDAKTION_LAST_BUILD['running']
@@ -3477,5 +4015,6 @@ def get_news_redaktion():
         'items': items,
         'count': len(items),
         'warming': (not items) and (building or running),
+        'interactions_available': counts_ok,
         'generated_at': datetime.now(timezone.utc).isoformat(),
     })

@@ -51693,7 +51693,7 @@ def ax_crew_punctuality(token):
 @app.route('/api/moderation/<token>/report', methods=['POST'])
 def moderation_report(token):
     """Inhalts-Meldung. Body: {kind: 'wall_post'|'wall_comment'|'forum_thread'|
-    'forum_reply'|'layoverrec'|'chat_msg'|'user', target_id: str,
+    'forum_reply'|'layoverrec'|'chat_msg'|'user'|'news_comment', target_id: str,
     target_token: str?, reason: str, note: str?}"""
     # Anti-Spam: max 30 Meldungen/Stunde/User — verhindert Report-Flooding eines
     # fremden Users / der Moderations-Queue.
@@ -51711,7 +51711,11 @@ def moderation_report(token):
         return jsonify({'ok': False, 'error': 'kind_and_reason_required'}), 400
     if kind not in ('wall_post', 'wall_comment', 'forum_thread', 'forum_reply',
                     'layoverrec', 'layoverrec_comment', 'chat_msg', 'user',
-                    'smp_flashcard', 'smp_exam_question'):
+                    'smp_flashcard', 'smp_exam_question',
+                    # News-Kommentare (2026-08-11): KEIN eigener Melde-Weg —
+                    # dieselbe Queue, dieselbe Betreiber-Mail, dasselbe
+                    # Rate-Limit wie bei Forum/Wall.
+                    'news_comment'):
         return jsonify({'ok': False, 'error': 'invalid_kind'}), 400
     if kind in ('smp_flashcard', 'smp_exam_question') and len(note) < 5:
         return jsonify({'ok': False, 'error': 'description_required'}), 400
