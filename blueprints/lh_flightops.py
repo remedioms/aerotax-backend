@@ -5321,6 +5321,12 @@ def _crew_cache_batch_hits(token, legs, now=None):
         crew = best.get('crew') or []
         if not crew:
             continue
+        # Wie ALLE Einzel-Serve-Pfade (5254/5635/5719): AeroX-Profile FRISCH
+        # matchen statt die rohe Cache-Zeile durchzureichen. Ohne das blieb die
+        # Monats-Historie im Client unvervollständigt (Tester 12.08.: „kollegen
+        # von aero x hier nicht vervollständigt") — der Batch war der einzige
+        # Pfad ohne Re-Match. Kostet keinen LH-Call, nur Supabase-Reads.
+        crew = _crew_reenrich(crew, flight=flight, date=date)
         out.append({
             'flight': flight, 'date': date, 'dep': dep, 'arr': arr,
             'flight_date': str(best.get('flight_date') or '')[:10] or date,

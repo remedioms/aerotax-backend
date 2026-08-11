@@ -7284,6 +7284,10 @@ _PUBLIC_USER_REF_PATH_PREFIXES = (
     '/api/layover-group/',
     '/api/layover-web/',
     '/api/lh/flightops/crewlist/',
+    # Der Monats-Batch liefert dieselben Crew-Zeilen wie der Einzelpfad —
+    # ohne diesen Eintrag verließen rohe AT-Tokens fremder Nutzer den Server
+    # (AT = das Credential; Einzelpfad lieferte längst AXU). Befund 12.08.
+    '/api/lh/flightops/crewlist-batch/',
     '/api/lh/flightops/sim-crewlist/',
     '/api/feed-status/',
     '/api/family-request/',
