@@ -3590,6 +3590,57 @@ def test_crewlist_solo_paths_unchanged_without_table(monkeypatch):
     assert r.status_code == 401 and r.get_json()['error'] == 'not_connected'
 
 
+def test_crewlist_batch_returns_authorised_fresh_cache_only(monkeypatch):
+    """Ein Monats-Batch fächert nur den Cache auf und ruft niemals LH."""
+    now = 1_000_000.0
+    rows = [{
+        'token': 'AT-KOLLEGE', 'flight': 'LH400',
+        'flight_date': '2026-07-24', 'crew': [{'name': 'CACHE, CARLA'}],
+        'cached_at': now - 60,
+    }]
+    monkeypatch.setattr(fo, '_links_load', lambda _tok: ['proof'])
+    monkeypatch.setattr(fo, '_links_find', lambda *a, **k: {'accessCode': 'OK'})
+    monkeypatch.setattr(fo, '_crew_cache_scan', lambda flight, date: rows)
+    monkeypatch.setattr(fo, 'crew_list', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('Cache-Batch darf COMMON_CREWLIST nie aufrufen')))
+    hits = fo._crew_cache_batch_hits('AT-ICH', [{
+        'flight': 'LH 400', 'date': '2026-07-24',
+        'dep': 'fra', 'arr': 'jfk',
+    }], now=now)
+    assert len(hits) == 1
+    assert hits[0]['flight'] == 'LH400'
+    assert hits[0]['crew'][0]['name'] == 'CACHE, CARLA'
+    assert hits[0]['shared'] is True
+
+
+def test_crewlist_batch_rejects_unproven_shared_and_stale_rows(monkeypatch):
+    now = 1_000_000.0
+    row = {'token': 'AT-FREMD', 'flight': 'LH400',
+           'flight_date': '2026-07-24', 'crew': [{'name': 'PRIVATE'}],
+           'cached_at': now - 60}
+    monkeypatch.setattr(fo, '_links_load', lambda _tok: [])
+    monkeypatch.setattr(fo, '_links_find', lambda *a, **k: None)
+    monkeypatch.setattr(fo, '_crew_cache_scan', lambda flight, date: [row])
+    leg = {'flight': 'LH400', 'date': '2026-07-24', 'dep': 'FRA', 'arr': 'JFK'}
+    assert fo._crew_cache_batch_hits('AT-ICH', [leg], now=now) == []
+
+    # Auch mit Roster-Beweis darf ein abgelaufener Cache nicht als „aktuell"
+    # in den ganzen Monat vorgeladen werden.
+    monkeypatch.setattr(fo, '_links_find', lambda *a, **k: {'accessCode': 'OK'})
+    monkeypatch.setattr(fo, '_crew_shared_fresh', lambda *a, **k: False)
+    assert fo._crew_cache_batch_hits('AT-ICH', [leg], now=now) == []
+
+
+def test_crewlist_batch_endpoint_validates_shape(monkeypatch):
+    import app as backend
+    _pass_auth_gate(monkeypatch)
+    client = backend.app.test_client()
+    r = client.post('/api/lh/flightops/crewlist-batch/AT-ICH',
+                    headers={'Authorization': 'Bearer AT-ICH'},
+                    json={'legs': 'not-a-list'})
+    assert r.status_code == 400 and r.get_json()['error'] == 'invalid_legs'
+
+
 # ── Prefetch ────────────────────────────────────────────────────────────────
 
 def test_crew_prefetch_legs_uses_duty_links_only():

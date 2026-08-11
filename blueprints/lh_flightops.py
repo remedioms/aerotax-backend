@@ -5281,6 +5281,55 @@ def _crew_shared_serve(token, flight, date, dep=None, arr=None, now=None):
         return None
 
 
+# Cache-only batch lookup for a complete roster month.  This endpoint must
+# never call COMMON_CREWLIST: its purpose is to fan IN the durable/shared
+# cache with one app request, not to reintroduce the old month-wide LH fanout.
+_CREW_CACHE_BATCH_MAX_LEGS = 80
+
+
+def _crew_cache_batch_hits(token, legs, now=None):
+    """Return authorised, fresh cache hits for up to one roster month.
+
+    A shared cache row is PII.  It is returned only when the requesting user's
+    own Duty-Events links prove that the exact leg belongs to their roster, or
+    when the row itself belongs to that user.  No LH service is called here.
+    """
+    links = _links_load(token)
+    out, seen = [], set()
+    for raw in (legs or [])[:_CREW_CACHE_BATCH_MAX_LEGS]:
+        if not isinstance(raw, dict):
+            continue
+        flight = str(raw.get('flight') or '').upper().replace(' ', '')
+        date = str(raw.get('date') or '')[:10]
+        dep = str(raw.get('dep') or '').upper().strip()
+        arr = str(raw.get('arr') or '').upper().strip()
+        key = (flight, date, dep, arr)
+        if not flight or len(date) != 10 or key in seen:
+            continue
+        seen.add(key)
+
+        rows = _crew_cache_scan(flight, date)
+        if not rows:
+            continue
+        own = any(str(row.get('token') or '') == token for row in rows)
+        if not own and not _links_find(links, 'crewlist', flight, date, dep, arr):
+            continue
+        best = _crew_pick_best(rows, date)
+        if not best or not _crew_shared_fresh(best.get('flight_date'),
+                                              best.get('cached_at'), now):
+            continue
+        crew = best.get('crew') or []
+        if not crew:
+            continue
+        out.append({
+            'flight': flight, 'date': date, 'dep': dep, 'arr': arr,
+            'flight_date': str(best.get('flight_date') or '')[:10] or date,
+            'crew': crew, 'cached_at': best.get('cached_at'),
+            'shared': str(best.get('token') or '') != token,
+        })
+    return out
+
+
 # ── PREFETCH: „alles laden, wenn verbunden" (Owner 2026-07-28) ──────────────
 # Nach jedem erfolgreichen Roster-Import werden die Crew-Listen der nächsten
 # Legs im Hintergrund vorgewärmt, damit der Crew-Button sofort (und offline)
@@ -5723,6 +5772,25 @@ def flightops_crewlist(token):
     # ist per Konstruktion das angefragte Datum.
     return jsonify({'ok': True, 'crew': crew,
                     'flight_date': str(date or '')[:10]})
+
+
+@lh_flightops_bp.route('/api/lh/flightops/crewlist-batch/<token>', methods=['POST'])
+def flightops_crewlist_batch(token):
+    """Cache-only monthly crew-list hydration.
+
+    The client sends its roster legs and receives every currently fresh,
+    authorised backend-cache hit in one response.  Misses are deliberately
+    omitted: the existing three-day prefetch and interactive single-leg route
+    remain the only paths allowed to spend COMMON_CREWLIST quota.
+    """
+    body = request.get_json(silent=True) or {}
+    legs = body.get('legs')
+    if not isinstance(legs, list):
+        return jsonify({'ok': False, 'error': 'invalid_legs'}), 400
+    requested = min(len(legs), _CREW_CACHE_BATCH_MAX_LEGS)
+    hits = _crew_cache_batch_hits(token, legs)
+    return jsonify({'ok': True, 'items': hits, 'requested': requested,
+                    'hits': len(hits), 'cache_only': True})
 
 
 @lh_flightops_bp.route('/api/lh/flightops/checkin/<token>', methods=['POST'])
