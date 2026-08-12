@@ -133,6 +133,37 @@ def test_control_violation_goes_to_review_not_user_failed(monkeypatch):
     assert events[0][0] == "review"
 
 
+def test_fcl_carryover_is_persisted_in_import_meta(monkeypatch):
+    h = Harness(monkeypatch, {40: (b"fcl", [LEG_A])})
+    monkeypatch.setattr(
+        w, "_try_parsers",
+        lambda _path: ("offblock_fcl050", [LEG_A], [],
+                       {"month": "2012-01–2026-08",
+                        "carryover_min": 634764}))
+    events = []
+    w.process_token_batch("AT-TEST", [_row(40, b"fcl")], events)
+    assert h.upserts[0][3]["carryover_min"] == 634764
+
+
+def test_fcl_carryover_conflict_goes_to_review(monkeypatch):
+    h = Harness(monkeypatch, {41: (b"fcl", [LEG_A])},
+                existing_import=[])
+    monkeypatch.setattr(
+        w, "_try_parsers",
+        lambda _path: ("offblock_fcl050", [LEG_A], [],
+                       {"month": "2012-01–2026-08",
+                        "carryover_min": 634764}))
+    monkeypatch.setattr(
+        w, "_rest",
+        lambda *_args, **_kwargs: [{"legs": [], "sim": [],
+                                    "meta": {"carryover_min": 1}}])
+    events = []
+    w.process_token_batch("AT-TEST", [_row(41, b"fcl")], events)
+    assert h.statuses_for(41)[-1] == (w.STATUS_REVIEW, None)
+    assert not h.upserts and not h.pushes
+    assert "FCL.050" in events[0][3]
+
+
 def test_sha_mismatch_goes_to_review(monkeypatch):
     wrong = hashlib.sha256(b"anderes").hexdigest()
     h = Harness(monkeypatch, {9: (b"pdf-9", [LEG_A])})

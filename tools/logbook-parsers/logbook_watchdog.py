@@ -14,10 +14,10 @@ Ablauf pro Lauf:
      und pro Token bündeln: EIN Nutzer-Batch = EIN Import + EIN Push.
   3. Je Datei: sha256 gegen die gespeicherte Prüfsumme, Byte-Dubletten im
      Batch aussortieren, dann inhaltsbasierte Format-Erkennung über die
-     STRIKTEN Parser (OffBlock-Duties-CSV, LH-Flugstundenübersicht
-     Cockpit+Kabine, Condor/CFG). Jeder Parser prüft seine Summen selbst und
-     bricht bei Abweichung ab — der Wächter erbt diese Garantien, statt eigene
-     Leseheuristik zu erfinden.
+     STRIKTEN Parser (OffBlock-Duties-CSV und FCL.050, LH-/CAS-/Cargo-Roster,
+     LH-Flugstundenübersicht Cockpit+Kabine, Condor/CFG). Jeder Parser prüft
+     seine verfügbaren Kontrollen selbst und bricht bei Abweichung ab — der
+     Wächter erbt diese Garantien, statt eigene Leseheuristik zu erfinden.
   4. Legs werden mit einem BESTEHENDEN Import VERSCHMOLZEN (Union über
      Leg-Schlüssel) — `ax_logbook_import` ist eine Zeile pro Token, ein
      naives Upsert würde die Historie des Nutzers löschen.
@@ -218,8 +218,10 @@ def _try_parsers(path):
     except ImportError:  # pragma: no cover - Produktions-Altversion
         pdf_errors = (PDFSyntaxError,)
     import parse_duties_v8
+    import parse_fcl050_v2
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
+    import parse_roster_logbook
 
     # Der Upload-Endpunkt nimmt CSV/Excel/PDF/JSON/ZIP an. Vorher bekam jede
     # Datei trotzdem die Endung .pdf und lief blind in pdfplumber. Ein valides
@@ -233,6 +235,9 @@ def _try_parsers(path):
     with open(path, "rb") as handle:
         if not handle.read(5).startswith(b"%PDF-"):
             return "unsupported", None, None, None
+    if parse_fcl050_v2.matches_pdf(path):
+        legs, sims, report = parse_fcl050_v2.parse_pdf(path)
+        return "offblock_fcl050", legs, sims, report
     try:
         with pdfplumber.open(path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
@@ -241,6 +246,19 @@ def _try_parsers(path):
         # kein transienter Backendfehler. ``unsupported`` setzt processed=true
         # und bittet den Nutzer idempotent einmal um einen erneuten Upload.
         return "unsupported", None, None, None
+    if (parse_roster_logbook.ACK_KIND.search(text[:500])
+            or ("Crew Assignment System" in text[:1500]
+                and ("Einsatzplan" in text[:1500]
+                     or "Dienstplan" in text[:1500]))
+            or ("Duty plan requested at" in text[:1000]
+                and "All times: Local FRA" in text[:1000])
+            or ("Individual duty plan" in text[:1000]
+                and "NetLine/Crew(CFG)" in text[:1000])):
+        payload = parse_roster_logbook.parse_sources(
+            [path], completed_at=datetime.now(timezone.utc),
+            preserve_source_month=True)
+        return ("roster_logbook", payload["legs"], payload["sim"],
+                payload["report"])
     if not parse_lh_flugstunden.RE_HEADER.search(text):
         return "unsupported", None, None, None
     if "Condor" in text:
@@ -327,6 +345,40 @@ def merge_sims(existing, new):
         by_key.setdefault(_sim_key(sim), sim)
     return sorted(by_key.values(),
                   key=lambda s: (s.get("date") or "", s.get("code") or ""))
+
+
+def resolve_roster_revisions(parsed_files):
+    """Drop older complete monthly roster revisions inside one upload batch.
+
+    This is deliberately done before the append-only import merge. A later
+    Acknowledged roster can replace a Released roster with an entirely
+    different flight/routing; leg-key dedupe alone cannot recognize that the
+    older assignment was cancelled. A zero-flight newer roster is also a
+    meaningful complete replacement for its month.
+    """
+    roster_files = [item for item in parsed_files
+                    if item.get("parser") == "roster_logbook"]
+    month_winners = {}
+    for item in roster_files:
+        report = item.get("report") or {}
+        created = report.get("source_created_at") or ""
+        rank = (created, int(item.get("id") or 0))
+        for month in report.get("coverage_months") or []:
+            previous = month_winners.get(month)
+            if previous is None or rank > previous[0]:
+                month_winners[month] = (rank, item["id"])
+    superseded = 0
+    for item in roster_files:
+        kept = []
+        for leg in item.get("legs") or []:
+            month = leg.pop("_roster_month", None)
+            winner = month_winners.get(month)
+            if month and winner and winner[1] != item["id"]:
+                superseded += 1
+                continue
+            kept.append(leg)
+        item["legs"] = kept
+    return superseded
 
 
 def _capped_source(prev, label, keep=SOURCE_KEEP):
@@ -522,6 +574,7 @@ def process_token_batch(token, rows, events, terminal=None):
     dups = [f for f in parsed_files if "dup_of" in f]
 
     if real:
+        roster_superseded = resolve_roster_revisions(real)
         new_legs = [leg for f in real for leg in f["legs"]]
         new_sims = [sim for f in real for sim in f["sims"]]
         existing = _rest("GET", f"ax_logbook_import?token=eq.{token}"
@@ -541,14 +594,34 @@ def process_token_batch(token, rows, events, terminal=None):
                  if len(months) > 1 else
                  f"Watchdog: {real[0]['parser']} {months[0]}")
         prev_meta = (existing[0].get("meta") or {}) if existing else {}
+        report_carryovers = {
+            int(f["report"]["carryover_min"])
+            for f in real
+            if isinstance(f.get("report"), dict)
+            and isinstance(f["report"].get("carryover_min"), int)
+        }
+        prev_carryover = prev_meta.get("carryover_min")
+        if (len(report_carryovers) > 1
+                or (report_carryovers and isinstance(prev_carryover, int)
+                    and prev_carryover not in report_carryovers)):
+            _status(ids, STATUS_REVIEW)
+            events.append(("review", token, ids,
+                           "widersprüchliche FCL.050-Überträge"))
+            return
+        carryover_min = (next(iter(report_carryovers))
+                         if report_carryovers else prev_carryover)
         label = _capped_source(prev_meta.get("source"), label)
-        meta = _meta_for(merged_legs, merged_sims, label, {
+        extra_meta = {
             "watchdog": {"upload_ids": [f["id"] for f in real],
                          "duplicates_skipped": [f["id"] for f in dups],
                          "added_legs": added,
+                         "roster_revision_legs_superseded": roster_superseded,
                          "dedupe_suffixes": len(collisions),
                          "ts": datetime.now(timezone.utc).isoformat()},
-        })
+        }
+        if isinstance(carryover_min, int) and carryover_min >= 0:
+            extra_meta["carryover_min"] = carryover_min
+        meta = _meta_for(merged_legs, merged_sims, label, extra_meta)
         _upsert_import(token, merged_legs, merged_sims, meta)
         _bust_import_cache(token)
         _status([f["id"] for f in real], STATUS_COMPLETED, processed=True)

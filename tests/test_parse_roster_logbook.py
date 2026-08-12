@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+from datetime import datetime, timezone
 
 
 PARSER_PATH = os.path.join(
@@ -219,3 +220,77 @@ def test_unknown_pdf_text_is_rejected():
         assert "unsupported" in str(exc)
     else:
         raise AssertionError("unknown format was claimed")
+
+
+def test_cargo_released_roster_uses_processing_cutoff_not_print_cutoff():
+    text = """Released Roster
+Month: July 2026
+Company Name: YF
+Jul 99:00
+Date (LT) Trip ID Report (LT) Pos Activity From To Start (UTC) End (UTC) A/C Layover
+04 Sat 12345 01:10 SF 8387 ICN FRA (03) 17:25 06:45 77X
+Created 22Jun2026 12:34 (UTC) by Jeppesen
+"""
+    # CLI/backfill default stays conservative: at print time this was future.
+    old, _ = PARSER.parse_acknowledged_text(text)
+    assert old == []
+    legs, meta = PARSER.parse_acknowledged_text(
+        text, completed_at=datetime(2026, 8, 12, tzinfo=timezone.utc))
+    assert len(legs) == 1
+    assert legs[0]["flight"] == "LH8387"
+    assert legs[0]["block_min"] == 800
+    # YF's monthly value is contractual credit, not a leg-time checksum.
+    assert meta["monthly_total_control"] == "not_applicable_yf_credit_time"
+
+
+def test_complete_newer_roster_month_replaces_changed_old_assignment():
+    old = {
+        "date": "2026-06-11", "flight": "LH8364", "from": "FRA",
+        "to": "HYD", "dep_iso": "2026-06-11T08:45:00Z",
+        "arr_iso": "2026-06-11T17:35:00Z", "block_min": 530,
+        "_roster_month": "2026-06",
+    }
+    new = {
+        "date": "2026-06-11", "flight": "LH8160", "from": "FRA",
+        "to": "JFK", "dep_iso": "2026-06-11T17:20:00Z",
+        "arr_iso": "2026-06-12T01:45:00Z", "block_min": 505,
+        "_roster_month": "2026-06",
+    }
+    legs, superseded = PARSER._merge_source_legs([
+        ("old", [old], {"created_at": "2026-05-20T13:00:00+00:00",
+                         "coverage_months": ["2026-06"]}),
+        ("new", [new], {"created_at": "2026-06-03T17:26:00+00:00",
+                         "coverage_months": ["2026-06"]}),
+    ])
+    assert legs == [new]
+    assert superseded == 1
+
+
+def test_cas_calendar_rows_convert_all_flights_without_invented_fields(
+        monkeypatch, tmp_path):
+    import cas_roster_parser
+    source = tmp_path / "cas.pdf"
+    source.write_bytes(b"%PDF-CAS")
+    result = {
+        "period": "FEB 2025",
+        "printed_at": datetime(2025, 2, 26, 16, 21),
+        "coverage_dates": ["2025-02-01"],
+        "counts": {"flight_legs": 1},
+        "warnings": [],
+        "events": [("x", datetime(2025, 2, 1, 11, 21),
+                    datetime(2025, 2, 1, 19, 30),
+                    "10:25 LT Briefing FRA · LH756 FRA - BOM", False)],
+    }
+    monkeypatch.setattr(
+        cas_roster_parser, "parse_cas_roster_pdf",
+        lambda *_args, **_kwargs: (result, None))
+    legs, meta = PARSER.parse_cas_pdf(
+        str(source), completed_at=datetime(2026, 1, 1,
+                                           tzinfo=timezone.utc))
+    assert legs == [{
+        "date": "2025-02-01", "flight": "LH756", "from": "FRA",
+        "to": "BOM", "dep_iso": "2025-02-01T11:21:00Z",
+        "arr_iso": "2025-02-01T19:30:00Z", "block_min": 489,
+        "remarks": "Lufthansa CAS roster; UTC schedule row",
+    }]
+    assert meta["flight_rows_verified"] == 1

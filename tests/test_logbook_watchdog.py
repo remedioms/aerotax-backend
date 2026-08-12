@@ -224,6 +224,49 @@ def test_try_parsers_routes_offblock_csv_by_content(tmp_path):
     }]
 
 
+def test_try_parsers_routes_fcl050_before_generic_pdf(monkeypatch, tmp_path):
+    import parse_fcl050_v2
+    path = tmp_path / "fcl.upload"
+    path.write_bytes(b"%PDF-fcl")
+    report = {"month": "2012-01–2026-08", "carryover_min": 42}
+    monkeypatch.setattr(parse_fcl050_v2, "matches_pdf", lambda _path: True)
+    monkeypatch.setattr(parse_fcl050_v2, "parse_pdf",
+                        lambda _path: ([OLD[0]], [], report))
+    assert logbook_watchdog._try_parsers(str(path)) == (
+        "offblock_fcl050", [OLD[0]], [], report)
+
+
+def test_try_parsers_routes_jeppesen_roster(monkeypatch, tmp_path):
+    import parse_fcl050_v2
+    import parse_roster_logbook
+    path = tmp_path / "roster.upload"
+    path.write_bytes(b"%PDF-roster")
+    text = "Released Roster\nMonth: July 2026\nCompany Name: YF"
+    monkeypatch.setattr(pdfplumber, "open",
+                        lambda _path: _FakePDF([_FakePage(text, [])]))
+    monkeypatch.setattr(parse_fcl050_v2, "matches_pdf", lambda _path: False)
+    payload = {"legs": [OLD[0]], "sim": [],
+               "report": {"month": "2026-07"}}
+    monkeypatch.setattr(parse_roster_logbook, "parse_sources",
+                        lambda *_args, **_kwargs: payload)
+    assert logbook_watchdog._try_parsers(str(path)) == (
+        "roster_logbook", [OLD[0]], [], payload["report"])
+
+
+def test_roster_batch_keeps_only_newest_complete_month_revision():
+    old = {"id": 1, "parser": "roster_logbook",
+           "report": {"coverage_months": ["2026-06"],
+                      "source_created_at": "2026-05-20T13:00:00+00:00"},
+           "legs": [dict(OLD[0], _roster_month="2026-06")]}
+    new = {"id": 2, "parser": "roster_logbook",
+           "report": {"coverage_months": ["2026-06"],
+                      "source_created_at": "2026-06-03T17:26:00+00:00"},
+           "legs": [dict(OLD[1], _roster_month="2026-06")]}
+    assert logbook_watchdog.resolve_roster_revisions([old, new]) == 1
+    assert old["legs"] == []
+    assert new["legs"] == [OLD[1]]
+
+
 def test_try_parsers_turns_corrupt_pdf_into_terminal_unsupported(tmp_path):
     path = tmp_path / "broken.upload"
     path.write_bytes(b"%PDF-this-is-not-a-real-pdf")

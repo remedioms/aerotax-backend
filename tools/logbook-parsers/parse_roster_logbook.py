@@ -3,14 +3,17 @@
 
 Supported, deliberately narrow formats:
 
-* Lufthansa Jeppesen ``Acknowledged Roster`` (confirmedPlan/yearPlan)
+* Lufthansa Jeppesen ``Acknowledged Roster`` / ``Released Roster``
+  (LH and Lufthansa Cargo/YF)
+* Lufthansa ``Crew Assignment System`` roster PDFs
 * Condor ``Duty plan requested at ... - All times: Local FRA``
 * Condor NetLine/Crew ``Individual duty plan``
 
-Both documents can contain future planned duties.  A logbook may only contain
-completed flying, so this parser requires the document's own generation time
-and drops every leg whose arrival lies after that timestamp.  Deadheads and
-ground duties are never converted into flying legs.
+These documents can contain future planned duties. A logbook may only contain
+completed flying. The standalone parser therefore defaults to the document's
+own generation time; the production watcher supplies its processing time and
+still excludes every leg whose arrival is in the future. Deadheads and ground
+duties are never converted into flying legs.
 
 Usage::
 
@@ -30,6 +33,10 @@ from zoneinfo import ZoneInfo
 import pdfplumber
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 from legkeys import dedupe_keys
 
 
@@ -71,6 +78,8 @@ ACK_CREATED = re.compile(
     r"Created\s+(\d{2})([A-Za-z]{3})(\d{4})\s+"
     r"(\d{1,2}):(\d{2})\s+\(UTC\)\s+by\s+Jeppesen"
 )
+ACK_KIND = re.compile(r"(?im)^\s*(Acknowledged|Released) Roster\s*$")
+ACK_COMPANY = re.compile(r"Company Name:\s*(LH|YF)\b")
 
 CONDOR_CREATED = re.compile(
     r"Duty plan requested at\s+(\d{2})([A-Z]{3})(\d{2})\s+"
@@ -193,12 +202,22 @@ def _leg(carrier, number, frm, to, start, end, aircraft_type, role,
     return result
 
 
-def parse_acknowledged_text(text, validate_totals=True):
+def _utc_cutoff(value, fallback):
+    cutoff = value if value is not None else fallback
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    return cutoff.astimezone(timezone.utc)
+
+
+def parse_acknowledged_text(text, validate_totals=True, completed_at=None,
+                            preserve_source_month=False):
     """Return historical flight legs plus source metadata."""
-    if (not re.search(r"(?im)^\s*Acknowledged Roster\s*$", text[:500])
-            or ACK_HEADER not in text
-            or not re.search(r"Company Name:\s*LH\b", text[:1500])):
+    kind_match = ACK_KIND.search(text[:500])
+    company_match = ACK_COMPANY.search(text[:1500])
+    if not kind_match or ACK_HEADER not in text or not company_match:
         raise ValueError("unsupported acknowledged-roster format")
+    roster_kind = kind_match.group(1).lower()
+    company = company_match.group(1).upper()
     created_matches = ACK_CREATED.findall(text)
     if not created_matches:
         raise ValueError("acknowledged-roster creation timestamp missing")
@@ -210,6 +229,7 @@ def parse_acknowledged_text(text, validate_totals=True):
     if len(created_values) != 1:
         raise ValueError("acknowledged-roster creation timestamps disagree")
     created = created_values.pop()
+    cutoff = _utc_cutoff(completed_at, created)
 
     legs = []
     period = None
@@ -246,7 +266,7 @@ def parse_acknowledged_text(text, validate_totals=True):
         end = _clock(end_day, end_clock)
         if end <= start:
             end += timedelta(days=1)
-        if end > created:
+        if end > cutoff:
             future += 1
             return
         leg = _leg(
@@ -328,7 +348,7 @@ def parse_acknowledged_text(text, validate_totals=True):
                 end = _clock(clock_day, split.group("clock"))
                 if end <= start:
                     end += timedelta(days=1)
-                if end > created:
+                if end > cutoff:
                     future += 1
                 else:
                     leg = _leg(
@@ -380,20 +400,39 @@ def parse_acknowledged_text(text, validate_totals=True):
             continue
         key = f"{year:04d}-{month:02d}"
         actual = parsed_monthly.get(key, 0)
-        if validate_totals and actual != expected:
+        # Cargo/YF's printed "Blocktime" contains contractual credit
+        # adjustments (the production samples differ by exactly 01:30 from
+        # the sum of their explicit leg rows). It is not a mathematical
+        # flight-time checksum and must not be presented as one. Every YF leg
+        # is instead controlled through its printed UTC start/end pair.
+        if validate_totals and company == "LH" and actual != expected:
             raise ValueError(
                 f"acknowledged-roster block total mismatch for {key}: "
                 f"source={expected} parsed={actual}")
         checked_totals[key] = expected
-    for leg in legs:
-        leg.pop("_roster_month", None)
+    if not preserve_source_month:
+        for leg in legs:
+            leg.pop("_roster_month", None)
     return legs, {
-        "format": "lufthansa_acknowledged_roster",
+        "format": f"lufthansa_{company.lower()}_{roster_kind}_roster",
         "created_at": created.isoformat(),
+        "completed_cutoff": cutoff.isoformat(),
+        "coverage_months": sorted({
+            f"{int(match.group(2)):04d}-{_month(match.group(1)):02d}"
+            for match in month_headers
+        }),
         "future_legs_excluded": future,
         "deadheads_excluded": deadheads,
         "duplicate_carry_rows_excluded": duplicate_rows,
-        "verified_monthly_block_totals": checked_totals,
+        "verified_monthly_block_totals": (
+            checked_totals if company == "LH" else {}),
+        "source_monthly_block_totals": {
+            f"{year:04d}-{month:02d}": value
+            for (year, month), value in monthly_totals.items()
+        },
+        "monthly_total_control": (
+            "verified" if company == "LH"
+            else "not_applicable_yf_credit_time"),
     }
 
 
@@ -640,9 +679,89 @@ def parse_condor_individual_pdf(pdf):
         header_text, segments, roles.pop())
 
 
-def parse_text(text):
-    if re.search(r"(?im)^\s*Acknowledged Roster\s*$", text[:500]):
-        return parse_acknowledged_text(text)
+def parse_cas_pdf(path, completed_at=None, preserve_source_month=False):
+    """Convert the already verified CAS calendar rows into logbook legs.
+
+    CAS contains no reliable aircraft registration/type or landing columns,
+    so those fields stay absent. UTC start/end, flight number and routing are
+    taken only from the deterministic coordinate parser used by the calendar
+    import. All flight tuples must convert; a partial conversion is rejected.
+    """
+    from cas_roster_parser import parse_cas_roster_pdf
+
+    result, error = parse_cas_roster_pdf(path, carrier="LH")
+    if error or not result:
+        raise ValueError(f"CAS roster parse failed: {error or 'empty'}")
+    printed = result.get("printed_at")
+    if not isinstance(printed, datetime):
+        raise ValueError("CAS roster print timestamp missing")
+    created = printed.replace(tzinfo=timezone.utc) if printed.tzinfo is None \
+        else printed.astimezone(timezone.utc)
+    cutoff = _utc_cutoff(completed_at, created)
+    flight_re = re.compile(
+        r"(?:^|·\s*)(LH\d{2,4}[A-Z]?)\s+([A-Z]{3})\s+-\s+([A-Z]{3})$")
+    legs = []
+    candidates = future = 0
+    for event in result.get("events") or []:
+        if len(event) < 5 or event[4]:
+            continue
+        match = flight_re.search(str(event[3] or ""))
+        if not match:
+            continue
+        candidates += 1
+        start, end = event[1], event[2]
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise ValueError("CAS roster flight chronology missing")
+        start = start.replace(tzinfo=timezone.utc) if start.tzinfo is None \
+            else start.astimezone(timezone.utc)
+        end = end.replace(tzinfo=timezone.utc) if end.tzinfo is None \
+            else end.astimezone(timezone.utc)
+        block = int((end - start).total_seconds() // 60)
+        if not 0 < block < 1200:
+            raise ValueError("invalid CAS roster block time")
+        if end > cutoff:
+            future += 1
+            continue
+        leg = {
+            "date": start.date().isoformat(),
+            "flight": match.group(1),
+            "from": match.group(2),
+            "to": match.group(3),
+            "dep_iso": _iso_utc(start),
+            "arr_iso": _iso_utc(end),
+            "block_min": block,
+            "remarks": "Lufthansa CAS roster; UTC schedule row",
+            "_roster_month": start.strftime("%Y-%m"),
+        }
+        legs.append(leg)
+    expected = int((result.get("counts") or {}).get("flight_legs") or 0)
+    if not expected or candidates != expected:
+        raise ValueError(
+            f"CAS roster flight conversion incomplete: {candidates}!={expected}")
+    if not preserve_source_month:
+        for leg in legs:
+            leg.pop("_roster_month", None)
+    coverage_dates = list(result.get("coverage_dates") or [])
+    coverage_months = sorted({day[:7] for day in coverage_dates
+                              if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)})
+    return legs, {
+        "format": "lufthansa_cas_roster",
+        "created_at": created.isoformat(),
+        "completed_cutoff": cutoff.isoformat(),
+        "period": result.get("period"),
+        "coverage_dates": coverage_dates,
+        "coverage_months": coverage_months,
+        "flight_rows_verified": expected,
+        "future_legs_excluded": future,
+        "warnings": list(result.get("warnings") or []),
+    }
+
+
+def parse_text(text, completed_at=None, preserve_source_month=False):
+    if ACK_KIND.search(text[:500]):
+        return parse_acknowledged_text(
+            text, completed_at=completed_at,
+            preserve_source_month=preserve_source_month)
     if "Duty plan requested at" in text[:1000]:
         return parse_condor_text(text)
     if "Individual duty plan" in text[:1000]:
@@ -659,23 +778,45 @@ def _merge_source_legs(parsed_sources):
     """
     by_key = defaultdict(lambda: defaultdict(list))
     source_created = {}
+    month_sources = defaultdict(set)
     for source_id, legs, meta in parsed_sources:
         source_created[source_id] = datetime.fromisoformat(meta["created_at"])
+        for month in meta.get("coverage_months") or []:
+            month_sources[month].add(source_id)
         for leg in legs:
             key = (leg["date"], leg["flight"], leg["from"], leg["to"])
             by_key[key][source_id].append(leg)
+    # A roster is a complete plan revision for every printed month. A newer
+    # document must therefore replace that whole month's older assignment,
+    # including flights whose number/routing changed or disappeared. A plain
+    # leg-key merge would incorrectly retain both revisions.
+    month_winners = {
+        month: max(sources, key=lambda source: source_created[source])
+        for month, sources in month_sources.items()
+    }
     merged = []
     superseded = 0
     for sources in by_key.values():
-        winner = max(sources, key=lambda item: source_created[item])
-        merged.extend(sources[winner])
+        eligible = {}
+        for source_id, source_legs in sources.items():
+            kept = [leg for leg in source_legs
+                    if not leg.get("_roster_month")
+                    or month_winners.get(leg["_roster_month"], source_id)
+                    == source_id]
+            superseded += len(source_legs) - len(kept)
+            if kept:
+                eligible[source_id] = kept
+        if not eligible:
+            continue
+        winner = max(eligible, key=lambda item: source_created[item])
+        merged.extend(eligible[winner])
         superseded += sum(len(value) for key, value in sources.items()
-                          if key != winner)
+                          if key != winner and key in eligible)
     merged.sort(key=lambda leg: (leg["date"], leg["dep_iso"], leg["flight"]))
     return merged, superseded
 
 
-def parse_sources(paths):
+def parse_sources(paths, completed_at=None, preserve_source_month=False):
     parsed = []
     reports = []
     seen_hashes = set()
@@ -692,14 +833,25 @@ def parse_sources(paths):
             if ("Individual duty plan" in text[:1000]
                     and "NetLine/Crew(CFG)" in text[:1000]):
                 legs, meta = parse_condor_individual_pdf(pdf)
+            elif ("Crew Assignment System" in text[:1500]
+                  and ("Einsatzplan" in text[:1500]
+                       or "Dienstplan" in text[:1500])):
+                legs, meta = parse_cas_pdf(
+                    path, completed_at=completed_at,
+                    preserve_source_month=True)
             else:
-                legs, meta = parse_text(text)
+                legs, meta = parse_text(
+                    text, completed_at=completed_at,
+                    preserve_source_month=True)
         source_id = digest[:16]
         parsed.append((source_id, legs, meta))
         reports.append({**meta, "sha256_prefix": source_id,
                         "legs_before_merge": len(legs)})
     legs, superseded = _merge_source_legs(parsed)
     collisions = dedupe_keys(legs)
+    if not preserve_source_month:
+        for leg in legs:
+            leg.pop("_roster_month", None)
     for leg in legs:
         for code in (leg["from"], leg["to"]):
             if not re.fullmatch(r"[A-Z]{3}", code):
@@ -712,12 +864,24 @@ def parse_sources(paths):
         "duplicate_files_skipped": duplicate_files,
         "superseded_revision_legs": superseded,
         "dedupe_suffixes": collisions,
+        "coverage_months": sorted({
+            month for source in reports
+            for month in (source.get("coverage_months") or [])
+        }),
+        "source_created_at": max(
+            (source["created_at"] for source in reports), default=None),
         "totals": {
             "legs": len(legs),
             "block_min": sum(leg["block_min"] for leg in legs),
             "landings": 0,
         },
     }
+    report["month"] = (
+        "–".join((report["coverage_months"][0],
+                  report["coverage_months"][-1]))
+        if len(report["coverage_months"]) > 1
+        else (report["coverage_months"][0]
+              if report["coverage_months"] else "unknown"))
     return {"legs": legs, "sim": [], "report": report}
 
 
