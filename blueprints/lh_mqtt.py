@@ -1303,11 +1303,39 @@ def _facts_force_ok(flight_disp, topic_date, now=None):
 
 
 def _hhmm(iso_str):
-    """'2026-07-22T17:45:00+02:00' → '17:45' (station-lokal, wie geliefert)."""
+    """'2026-07-22T17:45:00+02:00' → '17:45' (wie geliefert — NUR noch für
+    Werte, deren Station unbekannt ist; sonst `_hhmm_station`)."""
     try:
         return str(iso_str)[11:16]
     except Exception:
         return None
+
+
+def _hhmm_station(iso_str, iata):
+    """HH:MM in der ZONE DER STATION — nie in der Zone des gelieferten
+    Strings. Tibor 13.08. (Layover Seoul): der Verspätungs-Push nannte den
+    ICN-Abflug in DEUTSCHER Zeit, weil LHs Event-Zeiten je nach Feed mit
+    CE(S)T-/UTC-Offset kommen und `_hhmm` blind schnitt („station-lokal, wie
+    geliefert" war eine Annahme, kein Vertrag). Trägt der String einen Offset
+    und die Station eine bekannte Zone, wird umgerechnet; ein NAIVER String
+    wird wie bisher geschnitten (Annahme station-lokal) — dort umzurechnen
+    wäre geraten. Unbekannte Station ⇒ Schnitt wie bisher."""
+    raw = _hhmm(iso_str)
+    if not iso_str or not iata:
+        return raw
+    try:
+        parsed = datetime.fromisoformat(str(iso_str).replace('Z', '+00:00'))
+    except Exception:
+        return raw
+    if parsed.tzinfo is None:
+        return raw
+    tz = _station_tz(str(iata).strip().upper())
+    if tz is None:
+        return raw
+    try:
+        return parsed.astimezone(tz).strftime('%H:%M')
+    except Exception:
+        return raw
 
 
 def _do_push(token, title, body, data=None, idempotency_key=None):
@@ -1348,8 +1376,8 @@ def _build_push(kind, flight_disp, topic_date, facts, sector):
 
     if kind == 'est_dep':
         delay = facts.get('dep_delay_min')
-        est = _hhmm(facts.get('est_dep'))
-        sched = _hhmm(facts.get('sched_dep'))
+        est = _hhmm_station(facts.get('est_dep'), frm)
+        sched = _hhmm_station(facts.get('sched_dep'), frm)
         if not isinstance(delay, int) or delay < 15 or not est:
             return None
         body = f'{route or flight_disp} am {nice_date}: Abflug {est}'
@@ -1401,7 +1429,7 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
     dates = [(now_utc.date() + timedelta(days=o)).isoformat()
              for o in (-1, 0, 1, 2)]
     rows = _rows_from_station(dates[:3], arr)
-    est_arr = _hhmm(facts.get('est_arr') or facts.get('sched_arr'))
+    est_arr = _hhmm_station(facts.get('est_arr') or facts.get('sched_arr'), arr)
     origin = facts.get('dep_iata')
     delay = facts.get('arr_delay_min')
     delay_txt = (f' ({delay:+d} min)'
@@ -1459,7 +1487,7 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
             ptype = 'inbound_departure'
             key = f'lhflup:inb:{event_flight}:{topic_date}:{kind}:{tok}'
         elif kind == 'est_dep':
-            est_dep = _hhmm(facts.get('est_dep'))
+            est_dep = _hhmm_station(facts.get('est_dep'), origin)
             dep_delay = facts.get('dep_delay_min')
             title = f'Dein Flieger verspätet sich · {user_flight}'
             body = f'{reg} ({event_flight}) startet'

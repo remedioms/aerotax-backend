@@ -1338,3 +1338,29 @@ def test_daemon_docstring_warnt_vor_der_clientid_kollision():
     assert 'neue eindeutige clientID' not in doc
     assert 'STABIL' in doc
     assert 'EIN DAEMON' in doc.upper()
+
+
+# ── Push-Text-Zeiten in der Zone der Station (Tibor, 13.08.2026) ────────────
+
+def test_hhmm_station_rechnet_offset_in_die_stationszone_um():
+    """Der Verspätungs-Push nannte den ICN-Abflug in DEUTSCHER Zeit: LH
+    liefert Event-Zeiten je nach Feed mit CE(S)T-/UTC-Offset, und der blinde
+    String-Schnitt übernahm die fremde Zone. 12:20 KST kam als +02:00-String
+    (05:20) — der Text muss trotzdem 12:20 sagen."""
+    import blueprints.lh_mqtt as mq
+    assert mq._hhmm_station('2026-08-12T05:20:00+02:00', 'ICN') == '12:20'
+    # UTC-Suffix genauso:
+    assert mq._hhmm_station('2026-08-12T03:20:00Z', 'ICN') == '12:20'
+
+
+def test_hhmm_station_naiv_bleibt_wie_geliefert():
+    """Ein naiver String traegt keine Zone — umrechnen waere geraten. Er wird
+    wie bisher geschnitten (Annahme station-lokal)."""
+    import blueprints.lh_mqtt as mq
+    assert mq._hhmm_station('2026-08-12T12:20:00', 'ICN') == '12:20'
+
+
+def test_hhmm_station_unbekannte_station_faellt_auf_schnitt_zurueck():
+    import blueprints.lh_mqtt as mq
+    assert mq._hhmm_station('2026-08-12T05:20:00+02:00', 'XXX') == '05:20'
+    assert mq._hhmm_station('2026-08-12T05:20:00+02:00', None) == '05:20'
