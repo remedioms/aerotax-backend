@@ -10648,6 +10648,38 @@ def ax_flight_recap(token):
         if _au_chk is not None and _au_chk > _now_utc:
             actual_arr = None
             block_min = None
+    # ── EINE GEMESSENE IST-ZEIT SCHLÄGT JEDE SCHÄTZUNG (2026-08-13) ────────
+    # Alles oben ist bestenfalls „die letzte Zahl, die die Tafel zeigte"
+    # (`esti_*`) oder der eigene Roster-Instant — `actual_*` war damit ein
+    # Etikett, keine Messung (Owner-Befund: „warum touchdown von ADS-B?").
+    # `actual_*_iso` trägt dagegen LHs `ActualTimeUTC` aus DERSELBEN
+    # flightstatus-Antwort, die der Merge ohnehin liest: kein zusätzlicher
+    # Call, keine neue Quelle, keine Inferenz.
+    # Die Zukunfts-Sperre darüber bleibt unangetastet; sie gilt der est-Zahl.
+    # Eine Messung wird hier EIGENSTÄNDIG gegen dieselbe Physik geprüft — was
+    # in der Zukunft läge, ist keine Messung und wird nicht übernommen.
+    _m_dep = _recap_utc(m.get('actual_dep_iso'))
+    _m_arr = _recap_utc(m.get('actual_arr_iso'))
+    if _m_dep is not None and _m_dep <= _now_utc:
+        actual_dep = _m_dep.isoformat()
+    if _m_arr is not None and _m_arr <= _now_utc:
+        actual_arr = _m_arr.isoformat()
+    if (_m_dep is not None) or (_m_arr is not None):
+        # Die Blockzeit MUSS aus den angezeigten Zeiten folgen — sonst steht
+        # eine Dauer über zwei Uhrzeiten, die sie nicht ergeben (genau der
+        # Owner-Screenshot vom 10.08.). Aware-Instants werden als solche
+        # gelesen, bare Stationszeit weiter über die Ziel-TZ.
+        def _recap_instant(val, iata):
+            if not val:
+                return None
+            return _recap_utc(val) or (_local_to_utc(val, iata) if iata else None)
+        _fd = _recap_instant(actual_dep, dep)
+        _fa = _recap_instant(actual_arr, dest)
+        block_min = None
+        if _fd is not None and _fa is not None:
+            _bm = int(round((_fa - _fd).total_seconds() / 60.0))
+            if 0 < _bm <= 20 * 60:
+                block_min = _bm
     payload = {
         'ok': True, 'flight': flight_no, 'date': date,
         'dep': _airport_brief(dep), 'dest': _airport_brief(dest),

@@ -65,3 +65,39 @@ def test_providers_dedupliziert_stub_provider(monkeypatch):
     assert G._providers() == ["direct"]
     monkeypatch.setenv("FR24_GRPC_PROVIDERS", "cloudflare,nas")
     assert G._providers() == ["cloudflare"]
+
+
+# ── detail_card: FR24s ECHTE Ist-Ankunft nicht mehr wegwerfen (2026-08-13) ──
+# Die Karte trug `actual_dep`, ließ `actual_arrival` aus DERSELBEN Antwort aber
+# fallen. Der Wert kostet nichts extra (kein neuer Call, HARD-CACHE-Regel
+# unberührt) — weggeworfen wurde er nur, weil ihn niemand abholte.
+
+def _stub_detail(monkeypatch, schedule_info):
+    monkeypatch.setattr(G, 'tap_detail', lambda **k: {
+        'row': {'extra_info': {'reg': 'D-AIHY', 'flight': 'LH400'}},
+        'detail': {'schedule_info': schedule_info,
+                   'aircraft_info': {'reg': 'D-AIHY', 'type': 'A346'}},
+    })
+
+
+def test_detail_card_reicht_ist_ankunft_durch(monkeypatch):
+    _stub_detail(monkeypatch, {'flight_number': 'LH400',
+                               'scheduled_departure': 1_783_580_000,
+                               'actual_departure': 1_783_580_600,
+                               'scheduled_arrival': 1_783_600_000,
+                               'actual_arrival': 1_783_599_100})
+    card = G.detail_card(callsign='DLH400', lat=50.0, lon=8.5)
+    assert card['actual_dep'] == 1_783_580_600
+    assert card['actual_arr'] == 1_783_599_100
+
+
+def test_detail_card_ohne_ist_ankunft_bleibt_ohne_feld(monkeypatch):
+    """Fliegender Flug: FR24 kennt die Landung noch nicht — dann steht dort
+    auch nichts (None-Felder fallen aus der Karte)."""
+    _stub_detail(monkeypatch, {'flight_number': 'LH400',
+                               'scheduled_departure': 1_783_580_000,
+                               'actual_departure': 1_783_580_600,
+                               'scheduled_arrival': 1_783_600_000})
+    card = G.detail_card(callsign='DLH400', lat=50.0, lon=8.5)
+    assert 'actual_arr' not in card
+    assert card['actual_dep'] == 1_783_580_600

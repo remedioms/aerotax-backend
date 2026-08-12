@@ -55,6 +55,29 @@ def test_apply_fill_builds_pure_lh_record_from_none():
     assert out['delay_known'] is True
 
 
+def test_apply_fill_reicht_echte_ist_zeiten_durch():
+    """LHs `ActualTimeUTC` ist der EINZIGE Wert im Merge, der eine MESSUNG
+    behauptet — `esti_*` ist auch nach der Landung nur die letzte Tafel-Zahl.
+    Ohne dieses Durchreichen kann `obs_from_board_merged` kein `arr_time.actual`
+    erzeugen und `eta_conf` bleibt strukturell für immer `estimated`."""
+    lh = dict(LH, actual_dep='2026-07-22T11:05:00+02:00',
+              actual_arr='2026-07-22T13:03:00-04:00')
+    out = A._lh_apply_obs_fill(None, lh)
+    # Offset-ISO → absolute UTC (kein Doppel-Offset, wie bei est_*_iso)
+    assert out['actual_dep_iso'].startswith('2026-07-22T09:05')
+    assert out['actual_arr_iso'].startswith('2026-07-22T17:03')
+
+
+def test_apply_fill_ohne_actual_bleibt_leer():
+    """Nur Estimated ⇒ KEINE Ist-Zeit. Ein est als actual auszugeben wäre genau
+    der Etikettenschwindel, den die Kette abstellen soll."""
+    out = A._lh_apply_obs_fill(None, LH)
+    assert out['actual_dep_iso'] is None and out['actual_arr_iso'] is None
+    # …und der Board-Record bekommt ohne LH-Actual auch keinen Schlüssel dazu.
+    rec = {'sched_dep': '10:55', 'esti_dep': '11:20'}
+    assert A._lh_apply_obs_fill(rec, LH).get('actual_arr_iso') is None
+
+
 def test_apply_fill_empty_lh_keeps_none():
     assert A._lh_apply_obs_fill(None, {}) is None
     rec = {'sched_dep': '10:55'}

@@ -18,6 +18,12 @@ FRA = (50.03, 8.57)
 GVA = (46.24, 6.11)
 
 
+def _t_iso(ts):
+    """Epoch → UTC-ISO ('…Z'), wie die Quellen sie liefern."""
+    import time as _t
+    return _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(ts))
+
+
 def test_classify_departed_is_offblock_not_airborne():
     # THE ghost-bug encoding: dep-side "Abgeflogen" = off-block = TAXI_OUT
     assert classify_board_status("Abgeflogen", "dep") == (TAXI_OUT, True, False)
@@ -254,6 +260,103 @@ def test_build_keys_derives_sched_dep_ts():
     k2 = build_keys("LH2557", "2026-07-09", "FRA", "GVA",
                     sched_dep_iso=dep_iso, sched_dep_ts=123.0)
     assert k2["sched_dep_ts"] == 123.0
+
+
+# ── ECHTE IST-ZEITEN → eta_conf=observed (2026-08-13) ──────────────────────
+# Vorher konnte `_resolve_eta` seinen ersten Rang (arr_time.actual ⇒ OBSERVED)
+# strukturell NIE erreichen: obs_from_board_merged ist der einzige Erzeuger von
+# `arr_time` und füllte nur sched/est. flight-live meldete damit nie eine
+# gemessene Ankunft, flight-recap.actual_arr war in Wahrheit die est-Zahl.
+
+def test_actual_arrival_macht_eta_observed():
+    """Quelle liefert eine ECHTE Ist-Ankunft (LH ActualTimeUTC) ⇒ observed."""
+    keys = build_keys("LH400", "2026-07-09", "FRA", "JFK",
+                      sched_arr_iso="2026-07-09T17:35:00Z")
+    landed = _t_iso(NOW - 600)
+    obs = obs_from_board_merged({
+        "status_arr": "Gelandet", "sched_arr": "2026-07-09T17:35:00Z",
+        "esti_arr": "2026-07-09T17:03:00Z", "actual_arr_iso": landed,
+    }, keys, now=NOW)
+    arr = [o for o in obs if o.kind == "arr_time"][0]
+    assert arr.value["actual"] == landed
+    fs = resolve_flight_state(keys, obs, now=NOW)
+    assert fs["times"]["eta_conf"] == "observed"
+    assert fs["times"]["eta_iso"] == landed
+    assert fs["times"]["act_arr_iso"] == landed
+    assert fs["times"]["arr_conf"] == "observed"
+
+
+def test_nur_estimated_bleibt_estimated():
+    """Dieselbe Zeile OHNE Ist-Wert: unverändert `estimated` (kein Etikett)."""
+    keys = build_keys("LH400", "2026-07-09", "FRA", "JFK",
+                      sched_arr_iso="2026-07-09T17:35:00Z")
+    obs = obs_from_board_merged({
+        "status_arr": "Gelandet", "sched_arr": "2026-07-09T17:35:00Z",
+        "esti_arr": "2026-07-09T17:03:00Z",
+    }, keys, now=NOW)
+    assert "actual" not in [o for o in obs if o.kind == "arr_time"][0].value
+    fs = resolve_flight_state(keys, obs, now=NOW)
+    assert fs["times"]["eta_conf"] == "estimated"
+    assert fs["times"]["act_arr_iso"] is None
+    assert fs["times"]["arr_conf"] == "estimated"
+
+
+def test_actual_departure_setzt_dep_conf_observed():
+    keys = build_keys("LH400", "2026-07-09", "FRA", "JFK")
+    off_block = _t_iso(NOW - 3600)
+    obs = obs_from_board_merged({
+        "status_dep": "Abgeflogen", "sched_dep": "2026-07-09T08:55:00Z",
+        "actual_dep_iso": off_block,
+    }, keys, now=NOW)
+    fs = resolve_flight_state(keys, obs, now=NOW)
+    assert fs["times"]["act_dep_iso"] == off_block
+    assert fs["times"]["dep_conf"] == "observed"
+
+
+def test_ist_zeit_in_der_zukunft_ist_keine_messung():
+    """Eine Landung kann nicht gemessen worden sein, bevor sie stattfand —
+    der Wert wird verworfen, nicht als `observed` durchgereicht."""
+    keys = build_keys("LH400", "2026-07-09", "FRA", "JFK",
+                      sched_arr_iso="2026-07-09T17:35:00Z")
+    obs = obs_from_board_merged({
+        "sched_arr": "2026-07-09T17:35:00Z",
+        "actual_arr_iso": _t_iso(NOW + 3600),
+    }, keys, now=NOW)
+    assert "actual" not in [o for o in obs if o.kind == "arr_time"][0].value
+    fs = resolve_flight_state(keys, obs, now=NOW)
+    assert fs["times"]["eta_conf"] != "observed"
+    # Uhren-Versatz innerhalb der Toleranz bleibt dagegen eine Messung
+    ok = _t_iso(NOW + 60)
+    obs2 = obs_from_board_merged({"actual_arr_iso": ok}, keys, now=NOW)
+    assert [o for o in obs2 if o.kind == "arr_time"][0].value["actual"] == ok
+
+
+def test_unparsebare_ist_zeit_wird_verworfen():
+    """Fail-closed: was wir nicht in die Zeit legen können, belegt nichts."""
+    keys = build_keys("LH400", "2026-07-09", "FRA", "JFK")
+    obs = obs_from_board_merged({
+        "esti_arr": "2026-07-09T17:03:00Z", "actual_arr_iso": "kaputt!!",
+    }, keys, now=NOW)
+    assert "actual" not in [o for o in obs if o.kind == "arr_time"][0].value
+
+
+def test_station_lokale_ist_zeit_laeuft_durch_board_to_iso():
+    """Board-Form (bare Stationszeit) wird wie sched/est konvertiert."""
+    keys = build_keys("LH400", "2026-07-09", "FRA", "JFK")
+    landed = _t_iso(NOW - 300)
+    obs = obs_from_board_merged(
+        {"actual_arr": "13:03"}, keys, now=NOW,
+        board_to_iso=lambda hhmm, iata: landed if hhmm == "13:03" else None)
+    assert [o for o in obs if o.kind == "arr_time"][0].value["actual"] == landed
+
+
+def test_actual_allein_erzeugt_die_arr_time_observation():
+    """Ohne sched/est darf die Messung nicht durchs Raster fallen."""
+    keys = build_keys("LH400", "2026-07-09", "FRA", "JFK")
+    landed = _t_iso(NOW - 120)
+    obs = obs_from_board_merged({"actual_arr_iso": landed}, keys, now=NOW)
+    arr = [o for o in obs if o.kind == "arr_time"]
+    assert len(arr) == 1 and arr[0].value == {"actual": landed}
 
 
 def test_gepaeckausgabe_kompositum_ist_landung():

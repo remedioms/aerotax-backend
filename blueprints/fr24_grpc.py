@@ -511,6 +511,12 @@ def detail_card(callsign=None, hex=None, reg=None, lat=None, lon=None):
         "sched_dep": si.get("scheduled_departure") or None,
         "actual_dep": si.get("actual_departure") or None,
         "sched_arr": si.get("scheduled_arrival") or None,
+        # `actual_arrival` steht in DERSELBEN Antwort und wurde bis 2026-08-13
+        # hier weggeworfen — der Wert kostet also nichts extra (HARD-CACHE-/
+        # zero-double-spend-Regel bleibt gewahrt, es gibt keinen neuen Call).
+        # Bei einem laufenden Flug ist er leer; erst nach der Landung trägt
+        # FR24 hier die echte Ist-Ankunft (Epoch-Sekunden UTC).
+        "actual_arr": si.get("actual_arrival") or d.get("actual_arrival") or None,
         "eta": fp.get("eta") or None,
         "progress_pct": fp.get("progress_pct"),
         "delay_status": fp.get("delay_status") or None,

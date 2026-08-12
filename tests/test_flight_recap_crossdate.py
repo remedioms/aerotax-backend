@@ -200,3 +200,50 @@ def test_zukunft_wird_nie_als_ist_ausgeliefert(monkeypatch):
     d = r.get_json()
     assert d['actual_arr'] is None
     assert d['block_time_min'] is None
+
+
+# ── Eine GEMESSENE Ist-Zeit schlägt jede Schätzung (2026-08-13) ─────────────
+# Befund: `actual_*` war bis hierher ein Etikett — die Zahl darunter war
+# `esti_*` (Prognose) oder der Roster-Instant (Plan). LH liefert in derselben
+# flightstatus-Antwort, die der Merge ohnehin liest, `ActualTimeUTC`; der
+# Merge reicht sie als `actual_*_iso` durch (app._lh_apply_obs_fill).
+
+# Gemessene Ist-Zeiten: 15:58Z ab, 04:05Z an (≠ Plan UND ≠ Roster-Instant).
+OBS_GEMESSEN = dict(OBS_FALSCH,
+                    actual_dep_iso='2026-08-09T15:58:00+00:00',
+                    actual_arr_iso='2026-08-10T04:05:00+00:00')
+
+
+def test_gemessene_ist_zeit_schlaegt_den_roster_instant(monkeypatch):
+    """Der Roster-Instant ist der beste Beleg, SOLANGE keiner gemessen hat.
+    Liegt eine echte Messung vor, ist sie die Wahrheit — und die Blockzeit
+    folgt den angezeigten Zeiten, nicht mehr dem Plan."""
+    _mock(monkeypatch, obs=OBS_GEMESSEN)
+    d = _hole(_app().app.test_client())
+    assert d['actual_dep'].startswith('2026-08-09T15:58')
+    assert d['actual_arr'].startswith('2026-08-10T04:05')
+    assert d['block_time_min'] == 727            # 15:58Z → 04:05Z
+    dep, arr = ax._recap_utc(d['actual_dep']), ax._recap_utc(d['actual_arr'])
+    assert round((arr - dep).total_seconds() / 60) == d['block_time_min']
+
+
+def test_ohne_gemessene_zeit_bleibt_alles_beim_alten(monkeypatch):
+    """Kein `actual_*_iso` ⇒ exakt das bisherige Verhalten (Roster-Instants)."""
+    _mock(monkeypatch)
+    d = _hole(_app().app.test_client())
+    assert d['actual_dep'].startswith('2026-08-09T15:54')
+    assert d['actual_arr'].startswith('2026-08-10T04:14')
+    assert d['block_time_min'] == 740
+
+
+def test_gemessene_zeit_in_der_zukunft_wird_nicht_uebernommen(monkeypatch):
+    """Eine Messung kann nicht vor dem Ereignis entstanden sein. Ein
+    Zukunfts-Wert wird verworfen, nicht als Ist ausgeliefert."""
+    from datetime import datetime, timedelta, timezone
+    kuenftig = (datetime.now(timezone.utc) + timedelta(hours=4))
+    _mock(monkeypatch, obs=dict(
+        OBS_FALSCH, actual_arr_iso=kuenftig.isoformat()))
+    d = _hole(_app().app.test_client())
+    # Fällt auf den bisherigen (Roster-)Beleg zurück, nicht auf die Zukunft.
+    assert d['actual_arr'].startswith('2026-08-10T04:14')
+    assert d['block_time_min'] == 740

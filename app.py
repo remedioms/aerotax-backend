@@ -43192,6 +43192,7 @@ def _lh_apply_obs_fill(rec, lh):
         'aircraft': None, 'sides': {'dep': None, 'arr': None},
         'has_dep': False, 'has_arr': False,
         'est_dep_iso': None, 'est_arr_iso': None,
+        'actual_dep_iso': None, 'actual_arr_iso': None,
     }
     filled = False
     for rk, lk in _LH_OBS_FILL:
@@ -43203,7 +43204,19 @@ def _lh_apply_obs_fill(rec, lh):
         filled = True
     # Absolute UTC-Est-Zeiten: LH liefert Offset-ISO → direkt nach UTC heben
     # (KEIN _board_local_to_utc_iso — das würde den Offset doppelt anwenden).
-    for iso_k, lk in (('est_dep_iso', 'est_dep'), ('est_arr_iso', 'est_arr')):
+    #
+    # `actual_*_iso` (2026-08-13): dieselbe Umrechnung für LHs ECHTE Ist-Zeiten
+    # (`ActualTimeUTC`, s. lh_open_api._side_actual). Sie sind der EINZIGE Wert
+    # im Merge, der eine MESSUNG behauptet — `esti_*` ist auch nach der Landung
+    # nur „die letzte Zahl, die die Tafel zeigte". Erst dadurch kann
+    # `obs_from_board_merged` ein `arr_time.actual` erzeugen und die Engine
+    # `eta_conf=observed` vergeben (vorher strukturell unerreichbar). Kein
+    # zusätzlicher Call: der Wert steckt in derselben Antwort wie est/gate/reg.
+    # Der Instanz-Riegel (`_lh_facts_same_instance`) liegt VOR diesem Fill —
+    # eine Ist-Zeit des 24-h-Nachbarn kommt hier also gar nicht erst an.
+    for iso_k, lk in (('est_dep_iso', 'est_dep'), ('est_arr_iso', 'est_arr'),
+                      ('actual_dep_iso', 'actual_dep'),
+                      ('actual_arr_iso', 'actual_arr')):
         if out.get(iso_k) is None and lh.get(lk):
             try:
                 from datetime import datetime as _dtl, timezone as _tzl

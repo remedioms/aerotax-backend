@@ -104,6 +104,26 @@ def test_leg_to_facts_departed_with_delay():
     assert facts["dep_status"] == "Flight Departed"
 
 
+def test_leg_to_facts_trennt_actual_von_estimated():
+    """LH schickt Actual UND Estimated — bis 2026-08-13 fielen beide in dasselbe
+    `est_*`. Die Ist-Zeit muss als solche erkennbar sein, sonst kann keine
+    Ankunft je als GEMESSEN gelten (eta_conf=observed)."""
+    facts = lh._leg_to_facts(FS_LH400["FlightStatusResource"]["Flights"]["Flight"])
+    # dep-Seite: LH liefert ActualTime* → echte Messung
+    assert facts["actual_dep"] == "2026-07-21T11:05:00+02:00"
+    # arr-Seite: NUR EstimatedTime* → keine Messung, kein actual_arr
+    assert "actual_arr" not in facts
+    assert facts["est_arr"] == "2026-07-21T13:03:00-04:00"
+    # est_* bleibt unverändert (Actual-bevorzugt) — rein additive Ergänzung
+    assert facts["est_dep"] == facts["actual_dep"]
+
+
+def test_leg_to_facts_ohne_ist_kein_actual():
+    """Zukunftsflug: weder Actual noch Estimated → beide Felder fehlen."""
+    facts = lh._leg_to_facts(FS_4Y136["FlightStatusResource"]["Flights"]["Flight"][0])
+    assert "actual_dep" not in facts and "actual_arr" not in facts
+
+
 def test_flight_facts_picks_matching_leg(monkeypatch):
     monkeypatch.setattr(lh, "_KEY", "k"); monkeypatch.setattr(lh, "_SECRET", "s")
     monkeypatch.setattr(lh, "_get", lambda path, caller=None: FS_4Y136)

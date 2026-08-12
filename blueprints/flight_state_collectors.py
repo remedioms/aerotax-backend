@@ -117,6 +117,11 @@ def classify_board_status(status, side: str):
 
 # ── collectors: fetched data -> Observations (pure) ────────────────────────
 
+# Uhren-Versatz zwischen Datenquelle und Server. Mehr Spielraum würde eine
+# PROGNOSE als Messung durchlassen — genau die Fehlerklasse, die `est` von
+# `actual` trennt (vgl. app._ARR_OBS_SETTLE_MIN, dieselbe Größenordnung).
+_ACTUAL_FUTURE_TOL_S = 180
+
 def obs_from_board_merged(m: dict, keys: dict, now: Optional[float] = None,
                           board_to_iso=None) -> list:
     """Map a `_flight_obs_merged` record into Observations.
@@ -142,6 +147,27 @@ def obs_from_board_merged(m: dict, keys: dict, now: Optional[float] = None,
             return board_to_iso(hhmm, iata)
         return hhmm
 
+    def actual(iso_key, local_key, iata):
+        """Eine ECHTE Ist-Zeit aus dem Merged-Record — oder None.
+
+        `<seite>_iso` ist ein ABSOLUTER Instant (UTC/Offset, z.B. LHs
+        `ActualTimeUTC` über app._lh_apply_obs_fill) und läuft NICHT durch
+        `iso()`; die station-lokale Board-Form tut es. Zwei Riegel, beide aus
+        der Owner-Regel „keine Fake-Werte":
+          · unparsebar ⇒ verworfen. Ein Wert, den wir nicht in die Zeit legen
+            können, kann keine Messung belegen (fail-closed).
+          · in der ZUKUNFT ⇒ verworfen. Eine Landung kann nicht gemessen
+            worden sein, bevor sie stattfand; `_ACTUAL_FUTURE_TOL_S` deckt nur
+            den Uhren-Versatz zwischen Quelle und Server ab.
+        """
+        val = m.get(iso_key) or iso(m.get(local_key), iata)
+        if not val:
+            return None
+        ts = _iso_or_epoch(val)
+        if ts is None or ts > (now + _ACTUAL_FUTURE_TOL_S):
+            return None
+        return val
+
     out = []
     # -- phase (side-aware, hard/soft) --
     ph_dep, hard_dep, proven_dep = classify_board_status(m.get("status_dep"), "dep")
@@ -159,11 +185,21 @@ def obs_from_board_merged(m: dict, keys: dict, now: Optional[float] = None,
                                meta={"side": "dep", "proven_airborne": proven_dep}))
 
     # -- times --
+    # `actual` ist die GEMESSENE Zeit, `est` die Prognose. Bis 2026-08-13 füllte
+    # dieser Kollektor NUR sched/est — und weil er der einzige Erzeuger von
+    # `arr_time` ist, konnte `_resolve_eta` seinen ersten Rang (arr_time.actual
+    # ⇒ OBSERVED) strukturell nie erreichen: `eta_conf` war nie `observed`,
+    # flight-recap.actual_arr in Wahrheit die est-Zahl. Quellen, die eine echte
+    # Ist-Zeit liefern (LH `ActualTimeUTC` — s. app._lh_apply_obs_fill), reichen
+    # sie jetzt als `actual_*_iso` durch. Fehlt sie, ändert sich nichts.
     dep_val = {}
     if m.get("sched_dep"):
         dep_val["sched"] = iso(m.get("sched_dep"), dep_iata)
     if m.get("esti_dep"):
         dep_val["est"] = iso(m.get("esti_dep"), dep_iata)
+    _act_dep = actual("actual_dep_iso", "actual_dep", dep_iata)
+    if _act_dep:
+        dep_val["actual"] = _act_dep
     if dep_val:
         out.append(Observation("dep_time", dep_val, "board", obs_ts))
     arr_val = {}
@@ -171,8 +207,14 @@ def obs_from_board_merged(m: dict, keys: dict, now: Optional[float] = None,
         arr_val["sched"] = iso(m.get("sched_arr"), arr_iata)
     if m.get("esti_arr"):
         arr_val["est"] = iso(m.get("esti_arr"), arr_iata)
+    _act_arr = actual("actual_arr_iso", "actual_arr", arr_iata)
+    if _act_arr:
+        arr_val["actual"] = _act_arr
     if arr_val:
         out.append(Observation("arr_time", arr_val, "board", obs_ts))
+        # Die ETA-Leiter selbst entscheidet der Reducer (`_resolve_eta`, actual
+        # zuerst); diese Observation bleibt der est/sched-Kandidat der Board-
+        # Stufe — mit actual wird sie gar nicht erst erreicht.
         out.append(Observation("eta", {"eta": arr_val.get("est") or arr_val.get("sched")},
                                "board", obs_ts))
 

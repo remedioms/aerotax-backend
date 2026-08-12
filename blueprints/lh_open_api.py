@@ -598,6 +598,30 @@ def _side_times(side):
     return sched, est
 
 
+def _side_actual(side):
+    """Die ECHTE Ist-Zeit einer LH-Departure/Arrival-Seite als Station-Offset-ISO,
+    oder None, wenn LH für diese Seite nur eine Schätzung kennt.
+
+    WARUM SEPARAT (Befund 2026-08-13): `_side_times` faltet Actual UND Estimated
+    in dasselbe `est`-Feld („Ist bevorzugt Actual, sonst Estimated"). Genau die
+    Information, die dabei verloren geht — IST DAS EINE MESSUNG? — braucht die
+    FlightState-Engine für `eta_conf=observed`; ohne sie kann sie eine Landung
+    nie von einer Prognose unterscheiden. Der TTL-Kommentar weiter unten sagt
+    denselben Befund seit Wochen wörtlich: „`est_arr` ist mal Actual, mal
+    Estimated — die Fakten sagen nicht, welches von beiden."
+
+    Kostet KEINEN zusätzlichen Call: `ActualTimeLocal`/`ActualTimeUTC` stehen in
+    genau der flightstatus-Antwort, die wir für Zeiten/Gate/Reg ohnehin kaufen.
+    `est` bleibt unverändert (weiter Actual-bevorzugt) — dieser Wert ist rein
+    additiv, kein Consumer sieht ihn, bis er ihn abholt."""
+    if not isinstance(side, dict):
+        return None
+    loc = (side.get('ActualTimeLocal') or {}).get('DateTime')
+    if not loc:
+        return None
+    return _offset_iso(loc, (side.get('ActualTimeUTC') or {}).get('DateTime'))
+
+
 def _delay_min(sched_iso, est_iso):
     """Delay in Minuten aus zwei Offset-ISO-Strings (oder None)."""
     if not sched_iso or not est_iso:
@@ -688,6 +712,15 @@ def _leg_to_facts(leg, flight_no=None):
         facts['sched_arr'] = sa
     if ea:
         facts['est_arr'] = ea
+    # ECHTE Ist-Zeiten (2026-08-13) — additiv NEBEN est_*, nie statt dessen.
+    # Nur gesetzt, wenn LH wirklich `ActualTime*` liefert; ein Estimated landet
+    # hier NIE (s. `_side_actual`). Delay/TTL/Consumer bleiben unberührt.
+    ad = _side_actual(dep)
+    if ad:
+        facts['actual_dep'] = ad
+    aa = _side_actual(arr)
+    if aa:
+        facts['actual_arr'] = aa
     dm = _delay_min(sd, ed)
     if dm is not None:
         facts['dep_delay_min'] = dm
