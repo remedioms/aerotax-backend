@@ -169,3 +169,34 @@ def test_memo_trennt_die_nutzer(monkeypatch):
     monkeypatch.setattr(_app(), '_ical_briefings_load', lambda t: {},
                         raising=False)
     assert _hole(client, token='testtoken-user-b')['block_time_min'] is None
+
+
+# ── Keine Zukunft als Ist (iOS-Ampel-Befund 12.08.2026, LH402 AIRBORNE) ─────
+
+def test_zukunft_wird_nie_als_ist_ausgeliefert(monkeypatch):
+    """Der Flug ist noch in der Luft (Roster-Ankunft in der Zukunft): weder
+    darf der Roster-Instant als actual_* erscheinen (das sind PLANWERTE bis
+    zur Landung) noch eine geschätzte Zukunfts-Ankunft der Board-Seite. Genau
+    so entstand das Plan-Echo: recap lieferte 13:00-18:00 als actual bei
+    delay_min 25 und die App färbte 'pünktlich'."""
+    from datetime import datetime, timedelta, timezone
+    dep = (datetime.now(timezone.utc) + timedelta(hours=1))
+    arr = (datetime.now(timezone.utc) + timedelta(hours=3))
+    heute = dep.date().isoformat()
+    zukunft = dict(SEKTOR,
+                   dep_iso=dep.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                   arr_iso=arr.strftime('%Y-%m-%dT%H:%M:%SZ'))
+    obs_zukunft = dict(OBS_FALSCH,
+                       esti_arr=arr.strftime('%Y-%m-%dT%H:%M:%S'),
+                       delay_known=True, delay_min=25)
+    _mock(monkeypatch, briefs={heute: {'ical_sectors': [zukunft]}},
+          obs=obs_zukunft)
+    token = 'testtoken-recap'
+    r = _app().app.test_client().get(
+        '/api/ax/flight-recap/' + token
+        + '?flight_no=LH781&date=' + heute + '&dep_iata=SIN&arr_iata=FRA',
+        headers={'Authorization': 'Bearer ' + token})
+    assert r.status_code == 200, r.get_data(as_text=True)[:200]
+    d = r.get_json()
+    assert d['actual_arr'] is None
+    assert d['block_time_min'] is None

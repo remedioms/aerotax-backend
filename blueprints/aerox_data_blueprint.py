@@ -10611,7 +10611,14 @@ def ax_flight_recap(token):
     if isinstance(leg, dict):
         rdep = _recap_utc(leg.get('dep_iso'))
         rarr = _recap_utc(leg.get('arr_iso'))
-        if rdep is not None and rarr is not None:
+        # NUR wenn der Flug VORBEI ist (Ankunfts-Instant in der Vergangenheit):
+        # vor der Landung sind die Roster-Instants PLANWERTE — der Vorfall vom
+        # 12.08. (iOS-Ampel-Runde, LH402 AIRBORNE): recap lieferte 13:00-18:00
+        # als actual_* bei delay_min 25 und der Client faerbte 'puenktlich'.
+        # Ein 'actual' aus der Zukunft ist per Definition nicht gemessen.
+        from datetime import datetime as _dtc, timezone as _tzc
+        if (rdep is not None and rarr is not None
+                and rarr <= _dtc.now(_tzc.utc)):
             bm = int(round((rarr - rdep).total_seconds() / 60.0))
             if 0 < bm <= 20 * 60:
                 block_min = bm
@@ -10621,6 +10628,26 @@ def ax_flight_recap(token):
                 # zwischen zwei Zeiten, die 12:20 auseinanderliegen).
                 actual_dep = rdep.isoformat()
                 actual_arr = rarr.isoformat()
+    # ── KEINE ZUKUNFT ALS IST (Keine-Fake-Werte-Regel) ────────────────────
+    # Auch die Board-Seite (`esti_*`) kann waehrend des Flugs eine SCHAETZUNG
+    # oder ein Plan-Echo tragen. Ein Recap ist die Post-Flight-Wahrheit:
+    # liegt der Ankunfts-Instant in der Zukunft, wird actual_arr (und die
+    # daraus abgeleitete Blockzeit) NICHT ausgeliefert.
+    from datetime import datetime as _dtc, timezone as _tzc
+    _now_utc = _dtc.now(_tzc.utc)
+    if actual_arr:
+        _au_chk = _local_to_utc(actual_arr, dest) if dest else None
+        if _au_chk is None:
+            try:
+                _au_chk = _dtc.fromisoformat(
+                    str(actual_arr).replace('Z', '+00:00'))
+                if _au_chk.tzinfo is None:
+                    _au_chk = _au_chk.replace(tzinfo=_tzc.utc)
+            except Exception:
+                _au_chk = None
+        if _au_chk is not None and _au_chk > _now_utc:
+            actual_arr = None
+            block_min = None
     payload = {
         'ok': True, 'flight': flight_no, 'date': date,
         'dep': _airport_brief(dep), 'dest': _airport_brief(dest),
