@@ -18193,8 +18193,8 @@ def get_friends_today(token):
     """
     from datetime import date as _date
     import time as _time
-    from blueprints.aerox_data_blueprint import (_route_label_cities, _iata_city_name,
-                                                 _aircraft_live_pos)
+    from blueprints.aerox_data_blueprint import (
+        _route_label_cities, _iata_city_name, _crew_live_pos_free_first)
     # TZ-Fix (Sweep J7 2026-07-10): Default-„heute" = Berliner Betriebstag
     # (die Roster-`datum`-Keys sind Homebase-Tage), NICHT Server-UTC — zwischen
     # 00:00–02:00 CEST zeigte der UTC-Default sonst den Vortag und der 90s-Memo
@@ -18646,8 +18646,9 @@ def get_friends_today(token):
                             # fliegende Nummer die Position des NACHBARTAGES.
                             # Dieselbe Schranke, die `_flights_live_obs_wrong_day`
                             # eine Zeile höher für die Board-Obs zieht.
-                            _cp, _cr, _crg, _cty = _aircraft_live_pos(
-                                flight=fno, dep=_arr_ia,
+                            _cp, _cr, _crg, _cty = _crew_live_pos_free_first(
+                                fno, _dep_ia, _arr_ia,
+                                reg=(m.get('reg') or None),
                                 sched_dep_iso=_leg_dep_iso)
                             if _cp and not _cp.get('on_ground'):
                                 _clp = {'lat': _cp.get('lat'), 'lon': _cp.get('lon'),
@@ -18660,11 +18661,19 @@ def get_friends_today(token):
                                 _fr24_live_card_cached,
                                 _fr24_operational_times,
                                 _canonical_operational_times)
-                            _friend_card = _fr24_live_card_cached(
-                                flight_no=fno, reg=(m.get('reg') or _crg),
-                                lat=(_cp or {}).get('lat'),
-                                lon=(_cp or {}).get('lon'),
-                                origin=_dep_ia, dest=_arr_ia)
+                            # Der gezielte Korridor-Fill hat seine FR24-Details
+                            # (inkl. ETA) bereits kostenlos mitgeladen. Nur wenn
+                            # der Fix aus NAS/Store kam, braucht es den geteilten
+                            # Detail-Resolver. So bleiben Position und Ankunft
+                            # aus EINER Beobachtung und es gibt keinen Doppelcall.
+                            _friend_card = ((_cp or {}).get('_fr24_card')
+                                            or _fr24_live_card_cached(
+                                                flight_no=fno,
+                                                callsign=(_cp or {}).get('callsign'),
+                                                reg=(m.get('reg') or _crg),
+                                                lat=(_cp or {}).get('lat'),
+                                                lon=(_cp or {}).get('lon'),
+                                                origin=_dep_ia, dest=_arr_ia))
                             _friend_fr = _fr24_operational_times(
                                 _friend_card, _dep_ia, _arr_ia)
                         except Exception:
@@ -18693,6 +18702,10 @@ def get_friends_today(token):
                                 airborne=bool(_clp), landed=_friend_landed)
                         except Exception:
                             _friend_times = _friend_official
+                        _canonical_arr_delay = _friend_times.get('arr_delay_min')
+                        _friend_arr_delay = (_canonical_arr_delay
+                                             if _canonical_arr_delay is not None
+                                             else m.get('arr_delay_min'))
                         # est_*/sched_*: Board-Zeiten stehen in STATIONS-Ortszeit
                         # (dep mit airport_tz(from), arr mit airport_tz(to)) → hier
                         # genau EINMAL nach echt-UTC (…Z) wandeln, damit iOS sie wie
@@ -18704,10 +18717,14 @@ def get_friends_today(token):
                             'flight': fno,
                             'dep_iata': _dep_ia, 'arr_iata': _arr_ia,
                             'dep_delay_min': m.get('dep_delay_min'),
-                            'arr_delay_min': m.get('arr_delay_min'),
-                            'delay_min': m.get('delay_min'),
-                            'delay_side': m.get('delay_side'),
-                            'delay_known': bool(m.get('delay_known')),
+                            'arr_delay_min': _friend_arr_delay,
+                            'delay_min': (_friend_arr_delay
+                                          if _canonical_arr_delay is not None
+                                          else m.get('delay_min')),
+                            'delay_side': ('arr' if _canonical_arr_delay is not None
+                                           else m.get('delay_side')),
+                            'delay_known': bool(m.get('delay_known')
+                                                or _canonical_arr_delay is not None),
                             'status': m.get('status'),
                             'cancelled': m.get('cancelled'),
                             'sched_dep_iso': _board_local_to_utc_iso(

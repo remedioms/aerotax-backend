@@ -605,6 +605,23 @@ def test_canonical_running_flight_takes_fr24_ist_abflug_als_lueckenfueller():
     assert out['dep_source'] == 'fr24'
 
 
+def test_canonical_delay_uses_same_fr24_eta_as_displayed_arrival():
+    """LH732-Repro: Plan 15:05, FR24-ETA 14:38 und Board-ETA 14:32.
+    Sobald 14:38 gewinnt, ist der dazugehoerige Delay -27 — nie mehr -33."""
+    official = {
+        'sched_arr': '2026-08-13T15:05:00',
+        'est_arr': '2026-08-13T14:32:00',
+    }
+    fr24 = {'est_arr': '2026-08-13T14:38:00'}
+
+    out = axd._canonical_operational_times(
+        official, fr24, airborne=True, landed=False)
+
+    assert out['est_arr'] == '2026-08-13T14:38:00'
+    assert out['arr_source'] == 'fr24'
+    assert out['arr_delay_min'] == -27
+
+
 def test_canonical_landed_flight_prefers_lh_actual_arrival_over_fr24():
     """QUELLEN-STAFFELUNG (Scraper→LH→FR24, hoeherer Tier gewinnt): liegen ZWEI
     Ist-Ankuenfte vor, gewinnt die offizielle (LH `ActualTimeUTC`, 18:39) — nicht

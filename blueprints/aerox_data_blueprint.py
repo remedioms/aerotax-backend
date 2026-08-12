@@ -432,7 +432,11 @@ def _nas_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_s=2100
     pos = {'lat': p.get('lat'), 'lon': p.get('lon'),
            'track': p.get('track'), 'gs': p.get('gs_kt'), 'alt': p.get('alt_ft'),
            'on_ground': bool(p.get('on_ground')),
-           'source': 'aircraft_live_nas', 'seen_ts': p.get('seen_ts')}
+           'source': 'aircraft_live_nas', 'seen_ts': p.get('seen_ts'),
+           # Der NAS speichert den echten ICAO-Funknamen bereits. Ihn hier
+           # wegzulassen zwang Friends/Feed später zu einem unsicheren Match
+           # nur über Flugnummer/Reg, während Radar exakt `DLH732` verwendete.
+           'callsign': ((p.get('callsign') or '').strip().upper() or None)}
     reg_disp = (p.get('reg_display') or p.get('reg') or '').strip().upper() or None
     ac_type = (p.get('ac_type') or '').strip().upper() or None
     return pos, (src, dst), reg_disp, ac_type
@@ -804,11 +808,12 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
 def _free_crew_live_pos(flight, dep_iata, arr_iata):
     """Gezielter, GRATIS Live-Fill für einen nachweislich aktuellen Crew-Leg.
 
-    Der normale Weg bleibt der schnelle NAS/Supabase-Read. Nur bei dessen Miss
-    ruft ``build_live_lookup`` diese Funktion auf. Sie nimmt Callsign/echte Reg
-    aus dem letzten *route-konsistenten* aircraft_live-Snapshot und sucht genau
-    diese Maschine im freien FR24-gRPC-Korridor dep→arr. Dadurch kann ein alter
-    Roster-Tail niemals einen gerade völlig anderen Flug liefern.
+    Der normale Weg bleibt der schnelle NAS/Supabase-Read. Bei dessen Miss oder
+    einem belegbar mehr als drei Minuten alten Fix ruft ``build_live_lookup``
+    diese Funktion auf. Sie nimmt Callsign/echte Reg aus dem letzten
+    *route-konsistenten* aircraft_live-Snapshot und sucht genau diese Maschine
+    im freien FR24-gRPC-Korridor dep→arr. Dadurch kann ein alter Roster-Tail
+    niemals einen gerade völlig anderen Flug liefern.
 
     Fällt der direkte freie Abruf kurz aus, geben wir den letzten passenden Fix
     mit seiner ECHTEN alten ``seen_ts`` zurück. Consumer können ihn sichtbar als
@@ -879,7 +884,35 @@ def _free_crew_live_pos(flight, dep_iata, arr_iata):
                                       or (alt is None and
                                           (not isinstance(gs, (int, float)) or gs < 80))),
                     'source': 'fr24_grpc_corridor', 'seen_ts': seen,
+                    'callsign': (str(live.get('callsign') or callsign or '')
+                                 .strip().upper() or None),
                 })
+                # `inbound_by_route` hat für diesen einen freien Abruf bereits
+                # dieselbe FR24-Detailantwort (inkl. ETA) geladen. Intern an den
+                # Fix hängen, damit der Feed nicht unmittelbar noch einmal nach
+                # denselben Daten fragt. Der Warm-Store unten persistiert dieses
+                # Hilfsfeld bewusst nicht.
+                corridor_card = {
+                    k: v for k, v in {
+                        'sched_dep': live.get('sched_dep'),
+                        'actual_dep': live.get('actual_dep'),
+                        'sched_arr': live.get('sched_arr'),
+                        'actual_arr': live.get('actual_arr'),
+                        'eta': live.get('eta'),
+                        'flight_stage': live.get('flight_stage'),
+                        'route_from': src, 'route_to': dst,
+                        'reg': live.get('reg') or stale_reg,
+                        'source': live.get('source') or 'fr24_grpc_corridor',
+                    }.items() if v is not None
+                }
+                # War `flight_details` innerhalb des Korridorabrufs kurz leer,
+                # enthält die Karte nur Route/Reg. Dann NICHT als vollständigen
+                # Detailtreffer markieren: der geteilte Resolver darf einmal
+                # nachziehen. Nur echte operative Felder vermeiden den Doppelcall.
+                if any(corridor_card.get(k) is not None for k in (
+                        'sched_dep', 'actual_dep', 'sched_arr', 'actual_arr',
+                        'eta', 'flight_stage')):
+                    pos['_fr24_card'] = corridor_card
                 reg_disp = (str(live.get('reg') or stale_reg or '').strip().upper()
                             or None)
                 ac_type = ((stale or {}).get('ac_type') or '').strip().upper() or None
@@ -914,6 +947,7 @@ def _free_crew_live_pos(flight, dep_iata, arr_iata):
             'track': stale.get('track'), 'gs': stale.get('gs_kt'),
             'alt': stale.get('alt_ft'), 'on_ground': bool(stale.get('on_ground')),
             'source': 'aircraft_live_last_known', 'seen_ts': stale.get('seen_ts'),
+            'callsign': callsign,
         })
         result = (pos, (dep, arr), stale_reg,
                   ((stale.get('ac_type') or '').strip().upper() or None))
@@ -925,6 +959,57 @@ def _free_crew_live_pos(flight, dep_iata, arr_iata):
                                      key=lambda item: item[1][0])[:100]:
                 _FREE_CREW_LIVE_MEMO.pop(old_key, None)
     return result or (None, None, None, None)
+
+
+def _crew_live_pos_free_first(flight, dep_iata, arr_iata, reg=None,
+                              sched_dep_iso=None, refresh_after_min=3):
+    """Jüngster kostenloser Fix EINER Crew-Fluginstanz.
+
+    ``aircraft_live`` bleibt der schnelle Primärpfad. Ein dort vorhandener Fix
+    durfte bisher aber bis zu 35 Minuten alt sein; genau deshalb zeigte der
+    Feed LH732 zwölf Minuten hinter Radar, obwohl der gezielte kostenlose
+    FR24-Korridor schon einen aktuellen Punkt kannte. Ab drei Minuten Alter
+    wird derselbe kurz memoiserte Korridor-Nachschlag wie beim Store-Miss
+    versucht. Er ersetzt den vorhandenen Fix nur, wenn sein echter
+    Beobachtungsstempel neuer ist. Miss/Fehler behalten das ehrliche LKG.
+
+    Rückgabe-Shape bleibt identisch zu ``_aircraft_live_pos``. Kein Paid-Pfad.
+    """
+    primary = _aircraft_live_pos(
+        reg=reg, flight=flight, dep=arr_iata,
+        sched_dep_iso=sched_dep_iso)
+    pos = primary[0]
+    if pos and not _pos_is_stale(pos, refresh_after_min):
+        return primary
+
+    candidate = _free_crew_live_pos(flight, dep_iata, arr_iata)
+    cand_pos = candidate[0]
+    if cand_pos and not _live_pos_instance_ok(cand_pos, sched_dep_iso):
+        candidate = (None, None, None, None)
+        cand_pos = None
+    if not pos:
+        return candidate
+    if not cand_pos:
+        return primary
+
+    def _observed_epoch(value):
+        if not isinstance(value, dict):
+            return None
+        raw = value.get('obs_ts')
+        if raw is None:
+            raw = value.get('seen_ts')
+        if raw is None:
+            raw = value.get('ts')
+        return _iso_to_epoch(raw)
+
+    primary_ts = _observed_epoch(pos)
+    candidate_ts = _observed_epoch(cand_pos)
+    # Ein vorhandener zeitgestempelter Fix darf nie durch einen Kandidaten ohne
+    # beweisbare Beobachtungszeit ersetzt werden. Bei zwei belegten Fixes gewinnt
+    # ausschließlich der jüngere; Gleichstand bleibt deterministisch primär.
+    if candidate_ts is not None and (primary_ts is None or candidate_ts > primary_ts):
+        return candidate
+    return primary
 
 
 def _aircraft_live_flight(flight=None, callsign=None, max_age_min=40):
@@ -5606,6 +5691,26 @@ def _canonical_operational_times(official, fr24, airborne=False, landed=False):
     elif actual_arr or est_arr or sched_arr:
         arr_source = 'official'
 
+    def _arrival_delay_minutes(current, scheduled):
+        """Delay aus genau den zwei Werten, die wir auch anzeigen.
+
+        Beide Werte sind bereits Stations-Lokalzeit derselben Ankunftsstation;
+        ihre Differenz ist daher auch ohne Zone korrekt. Das verhindert den
+        LH732-Mix „FR24 ETA 14:38" plus Board-Delay -33 (das zu 14:32 gehoert).
+        """
+        try:
+            from datetime import datetime as _dt5
+            cur = _dt5.fromisoformat(str(current).replace('Z', '+00:00'))
+            sch = _dt5.fromisoformat(str(scheduled).replace('Z', '+00:00'))
+            if (cur.tzinfo is None) != (sch.tzinfo is None):
+                return None
+            minutes = int(round((cur - sch).total_seconds() / 60.0))
+            return minutes if abs(minutes) <= 20 * 60 else None
+        except Exception:
+            return None
+
+    arr_delay_min = _arrival_delay_minutes(actual_arr or est_arr, sched_arr)
+
     return {
         'sched_dep': sched_dep,
         'est_dep': est_dep,
@@ -5617,6 +5722,7 @@ def _canonical_operational_times(official, fr24, airborne=False, landed=False):
         'official_est_arr': o.get('est_arr'),
         'dep_source': dep_source,
         'arr_source': arr_source,
+        'arr_delay_min': arr_delay_min,
     }
 
 

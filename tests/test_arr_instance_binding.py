@@ -472,6 +472,71 @@ def test_build_live_lookup_gated_auch_den_gRPC_fill(monkeypatch):
     assert lk('LH712', 'FRA', 'ICN', None, LH712_LEG_HEUTE) is not None
 
 
+def test_crew_live_pos_refreshes_stale_store_with_newer_free_fix(monkeypatch):
+    """LH732-Repro: ein vorhandener 12-min-LKG darf den gezielten kostenlosen
+    Korridor nicht mehr blockieren. Nur der nachweislich neuere Fix gewinnt."""
+    old = '2026-08-12T20:30:00Z'
+    fresh = '2026-08-12T20:41:00Z'
+    monkeypatch.setattr(AXD, '_pos_is_stale', lambda pos, minutes: True)
+    monkeypatch.setattr(
+        AXD, '_aircraft_live_pos',
+        lambda **kw: ({**_pos(old), 'lat': 48.20, 'lon': 16.37},
+                      ('FRA', 'PVG'), 'D-AIXF', 'A359'))
+    calls = []
+
+    def _free(*args):
+        calls.append(args)
+        return ({**_pos(fresh), 'lat': 47.31, 'lon': 20.16,
+                 'source': 'fr24_grpc_corridor'},
+                ('FRA', 'PVG'), 'D-AIXF', 'A359')
+
+    monkeypatch.setattr(AXD, '_free_crew_live_pos', _free)
+
+    out = AXD._crew_live_pos_free_first(
+        'LH732', 'FRA', 'PVG', reg='D-AIXF', sched_dep_iso=None)
+
+    assert calls == [('LH732', 'FRA', 'PVG')]
+    assert out[0]['lat'] == 47.31
+    assert out[0]['seen_ts'] == fresh
+    assert out[0]['source'] == 'fr24_grpc_corridor'
+
+
+def test_crew_live_pos_keeps_store_when_free_fix_is_older(monkeypatch):
+    """Der Nachschlag ist fail-soft: ein alter Korridor-LKG teleportiert die
+    Crew nie rueckwaerts, auch wenn der primaere Fix den Refresh ausloeste."""
+    primary = {**_pos('2026-08-12T20:35:00Z'), 'lat': 48.0, 'lon': 17.0}
+    older = {**_pos('2026-08-12T20:20:00Z'), 'lat': 50.0, 'lon': 10.0}
+    monkeypatch.setattr(AXD, '_pos_is_stale', lambda pos, minutes: True)
+    monkeypatch.setattr(
+        AXD, '_aircraft_live_pos',
+        lambda **kw: (primary, ('FRA', 'PVG'), 'D-AIXF', 'A359'))
+    monkeypatch.setattr(
+        AXD, '_free_crew_live_pos',
+        lambda *a: (older, ('FRA', 'PVG'), 'D-AIXF', 'A359'))
+
+    out = AXD._crew_live_pos_free_first('LH732', 'FRA', 'PVG')
+
+    assert out[0]['lat'] == 48.0
+    assert out[0]['seen_ts'] == primary['seen_ts']
+
+
+def test_crew_live_pos_fresh_store_avoids_corridor_call(monkeypatch):
+    """Kosten-/Last-Riegel: ein belegbar frischer Store-Fix bleibt O(1) und
+    startet keinen zusaetzlichen kostenlosen gRPC-Aufruf."""
+    primary = {**_pos('2026-08-12T20:41:30Z'), 'lat': 47.5, 'lon': 19.0}
+    monkeypatch.setattr(AXD, '_pos_is_stale', lambda pos, minutes: False)
+    monkeypatch.setattr(
+        AXD, '_aircraft_live_pos',
+        lambda **kw: (primary, ('FRA', 'PVG'), 'D-AIXF', 'A359'))
+    monkeypatch.setattr(
+        AXD, '_free_crew_live_pos',
+        lambda *a: pytest.fail('fresh store must not call corridor'))
+
+    out = AXD._crew_live_pos_free_first('LH732', 'FRA', 'PVG')
+
+    assert out[0]['lat'] == 47.5
+
+
 def test_resolver_gibt_den_soll_abflug_an_den_lookup(monkeypatch):
     """Der Resolver kennt den Soll-Abflug (`_norm_legs` macht daraus eine
     aware-UTC-Zeit) und muss ihn weiterreichen — sonst nuetzt der Riegel im

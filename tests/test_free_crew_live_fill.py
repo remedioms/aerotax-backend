@@ -2,6 +2,7 @@
 verschwinden noch über einen veralteten Roster-Tail zu einem fremden Flug springen.
 Alle getesteten Nachladepfade sind der anonyme FR24-gRPC-Korridor (kein paid API).
 """
+import json
 from types import SimpleNamespace
 
 import app
@@ -58,6 +59,7 @@ def test_targeted_free_corridor_refreshes_and_warms_store(monkeypatch):
         'lat': 44.20, 'lon': -67.85, 'track': 250, 'alt': 38000,
         'speed': 472, 'route_from': 'FRA', 'route_to': 'BOS',
         'reg': 'D-ABYH', 'callsign': 'DLH7K', 'obs_ts': 1784061240,
+        'eta': 1784071800, 'flight_stage': 'AIRBORNE',
     }
     monkeypatch.setattr(DATA, '_sb', lambda: sb)
     monkeypatch.setattr(DATA, '_iata_latlon', _airports)
@@ -68,6 +70,9 @@ def test_targeted_free_corridor_refreshes_and_warms_store(monkeypatch):
     pos, route, reg, typ = DATA._free_crew_live_pos('LH422', 'FRA', 'BOS')
     assert (pos['lat'], pos['lon']) == (44.20, -67.85)
     assert pos['source'] == 'fr24_grpc_corridor'
+    assert pos['_fr24_card']['route_from'] == 'FRA'
+    assert pos['_fr24_card']['route_to'] == 'BOS'
+    assert pos['_fr24_card']['eta'] == 1784071800
     assert pos['seen_ts'] and route == ('FRA', 'BOS')
     assert reg == 'D-ABYH' and typ == 'B748'
     assert len(calls) == 1
@@ -78,6 +83,33 @@ def test_targeted_free_corridor_refreshes_and_warms_store(monkeypatch):
     # kein zweiter externer Call.
     again = DATA._free_crew_live_pos('LH422', 'FRA', 'BOS')
     assert again[0]['lon'] == -67.85 and len(calls) == 1
+
+
+def test_nas_live_position_preserves_real_callsign(monkeypatch):
+    """LH732-Repro: der schnelle NAS-Pfad darf `DLH732` nicht abschneiden,
+    weil Radar und Feed sonst verschiedene FR24-Identitäten auflösen."""
+    payload = {'found': True, 'pos': {
+        'lat': 47.31, 'lon': 20.16, 'track': 92, 'gs_kt': 511,
+        'alt_ft': 37000, 'on_ground': False,
+        'origin': 'FRA', 'dest': 'PVG', 'reg_display': 'D-AIXF',
+        'callsign': 'dlh732', 'seen_ts': '2026-08-12T20:41:48Z',
+    }}
+
+    class _Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return json.dumps(payload).encode()
+
+    monkeypatch.setenv('NAS_LIVE_URL', 'https://nas.invalid/live')
+    monkeypatch.setattr(DATA.urllib.request, 'urlopen',
+                        lambda *a, **k: _Response())
+    DATA._NAS_DOWN_UNTIL[0] = 0
+
+    pos, route, reg, _ = DATA._nas_live_pos(
+        flight='LH732', dep='PVG')
+
+    assert pos['callsign'] == 'DLH732'
+    assert route == ('FRA', 'PVG') and reg == 'D-AIXF'
 
 
 def test_wrong_route_candidate_never_replaces_last_known(monkeypatch):
@@ -125,4 +157,3 @@ def test_overview_merges_grpc_even_when_store_has_some_aircraft(monkeypatch):
     assert body['count'] == 3
     lh422 = [x for x in body['aircraft'] if x.get('reg') == 'D-ABYH']
     assert len(lh422) == 1 and lh422[0]['lon'] == -67.85
-

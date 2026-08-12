@@ -1842,10 +1842,8 @@ def build_live_lookup():
     wie bisher (fail-open)."""
     def _lookup(flight_no, dep_iata, arr_iata, reg=None, sched_dep_iso=None):
         try:
-            from blueprints.aerox_data_blueprint import (_aircraft_live_pos,
-                                                         _free_crew_live_pos,
+            from blueprints.aerox_data_blueprint import (_crew_live_pos_free_first,
                                                          _iata_latlon)
-            from blueprints.leg_status_gate import live_pos_same_instance
         except Exception:
             return None
         try:
@@ -1854,32 +1852,17 @@ def build_live_lookup():
             # zurück, wenn der Welt-Harvester den Korridor per Flugnummer noch
             # nicht erfasst hat. Der Store normalisiert 'D-ABYN' → 'DABYN' intern
             # (re.sub[^A-Z0-9]) und findet so die bindestrich-lose Store-Row.
-            pos, _rt, live_reg, _ty = _aircraft_live_pos(
-                reg=reg, flight=flight_no, dep=arr_iata,
+            pos, _rt, live_reg, _ty = _crew_live_pos_free_first(
+                flight_no, dep_iata, arr_iata, reg=reg,
                 sched_dep_iso=sched_dep_iso)
             reg = live_reg or reg
-            if not pos:
-                # Der Welt-Harvester ist Round-robin und kann genau diesen
-                # Korridor kurz verpasst haben. Ein gezielter, kurz memoiserter
-                # GRATIS-gRPC-Fill sucht den Leg über Flug+Route; bei Ausfall
-                # liefert er höchstens den echten, zeitgestempelten LKG-Fix.
-                pos, _rt, _free_reg, _ty = _free_crew_live_pos(
-                    flight_no, dep_iata, arr_iata)
-                # Derselbe Instanz-Riegel: auch dieser Fill keyt NUR über
-                # Flugnummer/Route, kennt also kein Datum, und liefert im
-                # Zweifel den LKG-Fix der Vor-Instanz mit echter (alter)
-                # `seen_ts`. Ohne Soll-Zeit fail-open wie gehabt.
-                if pos and not live_pos_same_instance(pos.get('seen_ts'),
-                                                      sched_dep_iso):
-                    pos = None
-                else:
-                    reg = _free_reg or reg
             if not pos or pos.get('lat') is None or pos.get('lon') is None:
                 return None
             out = {'lat': float(pos['lat']), 'lon': float(pos['lon']),
                    'track': pos.get('track'), 'gs': pos.get('gs'),
                    'ts': pos.get('seen_ts'),
                    'source': pos.get('source') or 'aircraft_live',
+                   'callsign': pos.get('callsign'),
                    'on_ground': bool(pos.get('on_ground')),
                    'near_dep': False, 'near_arr': False, 'reg': reg}
             if out['on_ground']:

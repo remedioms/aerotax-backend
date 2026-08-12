@@ -163,7 +163,8 @@ OBS = {
 # ECHTE aircraft_live-Position NUR für Kais Maschine (über dem Atlantik).
 LIVE_POS_LH400 = {'lat': 50.03, 'lon': -20.5, 'track': 285.0, 'gs': 462.0,
                   'alt': 36000, 'on_ground': False,
-                  'seen_ts': '2026-07-09T09:58:20Z', 'source': 'aircraft_live'}
+                  'seen_ts': '2026-07-09T09:58:20Z', 'source': 'aircraft_live',
+                  'callsign': 'DLH400'}
 
 
 def _fake_obs_merged(flight_no, date=None, dep_iata=None, arr_iata=None,
@@ -192,7 +193,7 @@ def _pin_app_module():
 
 
 def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False,
-                   snapshot_reader=None, facts_fn=None):
+                   snapshot_reader=None, facts_fn=None, fr24_card_fn=None):
     """Der ECHTE Endpoint mit komplett injizierten Daten + Frozen-Clock."""
     snapshot_reader = snapshot_reader or (lambda fr: SNAPSHOTS.get(fr))
     facts_fn = facts_fn or (lambda *a, **k: {})
@@ -213,7 +214,7 @@ def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False,
          patch('blueprints.aerox_data_blueprint._aircraft_live_pos',
                side_effect=_fake_aircraft_live_pos), \
          patch('blueprints.aerox_data_blueprint._fr24_live_card_cached',
-               return_value=None), \
+               side_effect=fr24_card_fn or (lambda **kw: None)), \
          patch.dict(A._store, {}, clear=True):
         A._FRIENDS_TODAY_MEMO.clear()
         with A.app.test_request_context(
@@ -248,6 +249,23 @@ def test_friends_today_is_deterministic_across_runs():
     a = _call_endpoint()
     b = _call_endpoint()
     assert a == b, 'friends-today ist nicht deterministisch (Fund melden!)'
+
+
+def test_friends_today_reicht_echten_callsign_an_live_detail_weiter():
+    """LH732-Repro: Radar fand `DLH732` und damit ETA 14:38, der Feed fragte
+    nur mit `LH732`/Reg an und blieb bei 14:32. Dieselbe beobachtete Identitaet
+    muss denselben FR24-Resolver speisen."""
+    seen = []
+
+    def _card(**kwargs):
+        seen.append(kwargs)
+        return None
+
+    _call_endpoint(fr24_card_fn=_card)
+
+    kai = next(c for c in seen if c.get('flight_no') == 'LH400')
+    assert kai['callsign'] == 'DLH400'
+    assert kai['origin'] == 'FRA' and kai['dest'] == 'JFK'
 
 
 def test_friends_today_disables_http_cache():
