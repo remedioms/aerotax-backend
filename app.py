@@ -53748,13 +53748,78 @@ def _ics_classify_from_categories(categories):
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SWISS-DIENST-KÜRZEL — DIE eine Tabelle (Spiegel von `SwissRoster.
+# dutyCodeStems`, iOS `AeroTax/Models/SwissRoster.swift`)
+# ─────────────────────────────────────────────────────────────────────────────
+# SWISS schreibt Bereitschaftstage als `<STAMM>-<FLOTTE>`: `SBY-32S`,
+# `SBY-BCS`, `APSBY-32S`, `APSBY-BCS`. Der Teil HINTER dem Bindestrich ist die
+# Flotten-/Qualifikations-Kennung (`32S` = A320-Familie, `BCS` = A220/
+# C-Series) — er sieht aus wie ein IATA-Code, ist aber KEINE Station.
+#
+# Der KONTEXT entscheidet, nie der Code allein: gesperrt wird niemals `BCS`,
+# sondern nur das Paar „bekannter Dienst-Stamm links vom Bindestrich". Ein
+# echtes Leg `MIA-BCS` bleibt ein Flug.
+#
+# Belege je Eintrag (nichts geraten):
+#   • SBY / SBYAD / RESX / RES     — SWISS-iCal, seit 2026-07-17 dokumentiert
+#   • APSBY / APSB / STBY          — Ivan Delcev (SWISS PU), 2026-07-18
+#   • APSBY-BCS                    — Jan Pronk (SWISS ZRH), Prod 2026-08-10
+#   • SBY-BCS                      — Daniel (SWISS-Kabine), 2026-08-12
+#
+# Erweiterung = reine DATEN-Ergänzung hier (Daniels vollständige SWISS-
+# Standby-Code-Liste ist angekündigt). Beim Ergänzen die iOS-Tabelle
+# mitziehen — beide Seiten lesen dieselben Roster-Strings.
+_SWISS_DUTY_CODE_STEMS = frozenset({
+    'SBY',      # Standby (Home / All Destinations)
+    'SBYAD',    # Standby All Destinations
+    'APSBY',    # Airport-Standby
+    'APSB',     # Airport-Standby (Kurzform)
+    'STBY',     # Standby (ausgeschriebene Kurzform, auch „A/P STBY")
+    'RES',      # Reserve
+    'RESX',     # Reserve
+})
+
+
+def _strip_swiss_duty_codes(text):
+    """Entfernt SWISS-Dienst-Kürzel-WÖRTER der Paar-Form `<STAMM>-<SUFFIX>`
+    aus einem (bereits uppercased) Marker/Summary — der Token-Wächter, damit
+    Flug-Erkenner die Flotten-Kennung nicht als Zielflughafen lesen.
+
+    Wörter OHNE Trenner (nacktes `SBY`, `RESX`) bleiben unangetastet: sie
+    können nie als Route gelesen werden. Flug-Segmente im selben gemergten
+    Summary bleiben stehen — ein aus dem Standby aktivierter Tag zählt seinen
+    Block also weiterhin (`SBY-BCS · LX1830 ZRH 0927 ATH 1259`).
+    Spiegel von `SwissRoster.strippingDutyCodes` (iOS)."""
+    up = text or ''
+    if '-' not in up:
+        return up
+    out = []
+    for word in up.split():
+        if '-' in word:
+            tokens = [t for t in re.split(r'[^A-Z0-9]+',
+                                          word.replace('A/P', 'AP')) if t]
+            if tokens and tokens[0] in _SWISS_DUTY_CODE_STEMS:
+                continue
+        out.append(word)
+    return ' '.join(out)
+
+
 def _ev_is_flight_leg(summary):
     """True wenn das Event ein echtes Flug-Leg ist (für EASA-Block). Deadheads,
     Briefings, Layover, Standby zählen NICHT als Block."""
     up = (summary or '').upper()
     if up.startswith('DH ') or 'DH LH' in up or 'DEADHEAD' in up:
         return False
-    if re.search(r'[A-Z]{3}\s*-\s*[A-Z]{3}', up):
+    # DIENST-KÜRZEL-WÄCHTER (Daniel, SWISS-Kabine, 2026-08-12; Jan Pronk
+    # 2026-08-10). Das ungeschützte Muster las die SWISS-Standby-Codes
+    # „SBY-BCS" UND „APSBY-BCS" als Route → jeder Bereitschaftstag zählte
+    # seine volle Dauer (Prod-Tag 03:00–10:00Z = 7 h) als EASA-BLOCK. Der
+    # iOS-Fix vom 10.08. hat diese Fläche nie erreicht. Zwei Schrauben, beide
+    # nötig: (1) Wortgrenzen — der Substring darf nicht mitten im Kürzel
+    # matchen; (2) der Token-Wächter für Kürzel, deren Paar frei am Anfang
+    # steht. Echte Legs („FRA-SKG", „LH 1286: FRA-SKG", „MIA-BCS") bleiben.
+    if re.search(r'\b[A-Z]{3}\s*-\s*[A-Z]{3}\b', _strip_swiss_duty_codes(up)):
         return True
     if re.match(r'^(LH|CL|EW|EN|LX|OS|SN|4Y)\s*\d', up):
         return True
