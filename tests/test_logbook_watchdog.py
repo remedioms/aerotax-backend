@@ -224,6 +224,42 @@ def test_try_parsers_routes_offblock_csv_by_content(tmp_path):
     }]
 
 
+def test_try_parsers_accepts_expense_statement_without_inventing_legs(
+        monkeypatch, tmp_path):
+    path = tmp_path / "expense.upload"
+    path.write_bytes(b"%PDF-expense")
+    text = ("Streckeneinsatz-Abrechnung\n"
+            "Datum Ab An Spesenanspruch stfrei\n17.07.2024 14:00")
+    monkeypatch.setattr(pdfplumber, "open",
+                        lambda _path: _FakePDF([_FakePage(text, [])]))
+    import parse_fcl050_v2
+    import parse_faa_logbook
+    monkeypatch.setattr(parse_fcl050_v2, "matches_pdf", lambda _path: False)
+    monkeypatch.setattr(parse_faa_logbook, "matches_pdf", lambda _path: False)
+    name, legs, sims, report = logbook_watchdog._try_parsers(str(path))
+    assert name == "informational_pdf"
+    assert legs == sims == []
+    assert report["document_type"] == "streckeneinsatzabrechnung"
+
+
+def test_try_parsers_accepts_aggregate_statistics_without_fake_legs(
+        monkeypatch, tmp_path):
+    path = tmp_path / "stats.upload"
+    path.write_bytes(b"%PDF-stats")
+    text = ("Flight Time and Landings\n"
+            "Total since entry: 3203:28 703\n")
+    monkeypatch.setattr(pdfplumber, "open",
+                        lambda _path: _FakePDF([_FakePage(text, [])]))
+    import parse_fcl050_v2
+    import parse_faa_logbook
+    monkeypatch.setattr(parse_fcl050_v2, "matches_pdf", lambda _path: False)
+    monkeypatch.setattr(parse_faa_logbook, "matches_pdf", lambda _path: False)
+    name, legs, sims, report = logbook_watchdog._try_parsers(str(path))
+    assert name == "informational_pdf"
+    assert legs == sims == []
+    assert report["document_type"] == "aggregate_flight_time_statistics"
+
+
 def test_try_parsers_routes_fcl050_before_generic_pdf(monkeypatch, tmp_path):
     import parse_fcl050_v2
     path = tmp_path / "fcl.upload"
@@ -249,6 +285,18 @@ def test_try_parsers_routes_faa_logbook_before_generic_pdf(
                         lambda _path: ([OLD[0]], [], report))
     assert logbook_watchdog._try_parsers(str(path)) == (
         "offblock_faa", [OLD[0]], [], report)
+
+
+def test_faa_generic_sim_twins_yield_to_descriptive_easa_rows():
+    sims = [
+        {"date": "2026-01-10", "code": "RC25_1", "duration_min": 240},
+        {"date": "2026-01-10", "code": "FSTD", "duration_min": 240},
+        # A second generic session has no descriptive twin and must survive.
+        {"date": "2026-01-10", "code": "FSTD", "duration_min": 180},
+    ]
+    kept, removed = logbook_watchdog.remove_generic_faa_sim_twins(sims)
+    assert removed == 1
+    assert kept == [sims[0], sims[2]]
 
 
 def test_try_parsers_routes_jeppesen_roster(monkeypatch, tmp_path):

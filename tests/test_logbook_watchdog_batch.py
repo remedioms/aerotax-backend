@@ -61,6 +61,9 @@ class Harness:
                     return "unsupported", None, None, None
                 if outcome == "control":
                     raise ValueError("Effektiv 0 != PDF 123 min")
+                if outcome == "informational":
+                    return ("informational_pdf", [], [],
+                            {"month": "flight-time-statistics"})
                 return "lh_flugstunden", list(outcome), [], dict(REPORT)
         raise AssertionError("unbekannter Blob im Test")
 
@@ -131,6 +134,16 @@ def test_control_violation_goes_to_review_not_user_failed(monkeypatch):
     assert h.statuses_for(8)[-1] == (w.STATUS_REVIEW, None)
     assert not h.pushes and not h.upserts
     assert events[0][0] == "review"
+
+
+def test_informational_pdf_completes_without_fake_import_or_push(monkeypatch):
+    h = Harness(monkeypatch, {18: (b"stats", "informational")})
+    events = []
+    w.process_token_batch("AT-TEST", [_row(18, b"stats")], events)
+    assert h.statuses_for(18)[-1] == (w.STATUS_COMPLETED, True)
+    assert not h.upserts and not h.pushes
+    assert events == [("informational", "AT-TEST", [18],
+                       "erkannt; enthält keine einzelnen Flugbuch-Legs")]
 
 
 def test_fcl_carryover_is_persisted_in_import_meta(monkeypatch):

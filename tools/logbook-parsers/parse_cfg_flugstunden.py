@@ -126,7 +126,7 @@ def classify_row(cells):
         if not cells.get("anr") or cells.get("dh"):
             raise ValueError(f"TC 00 ohne eindeutige ANR. FL-ZEIT: {label}")
         return "leg", None
-    if tc in ("01", "10"):
+    if tc in ("01", "10", "20"):
         if cells.get("faktor") not in (None, "0,00"):
             raise ValueError(f"TC {tc} mit FAKTOR {cells.get('faktor')!r}: "
                              f"{label}")

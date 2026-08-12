@@ -71,6 +71,11 @@ AIRPORT_COORDS = _airport_coordinates()
 AIRPORT_COORDS.update({
     "TXL": (52.5597, 13.2877),  # Berlin-Tegel (EDDT)
 })
+# SAP occasionally prints the Paris metropolitan code instead of a concrete
+# airport.  CDG's coordinates are a deterministic city-area proxy for the
+# sole use here: civil day/night classification at arrival time.
+if "PAR" not in AIRPORT_COORDS and "CDG" in AIRPORT_COORDS:
+    AIRPORT_COORDS["PAR"] = AIRPORT_COORDS["CDG"]
 
 
 def decimal_hours_minutes(value):

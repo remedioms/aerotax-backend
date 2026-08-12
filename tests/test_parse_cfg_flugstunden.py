@@ -1,7 +1,7 @@
 """Schutztests für die Condor-Flugstundenübersicht (parse_cfg_flugstunden).
 
 Synthetische Zellen/Wörter — keine echten Nutzerdaten. Die Regeln stammen
-aus Upload #238 (05/2026): TC 00 + FAKTOR 1,00 = Leg, TC 01/10 = Deadhead,
+aus Produktions-Uploads: TC 00 + FAKTOR 1,00 = Leg, TC 01/10/20 = Deadhead,
 Zeilen ohne TC = Tages-Status, `L` = Landung, Dezimalstunden.
 """
 
@@ -43,7 +43,7 @@ def test_operating_leg_is_classified_as_leg():
 
 
 def test_deadhead_codes_are_never_legs():
-    for tc in ("01", "10"):
+    for tc in ("01", "10", "20"):
         cells = _cells(tc=tc, faktor="0,00", anr=None, dh="1,22")
         assert PARSER.classify_row(cells)[0] == "dh"
 
@@ -91,6 +91,11 @@ def test_role_mapping_only_maps_documented_functions():
     # Kabinen-/unbekannte Funktionen werden FB, nie geraten PIC.
     assert PARSER.role_from_funktion("PU") == "FB"
     assert PARSER.role_from_funktion(None) == "FB"
+
+
+def test_paris_metropolitan_code_has_night_classification_coordinates():
+    assert PARSER.is_civil_night.__globals__["AIRPORT_COORDS"]["PAR"] == \
+        PARSER.is_civil_night.__globals__["AIRPORT_COORDS"]["CDG"]
 
 
 def test_extract_cells_respects_column_windows():

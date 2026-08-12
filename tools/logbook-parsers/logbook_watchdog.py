@@ -250,6 +250,26 @@ def _try_parsers(path):
         # kein transienter Backendfehler. ``unsupported`` setzt processed=true
         # und bittet den Nutzer idempotent einmal um einen erneuten Upload.
         return "unsupported", None, None, None
+    # Valid documents that contain useful accounting/aggregate information,
+    # but no individual flight facts.  They are accepted deliberately without
+    # inventing routes, flight numbers or block times.  The tax-document and
+    # roster paths can consume them in their proper context; the logbook job
+    # must not loop/error-mail merely because they were uploaded here.
+    if (re.search(r"Streckeneinsatz\s*-?\s*Abrechnung", text,
+                  re.IGNORECASE)
+            and re.search(r"\bDatum\b.*\bAb\b.*\bAn\b.*\bstfrei\b", text,
+                          re.IGNORECASE | re.DOTALL)):
+        return "informational_pdf", [], [], {
+            "month": "tax-expense-statement",
+            "document_type": "streckeneinsatzabrechnung",
+        }
+    if (re.search(r"(?im)^\s*Flight Time and Landings\s*$", text)
+            and re.search(r"(?im)^\s*Total since entry:\s*\d+:\d{2}\s+\d+",
+                          text)):
+        return "informational_pdf", [], [], {
+            "month": "flight-time-statistics",
+            "document_type": "aggregate_flight_time_statistics",
+        }
     if (parse_roster_logbook.ACK_KIND.search(text[:500])
             or ("Crew Assignment System" in text[:1500]
                 and ("Einsatzplan" in text[:1500]
@@ -373,6 +393,32 @@ def merge_sims(existing, new):
         by_key.setdefault(_sim_key(sim), sim)
     return sorted(by_key.values(),
                   key=lambda s: (s.get("date") or "", s.get("code") or ""))
+
+
+def remove_generic_faa_sim_twins(sims):
+    """Drop FAA's generic FSTD copy when a descriptive EASA row exists.
+
+    Logbook Pro exports the same simulator session twice across its EASA and
+    FAA layouts: EASA retains the course code (for example ``RC25_1``), while
+    FAA reduces it to ``FSTD``.  ``merge_sims`` cannot normally collapse
+    those because its code field deliberately distinguishes two genuine
+    same-day sessions.  Pair generic rows one-for-one with descriptive rows
+    that have the exact same date and duration; unpaired FSTD sessions remain.
+    """
+    descriptive = defaultdict(int)
+    for sim in sims or []:
+        if str(sim.get("code") or "").upper() != "FSTD":
+            descriptive[(sim.get("date"), sim.get("duration_min"))] += 1
+    kept, removed = [], 0
+    for sim in sims or []:
+        fact = (sim.get("date"), sim.get("duration_min"))
+        if (str(sim.get("code") or "").upper() == "FSTD"
+                and descriptive.get(fact, 0) > 0):
+            descriptive[fact] -= 1
+            removed += 1
+            continue
+        kept.append(sim)
+    return kept, removed
 
 
 def remove_fcl_sim_leg_artifacts(legs, sims):
@@ -615,7 +661,10 @@ def process_token_batch(token, rows, events, terminal=None):
                        "; ".join(f"#{i}: {m}" for i, m in review)))
         return
 
-    real = [f for f in parsed_files if "parser" in f]
+    informational = [f for f in parsed_files
+                     if f.get("parser") == "informational_pdf"]
+    real = [f for f in parsed_files if "parser" in f
+            and f.get("parser") != "informational_pdf"]
     dups = [f for f in parsed_files if "dup_of" in f]
 
     if real:
@@ -637,6 +686,10 @@ def process_token_batch(token, rows, events, terminal=None):
             events.append(("review", token, ids, str(ex)))
             return
         merged_sims = merge_sims(old_sims, new_sims)
+        faa_sim_twins = 0
+        if any(f["parser"] == "offblock_faa" for f in real):
+            merged_sims, faa_sim_twins = remove_generic_faa_sim_twins(
+                merged_sims)
         collisions = dedupe_for_reader(merged_legs)
         months = sorted({f["report"]["month"] for f in real})
         label = (f"Watchdog: {real[0]['parser']} {months[0]}–{months[-1]}"
@@ -666,6 +719,7 @@ def process_token_batch(token, rows, events, terminal=None):
                          "added_legs": added,
                          "roster_revision_legs_superseded": roster_superseded,
                          "fcl_sim_leg_artifacts_removed": fcl_cleanup,
+                         "faa_sim_twins_removed": faa_sim_twins,
                          "dedupe_suffixes": len(collisions),
                          "ts": datetime.now(timezone.utc).isoformat()},
         }
@@ -679,6 +733,12 @@ def process_token_batch(token, rows, events, terminal=None):
         events.append(("imported", token, [f["id"] for f in real],
                        f"+{added} Legs (gesamt {len(merged_legs)})"))
 
+    if informational:
+        info_ids = [f["id"] for f in informational]
+        _status(info_ids, STATUS_COMPLETED, processed=True)
+        events.append(("informational", token, info_ids,
+                       "erkannt; enthält keine einzelnen Flugbuch-Legs"))
+
     if unsupported:
         _status(unsupported, STATUS_FAILED, processed=True)
         events.append(("unsupported", token, unsupported, "Format unbekannt"))
@@ -690,7 +750,7 @@ def process_token_batch(token, rows, events, terminal=None):
     # completed ohne Push.
     failed_dups = []
     if dups:
-        real_ids = {f["id"] for f in real}
+        real_ids = {f["id"] for f in real + informational}
         failed_dups = [f["id"] for f in dups if f["dup_of"] in set(unsupported)]
         done_dups = [f["id"] for f in dups
                      if f["dup_of"] in real_ids or f["dup_of"] not in
