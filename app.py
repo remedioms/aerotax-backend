@@ -31843,9 +31843,19 @@ def _forum_public_image_url(u):
 # Owner 2026-08-12: die Sektion stand auf einem festen 7-Tage-Fenster und
 # rotierte darum tagelang nicht („sonst ändern sich die posts ja nie"). Jetzt
 # gestaffelt — erst die letzten 6 Stunden, sonst 24 Stunden, sonst die Woche.
-# Das tatsächlich benutzte Fenster geht als `window_hours` mit der Antwort raus;
-# der Client beschriftet die Sektion damit (Zustand, kein Hinweistext).
+# Das tatsächlich benutzte Fenster geht als `window_hours` mit der Antwort raus —
+# als DIAGNOSE-Feld. Der Client zeigt es NICHT an (Owner 2026-08-12: „keine
+# untertitel bitte keine hinweise etc"); die Sektion trägt nur ihren Titel.
 _FORUM_TRENDING_TIERS = (6, 24, 168)
+
+# Kurz-Memo der Fenster-Aggregate (Fenster-Spanne → (Ablauf, Ergebnis)). Die
+# Threads-Route wird gepollt (684 Aufrufe in 10 min gemessen, s. _etag_json) —
+# ohne Memo läge da pro Aufruf ein Satz Aktivitäts-Abfragen drauf. Der Inhalt
+# ist NICHT personalisiert (nur Thread-IDs + Zählungen, die Sichtbarkeits-
+# Filter greifen danach je Aufrufer), darum ist das Teilen unbedenklich.
+# 60 s Standzeit sind gegenüber einem 6-Stunden-Fenster irrelevant.
+_FORUM_ACTIVITY_MEMO = {}
+_FORUM_ACTIVITY_MEMO_TTL = 60.0
 
 
 def _forum_activity_since(cutoff_ts):
@@ -31860,6 +31870,13 @@ def _forum_activity_since(cutoff_ts):
     out = {}
     if not SB_AVAILABLE:
         return out
+
+    _now = time.time()
+    # Memo-Schlüssel ist die SPANNE (6/24/168 h), nicht der wandernde Cutoff.
+    _memo_key = round((_now - float(cutoff_ts or 0)) / 3600.0, 2)
+    _hit = _FORUM_ACTIVITY_MEMO.get(_memo_key)
+    if _hit and _hit[0] > _now:
+        return _hit[1]
 
     def _bump(key, idx):
         if not key:
@@ -31892,6 +31909,14 @@ def _forum_activity_since(cutoff_ts):
         except Exception as e:
             app.logger.warning(f'[forum-trending] activity_fail table={_tbl} '
                                f'err={type(e).__name__}: {str(e)[:120]}')
+    _FORUM_ACTIVITY_MEMO[_memo_key] = (_now + _FORUM_ACTIVITY_MEMO_TTL, out)
+    # Der Speicher kann nur so viele Einträge haben wie es Spannen gibt; ein
+    # abgelaufener Rest wird beim nächsten Lauf überschrieben. Trotzdem hart
+    # deckeln, damit ein Aufrufer mit krummen Spannen ihn nicht aufbläht.
+    if len(_FORUM_ACTIVITY_MEMO) > 32:
+        for _k, _v in list(_FORUM_ACTIVITY_MEMO.items()):
+            if _v[0] <= _now:
+                _FORUM_ACTIVITY_MEMO.pop(_k, None)
     return out
 
 
