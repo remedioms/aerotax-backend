@@ -35,7 +35,14 @@ RE_DATE = re.compile(r"^(\d{2})\.(\d{2})\.$")
 RE_FLIGHT = re.compile(r"^([A-Z]{2})(\d{3,4})(?:/\d{1,2})?$")
 RE_CLOCKS = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$")
 RE_SIM_DEVICE = re.compile(r"^(?:[A-Z]{3}[A-Z0-9]{3}|FT\d{2})$")
-RE_LEGACY_CABIN = re.compile(r"Funktion\s+FB\s*/\s*KABINE", re.IGNORECASE)
+# Kabinen-Layout: „Funktion FB / KABINE" (alt) ebenso wie „P1 / KABINE" usw.
+# (Owner-Fall 2026-08-12, Uploads #324/#325). Die Spaltengeometrie der neuen
+# Kabinen-Übersichten ist mit dem bestehenden Kabinen-Pfad deckungsgleich
+# (nachgemessen: BLOCK 328∈[315,350], DH 426∈[415,445], TC 287∈[280,305],
+# Summenzeile 196/319 in den Leseranges) — nur die Funktions-Kennung vor
+# „/ KABINE" variiert. Die Kennung wird als Rolle übernommen (FB, P1, …);
+# COCKPIT-Varianten (z.B. „CP / COCKPIT") matchen bewusst NICHT.
+RE_CABIN = re.compile(r"Funktion\s+([A-Z0-9]{1,3})\s*/\s*KABINE", re.IGNORECASE)
 CONTROL_ROUNDING_TOLERANCE_MIN = 3
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -210,7 +217,9 @@ def parse_pdf(path):
         if not header:
             raise ValueError(f"kein LH-Flugstundenübersicht-Kopf: {path}")
         month, year = map(int, header.groups())
-        legacy_cabin = RE_LEGACY_CABIN.search(text) is not None
+        cabin_match = RE_CABIN.search(text)
+        legacy_cabin = cabin_match is not None
+        cabin_role = cabin_match.group(1).upper() if cabin_match else None
         summary = _summary(pdf.pages[-1], month)
         legs, sims, deadheads = [], [], []
         source_rows = landing_marks = 0
@@ -297,7 +306,7 @@ def parse_pdf(path):
                     "block_min": block_min,
                     "reg": normalized_registration(raw_reg),
                     "type": actype or None,
-                    "role": "FB" if legacy_cabin else "FO",
+                    "role": cabin_role if legacy_cabin else "FO",
                     "remarks": (f"LH-Flugstundenübersicht {month:02d}/{year}; "
                                 + ("BLOCK-Zeit, OUT/IN UTC" if legacy_cabin
                                    else "FAKT-Minuten, OUT/IN UTC")),
