@@ -98,6 +98,20 @@ def _rate_limited(*, ip=None, token=None, endpoint='adsb', limit=60, window_sec=
     return False
 
 
+def _authenticated_request():
+    """True nur für einen serverseitig validierten AeroX-Bearer.
+
+    Ein bloß syntaktisch vorhandener Authorization-Header darf niemals einen
+    kostenpflichtigen Positionsabruf freischalten.
+    """
+    try:
+        from app import _request_bearer_token, _validate_token_exists
+        bearer = _request_bearer_token()
+        return bool(bearer and _validate_token_exists(bearer) is not None)
+    except Exception:
+        return False
+
+
 def _req_ip(req):
     """Client-IP hinter Cloudflare. CF-Connecting-IP ist der vom Proxy gesetzte,
     vertrauenswürdige Header. In X-Forwarded-For hängt der Proxy die echte IP
@@ -1398,6 +1412,9 @@ def get_adsb_state():
                           (Owner 2026-07-06: „die familie/freunde sind
                           wichtiger als ich — wenn es sein muss kann man mal
                           1 pingen"), gleiche Budget-Mechanik.
+        purpose=flight_deck — expliziter Tap im Flugdetail. Dieser neue Pfad
+                          schaltet den bezahlten Notnagel nur mit Bearer frei;
+                          Hintergrund-Polling setzt ihn niemals.
 
     Antwort 200:
         {"hex": "<hex>", "position": <openSky-row> | null, "fetched_at": <unix>, "cached": <bool>}
@@ -1421,8 +1438,10 @@ def get_adsb_state():
     # ?purpose=own|inbound|watch); Radar-Sweeps setzen nichts.
     own_raw = (request.args.get('own') or '').strip().lower()
     purpose = (request.args.get('purpose') or '').strip().lower()
+    has_bearer = _authenticated_request()
     targeted = (own_raw in ('1', 'true', 'yes')
-                or purpose in ('own', 'inbound', 'watch'))
+                or purpose in ('own', 'inbound', 'watch')
+                or (purpose == 'flight_deck' and has_bearer))
 
     if not hex_param and not reg_param:
         return jsonify({"error": "missing hex or reg parameter"}), 400

@@ -38,6 +38,9 @@ def _isolated(monkeypatch):
 
     # Kein echtes Rate-Limit / Supabase / Watch-Set / Backfill.
     monkeypatch.setattr(ADSB, '_rate_limited', lambda **k: False)
+    monkeypatch.setattr(
+        ADSB, '_authenticated_request',
+        lambda: bool((ADSB.request.headers.get('Authorization') or '').strip()))
     monkeypatch.setattr(ADSB, '_sb_client', lambda: (None, False))
     monkeypatch.setattr(ADSB, '_backfill_cache_from_sb', lambda h: None)
     monkeypatch.setattr(ADSB, '_touch_watch', lambda *a, **k: None)
@@ -153,6 +156,50 @@ def test_purpose_inbound_also_enables_tier3(client, monkeypatch):
     r = client.get('/api/adsb/state?hex=3c64a8&reg=D-AIPA&purpose=inbound')
     assert r.get_json()['source'] == 'adb'
     assert http.call_count == 1
+
+
+def test_flight_deck_click_enables_exactly_one_paid_fallback(client, monkeypatch):
+    """Nur der authentifizierte, explizite UI-Tap darf diesen Purpose nutzen."""
+    http = MagicMock(return_value=_adb_payload(age_s=30))
+    monkeypatch.setattr(ADSB, '_adb_position_http', http)
+
+    r = client.get(
+        '/api/adsb/state?hex=3c64a8&reg=D-AIPA&purpose=flight_deck',
+        headers={'Authorization': 'Bearer AT-test-user'},
+    )
+
+    assert r.status_code == 200
+    assert r.get_json()['source'] == 'adb'
+    assert http.call_count == 1
+
+
+def test_flight_deck_purpose_without_bearer_never_spends(client, monkeypatch):
+    http = MagicMock(return_value=_adb_payload(age_s=30))
+    monkeypatch.setattr(ADSB, '_adb_position_http', http)
+
+    r = client.get('/api/adsb/state?hex=3c64a8&reg=D-AIPA&purpose=flight_deck')
+
+    assert r.status_code == 200
+    assert r.get_json()['position'] is None
+    http.assert_not_called()
+    BPD._budget_key_inc.assert_not_called()
+
+
+def test_flight_deck_invalid_bearer_never_spends(client, monkeypatch):
+    """Ein erfundener Authorization-Header ist keine Authentifizierung."""
+    monkeypatch.setattr(ADSB, '_authenticated_request', lambda: False)
+    http = MagicMock(return_value=_adb_payload(age_s=30))
+    monkeypatch.setattr(ADSB, '_adb_position_http', http)
+
+    r = client.get(
+        '/api/adsb/state?hex=3c64a8&reg=D-AIPA&purpose=flight_deck',
+        headers={'Authorization': 'Bearer erfunden'},
+    )
+
+    assert r.status_code == 200
+    assert r.get_json()['position'] is None
+    http.assert_not_called()
+    BPD._budget_key_inc.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
