@@ -220,6 +220,7 @@ def _try_parsers(path):
     import parse_duties_v8
     import parse_faa_logbook
     import parse_fcl050_v2
+    import parse_foreflight_easa
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
     import parse_roster_logbook
@@ -242,6 +243,9 @@ def _try_parsers(path):
     if parse_faa_logbook.matches_pdf(path):
         legs, sims, report = parse_faa_logbook.parse_pdf(path)
         return "offblock_faa", legs, sims, report
+    if parse_foreflight_easa.matches_pdf(path):
+        legs, sims, report = parse_foreflight_easa.parse_pdf(path)
+        return "foreflight_easa", legs, sims, report
     try:
         with pdfplumber.open(path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)

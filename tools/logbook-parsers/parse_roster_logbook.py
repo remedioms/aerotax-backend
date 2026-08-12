@@ -116,7 +116,12 @@ CONDOR_INDIVIDUAL_FLIGHT = re.compile(
     r"^DE\s+(?P<number>\d{3,4}[A-Z]?)\s+(?:R\s+)?"
     r"(?P<frm>[A-Z]{3})\s+(?P<start>\d{4})\s+"
     r"(?P<end>\d{4})\s+(?P<to>[A-Z]{3})\s+"
-    r"(?P<type>[A-Z0-9]{3})(?:\s+JU)?$"
+    # At the right edge of a printed column CREWLINK can append the duty's
+    # summary to the final flight row (``[FT 09:21]``).  It is not another
+    # time value, but rejecting that otherwise complete row made the strict
+    # document total differ by exactly the duration of the last leg.
+    r"(?P<type>[A-Z0-9]{3})(?:\s+JU)?"
+    r"(?:\s+\[FT\s+\d{1,2}:\d{2}\])?$"
 )
 
 

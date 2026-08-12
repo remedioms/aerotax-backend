@@ -197,6 +197,24 @@ Flight time 01:00 Off days 14
         raise AssertionError("mismatched source total was accepted")
 
 
+def test_condor_individual_plan_accepts_summary_touching_final_flight():
+    header = """Individual duty plan for [redacted]
+NetLine/Crew(CFG) printed by CREWLINK 12Aug26 18:39 Page 1
+Period: 01May26 - 31Aug26
+Flight time 09:21 Off days 14
+"""
+    legs, meta = PARSER.parse_condor_individual_segments(
+        header,
+        ["Tue28 C/I YYC 2100\n"
+         "DE 2443 R YYC 2233 0754 FRA 339 [FT 09:21]\n"],
+        "PU",
+    )
+    assert len(legs) == 1
+    assert legs[0]["flight"] == "DE2443"
+    assert legs[0]["block_min"] == 561
+    assert meta["verified_source_block_total"] == 561
+
+
 def test_merge_prefers_newest_document_revision():
     old = {
         "date": "2026-01-01", "flight": "LH84", "from": "FRA", "to": "DUS",
