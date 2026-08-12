@@ -91,3 +91,93 @@ def test_successful_reset_explicitly_nulls_token_columns():
     assert saved['reset_token'] is None
     assert saved['reset_expires'] is None
     assert saved.get('reset_used_at')
+
+
+def _login_with(store, password):
+    revoked = []
+
+    def get_user(email):
+        row = store.get(email)
+        return dict(row) if row is not None else None
+
+    def upsert(email, row):
+        store[email] = dict(row)
+        return True
+
+    with patch.object(A, '_auth_get_user', side_effect=get_user), \
+         patch.object(A, '_auth_upsert_user', side_effect=upsert), \
+         patch.object(A, '_auth_session_revoke_all',
+                      side_effect=lambda token: revoked.append(token) or True), \
+         patch.object(A, '_auth_success_payload',
+                      side_effect=lambda email, user: {
+                          'ok': True, 'email': email, 'token': user['token']}), \
+         patch.object(A, '_token_rate_limited', return_value=False), \
+         patch.object(A, '_ip_rate_limited', return_value=False), \
+         patch.object(A, '_durable_auth_rate_limited', return_value=False):
+        with A.app.test_request_context('/api/auth/login', method='POST', json={
+                'email': EMAIL, 'password': password}):
+            response = A.auth_login()
+            if isinstance(response, tuple):
+                response[0].status_code = response[1]
+                response = response[0]
+    return response, revoked
+
+
+def test_reset_code_works_as_one_time_password_and_replaces_old_password():
+    old_password = 'OriginalPassword123'
+    recovery_password = 'abc123abc123abc123abc123'
+    store = {EMAIL: {
+        'token': 'AT-RESET-TEST-1234',
+        'password_hash': A._password_hash(old_password),
+        'reset_token': recovery_password,
+        'reset_expires': (datetime.now() + timedelta(minutes=45)).isoformat(),
+        'reset_used_at': None,
+    }}
+
+    response, revoked = _login_with(store, recovery_password.upper())
+
+    assert response.status_code == 200
+    assert response.get_json()['ok'] is True
+    assert A._password_verify(recovery_password,
+                              store[EMAIL]['password_hash'])[0] is True
+    assert A._password_verify(recovery_password.upper(),
+                              store[EMAIL]['password_hash'])[0] is False
+    assert A._password_verify(old_password,
+                              store[EMAIL]['password_hash'])[0] is False
+    assert store[EMAIL]['reset_token'] is None
+    assert store[EMAIL]['reset_expires'] is None
+    assert store[EMAIL]['reset_used_at']
+    assert revoked == ['AT-RESET-TEST-1234']
+
+
+def test_requesting_reset_does_not_lock_out_existing_password():
+    old_password = 'OriginalPassword123'
+    store = {EMAIL: {
+        'token': 'AT-RESET-TEST-1234',
+        'password_hash': A._password_hash(old_password),
+        'reset_token': 'abc123abc123abc123abc123',
+        'reset_expires': (datetime.now() + timedelta(minutes=45)).isoformat(),
+        'reset_used_at': None,
+    }}
+
+    response, revoked = _login_with(store, old_password)
+
+    assert response.status_code == 200
+    assert store[EMAIL]['reset_token'] == 'abc123abc123abc123abc123'
+    assert revoked == []
+
+
+def test_expired_reset_code_is_not_accepted_as_password():
+    store = {EMAIL: {
+        'token': 'AT-RESET-TEST-1234',
+        'password_hash': A._password_hash('OriginalPassword123'),
+        'reset_token': 'abc123abc123abc123abc123',
+        'reset_expires': (datetime.now() - timedelta(seconds=1)).isoformat(),
+        'reset_used_at': None,
+    }}
+
+    response, revoked = _login_with(store, 'abc123abc123abc123abc123')
+
+    assert response.status_code == 401
+    assert response.get_json()['error'] == 'invalid_credentials'
+    assert revoked == []
