@@ -109,6 +109,7 @@ for _bp_path, _bp_name in [
     ('blueprints.layover_group_blueprint',   'layover_group_bp'),  # geteilter Layover-Plan + Polls
     ('blueprints.pexels_blueprint',          'pexels_bp'),  # Pexels-Proxy (Key server-seitig)
     ('blueprints.pixabay_blueprint',         'pixabay_bp'),  # Pixabay-Proxy (2. Quelle, gleiche Shape, 24h-Cache)
+    ('blueprints.gif_search_blueprint',      'gif_search_bp'),  # GIF-Suche: anbieterneutraler Proxy (Key server-seitig) + Import in die eigene Ablage
     ('blueprints.feed_status_blueprint',     'feed_status_bp'),  # 24h verschwindende Feed-Updates
     ('blueprints.flight_profile_blueprint',  'flight_profile_bp'),  # selbst-bauende Flug-DB + Crew-Ebene
     ('blueprints.aerox_data_blueprint',      'aerox_data_bp'),  # self-hosted Luftfahrt-DB (/api/ax/*)
@@ -27322,6 +27323,23 @@ _DM_MSG_KNOWN_COLS = {
 }
 
 
+def _dm_preview_text(msg):
+    """Vorschau-Zeile einer Chat-Nachricht für die Chats-Liste (max 80).
+
+    Ein reines Bild/GIF hat keinen Text — statt einer leeren Zeile steht dort
+    das Medium. Das Label kommt aus der magic-byte-geprüften Dateiendung des
+    Uploads, ist also keine Vermutung.
+    """
+    m = msg or {}
+    text = (m.get('text') or '').strip()
+    if text:
+        return text[:80]
+    url = (m.get('image_url') or '').strip()
+    if url:
+        return 'GIF' if url.lower().endswith('.gif') else 'Foto'
+    return ''
+
+
 def _dm_messages_load_from_supabase(channel_id):
     """Liest Messages für channel_id aus SB. None bei SB-down/error.
     Re-hydrated: SB-body → disk-text, iso aus metadata."""
@@ -28095,6 +28113,10 @@ def get_chat_messages(token, channel_id, _access_checked=False):
         # vollem Token) im Text → auf den opaken Key umschreiben.
         if mm.get('text'):
             mm['text'] = _wall_img_sanitize_urls(mm['text'])
+        # Gleiche Behandlung für das strukturierte Medium-Feld (GIF-Kette
+        # 2026-08-12): eine Legacy-URL darf auch dort kein Token tragen.
+        if mm.get('image_url'):
+            mm['image_url'] = _wall_img_sanitize_urls(mm['image_url'])
         out.append(mm)
     # NACHAUFLÖSUNG für den Bestand: alles, was vor dem Sende-Stempel
     # (2026-08-01) geschrieben wurde, hat kein `author_name`. Ohne diesen
@@ -28146,15 +28168,28 @@ def get_chat_messages(token, channel_id, _access_checked=False):
 
 @app.route('/api/crew-chat/<token>/channel/<channel_id>/send', methods=['POST'])
 def send_chat_message(token, channel_id):
-    """Body: {text, client_message_id?}. Author = token.
+    """Body: {text, image_url?, client_message_id?}. Author = token.
 
     ``client_message_id`` macht Offline-Replays idempotent. Alte Clients senden
     das Feld nicht und behalten dadurch exakt das bisherige Verhalten.
+
+    ``image_url`` (GIF-Kette 2026-08-12) ist ADDITIV: bisher trug der Chat
+    Bilder nur als URL IM TEXT (siehe `_wall_img_sanitize_urls`). Die Spalte
+    `dm_messages.image_url` existiert seit dem SB-Schema, wurde aber nie
+    befüllt. Mit einem eigenen Feld kann der Client ein GIF als Medium rendern,
+    statt eine URL aus dem Fließtext zu fischen. Erlaubt sind — wie bei Wall
+    und Forum — NUR backend-eigene Pfade (`_own_image_url_only`); eine fremde
+    URL wäre ein Tracking-Beacon im DM. Ohne das Feld ändert sich nichts.
     """
     body = request.get_json(silent=True) or {}
     text = (body.get('text') or '').strip()
+    image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     client_message_id = (body.get('client_message_id') or '').strip()
-    if not text: return jsonify({'ok': False, 'error': 'empty_text'}), 400
+    # Ein reines GIF/Foto ist eine vollwertige Nachricht — aber nur, wenn das
+    # Medium den Eigen-Pfad-Check überstanden hat. Ohne Bild bleibt der alte
+    # `empty_text`-Fehler wortgleich.
+    if not text and not image_url:
+        return jsonify({'ok': False, 'error': 'empty_text'}), 400
     if len(text) > 2000: return jsonify({'ok': False, 'error': 'text_too_long'}), 413
     if client_message_id and not re.fullmatch(
             r'[A-Za-z0-9_-]{8,64}', client_message_id):
@@ -28194,7 +28229,8 @@ def send_chat_message(token, channel_id):
                 existing.get('client_message_id') == client_message_id
                 and _chat_author_matches(existing.get('author_token'), token)
             ):
-                if existing.get('text') != text:
+                if (existing.get('text') != text
+                        or (existing.get('image_url') or None) != image_url):
                     return jsonify({
                         'ok': False,
                         'error': 'client_message_id_conflict',
@@ -28214,6 +28250,12 @@ def send_chat_message(token, channel_id):
             'ts': time.time(),
             'iso': datetime.now().isoformat(),
         }
+        # Medium nur setzen, wenn es eins gibt: alte Nachrichten und alte
+        # Clients bekommen den Key gar nicht erst zu sehen (additiv).
+        # `image_url` ist eine bekannte dm_messages-Spalte (_DM_MSG_KNOWN_COLS)
+        # → landet als echte Spalte in SB und kommt beim Laden zurück.
+        if image_url:
+            msg['image_url'] = image_url
         # ── NAME BEIM SENDEN STEMPELN (Owner/Forum 2026-08-01) ──────────────
         # Till Becke (Captain, LH) im Forum: „Beim Crewchat stehen Kürzel wie CC
         # und CA aber nicht die Namen." Die Kürzel sind KEINE Rang-Codes: der
@@ -28269,7 +28311,13 @@ def send_chat_message(token, channel_id):
     # 2026-07-02: dieser generische Send-Pfad (den die iOS-App für Gruppen
     # nutzt und über den auch /dm/send läuft) hatte vorher KEINEN Push.
     try:
-        _chat_push_fanout_async(token, channel_id, text,
+        # Bild-/GIF-Nachricht ohne Text: der Push-Body wäre sonst LEER. Das
+        # Label wird nicht geraten — die Endung stammt aus der Magic-Byte-
+        # Prüfung des Uploads, ein '.gif' IST also ein GIF.
+        preview = text
+        if not preview and image_url:
+            preview = ('GIF' if image_url.lower().endswith('.gif') else 'Foto')
+        _chat_push_fanout_async(token, channel_id, preview,
                                 message_id=msg.get('id'),
                                 message_kind=msg.get('kind'))
     except Exception:
@@ -29112,7 +29160,9 @@ def get_dm_inbox(token):
             'friend_token': friend_token,
             'channel_id': ch,
             'last_message_at': (last_msg or {}).get('ts'),
-            'last_message_preview': ((last_msg or {}).get('text') or '')[:80],
+            # Bild-/GIF-Nachricht ohne Text: sonst stünde in der Chats-Liste
+            # eine leere Zeile statt „GIF"/„Foto" (GIF-Kette 2026-08-12).
+            'last_message_preview': _dm_preview_text(last_msg),
             'last_message_from_me': _chat_author_matches(
                 (last_msg or {}).get('author_token'), token),
             'unread_count': unread,
@@ -29900,9 +29950,13 @@ def _sanitize_user_text(text, max_len=None):
     return s.strip()
 
 
-def _detect_image_type(data: bytes):
-    """Magic-Byte-Sniff. Returns ('jpeg'|'png'|'heic'|'webp'|None, extension).
+def _detect_image_type(data: bytes, allow_gif: bool = False):
+    """Magic-Byte-Sniff. Returns ('jpeg'|'png'|'heic'|'webp'|'gif'|None, extension).
     Verhindert dass jemand .jpg-Extension auf eine .html-Datei klebt.
+
+    `allow_gif` ist per Default AUS: GIF ist nur auf den Social-Upload-Pfaden
+    (Wall/Chat/Forum, Layover) erwünscht — der Avatar-Pfad re-kodiert nicht und
+    hat keinen Animations-Serve, dort bleibt GIF wie bisher abgelehnt (415).
     """
     if not data or len(data) < 12:
         return (None, None)
@@ -29915,7 +29969,124 @@ def _detect_image_type(data: bytes):
         return ('heic', '.heic')
     if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
         return ('webp', '.webp')
+    if allow_gif and head[:6] in (b'GIF87a', b'GIF89a'):
+        return ('gif', '.gif')
     return (None, None)
+
+
+# ── GIF-Durchlass (Owner-Go „GIF-Feature" 2026-08-12) ───────────────────────
+# Ein animiertes GIF überlebt KEINE Re-Kodierung: sobald PIL/JPEG dazwischen
+# steht, bleibt genau ein Standbild übrig. Die Social-Upload-Pfade (Wall/
+# Layover) schreiben die Bytes ohnehin 1:1 (kein `_normalize_upload`) — das
+# einzige, was GIFs bisher verhinderte, war der Magic-Byte-Filter oben.
+#
+# Deshalb die Regel des Owners: durchlassen ODER ehrlich ablehnen, aber NIE
+# still umkodieren. Deckel: 10 MB und 1200 px Kantenlänge. Alles darüber wird
+# mit klarem Fehlercode abgewiesen — der Client kann dem Nutzer sagen, warum.
+_GIF_MAX_BYTES = 10 * 1024 * 1024
+_GIF_MAX_DIM = 1200
+
+# Content-Type für Serve + R2. Bisher wanderte der reine Typ-String ('jpeg')
+# als ContentType nach R2 und von dort als `mimetype` in die Response — ein
+# ungültiger Header. Für GIF ist das nicht mehr egal: ohne `image/gif` liefert
+# kein Client eine Animation.
+_IMAGE_MIME_BY_TYPE = {
+    'jpeg': 'image/jpeg', 'png': 'image/png', 'heic': 'image/heic',
+    'webp': 'image/webp', 'gif': 'image/gif',
+}
+
+
+def _image_mime(detected_type, default='image/jpeg'):
+    """('jpeg'|'png'|'heic'|'webp'|'gif') → vollständiger MIME-Type."""
+    return _IMAGE_MIME_BY_TYPE.get(detected_type or '', default)
+
+
+_MIME_BY_EXT = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.heic': 'image/heic', '.webp': 'image/webp', '.gif': 'image/gif',
+}
+
+
+def _mime_from_filename(fname, default='image/jpeg'):
+    """Serve-MIME aus der (magic-byte-erzeugten) Dateiendung. Der Dateiname
+    kommt NICHT vom Client: die Upload-Pfade vergeben `uuid + detected_ext`."""
+    low = str(fname or '').lower()
+    for ext, mime in _MIME_BY_EXT.items():
+        if low.endswith(ext):
+            return mime
+    return default
+
+
+def _r2_serve_mime(r2_ctype, fname, default='image/jpeg'):
+    """MIME für eine aus R2 gestreamte Datei.
+
+    Alt-Objekte tragen als ContentType noch den nackten Typ-String ('jpeg'),
+    weil die Upload-Pfade `detected_type` statt eines MIME durchreichten. So
+    ein Wert darf nicht als Content-Type in die Response — deshalb: nur
+    vollständige `image/…`-Typen übernehmen, sonst aus dem Dateinamen ableiten
+    (der trägt die magic-byte-geprüfte Endung)."""
+    c = str(r2_ctype or '').strip().lower()
+    if c.startswith('image/'):
+        return c
+    if c in _IMAGE_MIME_BY_TYPE:
+        return _IMAGE_MIME_BY_TYPE[c]
+    return _mime_from_filename(fname, default=default)
+
+
+def _gif_dimensions(data: bytes):
+    """(width, height) aus dem GIF-Logical-Screen-Descriptor (Byte 6..10,
+    little-endian). Das ist die Leinwand — Einzel-Frames liegen laut Spec
+    darin. (None, None) wenn der Header nicht lesbar ist."""
+    if not data or len(data) < 10:
+        return (None, None)
+    try:
+        w = data[6] | (data[7] << 8)
+        h = data[8] | (data[9] << 8)
+    except Exception:
+        return (None, None)
+    if w <= 0 or h <= 0:
+        return (None, None)
+    return (w, h)
+
+
+def _gif_upload_reject(data: bytes):
+    """Prüft ein als GIF erkanntes Upload-Payload gegen die Deckel.
+
+    Returns None wenn es durchgereicht werden darf, sonst (json_dict, status).
+    Es wird NICHT umkodiert und NICHT skaliert — ein zu großes GIF wird
+    abgelehnt, damit nie ein totes Standbild im Chat landet.
+    """
+    if len(data) > _GIF_MAX_BYTES:
+        return ({'ok': False, 'error': 'gif_too_large_10mb',
+                 'message': 'Animierte GIFs dürfen höchstens 10 MB groß sein.'},
+                413)
+    w, h = _gif_dimensions(data)
+    if not w or not h:
+        return ({'ok': False, 'error': 'invalid_gif',
+                 'message': 'Diese GIF-Datei ist beschädigt.'}, 415)
+    if max(w, h) > _GIF_MAX_DIM:
+        return ({'ok': False, 'error': 'gif_too_large_1200px',
+                 'message': ('Animierte GIFs dürfen höchstens 1200 px Kanten'
+                             'länge haben (dieses: '
+                             f'{w}×{h} px).')}, 413)
+    return None
+
+
+def _social_upload_reject(data: bytes, detected_type):
+    """Gemeinsames Größen-/Format-Gate der Social-Upload-Pfade.
+
+    Reihenfolge bleibt gegenüber vorher verhaltensgleich: ein zu großer
+    Nicht-Bild-Blob antwortet weiter `too_large_5mb`, ein kleiner Nicht-Bild-
+    Blob weiter `invalid_image`. Neu ist nur der GIF-Zweig mit eigenem Deckel.
+    """
+    if detected_type == 'gif':
+        return _gif_upload_reject(data)
+    if len(data) > 5 * 1024 * 1024:
+        return ({'ok': False, 'error': 'too_large_5mb'}, 413)
+    if not detected_type:
+        return ({'ok': False, 'error': 'invalid_image',
+                 'message': 'Nur JPEG/PNG/HEIC/WebP/GIF-Bilder erlaubt.'}, 415)
+    return None
 
 
 # ── Wall-Image Token-Leak-Fix (2026-06-10) ──────────────────────────────────
@@ -29988,6 +30159,51 @@ def _wall_img_sanitize_urls(text):
         return text
 
 
+def wall_store_media_bytes(token, data):
+    """Validiert + speichert Medien-Bytes in der WALL-ABLAGE und gibt die
+    öffentliche Serve-URL zurück.
+
+    Returns (url, None) bei Erfolg, sonst (None, (json_dict, status)).
+
+    Herausgezogen aus `upload_wall_image` (GIF-Kette 12.08.), damit der
+    GIF-Such-Proxy dieselbe Ablage, dieselben Deckel und denselben opaken
+    Verzeichnis-Key benutzt — es darf keinen zweiten Speicherort geben.
+    """
+    detected_type, detected_ext = _detect_image_type(data, allow_gif=True)
+    rej = _social_upload_reject(data, detected_type)
+    if rej is not None:
+        return None, rej
+    import os, re, uuid
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not safe:
+        return None, ({'ok': False, 'error': 'invalid_token'}, 400)
+    # Token-Leak-Fix: opaker Key statt Token als öffentliches URL-Segment.
+    dir_key = _wall_img_key(token)
+    img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', dir_key)
+    os.makedirs(img_dir, exist_ok=True)
+    fname = f'{uuid.uuid4().hex[:12]}{detected_ext}'
+    # DURABILITY (2026-06-30, User #43 „Bild nicht ladbar"): Cloud-Run-Disk ist
+    # EPHEMER → Wall-/Chat-Bilder verschwanden bei jedem Redeploy. Wie bei Avataren
+    # bevorzugt nach R2 (Zero-Egress, durabel) schreiben; Disk nur noch Fallback.
+    # Die public URL bleibt der Backend-Serve-Pfad — serve_wall_image streamt aus R2.
+    r2_ok = False
+    if R2_AVATARS_ENABLED:
+        try:
+            _r2_put_bytes(f'wall/{dir_key}/{fname}', data,
+                          _image_mime(detected_type))
+            r2_ok = True
+        except Exception as e:
+            app.logger.warning(f'[wall-img] r2_put_fail: {str(e)[:120]}')
+    if not r2_ok:
+        try:
+            with open(os.path.join(img_dir, fname), 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            print(f'[wall_store_media_bytes] error: {type(e).__name__}: {str(e)[:300]}')
+            return None, ({'ok': False, 'error': 'internal_error'}, 500)
+    return f'/api/wall/image/{dir_key}/{fname}', None
+
+
 @app.route('/api/wall/<token>/upload-image', methods=['POST'])
 def upload_wall_image(token):
     """Upload Bild für Wall-Post. Returns {url} zum nachträglichen Einbetten in /post."""
@@ -29998,43 +30214,12 @@ def upload_wall_image(token):
     img = request.files.get('image')
     if not img:
         return jsonify({'ok': False, 'error': 'no_image'}), 400
-    data = img.read()
-    if len(data) > 5 * 1024 * 1024:
-        return jsonify({'ok': False, 'error': 'too_large_5mb'}), 413
-    # Magic-Byte-Validation — Extension-Check alleine ist unsicher
-    detected_type, detected_ext = _detect_image_type(data)
-    if not detected_type:
-        return jsonify({'ok': False, 'error': 'invalid_image',
-                        'message': 'Nur JPEG/PNG/HEIC/WebP-Bilder erlaubt.'}), 415
-    import os, re, uuid
-    safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
-    if not safe:
-        return jsonify({'ok': False, 'error': 'invalid_token'}), 400
-    # Token-Leak-Fix: opaker Key statt Token als öffentliches URL-Segment.
-    dir_key = _wall_img_key(token)
-    img_dir = os.path.join(_USER_HISTORY_DIR, 'wall_images', dir_key)
-    os.makedirs(img_dir, exist_ok=True)
-    ext = detected_ext  # Extension aus Magic-Byte, nicht aus filename
-    fname = f'{uuid.uuid4().hex[:12]}{ext}'
-    # DURABILITY (2026-06-30, User #43 „Bild nicht ladbar"): Cloud-Run-Disk ist
-    # EPHEMER → Wall-/Chat-Bilder verschwanden bei jedem Redeploy. Wie bei Avataren
-    # bevorzugt nach R2 (Zero-Egress, durabel) schreiben; Disk nur noch Fallback.
-    # Die public URL bleibt der Backend-Serve-Pfad — serve_wall_image streamt aus R2.
-    r2_ok = False
-    if R2_AVATARS_ENABLED:
-        try:
-            _r2_put_bytes(f'wall/{dir_key}/{fname}', data, detected_type)
-            r2_ok = True
-        except Exception as e:
-            app.logger.warning(f'[wall-img] r2_put_fail: {str(e)[:120]}')
-    if not r2_ok:
-        try:
-            with open(os.path.join(img_dir, fname), 'wb') as f:
-                f.write(data)
-        except Exception as e:
-            print(f'[upload_wall_image] error: {type(e).__name__}: {str(e)[:300]}')
-            return jsonify({'ok': False, 'error': 'internal_error'}), 500
-    return jsonify({'ok': True, 'url': f'/api/wall/image/{dir_key}/{fname}'})
+    # Magic-Byte-Validation — Extension-Check alleine ist unsicher.
+    # GIF ist hier erlaubt (Chat/Forum/Wall-Kette) und wird 1:1 gespeichert.
+    url, err = wall_store_media_bytes(token, img.read())
+    if err is not None:
+        return jsonify(err[0]), err[1]
+    return jsonify({'ok': True, 'url': url})
 
 
 @app.route('/api/wall/image/<token_safe>/<fname>', methods=['GET'])
@@ -30070,18 +30255,15 @@ def serve_wall_image(token_safe, fname):
                     r2_data = None
             if r2_data:
                 from flask import Response
-                return Response(r2_data, mimetype=r2_ctype or 'image/jpeg',
+                return Response(r2_data,
+                                mimetype=_r2_serve_mime(r2_ctype, safe),
                                 headers={'Cache-Control': 'public, max-age=31536000, immutable'})
         # Pre-R2-Bilder lagen NUR auf der ephemeren Cloud-Run-Disk (kein R2-, kein
         # Supabase-Backup) → nach einem Redeploy unwiederbringlich weg. Hier sauber
         # 404 (JSON), damit die iOS-Tafel/Chat einen Platzhalter zeigt statt zu hängen.
         return jsonify({'error': 'not_found'}), 404
     from flask import send_file
-    mime = 'image/jpeg'
-    if safe.lower().endswith('.png'): mime = 'image/png'
-    elif safe.lower().endswith('.heic'): mime = 'image/heic'
-    elif safe.lower().endswith('.webp'): mime = 'image/webp'
-    return send_file(path, mimetype=mime)
+    return send_file(path, mimetype=_mime_from_filename(safe))
 
 
 # ── Profil-Avatar Upload + Serve (2026-06-14) ───────────────────────────────
@@ -33301,12 +33483,11 @@ def upload_layover_image(token):
     if not img:
         return jsonify({'ok': False, 'error': 'no_image'}), 400
     data = img.read()
-    if len(data) > 5 * 1024 * 1024:
-        return jsonify({'ok': False, 'error': 'too_large_5mb'}), 413
-    detected_type, detected_ext = _detect_image_type(data)
-    if not detected_type:
-        return jsonify({'ok': False, 'error': 'invalid_image',
-                        'message': 'Nur JPEG/PNG/HEIC/WebP erlaubt.'}), 415
+    # GIF wie auf dem Wall-Pfad: 1:1 durchreichen, Deckel 10 MB / 1200 px.
+    detected_type, detected_ext = _detect_image_type(data, allow_gif=True)
+    _rej = _social_upload_reject(data, detected_type)
+    if _rej is not None:
+        return jsonify(_rej[0]), _rej[1]
     import os, re, uuid
     safe = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
     if not safe:
@@ -33320,7 +33501,8 @@ def upload_layover_image(token):
     r2_ok = False
     if R2_AVATARS_ENABLED:
         try:
-            _r2_put_bytes(f'layover/{dir_key}/{fname}', data, detected_type)
+            _r2_put_bytes(f'layover/{dir_key}/{fname}', data,
+                          _image_mime(detected_type))
             r2_ok = True
         except Exception as e:
             app.logger.warning(f'[layover-img] r2_put_fail: {str(e)[:120]}')
@@ -33352,15 +33534,12 @@ def serve_layover_image(token_safe, fname):
             r2_data, r2_ctype = _r2_get_bytes(f'layover/{safe_t}/{safe}')
             if r2_data:
                 from flask import Response
-                return Response(r2_data, mimetype=r2_ctype or 'image/jpeg',
+                return Response(r2_data,
+                                mimetype=_r2_serve_mime(r2_ctype, safe),
                                 headers={'Cache-Control': 'public, max-age=31536000, immutable'})
         return jsonify({'error': 'not_found'}), 404
     from flask import send_file
-    mime = 'image/jpeg'
-    if safe.lower().endswith('.png'): mime = 'image/png'
-    elif safe.lower().endswith('.heic'): mime = 'image/heic'
-    elif safe.lower().endswith('.webp'): mime = 'image/webp'
-    return send_file(path, mimetype=mime)
+    return send_file(path, mimetype=_mime_from_filename(safe))
 
 
 @app.route('/api/layover-recs/<token>/add', methods=['POST'])

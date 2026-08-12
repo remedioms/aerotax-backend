@@ -3839,18 +3839,100 @@ def news_toggle_like(article_id):
     })
 
 
-def _news_comment_view(row, viewer_token):
-    """Öffentliche Kommentar-Form. None ⇒ nicht auslieferbar (kein AXU)."""
-    author = row.get('author_token') or ''
-    ref = _news_public_ref(author)
-    if not ref:
+def _news_media_url(u):
+    """Nur backend-eigene Medien-Pfade als `media_url` durchlassen.
+
+    Gleiche Regel wie `app._own_image_url_only` für Wall/Forum (Full-Review
+    01.08.): eine fremde absolute URL wäre ein Tracking-Beacon — jeder Leser
+    des Kommentars würde beim Rendern still einen fremden Host treffen.
+    Legitime Werte kommen 1:1 aus `POST /api/wall/<token>/upload-image`
+    (`/api/wall/image/<key>/<datei>`). Ungültig ⇒ None (der Kommentar bleibt,
+    nur ohne Fremdbild).
+    """
+    fn = _app_attr('_own_image_url_only')
+    if callable(fn):
+        try:
+            return fn(u)
+        except Exception:
+            pass
+    # Fallback mit derselben Regel, falls app.py (noch) nicht geladen ist.
+    s = str(u or '').strip()
+    if not s or not s.startswith('/') or s.startswith('//'):
         return None
+    if '://' in s or '\n' in s or '\r' in s:
+        return None
+    return s
+
+
+def _news_anon_handle(token, salt):
+    """Pseudonymer, NICHT umkehrbarer Handle — exakt derselbe Erzeuger wie bei
+    Wall und Forum (`app._anon_handle_for`, HMAC mit Server-Secret + Per-Item-
+    Salt). Per-Item-Salt heißt: die anonymen Kommentare eines Users sind
+    untereinander nicht verkettbar."""
+    fn = _app_attr('_anon_handle_for')
+    if callable(fn):
+        try:
+            h = fn(token, salt=salt)
+            if h:
+                return str(h)
+        except Exception:
+            pass
+    # Kein Fallback-Handle erfinden: lieber „Anonym" als ein Pseudonym, das
+    # nach einem stabilen Kennzeichen aussieht, ohne eines zu sein.
+    return 'Anonym'
+
+
+def _news_comment_view(row, viewer_token):
+    """Öffentliche Kommentar-Form. None ⇒ nicht auslieferbar (kein AXU).
+
+    `media_url` (GIF-Kette 12.08.) ist ADDITIV und IMMER vorhanden — Wert
+    `null`, solange kein Medium hängt. Ein Feld, das mal fehlt und mal da ist,
+    ist für einen Swift-Decoder die gefährlichere Variante; ein stabiler
+    Null-Wert ist für `String?` unproblematisch und für Alt-Clients (die den
+    Key gar nicht kennen) unsichtbar.
+
+    `image_url` trägt DENSELBEN Wert wie `media_url`. Grund: die iOS-Composer-
+    Runde erwartet `image_url` (so heißt das Feld in Chat/Forum/Wall), der
+    Backend-Auftrag nannte `media_url`. Beide Namen zu bedienen kostet ein
+    Feld und kann keinen der beiden Clients brechen — welcher Name kanonisch
+    wird, entscheidet der Owner. Beim SCHREIBEN werden ebenfalls beide
+    akzeptiert.
+
+    `is_anonymous`/`anon_handle` (12.08., Owner „plus für anonym bild und so")
+    folgen dem Muster von Wall-Posts und Layover-Stories: bei einem anonymen
+    Kommentar geht KEIN `author_public_ref` und KEIN Klarname nach außen —
+    stattdessen der pseudonyme Handle. Der echte `author_token` bleibt in der
+    Zeile und ist damit für Moderation/Blockieren SERVERSEITIG weiter
+    auflösbar (`news_comment_author_token`), verlässt den Server aber nie.
+
+    Warum `author_public_ref` bei anonym ein LEERER STRING ist und nicht
+    `null`/fehlend: der Key war bisher immer ein nicht-leerer String. Ein
+    Swift-Struct, das ihn als `String` (nicht optional) deklariert, würde bei
+    `null` oder fehlendem Key den GANZEN Kommentar-Decode werfen — und ein
+    fremder anonymer Kommentar in der Liste hätte einem Alt-Client die
+    komplette Kommentarsektion geleert. Leerer String hält den Typ stabil und
+    verrät nichts.
+    """
+    author = row.get('author_token') or ''
+    anon = bool(row.get('is_anonymous'))
+    ref = _news_public_ref(author)
+    if not ref and not anon:
+        # Ohne AXU-Ref ist ein nicht-anonymer Kommentar nicht auslieferbar —
+        # lieber eine Zeile weniger als ein internes Token im Response.
+        return None
+    media = _news_media_url(row.get('media_url') or row.get('image_url'))
+    handle = (row.get('anon_handle')
+              or _news_anon_handle(author, row.get('id'))) if anon else None
     return {
         'id': str(row.get('id') or ''),
         'article_id': row.get('article_id') or '',
-        'author_public_ref': ref,
-        'author_name': row.get('author_name') or '',
+        'author_public_ref': '' if anon else ref,
+        'author_name': handle if anon else (row.get('author_name') or ''),
+        'is_anonymous': anon,
+        'anon_handle': handle,
         'body': row.get('body') or '',
+        'media_url': media,
+        'image_url': media,
         'created_at': row.get('created_at') or '',
         'is_mine': bool(viewer_token) and author == viewer_token,
     }
@@ -3882,8 +3964,13 @@ def news_list_comments(article_id):
         return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
     ids = _news_story_ids(aid)
     try:
+        # `*` statt fester Spaltenliste (GIF-Kette 12.08.): `media_url` kommt
+        # per Migration dazu, und eine Spalte, die auf einem Origin noch fehlt,
+        # würde bei explizitem SELECT die GESAMTE Kommentarliste auf 503
+        # schicken (Lehre fcm_token 01.08.). `_news_comment_view` gibt ohnehin
+        # nur eine feste Whitelist nach außen — `*` erweitert die Antwort nicht.
         q = (sb.table('ax_news_comments')
-             .select('id,article_id,author_token,body,created_at')
+             .select('*')
              .in_('article_id', ids)
              .order('created_at', desc=True)
              .limit(limit))
@@ -3907,9 +3994,13 @@ def news_list_comments(article_id):
         view = _news_comment_view(row, token)
         if view is None:
             continue
-        if author not in names:
-            names[author] = _news_author_name(author)
-        view['author_name'] = names.get(author) or ''
+        # ANONYM: den Klarnamen NICHT nachträglich hineinschreiben — hier stünde
+        # sonst der echte Name über einem anonymen Kommentar. Der pseudonyme
+        # Handle aus `_news_comment_view` bleibt stehen.
+        if not view.get('is_anonymous'):
+            if author not in names:
+                names[author] = _news_author_name(author)
+            view['author_name'] = names.get(author) or ''
         items.append(view)
     return jsonify({'ok': True, 'article_id': aid, 'items': items,
                     'count': len(items)})
@@ -3917,7 +4008,30 @@ def news_list_comments(article_id):
 
 @news_bp.route('/api/news/<article_id>/comments', methods=['POST'])
 def news_create_comment(article_id):
-    """Body: {body}. Länge auf 2000 Zeichen gedeckelt, HTML-escaped."""
+    """Body: {body, media_url?|image_url?, is_anonymous?}. Text auf 2000
+    Zeichen gedeckelt, HTML-escaped.
+
+    `media_url` (GIF-Kette 12.08.) ist optional und ADDITIV: ein Client, der
+    das Feld nicht kennt, verhält sich exakt wie vorher. `image_url` wird als
+    SYNONYM akzeptiert — die iOS-Composer-Runde erwartet diesen Namen (so heißt
+    das Feld in Chat/Forum/Wall), der Backend-Auftrag nannte `media_url`.
+    Beide anzunehmen kann keinen Client brechen; welcher Name kanonisch wird,
+    entscheidet der Owner. Erlaubt sind nur backend-eigene Pfade aus
+    `POST /api/wall/<token>/upload-image` — GIFs liegen damit in DERSELBEN
+    Ablage wie alle anderen Fotos (R2 `wall/…`, Disk-Fallback), es gibt keinen
+    zweiten Speicherort und keinen externen Dienst.
+
+    `is_anonymous` (Owner 12.08. „plus für anonym bild und so") folgt dem
+    Muster von Wall-Posts/Layover-Stories: statt Klarname + AXU-Ref geht ein
+    pseudonymer, per-Kommentar gesalzener Handle nach außen.
+
+    MODERATION BLEIBT VOLL FUNKTIONSFÄHIG — auch anonym: `author_token` steht
+    weiter in der Zeile. Melden läuft unverändert über
+    `POST /api/moderation/<token>/report` mit `kind='news_comment'`
+    (`news_comment_author_token` löst serverseitig auf), Blockieren unverändert
+    über `_news_blocked_by`. Anonym heißt anonym gegenüber ANDEREN NUTZERN,
+    nicht gegenüber der Moderation.
+    """
     token, err = _news_authed_token()
     if err:
         return err
@@ -3931,7 +4045,14 @@ def news_create_comment(article_id):
     if len(str(raw or '')) > _NEWS_COMMENT_MAX:
         return jsonify({'ok': False, 'error': 'too_long'}), 413
     text = _news_sanitize(raw)
-    if not text:
+    # Beide Feldnamen annehmen (siehe Docstring); `media_url` gewinnt, wenn
+    # ein Client beide schickt.
+    media_url = _news_media_url(payload.get('media_url')
+                                or payload.get('image_url'))
+    is_anonymous = bool(payload.get('is_anonymous'))
+    # Ein reines GIF ist ein vollwertiger Kommentar. Ohne Medium bleibt der
+    # bisherige Fehler wortgleich (`empty_comment`).
+    if not text and not media_url:
         return jsonify({'ok': False, 'error': 'empty_comment'}), 400
 
     sb, ok = _news_sb()
@@ -3944,6 +4065,16 @@ def news_create_comment(article_id):
         'body': text,
         'created_at': datetime.now(timezone.utc).isoformat(),
     }
+    # Spalten NUR mitschicken, wenn sie gebraucht werden: solange die Migration
+    # `20260812_news_comment_media.sql` auf einem Origin nicht gelaufen ist,
+    # bleibt der textliche Normalfall dadurch unberührt.
+    if media_url:
+        row['media_url'] = media_url
+    if is_anonymous:
+        row['is_anonymous'] = True
+        # Handle einmal beim Schreiben festhalten (wie Wall/Forum): er ist per
+        # Kommentar gesalzen und darf sich später nicht ändern.
+        row['anon_handle'] = _news_anon_handle(token, row['id'])
     try:
         sb.table('ax_news_comments').insert(row).execute()
     except Exception as exc:
@@ -3954,7 +4085,11 @@ def news_create_comment(article_id):
         # Kein AXU darstellbar ⇒ der Kommentar ist gespeichert, aber wir
         # liefern KEIN internes Token als Ersatz aus.
         return jsonify({'ok': False, 'error': 'public_ref_unavailable'}), 503
-    view['author_name'] = _news_author_name(token)
+    # Anonym: der Klarname darf auch in der EIGENEN Antwort nicht an die Stelle
+    # des Handles treten — sonst zeigt der Composer nach dem Absenden den
+    # echten Namen, obwohl alle anderen das Pseudonym sehen.
+    if not view.get('is_anonymous'):
+        view['author_name'] = _news_author_name(token)
     return jsonify({'ok': True, 'comment': view})
 
 
