@@ -209,6 +209,8 @@ def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False,
          patch.object(A, '_flight_obs_merged', side_effect=_fake_obs_merged), \
          patch('blueprints.aerox_data_blueprint._aircraft_live_pos',
                side_effect=_fake_aircraft_live_pos), \
+         patch('blueprints.aerox_data_blueprint._fr24_live_card_cached',
+               return_value=None), \
          patch.dict(A._store, {}, clear=True):
         A._FRIENDS_TODAY_MEMO.clear()
         with A.app.test_request_context(

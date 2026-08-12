@@ -18579,6 +18579,17 @@ def get_friends_today(token):
                     if m and _flights_live_obs_wrong_day(m, _leg_dep_iso, _arr_ia):
                         m = None
                     if m:
+                        # Dieselben offiziellen Fakten wie Radar/Detail verwenden.
+                        # cached_only hält den Freunde-Fan-out kostenfrei; ein
+                        # vorhandener LH-Cache kann dabei echte Ist-Zeiten liefern.
+                        try:
+                            from blueprints.aerox_data_blueprint import (
+                                _flight_facts_from_obs as _ffo)
+                            _friend_facts = _ffo(
+                                fno, datum, dep_iata=_dep_ia,
+                                arr_iata=_arr_ia, lh_cached_only=True) or {}
+                        except Exception:
+                            _friend_facts = {}
                         # ECHTE Live-Position dieses Legs aus dem NAS-Harvester-Store
                         # (aircraft_live/FR24-gRPC) — reale Süd-Route (LH meidet
                         # Russland!). Owner 2026-07-09: Crew wurde sonst per Großkreis
@@ -18602,6 +18613,44 @@ def get_friends_today(token):
                                         'alt': _cp.get('alt'), 'on_ground': False}
                         except Exception:
                             _clp = None
+                        try:
+                            from blueprints.aerox_data_blueprint import (
+                                _fr24_live_card_cached,
+                                _fr24_operational_times,
+                                _canonical_operational_times)
+                            _friend_card = _fr24_live_card_cached(
+                                flight_no=fno, reg=(m.get('reg') or _crg),
+                                lat=(_cp or {}).get('lat'),
+                                lon=(_cp or {}).get('lon'),
+                                origin=_dep_ia, dest=_arr_ia)
+                            _friend_fr = _fr24_operational_times(
+                                _friend_card, _dep_ia, _arr_ia)
+                        except Exception:
+                            _friend_fr = {}
+                        _friend_official = dict(_friend_facts)
+                        for _fk, _fv in (
+                                ('sched_dep', m.get('sched_dep')),
+                                ('est_dep', m.get('esti_dep')),
+                                ('actual_dep', m.get('actual_dep_iso')),
+                                ('sched_arr', m.get('sched_arr')),
+                                ('est_arr', m.get('esti_arr')),
+                                ('actual_arr', m.get('actual_arr_iso'))):
+                            if _fv and not _friend_official.get(_fk):
+                                _friend_official[_fk] = _fv
+                        _friend_status = ' '.join(str(x or '').lower() for x in (
+                            m.get('status'), m.get('status_arr'),
+                            _friend_facts.get('arr_status'),
+                            _friend_facts.get('actual_arr')))
+                        _friend_landed = bool(
+                            _friend_official.get('actual_arr') or any(
+                                x in _friend_status for x in
+                                ('landed', 'arrived', 'gelandet', 'angekommen')))
+                        try:
+                            _friend_times = _canonical_operational_times(
+                                _friend_official, _friend_fr,
+                                airborne=bool(_clp), landed=_friend_landed)
+                        except Exception:
+                            _friend_times = _friend_official
                         # est_*/sched_*: Board-Zeiten stehen in STATIONS-Ortszeit
                         # (dep mit airport_tz(from), arr mit airport_tz(to)) → hier
                         # genau EINMAL nach echt-UTC (…Z) wandeln, damit iOS sie wie
@@ -18620,16 +18669,31 @@ def get_friends_today(token):
                             'status': m.get('status'),
                             'cancelled': m.get('cancelled'),
                             'sched_dep_iso': _board_local_to_utc_iso(
-                                m.get('sched_dep'), _dep_ia),
+                                _friend_times.get('sched_dep'), _dep_ia),
                             'est_dep_iso': _board_local_to_utc_iso(
-                                m.get('esti_dep'), _dep_ia),
+                                _friend_times.get('est_dep'), _dep_ia),
                             'sched_arr_iso': _board_local_to_utc_iso(
-                                m.get('sched_arr'), _arr_ia),
+                                _friend_times.get('sched_arr'), _arr_ia),
                             'est_arr_iso': _board_local_to_utc_iso(
-                                m.get('esti_arr'), _arr_ia),
+                                _friend_times.get('est_arr'), _arr_ia),
                             'sides': m.get('sides'),
                             'live': _clp,   # echte FR24-Position (Süd-Route) | None
                         })
+                        if _friend_times.get('actual_dep'):
+                            flights_live[-1]['actual_dep_iso'] = \
+                                _board_local_to_utc_iso(
+                                    _friend_times.get('actual_dep'), _dep_ia)
+                        if _friend_times.get('actual_arr'):
+                            flights_live[-1]['actual_arr_iso'] = \
+                                _board_local_to_utc_iso(
+                                    _friend_times.get('actual_arr'), _arr_ia)
+                        # Additive Provenienz nur dann, wenn FR24 wirklich den
+                        # angezeigten laufenden Wert geliefert hat. Dadurch bleibt
+                        # die Legacy-Shape für reine Board-Daten unverändert.
+                        if _friend_times.get('dep_source') == 'fr24':
+                            flights_live[-1]['dep_time_source'] = 'fr24'
+                        if _friend_times.get('arr_source') == 'fr24':
+                            flights_live[-1]['arr_time_source'] = 'fr24'
                         # FLIGHTSTATE-Engine: Shadow (loggen) und/oder Flip (die
                         # Engine entscheidet `live` + liefert die Phase). Reuse von
                         # m + _cp (kein Extra-Read). Best-effort, nie werfend.
@@ -46049,7 +46113,9 @@ def ax_flight_info(flightno):
     if out is not None and out.get('found') and not out.get('stale'):
         try:
             from blueprints.aerox_data_blueprint import _flight_facts_from_obs
-            _ff = _flight_facts_from_obs(fn, out.get('date') or date_param)
+            _ff = _flight_facts_from_obs(
+                fn, out.get('date') or date_param,
+                dep_iata=out.get('origin'), arr_iata=out.get('dest'))
             # facts['stale'] = Vortags-Fallback der Obs-Quelle → gestrige Geister-
             # Ankunft NICHT durch die Hintertür füllen (gleiches Gate wie oben).
             if _ff and not _ff.get('stale'):
@@ -46057,6 +46123,11 @@ def ax_flight_info(flightno):
                     out['sched_arr'] = _ff['sched_arr']
                 if not out.get('esti_arr') and _ff.get('est_arr'):
                     out['esti_arr'] = _ff['est_arr']
+                if _ff.get('actual_dep'):
+                    out['actual_dep'] = _ff['actual_dep']
+                if _ff.get('actual_arr'):
+                    out['actual_arr'] = _ff['actual_arr']
+                    out['esti_arr'] = _ff['actual_arr']
                 if not out.get('arr_status') and _ff.get('arr_status'):
                     out['arr_status'] = _ff['arr_status']
                 if out.get('arr_delay_min') is None and _ff.get('arr_delay_min') is not None:
@@ -46080,6 +46151,11 @@ def ax_flight_info(flightno):
             _active = any(x in _status_text for x in (
                 'depart', 'airborn', 'enroute', 'en route', 'land', 'arriv',
                 'abgeflogen', 'gestartet', 'gelandet', 'angekommen'))
+            _landed = any(x in _status_text for x in (
+                'landed', 'arrived', 'gelandet', 'angekommen'))
+            _airborne = _active and not _landed
+            _landed_actual_needed = _landed \
+                and not out.get('actual_arr')
             _past = bool(_svc and _svc < datetime.now(timezone.utc).strftime('%Y-%m-%d'))
             # ABFLUG-LÜCKE (Owner 2026-07-25 „paid fr24 zusätzlich zu free
             # fr24", LH1133 BCN→FRA): GEPLANTE Flüge, deren Abflug-Board wir
@@ -46090,17 +46166,32 @@ def ax_flight_info(flightno):
             # SOLL-Zeit ist genau das Gesuchte.
             _dep_gap = (not out.get('sched') and out.get('origin')
                         and out.get('dest'))
-            _ops_case = ((_active or _past)
-                         and not (out.get('esti') or out.get('esti_arr')))
+            _ops_case = (_airborne or ((_active or _past)
+                         and (not (out.get('esti') or out.get('esti_arr'))
+                              or _landed_actual_needed)))
             if _paid_requested and _authed and (_ops_case or _dep_gap):
                 from blueprints.aerox_data_blueprint import _flight_times_free_first
                 _tf = _flight_times_free_first(
                     fn, _svc, out.get('origin'), out.get('dest'),
                     allow_paid=True, require_operational=not _dep_gap)
-                for _src, _dst in (('sched_dep', 'sched'), ('est_dep', 'esti'),
-                                   ('sched_arr', 'sched_arr'), ('est_arr', 'esti_arr')):
-                    if _tf.get(_src) and not out.get(_dst):
-                        out[_dst] = _tf[_src]
+                from blueprints.aerox_data_blueprint import _canonical_operational_times
+                _official_times = {
+                    'sched_dep': out.get('sched'), 'est_dep': out.get('esti'),
+                    'actual_dep': out.get('actual_dep'),
+                    'sched_arr': out.get('sched_arr'),
+                    'est_arr': out.get('esti_arr'),
+                    'actual_arr': out.get('actual_arr'),
+                }
+                _ct = _canonical_operational_times(
+                    _official_times, _tf, airborne=_airborne, landed=_landed)
+                out['sched'] = _ct.get('sched_dep')
+                out['esti'] = _ct.get('est_dep')
+                out['actual_dep'] = _ct.get('actual_dep')
+                out['sched_arr'] = _ct.get('sched_arr')
+                out['esti_arr'] = _ct.get('est_arr')
+                out['actual_arr'] = _ct.get('actual_arr')
+                out['dep_time_source'] = _ct.get('dep_source')
+                out['arr_time_source'] = _ct.get('arr_source')
         except Exception:
             pass
 

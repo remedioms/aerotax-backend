@@ -499,6 +499,52 @@ def test_operational_detail_can_fill_estimates_when_schedule_is_complete(monkeyp
     assert out.get('est_arr')
 
 
+def test_canonical_running_flight_prefers_fr24_eta_and_actual_departure():
+    official = {
+        'sched_dep': '2026-08-12T12:20:00',
+        'actual_dep': '2026-08-12T12:41:00',
+        'sched_arr': '2026-08-12T18:40:00',
+        'est_arr': '2026-08-12T18:17:00',
+    }
+    fr24 = {
+        'actual_dep': '2026-08-12T12:42:00',
+        'est_arr': '2026-08-12T18:36:00',
+    }
+
+    out = axd._canonical_operational_times(
+        official, fr24, airborne=True, landed=False)
+
+    assert out['est_dep'] == '2026-08-12T12:42:00'
+    assert out['est_arr'] == '2026-08-12T18:36:00'
+    assert out['official_est_arr'] == '2026-08-12T18:17:00'
+    assert out['dep_source'] == 'fr24'
+    assert out['arr_source'] == 'fr24'
+
+
+def test_canonical_landed_flight_uses_actual_arrival_not_old_eta():
+    official = {'est_arr': '2026-08-12T18:17:00',
+                'actual_arr': '2026-08-12T18:39:00'}
+    fr24 = {'est_arr': '2026-08-12T18:36:00',
+            'actual_arr': '2026-08-12T18:38:00'}
+
+    out = axd._canonical_operational_times(
+        official, fr24, airborne=False, landed=True)
+
+    assert out['actual_arr'] == '2026-08-12T18:38:00'
+    assert out['est_arr'] == '2026-08-12T18:38:00'
+    assert out['arr_source'] == 'fr24'
+
+
+def test_lh_actual_times_are_authoritative_facts():
+    out = axd._merge_lh_into_facts(
+        {'actual_dep': 'old', 'actual_arr': 'old'},
+        {'actual_dep': '2026-08-12T12:41:00',
+         'actual_arr': '2026-08-12T18:39:00'})
+
+    assert out['actual_dep'] == '2026-08-12T12:41:00'
+    assert out['actual_arr'] == '2026-08-12T18:39:00'
+
+
 # ── FlightState-Engine → status_category (Owner 2026-07-13) ───────────────────
 # _status_category_from_facts leitet status_category NICHT mehr per roher
 # Substring-Suche ab, sondern über die EINE FlightState-Engine (obs_from_board_

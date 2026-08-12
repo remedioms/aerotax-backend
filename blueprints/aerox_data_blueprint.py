@@ -935,7 +935,8 @@ def _aircraft_live_flight(flight=None, callsign=None, max_age_min=40):
         return None
     cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                            time.gmtime(time.time() - max_age_min * 60))
-    sel = 'flight,callsign,reg,reg_display,ac_type,origin,dest,on_ground,seen_ts'
+    sel = ('flight,callsign,reg,reg_display,ac_type,origin,dest,'
+           'lat,lon,on_ground,seen_ts')
     try:
         q = sb.table('aircraft_live').select(sel).gt('updated_at', cutoff)
         q = q.eq('flight', fn) if fn else q.eq('callsign', cs)
@@ -961,6 +962,8 @@ def _aircraft_live_flight(flight=None, callsign=None, max_age_min=40):
         'arr_gate': '', 'arr_terminal': '', 'arr_baggage': '',
         'status': ('on_ground' if a.get('on_ground') else 'enroute'),
         'status_category': '', 'aircraft': typ, 'reg': reg,
+        'lat': a.get('lat'), 'lon': a.get('lon'),
+        'on_ground': a.get('on_ground'), 'seen_ts': a.get('seen_ts'),
         'dep_delay_min': None, 'arr_delay_min': None,
         'delay_min': None, 'delay_side': None, 'source': 'aircraft_live',
     }
@@ -2171,6 +2174,11 @@ def _fr24_flight_by_number(flight_no, date=None):
             'airline': '', 'airline_name': '',
             'dep_iata': l['src'], 'dep_name': '', 'arr_iata': l['dst'], 'arr_name': '',
             'sched_dep': l['sched_dep'], 'sched_arr': l['sched_arr'],
+            # flight-summary/light benennt diese Felder historisch im internen
+            # Leg-Schema als sched_*, tatsächlich stammen sie aber aus
+            # datetime_takeoff/datetime_landed und sind gemessene Ist-Zeiten.
+            'actual_dep': l['sched_dep'],
+            'actual_arr': (l['sched_arr'] if l.get('status') == 'landed' else None),
             'est_dep': None, 'est_arr': None, 'duration_min': l['duration_min'],
             'dep_gate': '', 'dep_terminal': '', 'arr_gate': '', 'arr_terminal': '',
             'arr_baggage': '', 'status': l['status'] or '',
@@ -3809,13 +3817,10 @@ def ax_callsign(callsign):
     # FR24 nichts hat; Route/Status oben bleiben board-autoritativ (nicht überschrieben).
     if (request.args.get('rich') or '').strip() in ('1', 'true', 'yes') \
             and lat is not None and lon is not None:
-        try:
-            from blueprints import fr24_grpc
-            card = fr24_grpc.detail_card(callsign=cs, hex=hexid,
-                                         reg=((route or {}).get('reg') or reg),
-                                         lat=lat, lon=lon)
-        except Exception:
-            card = None
+        card = _fr24_live_card_cached(
+            flight_no=(route or {}).get('flight_no'), callsign=cs,
+            hexid=hexid, reg=((route or {}).get('reg') or reg),
+            lat=lat, lon=lon, origin=origin_iata, dest=dest_iata)
         if card:
             out['live'] = card
 
@@ -4750,6 +4755,7 @@ def _apply_paid_arrival_escalation(payload, flight_no, date, dep, dest, pos,
 # liest Fakten feldweise per `.get()`, ein zusätzlicher Key ist unsichtbar, bis
 # ihn jemand ausdrücklich abholt.
 _LH_AUTHORITATIVE = ('sched_dep', 'sched_arr', 'est_dep', 'est_arr',
+                     'actual_dep', 'actual_arr',
                      'dep_delay_min', 'arr_delay_min', 'gate', 'terminal',
                      'arr_gate', 'arr_terminal', 'reg', 'type', 'cancelled',
                      'codeshares', 'operated_by')
@@ -5357,12 +5363,18 @@ def _flight_times_free_first(flight_no, date, origin, dest,
                 break
     if g:
         sd = _epoch_to_local_iso(g.get('sched_dep'), origin)
+        ad = _epoch_to_local_iso(g.get('actual_dep'), origin)
         sa = _epoch_to_local_iso(g.get('sched_arr'), dest)
+        aa = _epoch_to_local_iso(g.get('actual_arr'), dest)
         ea = _epoch_to_local_iso(g.get('eta'), dest)
         if sd:
             out['sched_dep'] = sd
+        if ad:
+            out['actual_dep'] = ad
         if sa:
             out['sched_arr'] = sa
+        if aa:
+            out['actual_arr'] = aa
         if ea:
             out['est_arr'] = ea
     # 2) PAID-Backup wenn free das Paar NICHT komplett hatte (Langstrecke/gelandet).
@@ -5384,7 +5396,8 @@ def _flight_times_free_first(flight_no, date, origin, dest,
                 return _epoch_to_local_iso(dt.timestamp(), iata) or v
             except Exception:
                 return v
-        for k in ('sched_dep', 'est_dep', 'sched_arr', 'est_arr'):
+        for k in ('sched_dep', 'est_dep', 'actual_dep',
+                  'sched_arr', 'est_arr', 'actual_arr'):
             if p.get(k) and not out.get(k):
                 out[k] = _norm(p[k], origin if 'dep' in k else dest)
     _FREE_TIMES_MEMO[key] = (out or None, now)
@@ -5392,6 +5405,160 @@ def _flight_times_free_first(flight_no, date, origin, dest,
         for k in list(_FREE_TIMES_MEMO.keys())[:400]:
             _FREE_TIMES_MEMO.pop(k, None)
     return out
+
+
+# Eine FR24-Detailantwort wird von Radar, Kalender, Freundekarten und
+# flight-live benötigt. Ohne dieses kurze gemeinsame Memo würde ein einzelner
+# Tap/Poll dieselbe kostenlose gRPC-Abfrage mehrfach parallel auslösen.
+_FR24_LIVE_CARD_MEMO = {}
+_FR24_LIVE_CARD_LOCK = threading.Lock()
+_FR24_LIVE_CARD_HIT_TTL = 45.0
+_FR24_LIVE_CARD_MISS_TTL = 15.0
+
+
+def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
+                           lat=None, lon=None, origin=None, dest=None,
+                           hexid=None):
+    """Eine route-geprüfte FR24-Livekarte, geteilt über alle Consumer.
+
+    Position ist Pflicht: dadurch bleibt die gRPC-Box klein und ein Treffer
+    kann an Flug/Funkname/Reg gebunden werden. Ein explizit abweichendes
+    Start/Ziel wird verworfen, statt die Zeiten eines Nachbarflugs zu zeigen.
+    """
+    if lat is None or lon is None:
+        return None
+    fn = (flight_no or '').replace(' ', '').upper().strip() or None
+    cs = (callsign or '').replace(' ', '').upper().strip() or None
+    rg = re.sub(r'[^A-Z0-9]', '', (reg or '').upper()) or None
+    hx = (str(hexid or '').lower().strip() or None)
+    dep = (origin or '').upper().strip() or None
+    arr = (dest or '').upper().strip() or None
+    identity = cs or fn or rg or hx
+    if not identity:
+        return None
+    try:
+        lat_f, lon_f = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    key = (identity, dep, arr, round(lat_f, 2), round(lon_f, 2))
+    now = time.time()
+    with _FR24_LIVE_CARD_LOCK:
+        hit = _FR24_LIVE_CARD_MEMO.get(key)
+        if hit:
+            ttl = (_FR24_LIVE_CARD_HIT_TTL if hit[1] is not None
+                   else _FR24_LIVE_CARD_MISS_TTL)
+            if now - hit[0] < ttl:
+                return dict(hit[1]) if hit[1] else None
+    try:
+        from blueprints import fr24_grpc
+        card = fr24_grpc.detail_card(callsign=cs, hex=hx, reg=rg,
+                                     lat=lat_f, lon=lon_f)
+    except Exception:
+        card = None
+    if card:
+        cdep = (card.get('route_from') or '').upper().strip() or None
+        carr = (card.get('route_to') or '').upper().strip() or None
+        if (dep and cdep and dep != cdep) or (arr and carr and arr != carr):
+            card = None
+    with _FR24_LIVE_CARD_LOCK:
+        _FR24_LIVE_CARD_MEMO[key] = (now, dict(card) if card else None)
+        if len(_FR24_LIVE_CARD_MEMO) > 512:
+            old = sorted(_FR24_LIVE_CARD_MEMO.items(),
+                         key=lambda item: item[1][0])[:128]
+            for old_key, _ in old:
+                _FR24_LIVE_CARD_MEMO.pop(old_key, None)
+    return dict(card) if card else None
+
+
+def _fr24_operational_times(card, origin, dest):
+    """FR24-Card → stationslokale operative Zeiten mit eindeutiger Quelle."""
+    c = card if isinstance(card, dict) else {}
+
+    def _local(value, iata):
+        if value is None:
+            return None
+        # gRPC liefert normalerweise Epoch-Sekunden.
+        ep = _epoch_to_local_iso(value, iata)
+        if ep:
+            return ep
+        # Defensive Unterstützung für Offset-/Z-ISO aus Playback/Tests.
+        try:
+            from datetime import datetime as _dt4
+            dt = _dt4.fromisoformat(str(value).replace('Z', '+00:00'))
+            if dt.tzinfo is not None:
+                return _epoch_to_local_iso(dt.timestamp(), iata)
+        except Exception:
+            pass
+        return str(value) if str(value).strip() else None
+
+    out = {
+        'sched_dep': _local(c.get('sched_dep'), origin),
+        'actual_dep': _local(c.get('actual_dep'), origin),
+        'sched_arr': _local(c.get('sched_arr'), dest),
+        'actual_arr': _local(c.get('actual_arr'), dest),
+        'est_arr': _local(c.get('eta'), dest),
+        'source': 'fr24',
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _canonical_operational_times(official, fr24, airborne=False, landed=False):
+    """Eine deterministische Zeitwahrheit für alle App-Flächen.
+
+    * Plan bleibt offiziell (LH/Board), FR24 füllt nur Lücken.
+    * Im Flug gewinnt FR24 für Ist-Abflug und laufende ETA.
+    * Nach der Landung gewinnt die echte FR24-Ist-Ankunft; fehlt sie, gilt die
+      offizielle LH-Ist-Ankunft. Eine alte ETA wird nie als `actual_arr` erfunden.
+    """
+    o = official if isinstance(official, dict) else {}
+    f = fr24 if isinstance(fr24, dict) else {}
+    is_airborne = bool(airborne and not landed)
+    is_landed = bool(landed)
+
+    sched_dep = o.get('sched_dep') or f.get('sched_dep')
+    sched_arr = o.get('sched_arr') or f.get('sched_arr')
+
+    if is_airborne or is_landed:
+        actual_dep = f.get('actual_dep') or o.get('actual_dep')
+    else:
+        actual_dep = o.get('actual_dep')
+    if is_landed:
+        actual_arr = f.get('actual_arr') or o.get('actual_arr')
+    else:
+        actual_arr = o.get('actual_arr')
+
+    est_dep = actual_dep or o.get('est_dep') or f.get('est_dep')
+    if is_landed:
+        est_arr = actual_arr or o.get('est_arr') or f.get('est_arr')
+    elif is_airborne:
+        est_arr = f.get('est_arr') or o.get('est_arr')
+    else:
+        est_arr = o.get('est_arr') or f.get('est_arr')
+
+    dep_source = None
+    if actual_dep and actual_dep == f.get('actual_dep') and (is_airborne or is_landed):
+        dep_source = 'fr24'
+    elif actual_dep or est_dep or sched_dep:
+        dep_source = 'official'
+    arr_source = None
+    if ((is_landed and actual_arr and actual_arr == f.get('actual_arr'))
+            or (is_airborne and est_arr and est_arr == f.get('est_arr'))):
+        arr_source = 'fr24'
+    elif actual_arr or est_arr or sched_arr:
+        arr_source = 'official'
+
+    return {
+        'sched_dep': sched_dep,
+        'est_dep': est_dep,
+        'actual_dep': actual_dep,
+        'sched_arr': sched_arr,
+        'est_arr': est_arr,
+        'actual_arr': actual_arr,
+        'official_est_dep': o.get('est_dep'),
+        'official_est_arr': o.get('est_arr'),
+        'dep_source': dep_source,
+        'arr_source': arr_source,
+    }
 
 
 # status_category-Alphabet dieser Fläche (iOS `schedule.info.status_category`):
@@ -6055,14 +6222,53 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
         except Exception:
             _gated_arr = facts.get('arr_status')
 
+    # EIN gemeinsamer operativer Zeitentscheid für Radar, Detail, Kalender und
+    # Freundekarten. Die Board-/LH-Fakten bleiben der offizielle Plan; FR24
+    # liefert während des Flugs Ist-Abflug + ETA und nach der Landung die echte
+    # Ist-Ankunft. So können zwei Screens nicht mehr unabhängig verschiedene
+    # "aktuelle" Uhrzeiten auswählen.
+    _status_blob = ' '.join(str(x or '').lower() for x in (
+        alf.get('status'), alf.get('status_category'), facts.get('dep_status'),
+        _gated_arr, facts.get('actual_arr')))
+    _landed = bool(facts.get('actual_arr') or any(x in _status_blob for x in (
+        'landed', 'arrived', 'gelandet', 'angekommen')))
+    _airborne = bool(not _landed and (
+        alf.get('on_ground') is False or any(x in _status_blob for x in (
+            'airborne', 'enroute', 'en route', 'departed', 'abgeflogen',
+            'gestartet'))))
+    _live_lat = lat if lat is not None else alf.get('lat')
+    _live_lon = lon if lon is not None else alf.get('lon')
+    _fr_card = None
+    if (_airborne or _landed) and _live_lat is not None and _live_lon is not None:
+        _fr_card = _fr24_live_card_cached(
+            flight_no=flight_no, callsign=callsign, reg=reg,
+            lat=_live_lat, lon=_live_lon, origin=origin, dest=dest)
+    _fr_times = _fr24_operational_times(_fr_card, origin, dest)
+    _needs_fr_times = bool(
+        (_airborne and not (_fr_times.get('actual_dep')
+                            and _fr_times.get('est_arr')))
+        or (_landed and not (facts.get('actual_arr')
+                             or _fr_times.get('actual_arr'))))
+    if _needs_fr_times:
+        try:
+            _fallback_times = _flight_times_free_first(
+                flight_no, date, origin, dest, callsign=callsign,
+                allow_paid=allow_paid, require_operational=True)
+        except Exception:
+            _fallback_times = {}
+        for _k, _v in (_fallback_times or {}).items():
+            if _v and not _fr_times.get(_k):
+                _fr_times[_k] = _v
+    _canonical_times = _canonical_operational_times(
+        facts, _fr_times, airborne=_airborne, landed=_landed)
+
     out = {
         'ok': True, 'found': True, 'query': q, 'date': date,
         'identity': {'callsign': callsign, 'flight_no': flight_no, 'reg': reg,
                      'callsign_derived': callsign_derived or None},
         'route': ({'origin': _ap(origin), 'destination': _ap(dest)}
                   if (origin and dest) else None),
-        'times': {k: facts.get(k) for k in
-                  ('sched_dep', 'est_dep', 'sched_arr', 'est_arr')},
+        'times': _canonical_times,
         'status': {
             'gate': facts.get('gate'), 'terminal': facts.get('terminal'),
             'arr_gate': facts.get('arr_gate'), 'arr_terminal': facts.get('arr_terminal'),
@@ -6074,15 +6280,19 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
         },
         'aircraft': {'reg': reg, 'type': ac_type},
         'meta': {'route_source': route_src, 'route_confidence': route_conf,
-                 'facts_source': 'airport_delay_obs' if facts else None},
+                 'facts_source': 'airport_delay_obs' if facts else None,
+                 'dep_time_source': _canonical_times.get('dep_source'),
+                 'arr_time_source': _canonical_times.get('arr_source')},
     }
     # PLAN-Antwort transparent machen: Zeiten sind der letzte bekannte Fahrplan
     # (kein Ist), Consumer dürfen sie nur als „geplant" rendern.
     if plan_times is not None:
         out['times'] = {'sched_dep': plan_times.get('sched_dep'),
-                        'est_dep': None,
+                        'est_dep': None, 'actual_dep': None,
                         'sched_arr': plan_times.get('sched_arr'),
-                        'est_arr': None}
+                        'est_arr': None, 'actual_arr': None,
+                        'official_est_dep': None, 'official_est_arr': None,
+                        'dep_source': 'official', 'arr_source': 'official'}
         out['plan'] = True
         out['meta']['plan'] = True
     # Facts stammen vom Vortag (Overnight-Fallback) → transparent markieren.
@@ -9415,12 +9625,10 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     # bleibt null (ehrlich degradiert).
     if (chain['inbound_est_arr'] is None and pos_on_route
             and pos.get('lat') is not None and pos.get('lon') is not None):
-        try:
-            from blueprints import fr24_grpc
-            card = fr24_grpc.detail_card(callsign=cs, reg=reg,
-                                         lat=pos.get('lat'), lon=pos.get('lon'))
-        except Exception:
-            card = None
+        card = _fr24_live_card_cached(
+            flight_no=inbound_fn, callsign=cs, reg=reg,
+            lat=pos.get('lat'), lon=pos.get('lon'),
+            origin=inbound_origin, dest=dep)
         _creg = re.sub(r'[^A-Z0-9]', '', ((card or {}).get('reg') or '').upper())
         _treg = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
         if card and _creg and _creg == _treg:
@@ -10175,6 +10383,37 @@ def ax_flight_live(token):
     # Ankunft für jede ungescrapte Outstation leer, während uflight sie kannte.
     arr_fields = _live_arrival_facts(flight_no, date, dep, dest, merged)
     in_flight = bool(pos and not pos.get('on_ground'))
+    try:
+        _official = _flight_facts_from_obs(
+            flight_no, date, dep_iata=dep, arr_iata=dest,
+            lh_cached_only=True) or {}
+    except Exception:
+        _official = {}
+    _official = dict(_official)
+    for _k, _v in (
+            ('sched_dep', merged.get('sched_dep')),
+            ('est_dep', merged.get('esti_dep')),
+            ('actual_dep', merged.get('actual_dep_iso')),
+            ('sched_arr', arr_fields.get('sched_arr')),
+            ('est_arr', arr_fields.get('est_arr')),
+            ('actual_arr', merged.get('actual_arr_iso'))):
+        if _v and not _official.get(_k):
+            _official[_k] = _v
+    _live_status_blob = ' '.join(str(x or '').lower() for x in (
+        merged.get('status'), merged.get('status_arr'),
+        _official.get('arr_status'), _official.get('actual_arr')))
+    _is_landed = bool(_official.get('actual_arr') or any(
+        x in _live_status_blob for x in
+        ('landed', 'arrived', 'gelandet', 'angekommen')))
+    _fr_card = None
+    if pos and pos.get('lat') is not None and pos.get('lon') is not None:
+        _fr_card = _fr24_live_card_cached(
+            flight_no=flight_no, callsign=cs, reg=reg,
+            lat=pos.get('lat'), lon=pos.get('lon'), origin=dep, dest=dest,
+            hexid=hexid)
+    _fr_times = _fr24_operational_times(_fr_card, dep, dest)
+    _canonical_times = _canonical_operational_times(
+        _official, _fr_times, airborne=in_flight, landed=_is_landed)
     payload = {
         'ok': True, 'flight': flight_no, 'date': date,
         'reg': reg, 'hex': hexid, 'callsign': cs,
@@ -10185,15 +10424,19 @@ def ax_flight_live(token):
         # ABFLUG Soll/Ist (station-lokal, wie die Ankunfts-Seite) — Owner-Wunsch
         # „Abflug Soll und Ist fehlt". Die Werte liegen schon im Dual-Side-Merge,
         # wurden nur nicht durchgereicht. dep_delay_min nur bei bekanntem Delay.
-        'sched_dep': merged.get('sched_dep'),
-        'est_dep': merged.get('esti_dep'),
+        'sched_dep': _canonical_times.get('sched_dep'),
+        'est_dep': _canonical_times.get('est_dep'),
+        'actual_dep': _canonical_times.get('actual_dep'),
         'dep_delay_min': (merged.get('dep_delay_min')
                           if merged.get('delay_known') else None),
         'dep_gate': merged.get('gate_dep'),
         # ANKUNFT Soll/Ist/Delay/Gate — Board-Merge zuerst, kanonische Fakten
         # füllen die Lücken. Rangfolge: echtes est_arr > sched_arr > nichts.
-        'sched_arr': arr_fields['sched_arr'],
-        'est_arr': arr_fields['est_arr'],
+        'sched_arr': _canonical_times.get('sched_arr'),
+        'est_arr': _canonical_times.get('est_arr'),
+        'actual_arr': _canonical_times.get('actual_arr'),
+        'dep_time_source': _canonical_times.get('dep_source'),
+        'arr_time_source': _canonical_times.get('arr_source'),
         'arr_delay_min': arr_fields['arr_delay_min'],
         'dest_gate': arr_fields['dest_gate'],
         'live': pos,
@@ -10215,12 +10458,13 @@ def ax_flight_live(token):
             _to_utc = _life_app('_board_local_to_utc_iso')
             _fs_keys = _fs_bk(
                 flight_no, date, dep, dest, roster_tail=reg, callsign=cs,
-                sched_dep_iso=(_to_utc(merged.get('sched_dep'), dep) if _to_utc else None),
+                sched_dep_iso=(_to_utc(_canonical_times.get('sched_dep'), dep)
+                               if _to_utc else None),
                 # Soll-Ankunft aus DEM Feld, das auch die Antwort trägt (Board
                 # ODER kanonische Fakten) — sonst rechnete die Engine für jede
                 # ungescrapte Outstation ohne Fahrplan-Anker und lieferte
                 # eta_iso=None, obwohl die Zahl im Payload steht.
-                sched_arr_iso=(_to_utc(arr_fields['sched_arr'], dest)
+                sched_arr_iso=(_to_utc(_canonical_times.get('sched_arr'), dest)
                                if (_to_utc and dest) else None),
                 dep_ll=_iata_latlon(dep or ''), arr_ll=_iata_latlon(dest or ''),
                 dep_elev_ft=_iata_elev_ft(dep or ''))
