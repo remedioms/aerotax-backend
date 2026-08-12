@@ -12,6 +12,7 @@ P We 1 ORT MUC
 P Th 2 SB90 MUC 04:00 - 16:00
 P Fr 3 DE1000 32N DANCA CP C1 08:00 MUC 09:00 - 10:30 PMI 01:30
 P DE1001 32N DANCA CP C1 PMI 11:30 - 13:00 MUC 01:30
+P DH/LH2000 32N DANCA MUC 14:00 - 15:00 FRA 01:00
 P Sa 4 OFF MUC
 """
 
@@ -23,7 +24,7 @@ def test_utc_duty_plan_keeps_operating_legs_and_ground_days():
     summaries = [event[3] for event in events]
     assert summaries == [
         'Off Day', 'SB90 MUC', 'DE1000 MUC - PMI',
-        'DE1001 PMI - MUC', 'Off Day',
+        'DE1001 PMI - MUC', 'DH/LH2000 MUC - FRA', 'Off Day',
     ]
     assert events[2][1].isoformat() == '2026-07-03T09:00:00'
 

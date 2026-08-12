@@ -254,6 +254,10 @@ def parse_pdf(path):
                     deadheads.append({
                         "date": dep.date().isoformat(),
                         "flight": flight_match.group(0),
+                        "from": frm,
+                        "to": to,
+                        "dep_iso": dep.isoformat().replace("+00:00", "Z"),
+                        "arr_iso": arr.isoformat().replace("+00:00", "Z"),
                         "duration_min": decimal_hours_minutes(cells["dh"]),
                     })
                     continue
@@ -321,6 +325,7 @@ def parse_pdf(path):
             "deadheads_skipped": len(deadheads),
             "block_min": block_total,
             "deadhead_min": deadhead_min,
+            "_deadheads": deadheads,
             "flight_landings": sum(
                 l.get("ldg_day", 0) + l.get("ldg_night", 0) for l in legs),
             "control": "OK",

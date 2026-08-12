@@ -93,11 +93,21 @@ def duty_plan_events(text):
                                  tzid=tzid))
             continue
 
-        if not day_match or current_day is None:
+        if current_day is None:
             continue
-        rest = day_match.group(3).strip()
+        if day_match:
+            rest = day_match.group(3).strip()
+        else:
+            continuation = re.match(r'^P\s+(.*)$', line)
+            if not continuation:
+                continue
+            rest = continuation.group(1).strip()
         duty = rest.split()[0] if rest else ''
         if not duty or duty.startswith('DE'):
+            continue
+        # Only deadheads are meaningful undated continuation duties.  Other
+        # ground duties need their own printed day anchor.
+        if not day_match and not duty.startswith('DH/'):
             continue
 
         route = re.search(
@@ -161,6 +171,15 @@ def flight_hours_events(data, text):
         end = datetime.fromisoformat(leg['arr_iso'].replace('Z', '+00:00'))
         summary = f"{leg['flight']} {leg['from']} - {leg['to']}"
         events.append(_event(f'leg-{len(events)}', start, end, summary))
+
+    for deadhead in report.pop('_deadheads', []):
+        start = datetime.fromisoformat(
+            deadhead['dep_iso'].replace('Z', '+00:00'))
+        end = datetime.fromisoformat(
+            deadhead['arr_iso'].replace('Z', '+00:00'))
+        summary = (f"DH {deadhead['flight']} {deadhead['from']} - "
+                   f"{deadhead['to']}")
+        events.append(_event(f'dh-{len(events)}', start, end, summary))
 
     seen_days = set()
     for raw in source.splitlines():
