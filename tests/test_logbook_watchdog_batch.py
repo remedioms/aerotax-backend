@@ -33,6 +33,9 @@ class Harness:
         self.status_calls = []      # (ids, status, processed)
         self.upserts = []           # (token, legs, sims, meta)
         self.pushes = []            # ("completed"|"unsupported", token, anchor)
+        self.cache_busts = []       # Token, deren Lese-Cache gelöscht wurde
+        monkeypatch.setattr(w, "_bust_import_cache",
+                            lambda token: self.cache_busts.append(token))
         monkeypatch.setattr(w, "_set_status",
                             lambda ids, status, processed=None:
                             self.status_calls.append(
@@ -92,6 +95,8 @@ def test_happy_path_imports_and_completes(monkeypatch):
     assert h.statuses_for(1)[-1] == (w.STATUS_COMPLETED, True)
     assert h.pushes == [("completed", "AT-TEST", 2)]
     assert events[0][0] == "imported"
+    # Ohne Cache-Löschen zeigt die App nach dem Push bis zu 6 h den alten Stand.
+    assert h.cache_busts == ["AT-TEST"]
 
 
 def test_dup_of_unsupported_inherits_failed(monkeypatch):
@@ -134,6 +139,79 @@ def test_sha_mismatch_goes_to_review(monkeypatch):
     w.process_token_batch("AT-TEST", [_row(9, sha=wrong)], events)
     assert h.statuses_for(9)[-1] == (w.STATUS_REVIEW, None)
     assert not h.upserts and not h.pushes
+
+
+def test_reader_key_collision_is_numbered_before_upsert(monkeypatch):
+    # Zwei Legs, die sich NUR in der Abflugzeit unterscheiden: der Leser im
+    # Backend schlüsselt gröber (date|flight|from|to) und behielte nur das
+    # letzte — die Landungen des ersten wären still weg.
+    twin = dict(LEG_A, dep_iso="2026-02-06T18:26:00Z", block_min=94)
+    h = Harness(monkeypatch, {12: (b"pdf-12", [LEG_A, twin])})
+    events = []
+    w.process_token_batch("AT-TEST", [_row(12, b"pdf-12")], events)
+    _, legs, _, meta = h.upserts[0]
+    assert [l["flight"] for l in legs] == ["LH1642", "LH1642(2)"]
+    assert meta["watchdog"]["dedupe_suffixes"] == 1
+
+
+def test_cache_bust_removes_the_positive_disk_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(w, "_USER_HISTORY_DIR", str(tmp_path))
+    cached = tmp_path / "logbook_import_AT-TEST.json"
+    cached.write_text("{}")
+    w._bust_import_cache("AT-TEST")
+    assert not cached.exists()
+    w._bust_import_cache("AT-TEST")     # fehlende Datei ist kein Fehler
+
+
+def test_crash_after_completion_leaves_finished_rows_alone(monkeypatch):
+    # Die Notbremse setzte ALLE Zeilen des Batches auf `pending` zurück —
+    # auch schon `completed`+`processed`. Die holt `_pending_rows` nie wieder
+    # (processed=is.false), die App zeigte sie für immer als „in Arbeit".
+    resets = []
+    monkeypatch.setattr(w, "_recover_stale_processing", lambda: None)
+    monkeypatch.setattr(w, "_pending_rows",
+                        lambda: [_row(1, b"a"), _row(2, b"b")])
+    monkeypatch.setattr(w, "_set_status",
+                        lambda ids, status, processed=None:
+                        resets.append((sorted(ids), status, processed)))
+    monkeypatch.setattr(w, "_alert", lambda *args: None)
+
+    def _boom(token, rows, events, terminal=None):
+        terminal.add(1)                 # #1 ist verifiziert abgeschlossen
+        raise RuntimeError("Push kaputt")
+
+    monkeypatch.setattr(w, "process_token_batch", _boom)
+    w.main()
+    assert resets == [([2], w.STATUS_PENDING, None)]
+
+
+def test_batch_cap_never_splits_one_users_upload_group(monkeypatch):
+    # Mitten in einer Token-Gruppe zu kappen verteilt EINEN Upload-Schwung auf
+    # zwei Läufe — der Nutzer bekäme zwei „Import fertig"-Pushes.
+    rows = ([dict(_row(i), token="AT-A") for i in range(1, 31)]
+            + [dict(_row(i), token="AT-B") for i in range(31, 51)])
+    seen = []
+    monkeypatch.setattr(w, "_recover_stale_processing", lambda: None)
+    monkeypatch.setattr(w, "_pending_rows", lambda: rows)
+    monkeypatch.setattr(w, "_alert", lambda *args: None)
+    monkeypatch.setattr(w, "process_token_batch",
+                        lambda token, batch, events, terminal=None:
+                        seen.append((token, len(batch))))
+    w.main()
+    assert seen == [("AT-A", 30)]       # AT-B kommt komplett im nächsten Lauf
+
+
+def test_batch_cap_still_runs_a_single_oversized_group(monkeypatch):
+    rows = [dict(_row(i), token="AT-A") for i in range(1, 60)]
+    seen = []
+    monkeypatch.setattr(w, "_recover_stale_processing", lambda: None)
+    monkeypatch.setattr(w, "_pending_rows", lambda: rows)
+    monkeypatch.setattr(w, "_alert", lambda *args: None)
+    monkeypatch.setattr(w, "process_token_batch",
+                        lambda token, batch, events, terminal=None:
+                        seen.append((token, len(batch))))
+    w.main()
+    assert seen == [("AT-A", 59)]       # sonst bliebe die Gruppe ewig liegen
 
 
 def test_mixed_batch_imports_good_and_fails_unsupported(monkeypatch):

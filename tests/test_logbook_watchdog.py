@@ -2,23 +2,33 @@
 
 Der Wächter verschmilzt neue Parser-Legs mit dem BESTEHENDEN
 `ax_logbook_import` des Nutzers (eine Zeile pro Token). Diese Tests sichern
-die drei Eigenschaften, an denen Datenverlust oder Erfindung hinge:
+die vier Eigenschaften, an denen Datenverlust oder Erfindung hinge:
 
   1. Union statt Ersetzen — Bestehendes überlebt jeden Re-Import.
   2. Identischer Schlüssel + identische Blockzeit = Dublette (kein Doppel-Leg).
   3. Identischer Schlüssel + ABWEICHENDE Blockzeit = Konflikt → ValueError
      (der Wächter schickt den Batch dann in die manuelle Prüfung).
+  4. Was der LESER im Backend nicht auseinanderhalten kann, wird vor dem
+     Schreiben nummeriert — sonst frisst sein gröberer Schlüssel ein Leg.
+
+Dazu die Format-Erkennung selbst: `_try_parsers` entpackt die Rückgaben
+ZWEIER Parser mit VERSCHIEDENER Stelligkeit. Der Test läuft deshalb gegen die
+echten Parser-Module (nur die PDF-Text-Ebene ist synthetisch).
 """
 
 import os
 import sys
 
+import pdfplumber
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools", "logbook-parsers"))
 
-from logbook_watchdog import merge_legs, merge_sims  # noqa: E402
+import logbook_watchdog  # noqa: E402
+from logbook_watchdog import (  # noqa: E402
+    _capped_source, dedupe_for_reader, merge_legs, merge_sims,
+)
 
 
 def _leg(date, flight, frm, to, dep, block, **kw):
@@ -67,16 +77,123 @@ def test_merge_sorts_by_date_then_dep():
 def test_legs_without_dep_iso_fall_back_to_block_key():
     # Alt-Importe (z.B. Condor-Historie) können Legs ohne dep_iso tragen —
     # der Schlüssel weicht dann auf die Blockzeit aus, statt zu kollidieren.
+    # ABER: der Leser im Backend kennt nur `date|flight|from|to`. Beide Legs
+    # trügen dort denselben Schlüssel, das erste verschwände samt Landungen.
+    # Deshalb bekommt die zweite Belegung vor dem Schreiben ihr „(2)".
     a = {"date": "2024-01-01", "flight": "DE123", "from": "FRA", "to": "PMI",
          "block_min": 130}
     b = dict(a, block_min=131)  # gleiche Strecke, anderer Block ⇒ eigener Key
     merged, added = merge_legs([a], [b])
     assert added == 1 and len(merged) == 2
+    assert len(dedupe_for_reader(merged)) == 1
+    assert [l["flight"] for l in merged] == ["DE123", "DE123(2)"]
+
+
+def test_dedupe_is_stable_across_reruns_and_numbers_a_third_leg():
+    # Zweiter Lauf über eine bereits nummerierte Liste darf weder umbenennen
+    # noch „(2)" doppelt vergeben — sonst kollidierten die Legs erneut.
+    legs = [{"date": "2024-01-01", "flight": "DE123", "from": "FRA",
+             "to": "PMI", "block_min": 130 + i} for i in range(3)]
+    dedupe_for_reader(legs)
+    assert [l["flight"] for l in legs] == ["DE123", "DE123(2)", "DE123(3)"]
+    dedupe_for_reader(legs)
+    assert [l["flight"] for l in legs] == ["DE123", "DE123(2)", "DE123(3)"]
+
+
+def test_suffixed_leg_is_not_reimported_as_new():
+    # Derselbe Upload ein zweites Mal: das gespeicherte „DE123(2)" und das
+    # frisch geparste „DE123" sind DASSELBE Leg (Suffix ist Lesehilfe, keine
+    # Identität) — sonst wüchse das Flugbuch bei jedem Re-Upload.
+    stored = {"date": "2024-01-01", "flight": "DE123(2)", "from": "FRA",
+              "to": "PMI", "block_min": 131}
+    fresh = dict(stored, flight="DE123")
+    merged, added = merge_legs([stored], [fresh])
+    assert added == 0 and len(merged) == 1
+
+
+def test_source_label_is_capped_instead_of_growing_forever():
+    label = "Watchdog: lh_flugstunden 2026-01"
+    for month in range(2, 7):
+        label = _capped_source(label, f"Watchdog: lh_flugstunden 2026-{month:02d}")
+    assert label == ("… (+3) + Watchdog: lh_flugstunden 2026-04 + "
+                     "Watchdog: lh_flugstunden 2026-05 + "
+                     "Watchdog: lh_flugstunden 2026-06")
+    assert _capped_source(None, "Watchdog: cfg_flugstunden 2026-05") == \
+        "Watchdog: cfg_flugstunden 2026-05"
 
 
 def test_empty_existing_is_fine():
     merged, added = merge_legs(None, OLD)
     assert added == 2 and len(merged) == 2
+
+
+class _FakePage:
+    """Nur die zwei pdfplumber-Methoden, die die Parser benutzen."""
+
+    def __init__(self, text, words):
+        self._text, self._words = text, words
+
+    def extract_text(self):
+        return self._text
+
+    def extract_words(self, **_kwargs):
+        return self._words
+
+
+class _FakePDF:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def _word(text, x0, top):
+    return {"text": text, "x0": x0, "x1": x0 + 10, "top": top,
+            "bottom": top + 8}
+
+
+def _lh_pdf():
+    """Leerer LH-Monat 07/2022: Kopf + Summenzeile mit Nullwerten."""
+    text = "Flugstunden - Übersicht für Monat 07 / 2022"
+    words = [_word("07", 50, 720), _word("0", 170, 720), _word("0,00", 200, 720)]
+    return _FakePDF([_FakePage(text, words)])
+
+
+def _cfg_pdf():
+    """Leerer Condor-Monat 05/2026 — gleicher Kopf, eigener Summenblock."""
+    text = "Condor Flugstunden - Übersicht für Monat 05 / 2026"
+    words = [_word("Anzahl", 250, 700), _word("Landungen", 300, 700),
+             _word("0", 300, 720), _word("0,00", 370, 720)]
+    return _FakePDF([_FakePage(text, words)])
+
+
+def test_try_parsers_unpacks_both_real_parser_signatures(monkeypatch):
+    # Der Wächter entpackte fest dreistellig — die Condor-Variante gibt aber
+    # nur (legs, report) zurück. Jeder Condor-Upload starb deshalb an einem
+    # ValueError, der als „Kontrolle verletzt" in `review` gedeutet wurde.
+    # Bewusst gegen die ECHTEN Parser: nur die PDF-Ebene ist synthetisch.
+    docs = {"lh.pdf": _lh_pdf(), "condor.pdf": _cfg_pdf()}
+    monkeypatch.setattr(pdfplumber, "open", lambda path: docs[path])
+
+    name, legs, sims, report = logbook_watchdog._try_parsers("lh.pdf")
+    assert (name, legs, sims) == ("lh_flugstunden", [], [])
+    assert report["month"] == "2022-07"
+
+    name, legs, sims, report = logbook_watchdog._try_parsers("condor.pdf")
+    assert (name, legs, sims) == ("cfg_flugstunden", [], [])
+    assert report["month"] == "2026-05"
+
+
+def test_try_parsers_reports_unknown_format_without_touching_a_parser(
+        monkeypatch):
+    monkeypatch.setattr(pdfplumber, "open",
+                        lambda path: _FakePDF([_FakePage("Bordkarte", [])]))
+    assert logbook_watchdog._try_parsers("x.pdf") == \
+        ("unsupported", None, None, None)
 
 
 def test_merge_sims_dedupes_and_sorts():

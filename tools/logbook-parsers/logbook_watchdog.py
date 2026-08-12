@@ -42,6 +42,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import traceback
@@ -52,6 +53,8 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from legkeys import dedupe_keys  # noqa: E402
+
 ROSTER_MARKER = "AEROX_ROSTER_PDF_V1"
 ALERT_TO = "aerox@aerosteuer.de"
 ALERT_FROM = "noreply@aerosteuer.de"
@@ -61,6 +64,19 @@ STATUS_PROCESSING = "processing"
 STATUS_REVIEW = "review"      # wartet auf Menschen; App pollt weiter „queued"
 STATUS_FAILED = "failed"
 STATUS_COMPLETED = "completed"
+# Endzustände: einmal erreicht, NIE von der Notbremse in main() zurückgedreht.
+TERMINAL_STATUS = (STATUS_COMPLETED, STATUS_FAILED, STATUS_REVIEW)
+
+# Positiv-Cache des Backends (`logbook_import_<token>.json`, 6 h TTL). app.py
+# bildet den Pfad relativ zum Arbeitsverzeichnis (`_user_history_state`); der
+# Wächter läuft im selben Container auf demselben Volume, leitet den Pfad aber
+# aus der eigenen Dateilage ab — der Cron-Wrapper startet mit fremdem cwd.
+_USER_HISTORY_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "_user_history_state")
+RE_LEG_SUFFIX = re.compile(r"\(\d+\)$")
+RE_SOURCE_ELLIPSIS = re.compile(r"^…\s*\(\+(\d+)\)$")
+SOURCE_KEEP = 3               # meta.source wächst sonst mit jedem Import
 
 
 def _env(name):
@@ -198,14 +214,31 @@ def _try_parsers(path):
         name, mod = "cfg_flugstunden", parse_cfg_flugstunden
     else:
         name, mod = "lh_flugstunden", parse_lh_flugstunden
-    legs, sims, report = mod.parse_pdf(path)
+    # Die beiden Parser geben BEWUSST verschieden zurück: LH liefert
+    # (legs, sims, report), die Condor/CFG-Variante nur (legs, report) — sie
+    # bricht bei Simulator-Minuten ohnehin ab, hat also keine Sim-Liste. Ein
+    # festes Drei-Entpacken sprengte jeden Condor-Upload mit einem ValueError,
+    # der hier als „Kontrolle verletzt" gedeutet wurde → Datei in `review`.
+    out = mod.parse_pdf(path)
+    if len(out) == 3:
+        legs, sims, report = out
+    else:
+        legs, report = out
+        sims = []
     return name, legs, sims, report
 
 
 # ── Merge mit bestehendem Import ────────────────────────────────────────────
 
+def _base_flight(flight):
+    """Flugnummer ohne Kollisions-Suffix „(2)". Der Suffix ist reine
+    Lese-Disambiguierung (legkeys), keine Identität — ohne dieses Abziehen
+    gälte dasselbe Leg beim nächsten Upload derselben Datei als NEU."""
+    return RE_LEG_SUFFIX.sub("", (flight or "").upper().strip())
+
+
 def _leg_key(leg):
-    return (leg.get("date"), leg.get("flight"), leg.get("from"),
+    return (leg.get("date"), _base_flight(leg.get("flight")), leg.get("from"),
             leg.get("to"), leg.get("dep_iso") or f"block:{leg.get('block_min')}")
 
 
@@ -237,12 +270,73 @@ def merge_legs(existing, new):
     return merged, added
 
 
+def dedupe_for_reader(legs):
+    """Leg-Keys auf den GRÖBEREN Schlüssel des Lesers eindeutig machen.
+
+    Der Wächter unterscheidet Legs zusätzlich über `dep_iso`/Blockzeit, das
+    Backend liest sie aber nur als `date|flight|from|to` (`_logbook_leg_key`)
+    in ein Dict — zwei hier verschiedene Zeilen fielen dort STILL zusammen,
+    die zuerst gelesene verlor ihre Landungen. Nachbearbeitung wie in allen
+    Parsern: die zweite Belegung bekommt „(2)" (legkeys.dedupe_keys).
+
+    Vorher werden bestehende Suffixe abgezogen, damit die Nummerierung bei
+    jedem Lauf über die GANZE (sortierte) Liste neu und stabil vergeben wird —
+    sonst bekäme eine dritte Belegung erneut „(2)"."""
+    for leg in legs:
+        if leg.get("flight"):
+            leg["flight"] = _base_flight(leg["flight"])
+    return dedupe_keys(legs)
+
+
 def merge_sims(existing, new):
     by_key = {_sim_key(s): s for s in (existing or [])}
     for sim in new or []:
         by_key.setdefault(_sim_key(sim), sim)
     return sorted(by_key.values(),
                   key=lambda s: (s.get("date") or "", s.get("code") or ""))
+
+
+def _capped_source(prev, label, keep=SOURCE_KEEP):
+    """`meta.source` begrenzen. Jeder Import hängte bisher „ + <Label>" an —
+    die Zeichenkette wächst unbegrenzt und steht in der App als Dateiname.
+    Es bleiben die letzten `keep` Bausteine, davor „… (+N)" für den Rest."""
+    parts = [p.strip() for p in (prev or "").split(" + ") if p.strip()]
+    dropped = 0
+    if parts:
+        match = RE_SOURCE_ELLIPSIS.match(parts[0])
+        if match:
+            dropped = int(match.group(1))
+            parts = parts[1:]
+    parts.append(label)
+    if len(parts) > keep:
+        dropped += len(parts) - keep
+        parts = parts[-keep:]
+    return (f"… (+{dropped}) + " if dropped else "") + " + ".join(parts)
+
+
+def _bust_import_cache(token):
+    """Positiv-Cache-Datei des Backends für diesen Token löschen.
+
+    Ohne das zeigt die App nach dem „fertig"-Push bis zu 6 h den ALTEN Blob
+    (app.py `_logbook_import_load`, TTL 6 h). Best effort — ein Cache-Fehler
+    darf einen verifizierten Import nie zurückrollen.
+
+    TODO/GRENZE: Das ZWEITE Origin (NAS, https://nas-api.aerosteuer.de) hat
+    einen eigenen Datenträger und keine erreichbare Invalidierungs-Route; dort
+    bleibt der alte Blob bis zu 6 h warm. Bewusst KEIN neuer HTTP-Endpoint in
+    app.py — solange die Lücke nur diesen Cache betrifft, ist sie zeitlich
+    begrenzt und selbstheilend."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", token or "")[:64]
+    if not safe:
+        return
+    path = os.path.join(_USER_HISTORY_DIR, f"logbook_import_{safe}.json")
+    try:
+        os.unlink(path)
+        _log(f"Import-Cache gelöscht: {os.path.basename(path)}")
+    except FileNotFoundError:
+        pass
+    except OSError as ex:  # noqa: BLE001 — nur loggen
+        _log(f"Import-Cache-Löschen fehlgeschlagen ({type(ex).__name__}): {ex}")
 
 
 def _meta_for(legs, sims, label, extra):
@@ -317,9 +411,22 @@ def _push_unsupported(token, anchor_upload_id):
 
 # ── Batch-Verarbeitung ──────────────────────────────────────────────────────
 
-def process_token_batch(token, rows, events):
+def process_token_batch(token, rows, events, terminal=None):
     ids = [r["id"] for r in rows]
-    _set_status(ids, STATUS_PROCESSING)
+
+    def _status(target_ids, status, processed=None):
+        """Statuswechsel + Merkzettel `terminal`: Zeilen in einem Endzustand
+        darf die Notbremse in main() NICHT auf `pending` zurücksetzen — sonst
+        hängt eine längst fertige Datei in der App ewig als „in Arbeit"."""
+        _set_status(target_ids, status, processed)
+        if terminal is None:
+            return
+        if status in TERMINAL_STATUS:
+            terminal.update(target_ids)
+        else:
+            terminal.difference_update(target_ids)
+
+    _status(ids, STATUS_PROCESSING)
     parsed_files, unsupported, seen_sha = [], [], {}
     review = []
 
@@ -359,7 +466,7 @@ def process_token_batch(token, rows, events):
         # Ein einziger unklarer Fall reißt den ganzen Batch in die manuelle
         # Prüfung — Teilimporte neben offenen Fragen sind schwerer zu
         # entwirren als ein sauber liegender Batch.
-        _set_status(ids, STATUS_REVIEW)
+        _status(ids, STATUS_REVIEW)
         events.append(("review", token, ids,
                        "; ".join(f"#{i}: {m}" for i, m in review)))
         return
@@ -377,31 +484,33 @@ def process_token_batch(token, rows, events):
         try:
             merged_legs, added = merge_legs(old_legs, new_legs)
         except ValueError as ex:
-            _set_status(ids, STATUS_REVIEW)
+            _status(ids, STATUS_REVIEW)
             events.append(("review", token, ids, str(ex)))
             return
         merged_sims = merge_sims(old_sims, new_sims)
+        collisions = dedupe_for_reader(merged_legs)
         months = sorted({f["report"]["month"] for f in real})
         label = (f"Watchdog: {real[0]['parser']} {months[0]}–{months[-1]}"
                  if len(months) > 1 else
                  f"Watchdog: {real[0]['parser']} {months[0]}")
         prev_meta = (existing[0].get("meta") or {}) if existing else {}
-        if prev_meta.get("source"):
-            label = f"{prev_meta['source']} + {label}"
+        label = _capped_source(prev_meta.get("source"), label)
         meta = _meta_for(merged_legs, merged_sims, label, {
             "watchdog": {"upload_ids": [f["id"] for f in real],
                          "duplicates_skipped": [f["id"] for f in dups],
                          "added_legs": added,
+                         "dedupe_suffixes": len(collisions),
                          "ts": datetime.now(timezone.utc).isoformat()},
         })
         _upsert_import(token, merged_legs, merged_sims, meta)
-        _set_status([f["id"] for f in real], STATUS_COMPLETED, processed=True)
+        _bust_import_cache(token)
+        _status([f["id"] for f in real], STATUS_COMPLETED, processed=True)
         _push_completed(token, max(f["id"] for f in real))
         events.append(("imported", token, [f["id"] for f in real],
                        f"+{added} Legs (gesamt {len(merged_legs)})"))
 
     if unsupported:
-        _set_status(unsupported, STATUS_FAILED, processed=True)
+        _status(unsupported, STATUS_FAILED, processed=True)
         _push_unsupported(token, max(unsupported))
         events.append(("unsupported", token, unsupported, "Format unbekannt"))
 
@@ -417,9 +526,9 @@ def process_token_batch(token, rows, events):
                      if f["dup_of"] in real_ids or f["dup_of"] not in
                      set(unsupported) | real_ids]
         if failed_dups:
-            _set_status(failed_dups, STATUS_FAILED, processed=True)
+            _status(failed_dups, STATUS_FAILED, processed=True)
         if done_dups:
-            _set_status(done_dups, STATUS_COMPLETED, processed=True)
+            _status(done_dups, STATUS_COMPLETED, processed=True)
         events.append(("dups", token,
                        {"failed": failed_dups, "completed": done_dups}, ""))
 
@@ -430,21 +539,41 @@ def main():
     if not rows:
         _log("nichts offen")
         return
-    rows = rows[:MAX_BATCH_FILES]
     by_token = defaultdict(list)
     for row in rows:
         by_token[row["token"]].append(row)
+    if len(rows) > MAX_BATCH_FILES:
+        # Kappen NUR an Token-Grenzen: mitten in einer Nutzer-Gruppe zu
+        # schneiden verteilt EINEN Upload-Schwung auf zwei Läufe — der Nutzer
+        # bekäme zwei „Flugbuch-Import fertig"-Pushes. Die erste Gruppe läuft
+        # immer, auch wenn sie allein über der Grenze liegt (sonst bliebe sie
+        # für immer liegen).
+        kept, taken = {}, 0
+        for token, batch in by_token.items():
+            if taken and taken + len(batch) > MAX_BATCH_FILES:
+                break
+            kept[token] = batch
+            taken += len(batch)
+        by_token = kept
+        rows = [r for batch in kept.values() for r in batch]
     _log(f"{len(rows)} offene Datei(en) von {len(by_token)} Nutzer(n)")
 
     events = []
     for token, batch in by_token.items():
+        terminal = set()
         try:
-            process_token_batch(token, batch, events)
+            process_token_batch(token, batch, events, terminal)
         except Exception:  # noqa: BLE001
             # Unerwartet → Zeilen zurück auf pending (nächster Lauf), Alarm.
-            _set_status([r["id"] for r in batch], STATUS_PENDING)
+            # ABER nur die, die KEINEN Endzustand erreicht haben: eine bereits
+            # `completed`+`processed`-Zeile auf `pending` zurückzudrehen holt
+            # sie nie wieder (`_pending_rows` filtert processed=is.false) und
+            # zeigt dem Nutzer den fertigen Import ewig als „in Arbeit".
+            rest = [r["id"] for r in batch if r["id"] not in terminal]
+            if rest:
+                _set_status(rest, STATUS_PENDING)
             head = traceback.format_exc(limit=6)
-            events.append(("error", token, [r["id"] for r in batch], head))
+            events.append(("error", token, rest, head))
 
     lines = []
     for kind, token, ids, detail in events:

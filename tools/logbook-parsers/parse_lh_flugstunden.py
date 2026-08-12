@@ -42,7 +42,12 @@ RE_SIM_DEVICE = re.compile(r"^(?:[A-Z]{3}[A-Z0-9]{3}|FT\d{2})$")
 # Summenzeile 196/319 in den Leseranges) — nur die Funktions-Kennung vor
 # „/ KABINE" variiert. Die Kennung wird als Rolle übernommen (FB, P1, …);
 # COCKPIT-Varianten (z.B. „CP / COCKPIT") matchen bewusst NICHT.
-RE_CABIN = re.compile(r"Funktion\s+([A-Z0-9]{1,3})\s*/\s*KABINE", re.IGNORECASE)
+# IGNORECASE gilt NUR für die Wortmarken — mit globalem Flag hätte
+# `[A-Z0-9]{1,3}` auch Kleinbuchstaben-Müll geschluckt und die Datei wäre auf
+# die Kabinen-Spaltengeometrie umgesprungen; die Kennung selbst ist strikt
+# großgeschrieben und wortgenau abgegrenzt.
+RE_CABIN = re.compile(
+    r"(?i:Funktion)\s+\b([A-Z][A-Z0-9]{0,2})\b\s*/\s*(?i:KABINE)")
 CONTROL_ROUNDING_TOLERANCE_MIN = 3
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
