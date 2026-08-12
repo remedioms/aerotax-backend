@@ -141,6 +141,8 @@ def parse_pdf(src):
                 starts = to_int(A['to_day']) + to_int(A['to_night'])
                 landings = to_int(A['ldg_day']) + to_int(A['ldg_night'])
                 reg_raw = A['reg'].replace(' ', '').upper()
+                paired_sim = (iso_date(B['std_date']) == date
+                              and to_min(B['std_dur']) is not None)
 
                 # OffBlock bildet ältere, nicht einzeln verfügbare Flugzeit als
                 # 23:59-Sammelzeilen ab: gleicher Ort, kein Typ/Kennzeichen,
@@ -159,8 +161,15 @@ def parse_pdf(src):
                 # Simulator: steht doppelt (Flugtabelle + STD) → hier raus
                 if RE_SIM_TYPE.match(typ) and A['from'] == A['to']:
                     continue
+                # In the current OffBlock export FSTD rows have no aircraft
+                # type on the A page; the paired B row's STD date/duration is
+                # the reliable signal. Do not duplicate a pure sim session as
+                # a zero-time flight leg. A landing-only training row remains
+                # a leg so its explicitly printed landings are preserved.
+                if paired_sim and not block and starts == 0 and landings == 0:
+                    continue
 
-                leg = {'date': date}
+                leg = {'date': date, '_source_format': 'offblock_fcl050'}
                 if A['from']:
                     leg['from'] = A['from'].upper()[:4]
                 if A['to']:

@@ -236,6 +236,21 @@ def test_try_parsers_routes_fcl050_before_generic_pdf(monkeypatch, tmp_path):
         "offblock_fcl050", [OLD[0]], [], report)
 
 
+def test_try_parsers_routes_faa_logbook_before_generic_pdf(
+        monkeypatch, tmp_path):
+    import parse_faa_logbook
+    import parse_fcl050_v2
+    path = tmp_path / "faa.upload"
+    path.write_bytes(b"%PDF-faa")
+    report = {"month": "2012-01–2026-08", "carryover_min": 42}
+    monkeypatch.setattr(parse_fcl050_v2, "matches_pdf", lambda _path: False)
+    monkeypatch.setattr(parse_faa_logbook, "matches_pdf", lambda _path: True)
+    monkeypatch.setattr(parse_faa_logbook, "parse_pdf",
+                        lambda _path: ([OLD[0]], [], report))
+    assert logbook_watchdog._try_parsers(str(path)) == (
+        "offblock_faa", [OLD[0]], [], report)
+
+
 def test_try_parsers_routes_jeppesen_roster(monkeypatch, tmp_path):
     import parse_fcl050_v2
     import parse_roster_logbook
@@ -265,6 +280,27 @@ def test_roster_batch_keeps_only_newest_complete_month_revision():
     assert logbook_watchdog.resolve_roster_revisions([old, new]) == 1
     assert old["legs"] == []
     assert new["legs"] == [OLD[1]]
+
+
+def test_merge_dedupes_faa_twin_without_clock_against_fcl_leg():
+    fcl = dict(OLD[0], type="B 757-300", reg="D-ABCD",
+               ldg_day=1, night_min=20)
+    faa = {key: value for key, value in fcl.items() if key != "dep_iso"}
+    faa["type"] = "B757-300"  # templates format spaces differently
+    merged, added = merge_legs([fcl], [faa])
+    assert added == 0 and merged == [fcl]
+
+
+def test_fcl_cleanup_removes_only_pure_sim_copy():
+    pure_sim = {"date": "2022-01-10", "from": "FRA", "to": "FRA"}
+    landing_training = {"date": "2022-01-11", "from": "FRA", "to": "FRA",
+                        "ldg_day": 3}
+    flight = dict(OLD[0])
+    kept, removed = logbook_watchdog.remove_fcl_sim_leg_artifacts(
+        [pure_sim, landing_training, flight],
+        [{"date": "2022-01-10"}, {"date": "2022-01-11"}])
+    assert removed == 1
+    assert kept == [landing_training, flight]
 
 
 def test_try_parsers_turns_corrupt_pdf_into_terminal_unsupported(tmp_path):

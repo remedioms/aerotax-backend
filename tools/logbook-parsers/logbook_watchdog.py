@@ -218,6 +218,7 @@ def _try_parsers(path):
     except ImportError:  # pragma: no cover - Produktions-Altversion
         pdf_errors = (PDFSyntaxError,)
     import parse_duties_v8
+    import parse_faa_logbook
     import parse_fcl050_v2
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
@@ -238,6 +239,9 @@ def _try_parsers(path):
     if parse_fcl050_v2.matches_pdf(path):
         legs, sims, report = parse_fcl050_v2.parse_pdf(path)
         return "offblock_fcl050", legs, sims, report
+    if parse_faa_logbook.matches_pdf(path):
+        legs, sims, report = parse_faa_logbook.parse_pdf(path)
+        return "offblock_faa", legs, sims, report
     try:
         with pdfplumber.open(path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
@@ -297,13 +301,24 @@ def _sim_key(sim):
     return (sim.get("date"), sim.get("code"), sim.get("duration_min"))
 
 
+def _fact_key(leg):
+    """Physical-fact identity for exports without flight number/timestamps."""
+    compact = lambda value: re.sub(r"\s+", "", str(value or "")).upper()
+    return (leg.get("date"), leg.get("from"), leg.get("to"),
+            leg.get("block_min"), compact(leg.get("reg")),
+            compact(leg.get("type")), leg.get("ldg_day"),
+            leg.get("ldg_night"), leg.get("night_min"))
+
+
 def merge_legs(existing, new):
     """Union über Leg-Schlüssel. Bestehende Zeilen gewinnen unverändert;
     identische Schlüssel mit ABWEICHENDER Blockzeit sind ein Konflikt →
     ValueError (Aufrufer schickt den Batch in `review`)."""
     by_key = {}
+    facts = defaultdict(list)
     for leg in existing or []:
         by_key[_leg_key(leg)] = leg
+        facts[_fact_key(leg)].append(leg)
     added = 0
     for leg in new:
         key = _leg_key(leg)
@@ -313,7 +328,20 @@ def merge_legs(existing, new):
                     f"Merge-Konflikt {key}: block {by_key[key].get('block_min')}"
                     f" != {leg.get('block_min')}")
             continue
+        # FAA Logbook Pro omits flight number and departure clock. The same
+        # user can upload its EASA twin, which carries the same physical facts
+        # plus UTC clocks. If one side lacks a clock and every printed fact
+        # agrees, it is one leg, not a second flight. Consume candidates so
+        # repeated identical shuttles remain count-preserving.
+        candidates = facts.get(_fact_key(leg)) or []
+        match_index = next((index for index, candidate in enumerate(candidates)
+                            if bool(candidate.get("dep_iso"))
+                            != bool(leg.get("dep_iso"))), None)
+        if match_index is not None:
+            candidates.pop(match_index)
+            continue
         by_key[key] = leg
+        facts[_fact_key(leg)].append(leg)
         added += 1
     merged = sorted(by_key.values(),
                     key=lambda l: (l.get("date") or "", l.get("dep_iso") or "",
@@ -345,6 +373,23 @@ def merge_sims(existing, new):
         by_key.setdefault(_sim_key(sim), sim)
     return sorted(by_key.values(),
                   key=lambda s: (s.get("date") or "", s.get("code") or ""))
+
+
+def remove_fcl_sim_leg_artifacts(legs, sims):
+    """Remove old zero-time A-page copies after the fixed FCL parser runs."""
+    sim_dates = {sim.get("date") for sim in sims or [] if sim.get("date")}
+    kept, removed = [], 0
+    for leg in legs or []:
+        is_artifact = (
+            leg.get("date") in sim_dates
+            and leg.get("from") and leg.get("from") == leg.get("to")
+            and not leg.get("block_min")
+            and not leg.get("ldg_day") and not leg.get("ldg_night"))
+        if is_artifact:
+            removed += 1
+        else:
+            kept.append(leg)
+    return kept, removed
 
 
 def resolve_roster_revisions(parsed_files):
@@ -581,6 +626,10 @@ def process_token_batch(token, rows, events, terminal=None):
                                 "&select=legs,sim,meta") or []
         old_legs = existing[0]["legs"] if existing else []
         old_sims = (existing[0].get("sim") or []) if existing else []
+        fcl_cleanup = 0
+        if any(f["parser"] == "offblock_fcl050" for f in real):
+            old_legs, fcl_cleanup = remove_fcl_sim_leg_artifacts(
+                old_legs, old_sims)
         try:
             merged_legs, added = merge_legs(old_legs, new_legs)
         except ValueError as ex:
@@ -616,6 +665,7 @@ def process_token_batch(token, rows, events, terminal=None):
                          "duplicates_skipped": [f["id"] for f in dups],
                          "added_legs": added,
                          "roster_revision_legs_superseded": roster_superseded,
+                         "fcl_sim_leg_artifacts_removed": fcl_cleanup,
                          "dedupe_suffixes": len(collisions),
                          "ts": datetime.now(timezone.utc).isoformat()},
         }
