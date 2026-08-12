@@ -213,3 +213,68 @@ def test_aircraft_live_pos_flight_number_retry_both_forms(monkeypatch):
     assert pos is not None
     assert reg == 'D-AIZZ'
     assert od == ('HAJ', 'FRA')
+
+
+def test_aircraft_live_pos_ignoriert_innenliegende_leerzeichen(monkeypatch):
+    """„LH 713" ist derselbe Flug wie „LH713" (Owner 13.08., LH713 ICN→FRA).
+
+    Zwei Freunde sassen im selben Flieger, einer sah die laufende Ankunft
+    18:17, der andere die Planzeit 18:40. Der iCal-Zweig von friends-today gab
+    die Flugnummer unnormalisiert weiter; `_aircraft_live_pos` putzte nur die
+    Raender (`.strip()`), fragte `aircraft_live` mit „LH 713" ab und fand
+    nichts. Ohne Position gibt es keine FR24-Karte und damit keine laufende
+    Ankunft — der Flug war derselbe, nur der String nicht.
+    """
+    monkeypatch.setattr(axd, '_nas_live_pos', lambda **kw: None)
+
+    class FakeQuery:
+        def __init__(self, store):
+            self.store = store
+            self._col = None
+            self._val = None
+
+        def select(self, *a, **k):
+            return self
+
+        def eq(self, col, val):
+            if col in ('callsign', 'flight', 'reg'):
+                self._col, self._val = col, val
+            return self
+
+        def gt(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
+            return self
+
+        def execute(self):
+            rows = [r for r in self.store
+                    if r.get(self._col) == self._val] if self._col else []
+
+            class R:
+                def __init__(self, data):
+                    self.data = data
+            return R(rows)
+
+    store = [{'callsign': 'DLH713', 'flight': 'LH713', 'reg': 'DAIXP',
+              'reg_display': 'D-AIXP', 'lat': 48.1, 'lon': 13.0, 'track': 290,
+              'gs_kt': 470, 'alt_ft': 36000, 'origin': 'ICN', 'dest': 'FRA',
+              'ac_type': 'A359', 'on_ground': False,
+              'seen_ts': '2026-08-13T15:00:00Z',
+              'updated_at': '2999-01-01T00:00:00Z'}]
+
+    class FakeSB:
+        def table(self, name):
+            return FakeQuery(store)
+
+    monkeypatch.setattr(axd, '_sb', lambda: FakeSB())
+
+    pos, od, reg, ac = axd._aircraft_live_pos(flight='LH 713')
+    assert pos is not None
+    assert reg == 'D-AIXP'
+    assert od == ('ICN', 'FRA')
+
+    # Gleiche Regel auf der Funknamen-Seite.
+    pos2, _, reg2, _ = axd._aircraft_live_pos(callsign='DLH 713')
+    assert pos2 is not None
+    assert reg2 == 'D-AIXP'

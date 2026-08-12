@@ -708,8 +708,15 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                            time.gmtime(time.time() - max_age_min * 60))
     rn = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
-    fn = (flight or '').strip().upper() or None
-    cs = (callsign or '').strip().upper() or None
+    # INNENLIEGENDE LEERZEICHEN AUCH RAUS (Owner 13.08., LH713): `.strip()`
+    # putzt nur die Ränder, „LH 713" ging so unverändert in `eq('flight', …)`
+    # gegen `aircraft_live` — und die Spalte kennt nur „LH713". Auch
+    # `_callsign_zero_variants` rettet das nicht (die variiert nur die Ziffern).
+    # Ergebnis war ein stiller Treffer-Verlust: keine Position, keine FR24-
+    # Karte, keine laufende Ankunft. Dieselbe Regel fahren `_free_crew_live_pos`
+    # und `_fr24_live_card_cached` längst.
+    fn = re.sub(r'\s+', '', (flight or '')).upper() or None
+    cs = re.sub(r'\s+', '', (callsign or '')).upper() or None
     sel = 'reg,reg_display,callsign,flight,lat,lon,track,gs_kt,alt_ft,origin,dest,ac_type,on_ground,seen_ts'
     dep_n = _norm_iata(dep) if dep else None
 

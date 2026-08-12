@@ -18574,7 +18574,19 @@ def get_friends_today(token):
                             for i, fno in enumerate(fns[:4])]
             else:
                 for _sec in (day.get('ical_sectors') or [])[:4]:
-                    _fn = (_sec.get('flight') or _sec.get('flight_no') or '').strip()
+                    # GLEICHE SCHREIBWEISE WIE DER TAX-PFAD (Owner 13.08.,
+                    # LH713 ICN→FRA: zwei Freunde im SELBEN Flieger, einer sah
+                    # „Ankunft 18:17", der andere die Planzeit 18:40). Dieser
+                    # Zweig war der einzige `ical_sectors`-Leser ohne
+                    # `replace(' ','').upper()` — direkt daneben (`_sec_dep_iso`,
+                    # oben) und im Tax-Zweig (`fns`) steht dieselbe Regel. Ein
+                    # „LH 713" aus dem iCal lief damit als „LH 713" weiter:
+                    # `_aircraft_live_pos` normalisiert nur die Ränder
+                    # (`.strip()`), fand nichts → keine Live-Position → keine
+                    # FR24-Karte → kein `est_arr_iso`. Der Flug war derselbe,
+                    # nur der String nicht.
+                    _fn = (_sec.get('flight') or _sec.get('flight_no')
+                           or '').replace(' ', '').upper().strip()
                     _fr = (_sec.get('from') or _sec.get('dep') or '').strip().upper()
                     _to = (_sec.get('to') or _sec.get('arr') or '').strip().upper()
                     if _fn and len(_fr) == 3 and len(_to) == 3:
