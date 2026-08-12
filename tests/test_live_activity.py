@@ -2025,3 +2025,70 @@ def test_departed_ereignis_bleibt_der_direkte_weg_in_den_flugzustand(sb, auth,
     cs = apns['client'].sent[0]['payload']['aps']['content-state']
     assert cs['phase'] == 'inFlight' and cs['kicker'] == 'GESTARTET'
     assert cs['mainTime'] == cs['estArr']
+
+
+# ── Feld-Erhaltung gegen Teil-Absender (Vorfall Nr. 4, 13.08.2026) ──────────
+
+def test_teilabsender_loescht_die_kette_nicht_mehr(sb, auth, apns):
+    """DER BOARDING-FALL: Der Client hat eine volle Karte gesendet (Kette mit
+    Pickup/Boarding, Anzeige-Zone, Städten). Danach schickt der MQTT-Fanout
+    sein handgebautes Teil-Dict (est_dep) — APNs ersetzt vollständig. Vorher
+    verschwand damit die ganze Kette vom Sperrbildschirm; jetzt erhält der
+    Server die phasen-unabhängigen Felder aus dem zuletzt gesendeten Zustand."""
+    _seed_row(sb)
+    voll = {'stateVersion': 2, 'phase': 'briefing', 'kicker': 'PICKUP',
+            'generatedAt': '2026-08-12T00:30:00Z',
+            'mainTime': '2026-08-12T09:50:00+09:00',
+            'countdownTarget': '2026-08-12T12:20:00+09:00',
+            'displayTZIdentifier': 'Asia/Seoul',
+            'fromCity': 'Seoul', 'toCity': 'Frankfurt',
+            'chain': [{'label': 'Pickup',
+                       'time': '2026-08-12T09:50:00+09:00', 'state': 'current'},
+                      {'label': 'Boarding',
+                       'time': '2026-08-12T11:40:00+09:00', 'state': 'upcoming'}]}
+    r1 = LA.push_live_activity(TOKEN, voll)
+    assert r1['sent'] == 1
+
+    teil = {'stateVersion': 2, 'phase': 'briefing', 'kicker': 'ABFLUG',
+            'generatedAt': '2026-08-12T03:00:00Z',
+            'mainTime': '2026-08-12T12:35:00+09:00',
+            'countdownTarget': '2026-08-12T12:35:00+09:00',
+            'estDep': '2026-08-12T12:35:00+09:00'}
+    r2 = LA.push_live_activity(TOKEN, teil)
+    assert r2['sent'] == 1
+    cs = apns['client'].sent[-1]['payload']['aps']['content-state']
+    # Der Teil-Absender gewinnt, wo er etwas sagt …
+    assert cs['kicker'] == 'ABFLUG'
+    # … aber die Kette samt Boarding, Zone und Städte bleiben stehen.
+    assert [s['label'] for s in cs['chain']] == ['Pickup', 'Boarding']
+    assert cs['displayTZIdentifier'] == 'Asia/Seoul'
+    assert cs['fromCity'] == 'Seoul' and cs['toCity'] == 'Frankfurt'
+
+
+def test_teilabsender_ueberschreibt_erhaltene_felder_wenn_er_sie_setzt(sb, auth, apns):
+    """Erhaltung heisst NICHT einfrieren: setzt der neue Absender das Feld
+    selbst, gewinnt er."""
+    _seed_row(sb)
+    basis = {'stateVersion': 2, 'generatedAt': '2026-08-12T00:30:00Z',
+             'mainTime': '2026-08-12T09:50:00+09:00'}
+    LA.push_live_activity(TOKEN, dict(basis, phase='briefing', kicker='PICKUP',
+                                      displayTZIdentifier='Asia/Seoul'))
+    LA.push_live_activity(TOKEN, dict(basis, phase='briefing', kicker='ABFLUG',
+                                      displayTZIdentifier='Europe/Berlin'))
+    cs = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert cs['displayTZIdentifier'] == 'Europe/Berlin'
+
+
+def test_end_event_erhaelt_nichts(sb, auth, apns):
+    """Ein `end` beendet — da wird nichts aus alten Zustaenden angereichert."""
+    _seed_row(sb)
+    basis = {'stateVersion': 2, 'generatedAt': '2026-08-12T00:30:00Z',
+             'mainTime': '2026-08-12T09:50:00+09:00'}
+    LA.push_live_activity(TOKEN, dict(basis, phase='briefing', kicker='PICKUP',
+                                      chain=[{'label': 'Pickup',
+                                              'time': '2026-08-12T09:50:00+09:00',
+                                              'state': 'current'}]))
+    LA.push_live_activity(TOKEN, dict(basis, phase='turnaround',
+                                      kicker='GELANDET'), event='end')
+    cs = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert 'chain' not in cs

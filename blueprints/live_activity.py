@@ -545,7 +545,8 @@ def _content_digest(state):
 # ── Registry ────────────────────────────────────────────────────────────────
 
 _ROW_SELECT = ('id,user_token,kind,activity_id,la_token,bundle_id,environment,'
-               'active,content_digest,last_timestamp,failure_count')
+               'active,content_digest,last_timestamp,failure_count,'
+               'last_content_state')
 
 
 def _active_rows(user_token, kind, activity_id=None):
@@ -611,6 +612,58 @@ def _row_digest(row):
     with _state_lock:
         local = (_LAST_SENT.get((row or {}).get('id')) or {}).get('digest')
     return local or (row or {}).get('content_digest')
+
+
+# Felder, die ein TEIL-Absender strukturell nicht kennt und die ein
+# APNs-Vollersatz deshalb löschen würde. Phasen-abhängige Beschriftungen
+# (mainLabel, phaseLabel, footTrailing, mainTimeIsToday, mainTimeDayLabel,
+# progress) stehen bewusst NICHT hier — sie gehören zur Phase des Absenders.
+_MERGE_PRESERVED_FIELDS = ('chain', 'displayTZIdentifier', 'fromCity',
+                           'toCity', 'rosterFrozen', 'rosterFrozenNote')
+
+
+def _stored_state(rows):
+    """Zuletzt erfolgreich gesendeter Zustand über die Registry-Zeilen —
+    In-Process-Spiegel gewinnt (stimmt auch bei SB-Ausfall), sonst die
+    DB-Spalte `last_content_state` der frischesten Zeile. None wenn nichts da."""
+    best, best_ts = None, -1
+    for row in rows or []:
+        row_id = (row or {}).get('id')
+        with _state_lock:
+            slot = _LAST_SENT.get(row_id) or {}
+        cand = slot.get('state') or (row or {}).get('last_content_state')
+        if not isinstance(cand, dict):
+            continue
+        try:
+            ts = int(slot.get('ts') or row.get('last_timestamp') or 0)
+        except Exception:
+            ts = 0
+        if ts >= best_ts:
+            best, best_ts = cand, ts
+    return best
+
+
+def _store_last_state(sent_row_ids, state):
+    """Gesendeten (normalisierten) Zustand festschreiben — Grundlage der
+    Feld-Erhaltung beim nächsten Teil-Absender. Wirft nie; ein Fehlschlag
+    kostet nur die Erhaltung, nie den Push. `generatedAt`/Datumswerte sind
+    nach der Normalisierung ISO-Strings, das Dict ist JSON-tauglich."""
+    if not sent_row_ids or not isinstance(state, dict):
+        return
+    with _state_lock:
+        for rid in sent_row_ids:
+            slot = _LAST_SENT.setdefault(rid, {})
+            slot['state'] = state
+    client = _sb()
+    if client is None:
+        return
+    try:
+        (client.table('live_activities')
+         .update({'last_content_state': state})
+         .in_('id', list(sent_row_ids)).execute())
+    except Exception as exc:
+        log.warning('[live-activity] last_state write failed: %s',
+                    type(exc).__name__)
 
 
 def _next_timestamp(row):
@@ -883,6 +936,22 @@ def push_live_activity(user_token, content_state, event='update',
                 'problems': fatal}
 
     rows = _active_rows(user_token, 'update', activity_id=activity_id)
+    # ── FELD-ERHALTUNG GEGEN TEIL-ABSENDER (Vorfall Nr. 4, 2026-08-13) ──────
+    # APNs ERSETZT das ContentState vollständig. Ein Absender, der sein Dict
+    # von Hand baut (MQTT-Fanout), löschte damit alles, was er nicht kennt —
+    # zuletzt die komplette Dienst-Kette samt Boarding vom Sperrbildschirm
+    # (davor: flightNo 11.08., Bestätigungen 02.08., Zonen 29.07.). Statt den
+    # x-ten Absender nachzuziehen, erhält der SERVER jetzt strukturell: Felder
+    # aus dem zuletzt erfolgreich gesendeten Zustand, die der neue Absender
+    # NICHT setzt, bleiben stehen. Bewusst NUR phasen-UNABHÄNGIGE Felder —
+    # eine alte Beschriftung (mainLabel/…) zur neuen Phase wäre eine Lüge,
+    # dafür hat der Client Fallbacks.
+    if event != 'end':
+        preserved = _stored_state(rows)
+        if preserved:
+            for key in _MERGE_PRESERVED_FIELDS:
+                if key not in state and preserved.get(key) is not None:
+                    state[key] = preserved[key]
     used_event = event if event in ('update', 'end') else 'update'
     attrs = None
     if not rows and used_event != 'end' and attributes:
@@ -925,6 +994,10 @@ def push_live_activity(user_token, content_state, event='update',
             results.append({'status': 'failed', 'reason': 'internal'})
     counts = {k: sum(1 for r in results if r.get('status') == k)
               for k in ('sent', 'unchanged', 'failed', 'dead')}
+    if used_event != 'end' and counts['sent']:
+        _store_last_state([row.get('id') for row, res in zip(rows, results)
+                           if res.get('status') == 'sent' and row.get('id')],
+                          state)
     out = {'ok': True, 'event': used_event, 'targets': len(rows), **counts}
     if counts['sent'] == 0 and counts['unchanged'] == len(rows):
         out['skipped'] = 'unchanged'
