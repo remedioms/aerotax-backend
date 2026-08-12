@@ -31839,6 +31839,62 @@ def _forum_public_image_url(u):
     return u if u.startswith(('/', 'http')) else None
 
 
+# ───────── „Heiß diskutiert": echtes Aktivitätsfenster ─────────
+# Owner 2026-08-12: die Sektion stand auf einem festen 7-Tage-Fenster und
+# rotierte darum tagelang nicht („sonst ändern sich die posts ja nie"). Jetzt
+# gestaffelt — erst die letzten 6 Stunden, sonst 24 Stunden, sonst die Woche.
+# Das tatsächlich benutzte Fenster geht als `window_hours` mit der Antwort raus;
+# der Client beschriftet die Sektion damit (Zustand, kein Hinweistext).
+_FORUM_TRENDING_TIERS = (6, 24, 168)
+
+
+def _forum_activity_since(cutoff_ts):
+    """{thread_id: [kommentare, likes]} — ECHTE Aktivität seit `cutoff_ts`
+    (Unix-Sekunden), NICHT die Gesamt-Zähler am Thread.
+
+    Vier Quellen, weil das Forum zwei Sorten Threads zeigt: native Threads
+    (`forum_replies`/`forum_likes`) und die aus dem Crew-Feed gespiegelten
+    `wall:<id>`-Threads (`wall_comments`/`wall_likes`). Leeres Dict bei
+    Supabase-down → der Aufrufer fällt auf die Zähler-Heuristik zurück.
+    """
+    out = {}
+    if not SB_AVAILABLE:
+        return out
+
+    def _bump(key, idx):
+        if not key:
+            return
+        e = out.get(key)
+        if e is None:
+            e = out[key] = [0, 0]
+        e[idx] += 1
+
+    cutoff_ts = float(cutoff_ts or 0)
+    # 'Z' statt '+00:00': explizit UTC UND ohne '+', das in Query-Strings
+    # als Leerzeichen missverstanden werden kann.
+    cutoff_iso = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+    # (Tabelle, ID-Spalte, Zeit-Spalte, Grenzwert, ID-Prefix, Slot, Extra-Filter)
+    for _tbl, _col, _tscol, _tsval, _prefix, _idx, _flt in (
+            ('forum_replies', 'thread_id', 'ts', cutoff_ts, '', 0, None),
+            ('wall_comments', 'post_id', 'ts', cutoff_ts, 'wall:', 0, None),
+            ('forum_likes', 'target_id', 'created_at', cutoff_iso, '', 1,
+             ('target_type', 'thread')),
+            ('wall_likes', 'post_id', 'created_at', cutoff_iso, 'wall:', 1, None)):
+        try:
+            q = sb.table(_tbl).select(_col).gte(_tscol, _tsval)
+            if _flt:
+                q = q.eq(_flt[0], _flt[1])
+            r = q.limit(2000).execute()
+            for row in (r.data or []):
+                v = row.get(_col)
+                _bump((_prefix + str(v)) if v else None, _idx)
+        except Exception as e:
+            app.logger.warning(f'[forum-trending] activity_fail table={_tbl} '
+                               f'err={type(e).__name__}: {str(e)[:120]}')
+    return out
+
+
 @app.route('/api/forum/<token>/threads', methods=['GET'])
 def forum_list_threads(token):
     """Query: ?category=cabin&sort=hot|new|active|trending&limit=50"""
@@ -31907,6 +31963,9 @@ def forum_list_threads(token):
 
     # Sort
     now = time.time()
+    # Nur bei sort=trending gesetzt: das Aktivitätsfenster, das wirklich
+    # getragen hat (6/24/168 h) → geht als `window_hours` mit raus.
+    trending_window_hours = None
     if sort == 'new':
         threads.sort(key=lambda t: -(t.get('created_ts') or 0))
     elif sort == 'hot':
@@ -31917,21 +31976,41 @@ def forum_list_threads(token):
             return -(engagement / (age_h ** 1.5))
         threads.sort(key=hot_score)
     elif sort == 'trending':
-        # Trending = Heiß diskutiert: (replies*2 + likes) gewichtet nach Aktivität
-        # der letzten 7 Tage. Threads ohne jüngste Aktivität verfallen auf 0.
-        # last_reply_ts jünger als 7 Tage → voller Score; älter → kein Score.
-        _7d = 7 * 24 * 3600
-        def trending_score(t):
-            last_ts = t.get('last_reply_ts') or t.get('created_ts') or 0
-            age_s = now - last_ts
-            if age_s > _7d:
-                return 0
-            # Aktivitäts-Score aus aktuellen Zählern
-            engagement = (t.get('like_count') or 0) + (t.get('reply_count') or 0) * 2
-            # Frische-Bonus: je jünger die letzte Aktivität, desto höher
-            recency = max(0.0, 1.0 - age_s / _7d)
-            return -(engagement * (0.5 + 0.5 * recency))
-        threads.sort(key=trending_score)
+        # Trending = „Heiß diskutiert": ECHTE Aktivität (Kommentare + Likes) in
+        # einem GESTAFFELTEN Fenster — 6 h, sonst 24 h, sonst die Woche. Das
+        # erste Fenster MIT Treffern gewinnt, damit die Sektion rotiert statt
+        # eine Woche lang dieselben Threads zu zeigen.
+        _known = {t.get('id') for t in threads}
+        for _h in _FORUM_TRENDING_TIERS:
+            _acts = {k: v for k, v
+                     in _forum_activity_since(now - _h * 3600).items()
+                     if k in _known}
+            if not _acts:
+                continue
+            trending_window_hours = _h
+            threads = [t for t in threads if t.get('id') in _acts]
+            # Kommentare wiegen doppelt, Likes einfach (wie bisher);
+            # Gleichstand → jüngste Aktivität zuerst.
+            threads.sort(key=lambda t: (
+                -(_acts[t['id']][0] * 2 + _acts[t['id']][1]),
+                -(t.get('last_reply_ts') or t.get('created_ts') or 0)))
+            break
+        else:
+            # Kein Fenster trägt (oder Supabase down) → Zähler-Heuristik über
+            # die Woche wie bisher, damit die Sektion nicht grundlos leer ist.
+            trending_window_hours = _FORUM_TRENDING_TIERS[-1]
+            _7d = 7 * 24 * 3600
+            def trending_score(t):
+                last_ts = t.get('last_reply_ts') or t.get('created_ts') or 0
+                age_s = now - last_ts
+                if age_s > _7d:
+                    return 0
+                # Aktivitäts-Score aus aktuellen Zählern
+                engagement = (t.get('like_count') or 0) + (t.get('reply_count') or 0) * 2
+                # Frische-Bonus: je jünger die letzte Aktivität, desto höher
+                recency = max(0.0, 1.0 - age_s / _7d)
+                return -(engagement * (0.5 + 0.5 * recency))
+            threads.sort(key=trending_score)
     else:  # active = last activity
         threads.sort(key=lambda t: -((t.get('last_reply_ts') or t.get('created_ts') or 0)))
 
@@ -31973,7 +32052,10 @@ def forum_list_threads(token):
                 t.pop('author_avatar', None)
         # Strip author_token from public response
         t.pop('author_token', None)
-    return _etag_json({'count': len(threads), 'threads': threads})
+    _payload = {'count': len(threads), 'threads': threads}
+    if trending_window_hours is not None:
+        _payload['window_hours'] = trending_window_hours
+    return _etag_json(_payload)
 
 
 @app.route('/api/forum/<token>/threads', methods=['POST'])
