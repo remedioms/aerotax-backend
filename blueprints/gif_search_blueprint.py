@@ -73,6 +73,8 @@ _ALLOWED_MEDIA_HOST_RE = _re_ssrf.compile(r'^media[0-9]*\.giphy\.com$')
 # Harte Abbruchgrenze beim Herunterladen (der Deckel selbst liegt bei 10 MB;
 # ein Byte mehr reicht, um „zu groß" sicher zu erkennen).
 _DOWNLOAD_HARD_STOP = 10 * 1024 * 1024 + 1
+_GIF_MAX_BYTES = 10 * 1024 * 1024
+_GIF_MAX_DIMENSION = 1200
 
 _cache = {}                     # cache_key → (expires_ts, body_dict)
 _cache_lock = threading.Lock()
@@ -181,6 +183,32 @@ def _int_or_none(v):
         return None
 
 
+def _variant(images, names, *, require_import_limits=False):
+    """Erste brauchbare GIF-Variante aus `names` als (dict, url).
+
+    Fuer den Import muessen die von GIPHY gemeldeten Bytes und Masse bereits
+    in unseren Upload-Grenzen liegen. Der Import validiert die echte Datei
+    trotzdem noch einmal — Metadaten sind nur die Vorauswahl, nie Vertrauen.
+    """
+    for name in names:
+        candidate = images.get(name) or {}
+        if not isinstance(candidate, dict):
+            continue
+        url = (candidate.get('url') or '').split('?')[0]
+        if not url or not url.lower().endswith('.gif'):
+            continue
+        if require_import_limits:
+            size = _int_or_none(candidate.get('size'))
+            width = _int_or_none(candidate.get('width'))
+            height = _int_or_none(candidate.get('height'))
+            if (size is None or width is None or height is None
+                    or size > _GIF_MAX_BYTES
+                    or max(width, height) > _GIF_MAX_DIMENSION):
+                continue
+        return candidate, url
+    return None, ''
+
+
 def _normalize(raw):
     """Anbieter-Antwort → UNSERE Shape.
 
@@ -194,20 +222,44 @@ def _normalize(raw):
             continue
         images = entry.get('images') or {}
         full = images.get('original') or {}
-        prev = (images.get('fixed_width')
-                or images.get('fixed_height')
-                or images.get('preview_gif')
-                or full)
-        gif_url = (full.get('url') or '').split('?')[0]
-        preview_url = (prev.get('url') or '').split('?')[0]
+
+        # Raster: die downsampled-Varianten bewegen sich, enthalten aber
+        # deutlich weniger Frames/Bytes. Beim realen „hallo"-Treffer waren es
+        # 170 KB statt 4,46 MB fuer fixed_width — mal 24 sichtbare Kacheln ist
+        # das der Unterschied zwischen flüssigem Sheet und grauen Platzhaltern.
+        _, preview_url = _variant(images, (
+            'fixed_width_downsampled',
+            'fixed_height_downsampled',
+            'preview_gif',
+            'fixed_width_small',
+            'fixed_height_small',
+            'fixed_width',
+            'fixed_height',
+            'original',
+        ))
+
+        # Auswahl/Import: Original nur, wenn es bereits sicher unter 10 MB und
+        # 1200 px liegt. Sonst die qualitativ beste vollständige GIPHY-
+        # Downsized-Variante nehmen. So scheitert ein sichtbarer Treffer nicht
+        # erst nach dem Tap (der reale Treffer hatte 13,17 MB im Original,
+        # aber 7,27 MB als downsized_large).
+        chosen, gif_url = _variant(images, (
+            'original',
+            'downsized_large',
+            'downsized_medium',
+            'downsized',
+            'fixed_width',
+            'fixed_height',
+        ), require_import_limits=True)
         if not gif_url or not preview_url:
             continue
+        dimensions = full if isinstance(full, dict) else (chosen or {})
         items.append({
             'id': str(entry.get('id') or ''),
             'preview_url': preview_url,
             'gif_url': gif_url,
-            'width': _int_or_none(full.get('width')),
-            'height': _int_or_none(full.get('height')),
+            'width': _int_or_none(dimensions.get('width')),
+            'height': _int_or_none(dimensions.get('height')),
         })
     return {'items': items, 'attribution': _ATTRIBUTION,
             'provider': _PROVIDER}

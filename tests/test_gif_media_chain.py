@@ -276,6 +276,19 @@ def test_chat_nachricht_traegt_das_gif_als_eigenes_feld():
     assert pushed == ['GIF']
 
 
+def test_chat_nachricht_traegt_gif_und_text_gemeinsam():
+    body, status, pushed = _send_chat({
+        'text': 'Das passt perfekt 😄',
+        'image_url': _OWN_IMAGE,
+    })
+
+    assert status == 200, body
+    assert body['message']['text'] == 'Das passt perfekt 😄'
+    assert body['message']['image_url'] == _OWN_IMAGE
+    # Mit Bildunterschrift ist der Text die ehrlichere Inbox-/Push-Vorschau.
+    assert pushed == ['Das passt perfekt 😄']
+
+
 def test_chat_nachricht_ohne_medium_ist_unveraendert():
     body, status, _ = _send_chat({'text': 'Hallo'})
     assert status == 200
@@ -555,8 +568,12 @@ _PROVIDER_ANSWER = {
     'data': [
         {'id': 'abc123', 'images': {
             'original': {'url': 'https://media.giphy.com/media/abc123/giphy.gif?cid=x',
-                         'width': '480', 'height': '270'},
-            'fixed_width': {'url': 'https://media.giphy.com/media/abc123/200w.gif'},
+                         'width': '480', 'height': '270', 'size': '9000000'},
+            'fixed_width': {'url': 'https://media.giphy.com/media/abc123/200w.gif',
+                            'width': '200', 'height': '113', 'size': '2400000'},
+            'fixed_width_downsampled': {
+                'url': 'https://media.giphy.com/media/abc123/200w_d.gif',
+                'width': '200', 'height': '113', 'size': '170000'},
         }},
         # Unvollständig → muss rausfliegen, statt eine tote Kachel zu zeigen.
         {'id': 'kaputt', 'images': {'original': {}}},
@@ -589,9 +606,56 @@ def test_proxy_normalisiert_auf_unsere_shape(gif_client, monkeypatch):
     item = body['items'][0]
     assert set(item) == {'id', 'preview_url', 'gif_url', 'width', 'height'}
     assert item['gif_url'] == 'https://media.giphy.com/media/abc123/giphy.gif'
+    assert item['preview_url'] == 'https://media.giphy.com/media/abc123/200w_d.gif'
     assert item['width'] == 480 and item['height'] == 270
     # Der Anbieter-Rohbau darf NICHT durchschlagen.
     assert 'data' not in body and 'images' not in item
+
+
+def test_proxy_nimmt_bei_zu_grossem_original_eine_importierbare_variante(
+        gif_client, monkeypatch):
+    raw = {'data': [{'id': 'gross', 'images': {
+        'original': {
+            'url': 'https://media.giphy.com/media/gross/giphy.gif',
+            'width': '324', 'height': '480', 'size': '13168104'},
+        'downsized_large': {
+            'url': 'https://media.giphy.com/media/gross/giphy-downsized-large.gif',
+            'width': '274', 'height': '408', 'size': '7266267'},
+        'fixed_width_downsampled': {
+            'url': 'https://media.giphy.com/media/gross/200w_d.gif',
+            'width': '200', 'height': '298', 'size': '170497'},
+    }}]}
+    monkeypatch.setattr(gs, '_fetch_json', lambda _u: raw)
+
+    item = gif_client.get(
+        f'/api/gif-search/{TOKEN}?q=hallo').get_json()['items'][0]
+
+    assert item['gif_url'].endswith('giphy-downsized-large.gif')
+    assert item['preview_url'].endswith('200w_d.gif')
+    # Das Raster-Seitenverhaeltnis bleibt das des Originals; die importierte
+    # Variante ist nur kleiner, nicht anders beschnitten.
+    assert item['width'] == 324 and item['height'] == 480
+
+
+def test_proxy_liefert_keinen_treffer_der_nicht_importierbar_ist(
+        gif_client, monkeypatch):
+    raw = {'data': [{'id': 'zu-gross', 'images': {
+        'original': {
+            'url': 'https://media.giphy.com/media/x/giphy.gif',
+            'width': '1400', 'height': '900', 'size': '15000000'},
+        'fixed_width_downsampled': {
+            'url': 'https://media.giphy.com/media/x/200w_d.gif',
+            'width': '200', 'height': '129', 'size': '120000'},
+    }}]}
+    monkeypatch.setattr(gs, '_fetch_json', lambda _u: raw)
+
+    body = gif_client.get(
+        f'/api/gif-search/{TOKEN}?q=zu-gross').get_json()
+
+    # Eine downsampled Vorschau ist bewusst nicht automatisch der Sendeinhalt:
+    # sie kann nur einen Teil der Frames enthalten. Im echten Provider-Payload
+    # gibt es für den vollständigen Import `downsized*`/`fixed_width`.
+    assert body['items'] == []
 
 
 def test_zweite_gleiche_suche_kommt_aus_dem_cache(gif_client, monkeypatch):
