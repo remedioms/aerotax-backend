@@ -78,6 +78,10 @@ def test_faa_rows_reconcile_flight_sim_and_landings(monkeypatch, tmp_path):
                      "code": "FSTD"}]
     assert report["control"] == "OK"
     assert report["carryover_min"] == 600
+    assert report["carryover_ldg_day"] == 5
+    assert report["carryover_ldg_night"] == 0
+    assert report["carryover_landings"] == 5
+    assert report["final_landings"] == 6
     assert page_a.closed and page_b.closed
 
 

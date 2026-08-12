@@ -60,6 +60,21 @@ def test_pdf_carryover_nur_bei_range_all():
     assert 'LH500' not in text_2026        # 2019er-Import-Leg gefiltert
 
 
+def test_pdf_carryover_includes_historic_landings():
+    _seed()
+    blob = dict(IMPORT_BLOB)
+    blob['meta'] = {
+        **IMPORT_BLOB['meta'],
+        'carryover_ldg_day': 1050,
+        'carryover_ldg_night': 7,
+        'carryover_landings': 1057,
+    }
+    _seed_import(blob)
+    text = _pdf_text(_pdf())
+    assert '1057 Landungen aus dem Vor-Logbuch' in text
+    assert 'Landungen des Vor-Logbuchs sind nicht erfasst' not in text
+
+
 def test_pdf_sim_getrennt():
     _seed()
     _seed_import()

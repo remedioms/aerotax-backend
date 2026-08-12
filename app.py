@@ -23310,12 +23310,21 @@ def get_logbook(token):
     # eigenes Feld, wird NICHT in totals.block_min eingerechnet (die Summe
     # bleibt die Summe der sichtbaren Legs; der Übertrag ist eine Fußnote).
     carryover_min = 0
+    carryover_ldg_day = carryover_ldg_night = 0
     try:
-        c = (imp.get('meta') or {}).get('carryover_min')
+        import_meta = imp.get('meta') or {}
+        c = import_meta.get('carryover_min')
         if isinstance(c, int) and 0 < c < 60000 * 60:
             carryover_min = c
+        d = import_meta.get('carryover_ldg_day')
+        n = import_meta.get('carryover_ldg_night')
+        if isinstance(d, int) and 0 <= d < 100000:
+            carryover_ldg_day = d
+        if isinstance(n, int) and 0 <= n < 100000:
+            carryover_ldg_night = n
     except Exception:
         pass
+    carryover_landings = carryover_ldg_day + carryover_ldg_night
 
     by_type = {}
     by_year = {}
@@ -23351,10 +23360,22 @@ def get_logbook(token):
         'by_year': by_year_list,
         'totals': {'legs': len(entries), 'block_min': tot_block,
                    'landings': tot_ldg, 'days': len(dates_seen)},
+        # ``totals`` remains the exact sum of the visible per-leg rows. These
+        # career totals additionally include aggregate FAA/FCL carryovers that
+        # have no reconstructable individual legs.
+        'career_totals': {
+            'legs': len(entries),
+            'block_min': tot_block + carryover_min,
+            'landings': tot_ldg + carryover_landings,
+            'days': len(dates_seen),
+        },
         'imported_legs': imported_count,
         'sim_sessions': sim_sessions,
         'sim_total_min': sim_total,
         'carryover_min': carryover_min,
+        'carryover_ldg_day': carryover_ldg_day,
+        'carryover_ldg_night': carryover_ldg_night,
+        'carryover_landings': carryover_landings,
         'enrich_capped': enrich_capped,
         # Wie viele Legs noch auf Reg/Typ warten. 0 = fertig angereichert.
         # Additiv — ältere iOS-Builds ignorieren das Feld.
@@ -23429,6 +23450,10 @@ def get_logbook_pdf(token):
     # Der Vor-Logbuch-Übertrag gehört zur GESAMT-Historie; ein Teil-Range
     # (einzelnes Jahr) trägt ihn nicht — sonst stünde 2019 mit 130:00 da.
     carry = payload.get('carryover_min') or 0 if rng == 'all' else 0
+    carry_ldg_day = (payload.get('carryover_ldg_day') or 0
+                     if rng == 'all' else 0)
+    carry_ldg_night = (payload.get('carryover_ldg_night') or 0
+                       if rng == 'all' else 0)
 
     from io import BytesIO
     from reportlab.lib.pagesizes import A4, landscape
@@ -23520,7 +23545,7 @@ def get_logbook_pdf(token):
             x += w
         return y - 11
 
-    running = (carry, 0, 0, 0)
+    running = (carry, carry_ldg_day, carry_ldg_night, 0)
     for pi, chunk in enumerate(pages):
         y = _draw_header(pi + 1)
         c.setFont('Helvetica', 7)
@@ -23545,12 +23570,12 @@ def get_logbook_pdf(token):
         y = _draw_sum_line(y, 'Übertrag', running)
         running = tuple(a + b for a, b in zip(running, page_s))
         y = _draw_sum_line(y, 'Gesamt', running, bold=True)
-        if pi == 0 and carry:
+        if pi == 0 and (carry or carry_ldg_day or carry_ldg_night):
             c.setFont('Helvetica-Oblique', 6.5)
             c.drawString(margin, y - 2,
                          f'Übertrag enthält {_lb_pdf_hhmm(carry)} Blockzeit '
-                         f'aus dem Vor-Logbuch (Total from previous pages); '
-                         f'Landungen des Vor-Logbuchs sind nicht erfasst.')
+                         f'und {carry_ldg_day + carry_ldg_night} Landungen '
+                         f'aus dem Vor-Logbuch (Total from previous pages).')
         if pi < n_pages - 1 or sims:
             c.showPage()
 

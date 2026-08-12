@@ -158,6 +158,26 @@ def test_fcl_carryover_is_persisted_in_import_meta(monkeypatch):
     assert h.upserts[0][3]["carryover_min"] == 634764
 
 
+def test_faa_landing_carryover_is_persisted_in_import_meta(monkeypatch):
+    h = Harness(monkeypatch, {42: (b"faa", [LEG_A])})
+    monkeypatch.setattr(
+        w, "_try_parsers",
+        lambda _path: ("offblock_faa", [LEG_A], [], {
+            "month": "2012-01–2026-08",
+            "carryover_min": 634764,
+            "carryover_ldg_day": 1050,
+            "carryover_ldg_night": 0,
+            "carryover_landings": 1050,
+        }))
+    events = []
+    w.process_token_batch("AT-TEST", [_row(42, b"faa")], events)
+    meta = h.upserts[0][3]
+    assert meta["carryover_min"] == 634764
+    assert meta["carryover_ldg_day"] == 1050
+    assert meta["carryover_ldg_night"] == 0
+    assert meta["carryover_landings"] == 1050
+
+
 def test_fcl_carryover_conflict_goes_to_review(monkeypatch):
     h = Harness(monkeypatch, {41: (b"fcl", [LEG_A])},
                 existing_import=[])

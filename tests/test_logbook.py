@@ -474,6 +474,27 @@ def test_sim_sessions_separate_from_flight_totals():
     assert not any(t['type'] == 'RE359' for t in r['by_type'])
 
 
+def test_career_totals_include_aggregate_time_and_landing_carryovers():
+    _seed()
+    blob = dict(IMPORT_BLOB)
+    blob['meta'] = {
+        **IMPORT_BLOB['meta'],
+        'carryover_ldg_day': 1050,
+        'carryover_ldg_night': 7,
+        'carryover_landings': 1057,
+    }
+    _seed_import(blob)
+    r = _get()
+    assert r['carryover_min'] == 7800
+    assert r['carryover_ldg_day'] == 1050
+    assert r['carryover_ldg_night'] == 7
+    assert r['carryover_landings'] == 1057
+    assert r['career_totals']['block_min'] == \
+        r['totals']['block_min'] + 7800
+    assert r['career_totals']['landings'] == \
+        r['totals']['landings'] + 1057
+
+
 def test_sim_sessions_empty_without_import():
     _seed()
     r = _get()

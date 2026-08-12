@@ -239,7 +239,15 @@ def parse_pdf(src):
         'legs': len(legs), 'sim_sessions': len(sims),
         'block_min': parsed_block, 'sim_min': parsed_sim,
         'landings': parsed_landings, 'carryover_min': carryover_min,
+        # FAA prints day/night landing counters in the same ``AMOUNT
+        # FOREWARDED`` row as the historic flight-time total.  They are
+        # aggregate career facts without reconstructable individual legs, so
+        # preserve them explicitly as a carryover instead of dropping them.
+        'carryover_ldg_day': to_int(opening_a['ldg_day']),
+        'carryover_ldg_night': to_int(opening_a['ldg_night']),
+        'carryover_landings': opening_landings,
         'opening_total_min': opening_total,
+        'final_landings': final_landings,
         'carry_rows_min': carry_rows_min,
         'opening_page': first_page, 'final_page': final_page,
         'renamed_types': renamed, 'collisions': collisions,

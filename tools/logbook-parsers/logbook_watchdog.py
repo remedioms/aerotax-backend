@@ -716,6 +716,27 @@ def process_token_batch(token, rows, events, terminal=None):
             return
         carryover_min = (next(iter(report_carryovers))
                          if report_carryovers else prev_carryover)
+        carryover_landing_fields = {}
+        for field in ("carryover_ldg_day", "carryover_ldg_night",
+                      "carryover_landings"):
+            report_values = {
+                int(f["report"][field])
+                for f in real
+                if isinstance(f.get("report"), dict)
+                and isinstance(f["report"].get(field), int)
+            }
+            previous = prev_meta.get(field)
+            if (len(report_values) > 1
+                    or (report_values and isinstance(previous, int)
+                        and previous not in report_values)):
+                _status(ids, STATUS_REVIEW)
+                events.append(("review", token, ids,
+                               "widersprüchliche FAA-Landungsüberträge"))
+                return
+            value = (next(iter(report_values))
+                     if report_values else previous)
+            if isinstance(value, int) and value >= 0:
+                carryover_landing_fields[field] = value
         label = _capped_source(prev_meta.get("source"), label)
         extra_meta = {
             "watchdog": {"upload_ids": [f["id"] for f in real],
@@ -729,6 +750,7 @@ def process_token_batch(token, rows, events, terminal=None):
         }
         if isinstance(carryover_min, int) and carryover_min >= 0:
             extra_meta["carryover_min"] = carryover_min
+        extra_meta.update(carryover_landing_fields)
         meta = _meta_for(merged_legs, merged_sims, label, extra_meta)
         _upsert_import(token, merged_legs, merged_sims, meta)
         _bust_import_cache(token)
