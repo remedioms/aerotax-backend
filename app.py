@@ -22966,7 +22966,7 @@ def _logbook_roster_leg_completed(sec, now=None, proof=None):
 
 def _logbook_merged_legs(token, require_flight=True,
                          completed_roster_only=False, now=None,
-                         completion_proofs=None):
+                         completion_proofs=None, import_blob=None):
     """DIE EINE gemergte Leg-Quelle: Roster-Sektoren + importiertes Alt-Flugbuch.
 
     Geteilt von `get_logbook` UND `_passport_stats_compute` (Owner 2026-07-28:
@@ -23009,10 +23009,13 @@ def _logbook_merged_legs(token, require_flight=True,
             if isinstance(secs, list) and secs:
                 sectors_by_day[k] = secs
 
-    try:
-        imp = _logbook_import_load(token) or {}
-    except Exception:
-        imp = {}
+    if import_blob is None:
+        try:
+            imp = _logbook_import_load(token) or {}
+        except Exception:
+            imp = {}
+    else:
+        imp = import_blob if isinstance(import_blob, dict) else {}
     imp_by_key = {}
     for L in (imp.get('legs') or []):
         if not isinstance(L, dict):
@@ -23108,11 +23111,16 @@ def get_logbook(token):
     # So können auch noch unsichtbare, gerade gelandete Legs im Hintergrund ihre
     # Ankunfts-Fakten bekommen; ein Fahrplan allein materialisiert niemals eine
     # Flugbuch-Zeile.
-    all_merged = _logbook_merged_legs(token, require_flight=True)
     try:
         imp = _logbook_import_load(token) or {}
     except Exception:
         imp = {}
+    # Karriere-Importe können mehrere MB groß sein. Derselbe Blob wurde hier
+    # früher direkt nacheinander zweimal von Disk gelesen und JSON-dekodiert:
+    # einmal im Merge und danach nochmals für Simulator/Carryover. Ein Read
+    # genügt; Passport und andere Aufrufer behalten den bisherigen Fallback.
+    all_merged = _logbook_merged_legs(
+        token, require_flight=True, import_blob=imp)
 
     # Angereicherte Reg/Typ kommen aus dem persistenten Cache, NICHT aus einem
     # LH-Call im Request-Thread (siehe _logbook_facts_load). Was fehlt, wird
