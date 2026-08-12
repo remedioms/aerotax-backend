@@ -52382,7 +52382,10 @@ def moderation_block(token):
 @app.route('/api/moderation/<token>/unblock', methods=['POST'])
 def moderation_unblock(token):
     body = request.get_json(silent=True) or {}
-    target = (body.get('target_token') or '').strip()
+    raw = (body.get('target_ref') or body.get('target_token') or '').strip()
+    # Neue Clients schicken die AXU-Ref (aus /blocks); rohe Alt-Tokens bleiben
+    # zulaessig, damit bestehende Block-Eintraege loesbar bleiben.
+    target = _token_from_public_user_ref(raw) or raw
     blocks = _blocked_by(token)
     blocks.discard(target)
     _save_set_file(_blocks_path(token), blocks)
@@ -52392,10 +52395,14 @@ def moderation_unblock(token):
 @app.route('/api/moderation/<token>/blocks', methods=['GET'])
 def moderation_list_blocks(token):
     blocks = list(_blocked_by(token))
-    # Enrich mit Profilen wenn vorhanden
+    # KEIN rohes Token in der Antwort (Codex-Schlusspruefung 13.08.): der
+    # gespeicherte Block-Eintrag IST das Author-Credential; ihn hier
+    # auszuliefern deanonymisiert einen anonymen Kommentator und uebergibt
+    # sein Bearer-Token (Owner: Token = Credential). Ausgegeben wird die
+    # reversible AXU-Public-Ref; das Entblocken nimmt sie zurueck.
     enriched = []
     for t in blocks:
-        info = {'token': t}
+        info = {'ref': _public_user_ref(t)}
         try:
             with open(_user_profile_path(t)) as f:
                 pr = json.load(f).get('profile', {})
@@ -58513,6 +58520,134 @@ def _discover_roster_text_to_ics(text, carrier='4Y'):
                               prodid='AeroX Discover Roster PDF Import'), None
 
 
+def _swiss_roster_text_to_ics(text):
+    """SWISS CrewAccess roster variants -> the proven local-time parser.
+
+    SWISS prints the same semantic table as Discover, but calls the clock
+    columns ``Dep/Arr``, prefixes flight numbers with ``LX`` and omits the
+    flight number on the arrival half of split overnight rows.  Normalize
+    only those documented layout differences, then reuse the strict
+    station-local conversion and spillover handling above.
+    """
+    source = text or ''
+    title_ok = re.search(
+        r'(?im)^\s*(?:Released roster|Historical published roster|'
+        r'Pre-publication report)\s*$', source[:600])
+    header_ok = re.search(
+        r'(?im)^\s*Date\s+Report\b.*\bActivity\s+From\s+To\s+'
+        r'(?:Dep\s+Arr|Start\s+End)\b', source)
+    if (not title_ok or not header_ok
+            or not re.search(r'All times local', source, re.IGNORECASE)):
+        return None, 'unsupported_pdf_format'
+
+    period = re.search(r'Period:\s*([A-Za-z]+)\s+(\d{4})', source)
+    if not period:
+        period = re.search(
+            r'(?im)^\s*Pre-publication report\s*\n\s*'
+            r'([A-Za-z]+)\s+(\d{4})\s*$', source[:1000])
+    month_name = period.group(1) if period else ''
+    month = _CREWACCESS_MONTHS.get(month_name.lower(), 0)
+    if not period or not month:
+        return None, 'no_planning_period'
+    year = int(period.group(2))
+
+    # Some historical/pre-publication plans begin with the final day of the
+    # previous month.  In February/March the printed weekday can be identical
+    # 28 days apart, so the shared ambiguity guard intentionally refuses to
+    # guess.  Here the explicit leading high-day -> low-day rollover is enough
+    # evidence; start the shared parser one month earlier.
+    printed_days = []
+    in_source_table = False
+    for raw in source.splitlines():
+        compact = ' '.join(raw.split())
+        if re.match(r'^Date\s+Report\b', compact) and 'Activity' in compact:
+            in_source_table = True
+            continue
+        if compact.startswith(('Created ', 'Printed ')):
+            in_source_table = False
+        if in_source_table:
+            day_match = re.match(
+                r'^(\d{1,2})\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b', compact)
+            if day_match:
+                printed_days.append(int(day_match.group(1)))
+    parser_month_name, parser_year = month_name, year
+    if (printed_days and printed_days[0] >= 25
+            and any(day < 25 for day in printed_days[1:])):
+        serial = (year * 12 + month - 1) - 1
+        parser_year, parser_month = divmod(serial, 12)
+        parser_month += 1
+        parser_month_name = next(
+            name.title() for name, number in _CREWACCESS_MONTHS.items()
+            if number == parser_month)
+
+    normalized = [
+        'Roster', f'Period: {parser_month_name} {parser_year}', 'Base: ZRH',
+    ]
+    pending_number = None
+    in_table = False
+    for raw in source.splitlines():
+        line = ' '.join(raw.split())
+        if not line:
+            continue
+        if re.match(r'^Date\s+Report\b', line) and 'Activity' in line:
+            normalized.append(_DISCOVER_HEADER)
+            in_table = True
+            pending_number = None
+            continue
+        if line.startswith(('Created ', 'Printed ')):
+            normalized.append('Created ' + line.split(' ', 1)[1])
+            in_table = False
+            pending_number = None
+            continue
+        if not in_table:
+            continue
+
+        # SWISS uses *** for a planned local/free day.  The shared parser
+        # removes bid-star tokens, so make its meaning explicit first.
+        line = re.sub(r'(?<!\S)\*{3}(?!\S)', 'OFF', line)
+
+        # Operating legs: keep the proven parser's position + numeric flight
+        # shape.  ``LX 52`` and ``LX052`` are both emitted in real exports.
+        line = re.sub(
+            r'\bFA\s+LX\s*0*(\d{1,4}[A-Z]?)\b',
+            lambda match: f'CM {match.group(1)}', line)
+        # Deadheads retain DH so they become route events, never operating
+        # flight sectors.
+        line = re.sub(
+            r'\bDH\s+LX\s*0*(\d{1,4}[A-Z]?)\b',
+            lambda match: f'DH LX{match.group(1)}', line)
+
+        # Split closer: ``FA <TO> <ARR>`` carries no repeated LX number.
+        if pending_number:
+            closer = re.search(
+                r'\bFA\s+([A-Z]{3})\s+(\d{1,2}:\d{2})\b', line)
+            if closer:
+                line = (line[:closer.start()] +
+                        f'CM {pending_number} {closer.group(1)} '
+                        f'{closer.group(2)}')
+                pending_number = None
+
+        # The remaining position token belongs to ground activities.
+        line = re.sub(r'\bFA\b', 'CM', line)
+        line = re.sub(r'\bP\s+CM\b', 'CM', line)
+
+        # Remember only a genuine one-station/one-clock flight opener.
+        leg = re.search(
+            r'\bCM\s+(\d{1,4}[A-Z]?)\s+([A-Z]{3})\s+'
+            r'(\d{1,2}:\d{2})\b', line)
+        if leg:
+            tail = line[leg.end():]
+            has_second_station_and_clock = re.search(
+                r'\b[A-Z]{3}\s+\d{1,2}:\d{2}\b', tail)
+            pending_number = None if has_second_station_and_clock else leg.group(1)
+
+        normalized.append(line)
+
+    if _DISCOVER_HEADER not in normalized:
+        return None, 'unsupported_pdf_format'
+    return _discover_roster_text_to_ics('\n'.join(normalized), carrier='LX')
+
+
 _IOS_PDF_CID_RE = re.compile(r'\(cid:(\d{1,5})\)')
 
 
@@ -59057,6 +59192,21 @@ def _roster_pdf_upload_store(token, filename, blob):
     return bool(stored)
 
 
+def _pdf_informational_only_kind(text):
+    """Recognize valid PDFs that cannot truthfully create calendar events."""
+    source = text or ''
+    if (re.search(r'(?im)^\s*Flight Time and Landings\s*$', source)
+            and re.search(r'(?im)^\s*Total since entry:\s*\d+:\d{2}\s+\d+',
+                          source)):
+        return 'aggregate_flight_time_statistics'
+    if (re.search(r'Streckeneinsatz\s*-?\s*Abrechnung', source,
+                  re.IGNORECASE)
+            and re.search(r'\bDatum\b.*\bAb\b.*\bAn\b.*\bstfrei\b', source,
+                          re.IGNORECASE | re.DOTALL)):
+        return 'streckeneinsatzabrechnung'
+    return None
+
+
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
 def import_roster_pdf(token):
     """Roster-PDF-Upload for CrewAccess, Discover and Lufthansa CAS.
@@ -59080,6 +59230,7 @@ def import_roster_pdf(token):
     standard_calendars = []
     cas_results = []
     periods = []
+    informational_documents = []
     ai_fallback_used = False
 
     for upload in files:
@@ -59109,10 +59260,35 @@ def import_roster_pdf(token):
             return jsonify({'ok': False, 'error': 'pdf_extract_failed',
                             'monitoring_queued': all(queued)}), 422
 
+        informational_kind = _pdf_informational_only_kind(text)
+        if informational_kind:
+            informational_documents.append(informational_kind)
+            app.logger.info(
+                f'[roster-pdf] informational-only tok={token[:8]} '
+                f'sha={upload_sha} kind={informational_kind}')
+            continue
+
         ics, perr = _crewaccess_text_to_ics(text, carrier=carrier)
         if perr == 'unsupported_pdf_format':
             # Native Discover „Roster" format implies carrier 4Y.
             ics, perr = _discover_roster_text_to_ics(text, carrier='4Y')
+        if perr == 'unsupported_pdf_format':
+            # SWISS uses the same local-time semantics with different labels
+            # and split-arrival rows that omit the repeated flight number.
+            ics, perr = _swiss_roster_text_to_ics(text)
+        if perr == 'unsupported_pdf_format':
+            # Condor CUBE duty plans (UTC or Local FRA) and the strict SAP
+            # flight-hours statement both carry sufficient calendar facts.
+            from condor_roster_pdf import parse_condor_calendar
+            condor_events, condor_year, condor_month, condor_report, perr = \
+                parse_condor_calendar(data, text)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    condor_events, condor_year, condor_month,
+                    prodid='AeroX Condor Roster PDF Import')
+                periods.append(
+                    (condor_report or {}).get('month')
+                    or f'{condor_year:04d}-{condor_month:02d}')
         if perr == 'unsupported_pdf_format':
             # Lufthansa Jeppesen „Acknowledged Roster" / confirmedYearPlan
             # can carry several months in one PDF. Start/end columns are UTC,
@@ -59161,6 +59337,17 @@ def import_roster_pdf(token):
                 f'error={perr}')
             return jsonify({'ok': False, 'error': perr,
                             'monitoring_queued': all(queued)}), 422
+
+    if informational_documents and len(informational_documents) == len(files):
+        # A valid aggregate/tax statement is accepted, but must never become
+        # fake calendar events.  The private verification copy remains queued
+        # until the maintenance sweep confirms this exact classification.
+        return jsonify({
+            'ok': True, 'source': 'pdf', 'events_count': 0,
+            'briefings_imported': 0, 'informational_only': True,
+            'document_types': informational_documents,
+            'monitoring_queued': all(queued),
+        })
 
     cas_events = []
     cas_coverage = []
@@ -59244,6 +59431,8 @@ def import_roster_pdf(token):
             # unbekannte Felder nicht an — kein UI-Zwang, aber das Feld ist da.
             payload['source'] = _ROSTER_AI_MARKER
             payload['ki_hint'] = _ROSTER_AI_HINT
+        if informational_documents:
+            payload['informational_files'] = len(informational_documents)
         periods = [period for period in periods if period]
         if len(periods) == 1:
             payload['period'] = periods[0]

@@ -266,3 +266,30 @@ def test_smp_meldung_braucht_beschreibung():
         resp, status = A.moderation_report(TOKEN)
     assert status == 400
     assert resp.get_json()['error'] == 'description_required'
+
+
+# ── Blocklisten-Leak (Codex-Schlusspruefung 13.08.) ─────────────────────────
+
+def test_blocks_liste_liefert_keine_rohen_tokens():
+    """GET /blocks gab `token` = das rohe Author-Credential zurueck. Ueber
+    kind=news_comment haette man damit einen anonymen Kommentator
+    deanonymisieren UND sein Bearer-Token abgreifen koennen. Jetzt: AXU-Ref."""
+    viewer = 'AT-0123456789ABCDEF'
+    blocked = 'AT-FEDCBA9876543210'
+    _ok = A._TokenValidationResult(A._TokenValidationState.VALID, 'x@e.de')
+    with patch.object(A, '_blocked_by', return_value={blocked}), \
+         patch.object(A, '_validate_token', return_value=_ok), \
+         patch.object(A, '_request_bearer_matches', return_value=True), \
+         patch.object(A, '_user_profile_path', return_value='/nonexistent'):
+        client = A.app.test_client()
+        r = client.get(f'/api/moderation/{viewer}/blocks',
+                       headers={'Authorization': 'Bearer ' + viewer})
+    assert r.status_code == 200
+    body = r.get_json()
+    blob = str(body)
+    assert blocked not in blob, 'rohes Author-Token in der Blocklisten-Antwort!'
+    assert 'token' not in body['blocks'][0], 'Feld token darf nicht existieren'
+    ref = body['blocks'][0].get('ref')
+    assert ref and ref != blocked
+    # Die Ref muss serverseitig zurueck aufloesen (fuers Entblocken).
+    assert A._token_from_public_user_ref(ref) == blocked

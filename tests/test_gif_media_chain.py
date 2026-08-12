@@ -847,3 +847,15 @@ def test_block_by_content_antwortet_ohne_das_author_token():
     assert body['blocked_count'] == 1
     assert 'blocked_token' not in body
     assert 'AT-GEHEIMES-AUTOR-TOKEN' not in _json.dumps(body)
+
+
+def test_ssrf_allowlist_nur_media_hosts_und_443():
+    """Codex 13.08.: '.giphy.com' erlaubte api.giphy.com und beliebige Ports."""
+    import blueprints.gif_search_blueprint as G
+    assert G._allowed_media_url("https://media0.giphy.com/media/x.gif")
+    assert G._allowed_media_url("https://media4.giphy.com/media/x.gif")
+    assert G._allowed_media_url("https://media.giphy.com/media/x.gif")
+    assert G._allowed_media_url("https://api.giphy.com/v1/gifs/x") is None
+    assert G._allowed_media_url("https://media0.giphy.com:8443/x.gif") is None
+    assert G._allowed_media_url("http://media0.giphy.com/x.gif") is None
+    assert G._allowed_media_url("https://evil-giphy.com/x.gif") is None

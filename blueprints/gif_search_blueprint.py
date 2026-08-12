@@ -64,9 +64,12 @@ _SEARCH_RATE = (30, 60)
 _IMPORT_RATE = (20, 3600)
 
 # Der Import lädt eine vom CLIENT genannte URL — das ist ein SSRF-Vektor.
-# Deshalb hart auf die Medien-Hosts des Anbieters begrenzt: nur https, nur
-# diese Domains. Alles andere wird abgelehnt, bevor ein Socket aufgeht.
-_ALLOWED_HOST_SUFFIXES = ('.giphy.com',)
+# Deshalb hart auf die MEDIEN-Hosts des Anbieters begrenzt (Codex 13.08.:
+# `.giphy.com` erlaubte auch api.giphy.com und beliebige Ports): nur https,
+# nur `media*.giphy.com`, nur Port 443/leer. Alles andere wird abgelehnt,
+# bevor ein Socket aufgeht.
+import re as _re_ssrf
+_ALLOWED_MEDIA_HOST_RE = _re_ssrf.compile(r'^media[0-9]*\.giphy\.com$')
 # Harte Abbruchgrenze beim Herunterladen (der Deckel selbst liegt bei 10 MB;
 # ein Byte mehr reicht, um „zu groß" sicher zu erkennen).
 _DOWNLOAD_HARD_STOP = 10 * 1024 * 1024 + 1
@@ -283,8 +286,9 @@ def _allowed_media_url(u):
     if p.scheme != 'https' or not p.hostname:
         return None
     host = p.hostname.lower()
-    if not any(host == suf.lstrip('.') or host.endswith(suf)
-               for suf in _ALLOWED_HOST_SUFFIXES):
+    if not _ALLOWED_MEDIA_HOST_RE.match(host):
+        return None
+    if p.port not in (None, 443):
         return None
     return s
 
