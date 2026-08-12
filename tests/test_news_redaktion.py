@@ -425,12 +425,22 @@ def test_endpoint_caps_items_per_source(monkeypatch):
     nb._redaktion_store_merge(many)
     with nb._REDAKTION_LOCK:
         nb._REDAKTION_LAST_BUILD.update({'ts': _t.time(), 'running': False})
-    r = backend.app.test_client().get('/api/news/redaktion?limit=100')
-    assert r.status_code == 200
-    items = r.get_json()['items']
     from collections import Counter
-    counts = Counter(i['source_name'] for i in items)
+    client = backend.app.test_client()
+    # Übliches Fenster: der Deckel ist unverändert 8 (Bestandsverhalten).
+    r = client.get('/api/news/redaktion?limit=30')
+    assert r.status_code == 200
+    counts = Counter(i['source_name'] for i in r.get_json()['items'])
     assert counts['Fleissige Quelle'] == nb._REDAKTION_SOURCE_CAP
+    assert counts['Ruhige Quelle'] == 1
+    # Tiefes Fenster (seit 12.08.): der Deckel wächst mit, sonst schneidet er
+    # vor dem `limit` und ältere Artikel einer fleißigen Quelle sind für die
+    # App UNERREICHBAR — genau das ließ „News deiner Airline" verschwinden.
+    # Die Anti-Dominanz-Regel bleibt: höchstens ein Viertel des Fensters.
+    r = client.get('/api/news/redaktion?limit=100')
+    counts = Counter(i['source_name'] for i in r.get_json()['items'])
+    assert counts['Fleissige Quelle'] == nb._REDAKTION_SOURCE_CAP + 4
+    assert counts['Fleissige Quelle'] <= nb._redaktion_source_cap(100)
     assert counts['Ruhige Quelle'] == 1
 
 
@@ -469,3 +479,108 @@ def test_offtopic_stopcodes_never_count_as_airline_proof():
     assert not nb._redaktion_offtopic(
         'SpaceX-Rakete könnte auf dem Mond einschlagen', 'Raumfahrt.',
         mentioned=['LH'])
+
+
+def test_base_articles_tag_airlines_on_cold_path(monkeypatch):
+    """Vorfall 12.08. („News deiner Airline" fehlte ganz): der Kalt-Pfad setzte
+    nur `category` und nie `mentioned_airlines` — Lufthansa-Artikel landeten
+    mit [] im Store, obwohl der Extraktor auf denselben Text ['LH'] liefert."""
+    monkeypatch.setattr(nb, '_cache_get', lambda _k: None)
+    monkeypatch.setattr(nb, '_attach_stored_fulltexts', lambda _a: None)
+    monkeypatch.setattr(nb, '_aggregate_all_sources', lambda: ([{
+        'id': 'a1',
+        'title': 'Lufthansa Technik bildet 287 Nachwuchskräfte aus',
+        'summary': 'Der Konzern stellt am Standort Hamburg ein.',
+    }], {}))
+    out = nb._redaktion_base_articles()
+    assert 'LH' in out[0]['mentioned_airlines']
+
+
+def test_base_articles_drop_stopword_codes(monkeypatch):
+    """Live-Store 12.08.: die drei häufigsten „Airlines" waren TO/EI/AM —
+    Whole-Word-Treffer auf deutsche/englische Funktionswörter, kein Bezug.
+    Der Warm-Pfad reichte sie ungefiltert durch."""
+    art = {'id': 'a1',
+           'title': 'Boeing verzeichnet im Juli 38 neue Bestellungen',
+           'summary': 'Der Hersteller meldet am Dienstag Zahlen to date.'}
+    monkeypatch.setattr(nb, '_cache_get', lambda _k: {'articles': [art]})
+    out = nb._redaktion_base_articles()
+    assert not ({'AM', 'TO', 'EI'} & set(out[0]['mentioned_airlines']))
+    # Geteilter Feed-Cache bleibt unangetastet (die Redaktion kopiert).
+    assert 'mentioned_airlines' not in art
+
+
+def test_base_articles_keep_real_airline_next_to_stopword(monkeypatch):
+    """Filter darf nur das Rauschen nehmen: ein echter Treffer im selben Text
+    (Lufthansa) überlebt neben einem Stopwort-Code."""
+    monkeypatch.setattr(nb, '_cache_get', lambda _k: {'articles': [{
+        'id': 'a1',
+        'title': 'Lufthansa und Vereinigung Cockpit starten Schlichtung',
+        'summary': 'Die Gespräche beginnen am Montag.',
+    }]})
+    codes = nb._redaktion_base_articles()[0]['mentioned_airlines']
+    assert 'LH' in codes and 'AM' not in codes
+
+
+def test_source_cap_scales_with_window():
+    """Der feste Deckel 8 war stillschweigend ein GESAMT-Deckel: bei neun
+    Quellen konnte die Antwort nie mehr als ~70 Artikel tragen, egal welches
+    limit die App anfragte. Kleine Fenster bleiben unveraendert."""
+    assert nb._redaktion_source_cap(30) == 8      # Bestand: unveraendert
+    assert nb._redaktion_source_cap(32) == 8
+    assert nb._redaktion_source_cap(100) == 25    # tiefes Fenster reicht tief
+    assert nb._redaktion_source_cap(None) == nb._REDAKTION_SOURCE_CAP
+
+
+def test_deep_window_keeps_older_articles_of_a_busy_source(monkeypatch, tmp_path):
+    """Vorfall 12.08.: eine fleissige Quelle verbrauchte ihre acht Plaetze mit
+    ihren juengsten Meldungen — alle aelteren Artikel derselben Quelle fielen
+    komplett heraus. Live traf das 11 von 12 Artikeln mit Konzern-Bezug."""
+    import time as _t
+    import app as backend
+    monkeypatch.setattr(nb, '_REDAKTION_PATH', str(tmp_path / 's.json'))
+    monkeypatch.setattr(nb, '_redaktion_kick_build_if_stale', lambda: False)
+    # Bewusst inhaltlich VERSCHIEDENE Meldungen: der Story-Dedupe vor dem
+    # Quellen-Deckel wuerde fast gleichlautende Schlagzeilen zu einem Cluster
+    # zusammenfassen und damit am Deckel vorbeimessen.
+    themen = [
+        'Neue Verbindung nach Reykjavik ab Dezember',
+        'Frachtterminal in Leipzig wird erweitert',
+        'Pilotengewerkschaft kuendigt Urabstimmung an',
+        'Triebwerksrueckruf betrifft dreissig Maschinen',
+        'Gepaeckband am Terminal zwei faellt aus',
+        'Sommerflugplan bringt vier zusaetzliche Ziele',
+        'Regionalflughafen meldet Passagierrekord',
+        'Kerosinpreis steigt zum vierten Mal in Folge',
+        'Neue Kabinenbestuhlung ab Herbst im Einsatz',
+        'Vorfeldbrand legt Abfertigung kurzzeitig lahm',
+        'Nachtflugverbot wird erneut vor Gericht geprueft',
+        'Wartungshalle bekommt zweiten Hangarplatz',
+        'Schulungszentrum bildet mehr Techniker aus',
+        'Winterdienst ruestet mit neuen Fahrzeugen auf',
+        'Vielfliegerprogramm aendert die Statusregeln',
+        'Bodenpersonal erhaelt hoehere Schichtzulage',
+        'Neue Sicherheitsspuren verkuerzen die Wartezeit',
+        'Drohnensichtung stoppt Starts fuer zwanzig Minuten',
+        'Langstreckenflotte bekommt neues Bordinternet',
+        'Zusaetzliche Nachtstopps im Umlaufplan geplant',
+    ]
+    store = {}
+    for i, thema in enumerate(themen):
+        aid = f'a{i:02d}'
+        store[aid] = {
+            'id': aid, 'headline': thema,
+            'body': f'{thema}. Ausfuehrliche Erlaeuterung dazu im Text. ' * 3,
+            'category': 'general', 'source_name': 'Vielschreiber',
+            'source_url': f'https://example.test/{i}',
+            'published_at': f'2026-08-12T{i:02d}:00:00+00:00',
+            'mentioned_airlines': [], 'rev': nb._REDAKTION_REV,
+        }
+    nb._redaktion_store_merge(store)
+    with nb._REDAKTION_LOCK:
+        nb._REDAKTION_LAST_BUILD.update({'ts': _t.time(), 'running': False})
+    client = backend.app.test_client()
+    flach = client.get('/api/news/redaktion?limit=30').get_json()['items']
+    tief = client.get('/api/news/redaktion?limit=100').get_json()['items']
+    assert len(flach) == 8            # Bestandsverhalten bleibt
+    assert len(tief) == 20            # tiefes Fenster erreicht auch Aelteres

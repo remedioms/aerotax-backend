@@ -3039,6 +3039,35 @@ _REDAKTION_OFFTOPIC_RE = re.compile(
 _REDAKTION_SOURCE_CAP = 8
 
 
+def _redaktion_source_cap(limit):
+    """Quellen-Deckel für ein Fenster von `limit` Artikeln.
+
+    Der feste Deckel 8 war stillschweigend auch ein GESAMT-Deckel: bei neun
+    aktiven Quellen konnte die Antwort nie mehr als ~70 Artikel enthalten,
+    egal welches `limit` die App anfragte. Schlimmer, er wirkte NEUESTE-ZUERST
+    — jede Quelle verbrauchte ihre acht Plätze für ihre jüngsten Meldungen,
+    und alles Ältere fiel komplett heraus.
+
+    Live gemessen am 12.08. (Owner: „News deiner Airline" fehlte ganz):
+    Store 200 Artikel → 185 Cluster-Gewinner → davon 12 mit Konzern-Bezug
+    (Lufthansa/SWISS/Eurowings/Discover). Nach dem festen Deckel 8 blieb
+    davon GENAU EINER übrig; die anderen elf (u.a. „Lufthansa-Konzern startet
+    mit Starlink", „Eurowings reduziert Streckenangebot") wurden vom Deckel
+    gefressen, weil aeroTELEGRAPH/Aviation.Direct/aero.de ihre acht Plätze
+    schon an neuere Weltnachrichten vergeben hatten. Ein größeres `limit`
+    half deshalb nicht — der Deckel schnitt vorher.
+
+    Der Deckel bleibt relativ statt absolut: keine Quelle über einem Viertel
+    des Fensters. Für die bisherigen Fenstergrößen (limit <= 32) ändert sich
+    NICHTS (8 bleibt 8) — nur tiefe Anfragen reichen jetzt wirklich tief.
+    """
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        return _REDAKTION_SOURCE_CAP
+    return max(_REDAKTION_SOURCE_CAP, n // 4)
+
+
 # IATA-Codes, die zugleich deutsche/englische Funktionswörter sind:
 # `_extract_mentioned_airlines` matcht 2-Letter-Codes als ganze Wörter, und
 # „AM" (Aeroméxico) trifft damit jedes deutsche „am", „TO" jedes englische
@@ -3321,15 +3350,46 @@ def _redaktion_rewrite_batch(articles):
     return out
 
 
+def _redaktion_mentions(art):
+    """Airline-Erwähnungen eines Basis-Artikels — belastbar, nicht geraten.
+
+    Zwei Lecks, die den Store am 12.08. mit falschen bzw. FEHLENDEN Codes
+    gefüllt haben (Owner: „News deiner Airline" fehlte ganz):
+
+    (1) Der Kalt-Pfad (`_aggregate_all_sources`) setzte NUR `category` und nie
+        `mentioned_airlines` — jeder so eingelesene Artikel landete mit `[]`
+        im Store. Live-Beweis: 10 Lufthansa-Artikel im Store, 8 davon ohne
+        einen einzigen Code, obwohl `_extract_mentioned_airlines` auf denselben
+        Text sauber `['LH']` liefert.
+    (2) Der Warm-Pfad (Feed-Cache) brachte die Codes ungefiltert mit, inklusive
+        der Stopwort-Treffer: „AM" aus jedem deutschen „am", „TO" aus jedem
+        englischen „to", „EI" aus deutschen Texten. Im Live-Store waren das die
+        drei HÄUFIGSTEN „Airlines" (17× TO, 14× EI, 13× AM) — reines Rauschen.
+
+    Deshalb hier EIN Normalisierer für beide Pfade: immer selbst extrahieren
+    und die bekannten Stopwort-Codes (`_REDAKTION_MENTION_STOPCODES`) verwerfen.
+    Die betroffenen Airlines bleiben über ihre Namens-Aliase (>=4 Zeichen)
+    erkennbar — es geht nur das Rauschen verloren, kein echter Treffer.
+    """
+    codes = _extract_mentioned_airlines(art.get('title', ''),
+                                        art.get('summary', ''))
+    return [c for c in codes
+            if str(c).upper() not in _REDAKTION_MENTION_STOPCODES]
+
+
 def _redaktion_base_articles():
     """Faktenbasis: warmer Feed-Cache wenn vorhanden, sonst frisch aggregieren."""
     cached = _cache_get('*:*')
     if cached and cached.get('articles'):
-        return list(cached['articles'])
+        # Kopie je Artikel: der Feed-Cache ist geteilter Zustand, die Redaktion
+        # darf ihn nicht umschreiben (`/api/news/feed` liest dieselben Dicts).
+        return [{**art, 'mentioned_airlines': _redaktion_mentions(art)}
+                for art in cached['articles']]
     aggregated, _status = _aggregate_all_sources()
     for art in aggregated:
         art['category'] = _classify_category(art.get('title', ''),
                                              art.get('summary', ''))
+        art['mentioned_airlines'] = _redaktion_mentions(art)
     try:
         _attach_stored_fulltexts(aggregated)
     except Exception as exc:  # Volltext ist nice-to-have, kein Muss
@@ -4182,8 +4242,9 @@ def get_news_redaktion():
     # (1) Off-Topic-Reste sofort unsichtbar — der Build-Purge braucht sonst
     #     bis zum nächsten Lauf; geprüft wird hier der Rewrite-Text, die
     #     gespeicherte Airline-Erwähnung gewinnt weiterhin.
-    # (2) Höchstens _REDAKTION_SOURCE_CAP Artikel je Quelle, neueste zuerst —
-    #     eine fleißige Quelle dominiert die Liste nicht mehr.
+    # (2) Höchstens `source_cap` Artikel je Quelle, neueste zuerst — eine
+    #     fleißige Quelle dominiert die Liste nicht mehr. Der Deckel wächst
+    #     MIT dem angefragten Fenster (s. `_redaktion_source_cap`).
     # (3) Story-Dedupe (Owner 10.08.: 4× „Lufthansa Starlink-WLAN" in „Deine
     #     Airline"). Der Ingest-Pass verhindert NEUE Dubletten, heilt aber den
     #     schon gefüllten Store nicht — deshalb hier dieselbe Cluster-Funktion
@@ -4194,10 +4255,11 @@ def get_news_redaktion():
     items = []
     story_ids = {}          # ausgespielte ID -> alle IDs ihres Story-Clusters
     per_source = {}
+    source_cap = _redaktion_source_cap(limit)
     for winner, members in groups:
         it = all_candidates[winner]
         src = (it.get('source_name') or '?')
-        if per_source.get(src, 0) >= _REDAKTION_SOURCE_CAP:
+        if per_source.get(src, 0) >= source_cap:
             continue
         per_source[src] = per_source.get(src, 0) + 1
         items.append(it)
