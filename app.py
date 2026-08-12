@@ -32165,7 +32165,12 @@ def forum_trending_hashtags(token):
 # Kategorien: food | sight | sleep | gym | transport | nightlife | shopping
 # 'airport' (2026-07-19, Jamie Geddes Rowe): Geschäfte/Restaurants AM Flughafen
 # — eigener Bereich, gespeist aus Guide-airport_fb-Seeds + Crew-Posts.
-LAYOVER_CATEGORIES = {'food','sight','sleep','gym','transport','nightlife','shopping','coffee','airport','other'}
+# 'wellness' (2026-08-12, Owner nach Tibor/Seoul): Spa, Massage, Sauna, Beauty,
+# Schwimmbad. Bisher trugen 99 kuratierte Tipps diese Kategorie, ohne dass sie
+# irgendwo gültig war — der Client bog sie auf 'other' um, eine Einreichung mit
+# category=wellness wäre hier mit 400 invalid_category abgewiesen worden.
+# Ortsgebunden (der Tipp IST der Ort) → iOS rät dafür kein Kategorie-Stockfoto.
+LAYOVER_CATEGORIES = {'food','sight','sleep','gym','transport','nightlife','shopping','coffee','airport','wellness','other'}
 
 def _recs_dir():
     import os

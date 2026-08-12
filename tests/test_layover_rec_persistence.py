@@ -117,6 +117,49 @@ def test_anonymous_add_keeps_owner_internal_and_profile_private(client, monkeypa
     assert "author_airline" not in public
 
 
+def test_add_accepts_wellness_category(client, monkeypatch):
+    """Owner-Entscheid 2026-08-12 („wellness adden"): Spa/Massage/Beauty ist eine
+    ECHTE Kategorie, keine Notlandung auf `other`.
+
+    Vorher fehlte `wellness` in `LAYOVER_CATEGORIES` — 99 kuratierte Tipps trugen
+    die Kategorie schon, aber eine Crew-Einreichung damit wäre hier mit
+    400 invalid_category abgeprallt. Der Test prüft beides: die Annahme UND dass
+    die Kategorie unverändert gespeichert wird (kein stilles Umbiegen).
+    """
+    captured = _stub_add_dependencies(monkeypatch)
+
+    response = _post(client, category="wellness",
+                     title="Gesichtsbehandlung Nähe Novotel")
+
+    assert response.status_code == 200
+    assert response.get_json()["ok"] is True
+    assert captured[0]["category"] == "wellness"
+
+
+def test_get_accepts_wellness_filter(client, monkeypatch):
+    """Der Filter-Pfad validiert gegen dasselbe Set — sonst hätte die neue
+    Sektion einen Chip, der 400 zurückgibt."""
+    rec = {"id": "spa-1", "iata": "SFO", "category": "wellness",
+           "title": "Kabuki Springs", "vote_score": 3}
+    monkeypatch.setattr(app, "_recs_path", lambda _iata: "/valid")
+    monkeypatch.setattr(app, "_recs_load", lambda _iata: [rec])
+    monkeypatch.setattr(app, "_viewer_airline_and_calendar", lambda _t: ("", False))
+    monkeypatch.setattr(app, "_votes_load", lambda _t: {})
+
+    response = client.get("/api/layover-recs/SFO?category=wellness")
+
+    assert response.status_code == 200
+    recs = response.get_json()["recs"]
+    assert [r["title"] for r in recs] == ["Kabuki Springs"]
+
+
+def test_wellness_is_not_a_crew_hotel_category():
+    """`wellness` darf NIE unter das Crew-Hotel-Gate fallen (nur `sleep`) —
+    ein Spa ist keine airline-vertrauliche Unterkunft."""
+    assert "wellness" in app.LAYOVER_CATEGORIES
+    assert "wellness" not in app._CREW_HOTEL_CATS
+
+
 @pytest.mark.parametrize("category", ["adventure", "Food ", "..."])
 def test_add_rejects_unknown_category_instead_of_silently_reclassifying(
         client, monkeypatch, category):
