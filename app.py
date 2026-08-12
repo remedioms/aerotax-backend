@@ -38277,6 +38277,28 @@ def _password_policy_ok(pw):
     return (True, None)
 
 
+def _password_reset_credential_valid(user, candidate):
+    """Accept an unexpired reset code as a one-time login password.
+
+    The existing password intentionally remains valid until the mailbox owner
+    actually uses the recovery credential. Merely knowing an account's email
+    address must never let somebody lock that account out by requesting resets.
+    """
+    import hmac
+    reset_token = str((user or {}).get('reset_token') or '')
+    if not reset_token or not candidate or (user or {}).get('reset_used_at'):
+        return False
+    if not hmac.compare_digest(reset_token, str(candidate).strip().lower()):
+        return False
+    try:
+        expiry = datetime.fromisoformat(
+            str((user or {}).get('reset_expires') or '1970-01-01T00:00:00'))
+        now = datetime.now(expiry.tzinfo) if expiry.tzinfo else datetime.now()
+        return expiry > now
+    except (TypeError, ValueError):
+        return False
+
+
 _EMAIL_RX = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]{2,}$')
 
 def _email_valid(email: str) -> bool:
@@ -38366,9 +38388,36 @@ def auth_login():
     if not user:
         return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
     ok, needs_rehash = _password_verify(pw, user.get('password_hash', ''))
+    recovery_login = False
+    if not ok and _password_reset_credential_valid(user, pw):
+        # The emailed code doubles as a strong one-time password. This keeps
+        # every deployed client compatible: paste it into the normal password
+        # field, then optionally choose a memorable password under More.
+        ok = True
+        needs_rehash = False
+        recovery_login = True
     if not ok:
         return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
-    if needs_rehash:
+    if recovery_login:
+        try:
+            # Persist the exact value printed in the email. Recovery matching
+            # is deliberately case-insensitive for hex codes, but subsequent
+            # ordinary password logins must stay predictably case-sensitive.
+            user['password_hash'] = _password_hash(str(user['reset_token']))
+            user['reset_used_at'] = datetime.now().isoformat()
+            user['reset_token'] = None
+            user['reset_expires'] = None
+            if not _auth_upsert_user(email, user):
+                raise RuntimeError('auth store rejected recovery promotion')
+            # A successful mailbox recovery is an account-recovery boundary.
+            # The newly issued session below is therefore the only modern
+            # session that remains active.
+            _auth_session_revoke_all(user.get('token'))
+            app.logger.info(f'[auth] one-time password promoted for {email[:3]}***')
+        except Exception as e:
+            app.logger.error(f'[auth] one-time password promotion failed: {e}')
+            return _auth_store_unavailable_response()
+    elif needs_rehash:
         # Transparente Migration: alter sha256-Hash → neuer scrypt-Hash
         try:
             user['password_hash'] = _password_hash(pw)
@@ -38598,7 +38647,7 @@ def auth_apple():
 
 
 def _send_password_reset_email(to_email, reset_token):
-    """Schickt Reset-Token via Resend. Failures werden geloggt, User-Response
+    """Schickt Einmal-Passwort/Reset-Code via Resend. Failures werden geloggt, User-Response
     bleibt 200 (kein Email-Enumeration). Returns True/False für Telemetrie."""
     api_key = os.environ.get('RESEND_API_KEY', '').strip()
     from_addr = os.environ.get('RESET_FROM_EMAIL',
@@ -38612,10 +38661,10 @@ def _send_password_reset_email(to_email, reset_token):
         import urllib.request
         html_body = f"""
         <div style="font-family:-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:24px;">
-          <h2 style="color:#0F1A3D;margin:0 0 16px">Passwort zurücksetzen</h2>
+          <h2 style="color:#0F1A3D;margin:0 0 16px">Dein neues AeroX-Passwort</h2>
           <p style="color:#3a3a3a;line-height:1.5;font-size:14px">
-            Wir haben eine Anfrage erhalten dein AeroX-Passwort zurückzusetzen.
-            Verwende diesen Token in der App:
+            Kopiere dieses Einmal-Passwort direkt in das normale Passwortfeld
+            der AeroX-Anmeldung:
           </p>
           <div style="background:#f5f5f7;border-radius:12px;padding:20px;margin:20px 0;
                       text-align:center;font-family:'SF Mono',Menlo,monospace;
@@ -38624,8 +38673,15 @@ def _send_password_reset_email(to_email, reset_token):
             {reset_token}
           </div>
           <p style="color:#666;font-size:13px;line-height:1.5">
-            Der Token ist 2 Stunden gültig. Wenn du das Reset nicht angefordert
-            hast, ignoriere diese E-Mail — dein Passwort bleibt unverändert.
+            Es ist 2 Stunden gültig und wird bei der ersten Anmeldung zu deinem
+            neuen Passwort. Danach kannst du unter <strong>Mehr → Passwort
+            festlegen oder ändern</strong> ein eigenes Passwort wählen. In
+            neueren App-Versionen kannst du den Wert alternativ als Code nutzen
+            und sofort ein eigenes Passwort festlegen.
+          </p>
+          <p style="color:#666;font-size:13px;line-height:1.5">
+            Wenn du das nicht angefordert hast, ignoriere diese E-Mail — dein
+            bisheriges Passwort bleibt unverändert.
           </p>
           <p style="color:#888;font-size:11px;margin-top:32px">
             AeroX · aerosteuer.de · automatische Nachricht, bitte nicht antworten.
@@ -38635,7 +38691,7 @@ def _send_password_reset_email(to_email, reset_token):
         payload = json.dumps({
             'from': from_addr,
             'to': [to_email],
-            'subject': 'AeroX · Passwort zurücksetzen',
+            'subject': 'AeroX · Dein neues Einmal-Passwort',
             'html': html_body,
         }).encode()
         req = urllib.request.Request(
@@ -38678,10 +38734,31 @@ def auth_forgot():
     user = _auth_get_user(email)
     if user is not None:
         import uuid as _u
-        reset_token = _u.uuid4().hex[:24]
+        # Wiederholtes Tippen darf die gerade verschickte Mail nicht entwerten.
+        # Solange der vorhandene Token unbenutzt und noch gültig ist, schicken
+        # wir exakt denselben Code erneut. Erst nach Ablauf/Verwendung entsteht
+        # ein neuer. Das bleibt vollständig kompatibel mit allen alten Builds.
+        reset_token = None
+        existing_token = str(user.get('reset_token') or '').strip()
+        if existing_token and not user.get('reset_used_at'):
+            try:
+                existing_expiry = datetime.fromisoformat(
+                    str(user.get('reset_expires') or '1970-01-01T00:00:00'))
+                comparison_now = (datetime.now(existing_expiry.tzinfo)
+                                  if existing_expiry.tzinfo else datetime.now())
+                if existing_expiry > comparison_now:
+                    reset_token = existing_token
+            except (TypeError, ValueError):
+                pass
+        if not reset_token:
+            reset_token = _u.uuid4().hex[:24]
+            user['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
         user['reset_token'] = reset_token
-        user['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
-        user.pop('reset_used_at', None)  # alter used_at-Marker entfernen, neuer Token
+        # WICHTIG explizites None statt pop(): Supabase-UPSERT lässt eine nicht
+        # gesendete Spalte unverändert. Mit pop() blieb der alte used_at-Marker
+        # serverseitig stehen und ein frisch versandter Code galt sofort als
+        # bereits verwendet.
+        user['reset_used_at'] = None
         _auth_upsert_user(email, user)
         sent_ok = _send_password_reset_email(email, reset_token)
         if not sent_ok:
@@ -38716,11 +38793,13 @@ def auth_reset():
         pass
     user['password_hash'] = _password_hash(new_pw)
     user['reset_used_at'] = datetime.now().isoformat()  # Audit-Marker
-    user.pop('reset_token', None)
-    user.pop('reset_expires', None)
-    # SCALE-FIX: Single-Row-Upsert statt Full-Table-Save. ON-CONFLICT-Verhalten
-    # identisch zum alten Bulk-Save (gepoppte Spalten bleiben SB-seitig stehen,
-    # Replay-Schutz greift über reset_used_at — unverändert).
+    # Auch hier explizit NULL persistieren. Fehlende Keys löschen bei einem
+    # Supabase-Upsert keine bestehenden Spaltenwerte.
+    user['reset_token'] = None
+    user['reset_expires'] = None
+    # SCALE-FIX: Single-Row-Upsert statt Full-Table-Save. Die beiden expliziten
+    # NULLs räumen die Einmal-Credential ab; reset_used_at bleibt als Audit- und
+    # Replay-Marker bestehen.
     _auth_upsert_user(email, user)
     # A password reset is an account-recovery boundary: every modern device
     # session is revoked. Legacy AT clients stay compatible during rollout.
