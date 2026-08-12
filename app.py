@@ -53869,6 +53869,14 @@ _SWISS_DUTY_CODE_STEMS = frozenset({
     'STBY',     # Standby (ausgeschriebene Kurzform, auch „A/P STBY")
     'RES',      # Reserve
     'RESX',     # Reserve
+    # Vollstaendige Liste aus dem SWISS OPS Manual Kap. 7.2 (Daniel/Swiss,
+    # 12.08.2026): SBY90/SBY120 (90 min / 2 h Meldezeit), SBYAD120,
+    # APSBYAD, RESY (Reserve NRT-CCM 00:00-12:00).
+    'SBY90',
+    'SBY120',
+    'SBYAD120',
+    'APSBYAD',
+    'RESY',
 })
 
 

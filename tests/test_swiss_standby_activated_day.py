@@ -163,3 +163,15 @@ def test_duty_code_guard_strips_only_the_duty_word():
     # Gemergter Tag: das Flug-Segment überlebt.
     assert 'LX1830' in backend._strip_swiss_duty_codes(
         'SBY-BCS · LX1830 ZRH 0927 ATH 1259')
+
+
+def test_daniels_komplette_swiss_code_liste_wird_erkannt():
+    """SWISS OPS Manual Kap. 7.2 (Daniel, 12.08.2026) — jeder Code der
+    Tabelle ist ein Dienst-Code, kein Flug-Leg. BCS/32S sind Flotten-
+    Suffixe, die Staemme tragen die Erkennung."""
+    import app as A
+    for code in ('APSBY-BCS', 'APSBY-32S', 'APSBYAD', 'SBY-BCS', 'SBY-32S',
+                 'SBYAD', 'SBY90-BCS', 'SBY90-32S', 'SBY120-BCS',
+                 'SBY120-32S', 'SBYAD120', 'RESX', 'RESY'):
+        tokens = code.split('-')
+        assert tokens[0] in A._SWISS_DUTY_CODE_STEMS, code
