@@ -202,6 +202,29 @@ def test_zukunft_wird_nie_als_ist_ausgeliefert(monkeypatch):
     assert d['block_time_min'] is None
 
 
+def test_zukuenftiger_ist_abflug_wird_nie_ausgeliefert(monkeypatch):
+    """Spiegelbild zur Ankunft — die Lücke, die der erste Wächter offen ließ:
+    `actual_dep` kommt aus DERSELBEN `esti_*`-Quelle. Steht der Flug noch am
+    Gate, ist die Board-Schätzung des Abflugs ein PLANWERT in der Zukunft; als
+    „Ist-Abflug" ausgeliefert war sie ein synthetisierter Wert."""
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    ab = datetime.now(timezone.utc) + timedelta(hours=2)
+    an = datetime.now(timezone.utc) + timedelta(hours=5)
+    # Die Board-Obs tragen NAIVE Stationszeit — also in der jeweiligen Zone
+    # formatieren, sonst prüft der Test versehentlich einen Vergangenheitswert.
+    obs = dict(OBS_FALSCH,
+               esti_dep=ab.astimezone(ZoneInfo('Asia/Singapore'))
+               .strftime('%Y-%m-%dT%H:%M:%S'),
+               esti_arr=an.astimezone(ZoneInfo('Europe/Berlin'))
+               .strftime('%Y-%m-%dT%H:%M:%S'))
+    _mock(monkeypatch, briefs={}, obs=obs)
+    d = _hole(_app().app.test_client())
+    assert d['actual_dep'] is None
+    assert d['actual_arr'] is None
+    assert d['block_time_min'] is None
+
+
 # ── Eine GEMESSENE Ist-Zeit schlägt jede Schätzung (2026-08-13) ─────────────
 # Befund: `actual_*` war bis hierher ein Etikett — die Zahl darunter war
 # `esti_*` (Prognose) oder der Roster-Instant (Plan). LH liefert in derselben

@@ -499,7 +499,75 @@ def test_operational_detail_can_fill_estimates_when_schedule_is_complete(monkeyp
     assert out.get('est_arr')
 
 
-def test_canonical_running_flight_prefers_fr24_eta_and_actual_departure():
+# ─── Der gRPC-Korridor ist DATUMSBLIND (Keine-Fake-Werte, 2026-08-13) ────────
+# KEF als Station, weil dort Stationstag == UTC-Tag gilt (kein Sommerzeit-Rand,
+# an dem der Test gegen 23:00 UTC kippen würde).
+
+def _heute_utc():
+    import time as _t
+    return _t.strftime('%Y-%m-%d', _t.gmtime())
+
+
+def test_grpc_ist_zeiten_gelten_nicht_fuer_einen_fremden_tag(monkeypatch):
+    """`_grpc_times_free` fragt einen Korridor ab und bekommt den Flug, der
+    GERADE dort fliegt — die Funktion kennt gar kein Datum. Unter einem
+    Vergangenheitsdatum waeren ihre `actual_*` die Messung einer FREMDEN
+    Tages-Instanz, also ein synthetisierter Wert. Fahrplan/ETA bleiben."""
+    monkeypatch.setattr(
+        axd, '_grpc_times_free',
+        lambda *a, **k: {'sched_dep': 1784035800, 'actual_dep': 1784036400,
+                         'sched_arr': 1784043600, 'actual_arr': 1784043900,
+                         'eta': 1784043700})
+    monkeypatch.setattr(axd, '_fr24_flight_by_number', lambda *a, **k: {})
+
+    out = axd._flight_times_free_first(
+        'LH8801', '2026-07-14', 'KEF', 'BOS', allow_paid=False)
+
+    assert out.get('sched_dep') and out.get('sched_arr')
+    assert out.get('est_arr')
+    assert out.get('actual_dep') is None
+    assert out.get('actual_arr') is None
+
+
+def test_grpc_ist_zeiten_gelten_am_heutigen_stationstag_weiter(monkeypatch):
+    """Gegenprobe: am heutigen Tag ist die gratis gRPC-Ist-Zeit weiter die
+    wertvollste Zahl, die wir ohne Credits bekommen."""
+    monkeypatch.setattr(
+        axd, '_grpc_times_free',
+        lambda *a, **k: {'sched_dep': 1784035800, 'actual_dep': 1784036400})
+    monkeypatch.setattr(axd, '_fr24_flight_by_number', lambda *a, **k: {})
+
+    out = axd._flight_times_free_first(
+        'LH8802', _heute_utc(), 'KEF', 'BOS', allow_paid=False)
+
+    assert out.get('actual_dep')
+
+
+def test_freie_ist_zeit_verhindert_die_paid_eskalation(monkeypatch):
+    """`require_operational` heisst „operative Wahrheit fehlt" — eine IST-Zeit
+    IST operative Wahrheit. Ohne `actual_*` im Gate feuerte der bezahlte Call
+    auch dann, wenn der gratis Korridor den Ist-Abflug schon geliefert hatte:
+    Credits fuer laengst Bekanntes."""
+    paid = []
+    monkeypatch.setattr(
+        axd, '_grpc_times_free',
+        lambda *a, **k: {'sched_dep': 1784035800, 'sched_arr': 1784043600,
+                         'actual_dep': 1784036400})
+    monkeypatch.setattr(axd, '_fr24_flight_by_number',
+                        lambda *a, **k: paid.append(True) or {})
+
+    out = axd._flight_times_free_first(
+        'LH8803', _heute_utc(), 'KEF', 'BOS', allow_paid=True,
+        require_operational=True)
+
+    assert out.get('actual_dep')
+    assert paid == [], 'Ist-Zeit vorhanden ⇒ kein bezahlter Call'
+
+
+def test_canonical_running_flight_prefers_fr24_eta_but_not_fr24_ist_abflug():
+    """Im Flug ist FR24 die Quelle der LAUFENDEN ETA — aber nicht die des
+    Ist-Abflugs, wenn LH/Board ihn schon gemessen hat (Staffelung 2026-08-13).
+    Vorher gewann FR24 mit 12:42 gegen LHs 12:41."""
     official = {
         'sched_dep': '2026-08-12T12:20:00',
         'actual_dep': '2026-08-12T12:41:00',
@@ -514,16 +582,52 @@ def test_canonical_running_flight_prefers_fr24_eta_and_actual_departure():
     out = axd._canonical_operational_times(
         official, fr24, airborne=True, landed=False)
 
-    assert out['est_dep'] == '2026-08-12T12:42:00'
+    assert out['actual_dep'] == '2026-08-12T12:41:00'
+    assert out['est_dep'] == '2026-08-12T12:41:00'
     assert out['est_arr'] == '2026-08-12T18:36:00'
     assert out['official_est_arr'] == '2026-08-12T18:17:00'
-    assert out['dep_source'] == 'fr24'
+    assert out['dep_source'] == 'official'
     assert out['arr_source'] == 'fr24'
 
 
-def test_canonical_landed_flight_uses_actual_arrival_not_old_eta():
+def test_canonical_running_flight_takes_fr24_ist_abflug_als_lueckenfueller():
+    """Ohne offiziellen Ist-Abflug bleibt FR24 im Flug die Quelle — die
+    Staffelung darf die Karte nicht leerraeumen."""
+    official = {'sched_dep': '2026-08-12T12:20:00',
+                'sched_arr': '2026-08-12T18:40:00'}
+    fr24 = {'actual_dep': '2026-08-12T12:42:00',
+            'est_arr': '2026-08-12T18:36:00'}
+
+    out = axd._canonical_operational_times(
+        official, fr24, airborne=True, landed=False)
+
+    assert out['actual_dep'] == '2026-08-12T12:42:00'
+    assert out['dep_source'] == 'fr24'
+
+
+def test_canonical_landed_flight_prefers_lh_actual_arrival_over_fr24():
+    """QUELLEN-STAFFELUNG (Scraper→LH→FR24, hoeherer Tier gewinnt): liegen ZWEI
+    Ist-Ankuenfte vor, gewinnt die offizielle (LH `ActualTimeUTC`, 18:39) — nicht
+    FR24 (18:38). Bis 2026-08-13 war es umgekehrt: FR24 stand als `f.get() or
+    o.get()` vorne und kippte LHs Messung um eine Minute."""
     official = {'est_arr': '2026-08-12T18:17:00',
                 'actual_arr': '2026-08-12T18:39:00'}
+    fr24 = {'est_arr': '2026-08-12T18:36:00',
+            'actual_arr': '2026-08-12T18:38:00'}
+
+    out = axd._canonical_operational_times(
+        official, fr24, airborne=False, landed=True)
+
+    assert out['actual_arr'] == '2026-08-12T18:39:00'
+    assert out['est_arr'] == '2026-08-12T18:39:00'
+    assert out['arr_source'] == 'official'
+
+
+def test_canonical_landed_flight_uses_fr24_actual_arrival_when_lh_has_none():
+    """Gegenprobe zur Staffelung: FR24 bleibt der Lueckenfueller. Ohne offizielle
+    Ist-Ankunft liefert er sie weiterhin — sonst waere die alte ETA die einzige
+    Zahl auf der Karte."""
+    official = {'est_arr': '2026-08-12T18:17:00'}
     fr24 = {'est_arr': '2026-08-12T18:36:00',
             'actual_arr': '2026-08-12T18:38:00'}
 

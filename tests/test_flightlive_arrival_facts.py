@@ -246,3 +246,57 @@ def test_route_keeps_none_when_no_source_knows_the_arrival(client, monkeypatch):
     assert b['sched_arr'] is None
     assert b['arr_delay_min'] is None
     assert b['dest_gate'] is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Ist-Zeiten auf der Live-Karte: Tier + Zeitbasis (2026-08-13)
+# ──────────────────────────────────────────────────────────────────────────────
+# Zwei Befunde an derselben Stelle:
+#  · `_flight_facts_from_obs` faellt bei leerem Tag transparent auf den VORTAG
+#    zurueck und markiert das mit `stale`. flight-live las die Marke nie — die
+#    Karte eines noch nicht abgeflogenen Fluges trug die Ist-Ankunft von gestern.
+#  · Der Board-Merge sollte laut `_live_arrival_fields`-Vertrag IMMER gewinnen;
+#    hier war es umgekehrt verdrahtet (Fakten zuerst, Merge nur als Lueckenfueller).
+#  · `actual_*_iso` ist ABSOLUTES UTC, `sched_*`/`esti_*` sind Stationszeit —
+#    ungewandelt standen zwei Zonen untereinander in derselben Karte.
+# ══════════════════════════════════════════════════════════════════════════════
+_LIVE_URL = ('/api/ax/flight-live/TESTTOKEN?flight_no=LH454'
+             '&date=2026-07-30&reg=D-ABYP&dep_iata=FRA&arr_iata=SFO')
+
+
+def test_stale_facts_never_reach_the_live_card(client, monkeypatch):
+    """Vortags-Fakten (`stale`) sind fuer den angefragten Tag KEIN Beleg —
+    lieber keine Ist-Ankunft als die der gestrigen Instanz."""
+    _patch_route(monkeypatch, _BOARD_BLIND,
+                 {'actual_arr': '2026-07-29T20:11:00-07:00',
+                  'stale': True, 'obs_date': '2026-07-29'})
+    monkeypatch.setattr(BP, '_fr24_live_card_cached', lambda **k: None)
+    b = client.get(_LIVE_URL).get_json()
+    assert b['actual_arr'] is None
+    assert b['actual_dep'] is None
+
+
+def test_board_merge_beats_the_facts_and_lands_in_station_time(client, monkeypatch):
+    """Der frisch gepollte Board-Merge gewinnt gegen die Fakten — und seine
+    UTC-Instants kommen als STATIONSZEIT an, damit Soll und Ist in derselben
+    Zone untereinander stehen (FRA 08:25Z ⇒ 10:25, SFO 19:41Z ⇒ 12:41)."""
+    merged = dict(_BOARD_BLIND,
+                  actual_dep_iso='2026-07-30T08:25:00+00:00',
+                  actual_arr_iso='2026-07-30T19:41:00+00:00')
+    _patch_route(monkeypatch, merged,
+                 {'actual_dep': '2026-07-30T09:00:00',
+                  'actual_arr': '2026-07-30T11:00:00'})
+    monkeypatch.setattr(BP, '_fr24_live_card_cached', lambda **k: None)
+    b = client.get(_LIVE_URL).get_json()
+    assert b['actual_dep'] == '2026-07-30T10:25:00'
+    assert b['actual_arr'] == '2026-07-30T12:41:00'
+
+
+def test_facts_still_fill_the_gap_when_the_board_is_silent(client, monkeypatch):
+    """Gegenprobe zur Rangfolge: schweigt der Merge, liefern die (frischen)
+    Fakten die Ist-Zeit weiterhin — die Karte darf nicht leer bleiben."""
+    _patch_route(monkeypatch, _BOARD_BLIND,
+                 {'actual_arr': '2026-07-30T12:41:00'})
+    monkeypatch.setattr(BP, '_fr24_live_card_cached', lambda **k: None)
+    b = client.get(_LIVE_URL).get_json()
+    assert b['actual_arr'] == '2026-07-30T12:41:00'

@@ -2173,7 +2173,12 @@ def _fr24_flight_by_number(flight_no, date=None):
             'flight': l['flight_no'], 'callsign': l.get('callsign'),
             'airline': '', 'airline_name': '',
             'dep_iata': l['src'], 'dep_name': '', 'arr_iata': l['dst'], 'arr_name': '',
-            'sched_dep': l['sched_dep'], 'sched_arr': l['sched_arr'],
+            # KEIN FAHRPLAN AUS DIESER QUELLE (Keine-Fake-Werte, 2026-08-13):
+            # flight-summary/light kennt keine Sollzeit (s. Docstring) — die
+            # Felder unten sind Ist-Zeiten. Sie zusaetzlich als `sched_*` zu
+            # melden erfand ein Paar sched==actual, also „Verspaetung 0" fuer
+            # JEDEN Flug, der ueber diesen Zweig kam. Soll bleibt Board/Warehouse.
+            'sched_dep': None, 'sched_arr': None,
             # flight-summary/light benennt diese Felder historisch im internen
             # Leg-Schema als sched_*, tatsächlich stammen sie aber aus
             # datetime_takeoff/datetime_landed und sind gemessene Ist-Zeiten.
@@ -4483,10 +4488,14 @@ def _fr24_fill_missing_arrival(flight_no, date, dep_iata, arr_iata):
     except Exception:
         summary = {}
     # (a) NUR wenn die Summary eine ECHTE Ist-Ankunft trägt (datetime_landed →
-    #     sched_arr im flight_status-Schema von _fr24_flight_by_number; est_arr ist
-    #     dort immer None). Ohne Ist-Ankunft: nichts schreiben, Negative-Cache setzen.
-    ist_arr_utc = summary.get('sched_arr')
-    ist_dep_utc = summary.get('sched_dep')
+    #     `actual_arr`; est_arr ist dort immer None). Ohne Ist-Ankunft: nichts
+    #     schreiben, Negative-Cache setzen.
+    #     Seit 2026-08-13 meldet `_fr24_flight_by_number` kein `sched_*` mehr
+    #     (flight-summary/light KENNT keinen Fahrplan — sched==actual war ein
+    #     erfundenes 0-Minuten-Paar). `or`-Fallback auf die alten Schlüssel für
+    #     hart gecachte Antworten aus der Zeit davor.
+    ist_arr_utc = summary.get('actual_arr') or summary.get('sched_arr')
+    ist_dep_utc = summary.get('actual_dep') or summary.get('sched_dep')
     # Route-Konsistenz: der Summary-Treffer muss zum erwarteten Ziel passen (bzw. das
     # erwartete Ziel unbekannt sein). Ein umgeleiteter/falscher Treffer darf keine
     # fremde Ankunft in die ARR-Zeile schreiben.
@@ -5362,10 +5371,26 @@ def _flight_times_free_first(flight_no, date, origin, dest,
             if g:
                 break
     if g:
+        # DER KORRIDOR IST DATUMSBLIND (Keine-Fake-Werte, 2026-08-13): er
+        # liefert den Flug, der GERADE auf der Strecke ist — nicht den vom
+        # angefragten Tag. Fahrplan-/ETA-Werte sind davon unkritisch (der Slot
+        # ist tagesstabil, die ETA gilt ohnehin nur jetzt), eine IST-Zeit aber
+        # ist dann die Messung einer FREMDEN Tages-Instanz. `actual_*` deshalb
+        # nur am heutigen Stationstag des Startflughafens uebernehmen
+        # (unbekannte TZ ⇒ UTC-Tag).
+        try:
+            from zoneinfo import ZoneInfo as _ZIg
+            from airport_tz import airport_tz as _atzg
+            from datetime import datetime as _dtg
+            _heute_station = _dtg.now(
+                _ZIg(_atzg((origin or '').upper()) or 'UTC')).strftime('%Y-%m-%d')
+        except Exception:
+            _heute_station = time.strftime('%Y-%m-%d', time.gmtime())
+        _grpc_ist_ok = (_heute_station == d)
         sd = _epoch_to_local_iso(g.get('sched_dep'), origin)
-        ad = _epoch_to_local_iso(g.get('actual_dep'), origin)
+        ad = _epoch_to_local_iso(g.get('actual_dep'), origin) if _grpc_ist_ok else None
         sa = _epoch_to_local_iso(g.get('sched_arr'), dest)
-        aa = _epoch_to_local_iso(g.get('actual_arr'), dest)
+        aa = _epoch_to_local_iso(g.get('actual_arr'), dest) if _grpc_ist_ok else None
         ea = _epoch_to_local_iso(g.get('eta'), dest)
         if sd:
             out['sched_dep'] = sd
@@ -5379,9 +5404,15 @@ def _flight_times_free_first(flight_no, date, origin, dest,
             out['est_arr'] = ea
     # 2) PAID-Backup wenn free das Paar NICHT komplett hatte (Langstrecke/gelandet).
     #    Paid liefert ISO-Z (UTC) → auf Stationszeit normalisieren (wie die Obs).
+    #    `require_operational` heisst „operative Wahrheit fehlt" — eine IST-Zeit
+    #    IST operative Wahrheit (2026-08-13). Ohne `actual_*` im Gate feuerte der
+    #    bezahlte Call auch dann, wenn der gRPC-Korridor den Ist-Abflug/die
+    #    Ist-Ankunft schon gratis geliefert hatte: Credits fuer Bekanntes.
     if allow_paid and (not (out.get('sched_dep') and out.get('sched_arr'))
                        or (require_operational
-                           and not (out.get('est_dep') or out.get('est_arr')))):
+                           and not (out.get('est_dep') or out.get('est_arr')
+                                    or out.get('actual_dep')
+                                    or out.get('actual_arr')))):
         try:
             p = _fr24_flight_by_number(fn, date=d) or {}
         except Exception:
@@ -5440,7 +5471,12 @@ def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
         lat_f, lon_f = float(lat), float(lon)
     except (TypeError, ValueError):
         return None
-    key = (identity, dep, arr, round(lat_f, 2), round(lon_f, 2))
+    # Der Schluessel MUSS die Identitaeten tragen, mit denen FR24 tatsaechlich
+    # MATCHT (Funkname/Reg/Hex) — die Flugnummer geht gar nicht in `detail_card`.
+    # Mit `cs or fn or rg or hx` als Schluessel konnte ein Aufruf, der nur die
+    # Flugnummer kannte (zwangslaeufig MISS), 15 s lang den Treffer verdecken,
+    # den derselbe Flug unter seiner Reg gerade geliefert hatte.
+    key = (cs, rg, hx, fn, dep, arr, round(lat_f, 2), round(lon_f, 2))
     now = time.time()
     with _FR24_LIVE_CARD_LOCK:
         hit = _FR24_LIVE_CARD_MEMO.get(key)
@@ -5487,9 +5523,14 @@ def _fr24_operational_times(card, origin, dest):
             dt = _dt4.fromisoformat(str(value).replace('Z', '+00:00'))
             if dt.tzinfo is not None:
                 return _epoch_to_local_iso(dt.timestamp(), iata)
+            # Naive Stationszeit ist schon das Zielformat — unveraendert durch.
+            return str(value)
         except Exception:
             pass
-        return str(value) if str(value).strip() else None
+        # FAIL CLOSED (Keine-Fake-Werte, 2026-08-13): was weder Epoch noch ISO
+        # ist, ist keine Uhrzeit. Vorher ging alles als `str(value)` raus — eine
+        # FR24-Null wurde so zur angezeigten „Ist-Zeit 0".
+        return None
 
     out = {
         'sched_dep': _local(c.get('sched_dep'), origin),
@@ -5518,12 +5559,18 @@ def _canonical_operational_times(official, fr24, airborne=False, landed=False):
     sched_dep = o.get('sched_dep') or f.get('sched_dep')
     sched_arr = o.get('sched_arr') or f.get('sched_arr')
 
+    # QUELLEN-STAFFELUNG AUCH BEI DEN IST-ZEITEN (2026-08-13): die Kaskade ist
+    # Scraper→LH→FR24, FR24 ist der UNTERSTE Tier. Bei `f.get() or o.get()`
+    # schlug er aber LHs `ActualTimeUTC` — zwei Screens zeigten fuer denselben
+    # gelandeten Flug 18:38 (FR24) statt 18:39 (LH). FR24 fuellt Luecken, mehr
+    # nicht; im Flug/nach der Landung ist er weiterhin OFT der einzige, der
+    # ueberhaupt eine Ist-Zeit hat.
     if is_airborne or is_landed:
-        actual_dep = f.get('actual_dep') or o.get('actual_dep')
+        actual_dep = o.get('actual_dep') or f.get('actual_dep')
     else:
         actual_dep = o.get('actual_dep')
     if is_landed:
-        actual_arr = f.get('actual_arr') or o.get('actual_arr')
+        actual_arr = o.get('actual_arr') or f.get('actual_arr')
     else:
         actual_arr = o.get('actual_arr')
 
@@ -6227,17 +6274,24 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
     # liefert während des Flugs Ist-Abflug + ETA und nach der Landung die echte
     # Ist-Ankunft. So können zwei Screens nicht mehr unabhängig verschiedene
     # "aktuelle" Uhrzeiten auswählen.
+    # DATUMS-TREUE gilt auch fuer STATUS und POSITION (2026-08-13): `alf` ist
+    # derselbe DATUMSLOSE Jetzt-Schnappschuss, wegen dem `reg`/`ac_type` oben
+    # schon hinter `_live_ok` liegen. Ungegatet beschrieb er auf einem
+    # Vergangenheits-Tag den Flug von HEUTE — ein Flug von letzter Woche wurde
+    # so „airborne" samt heutiger Position, und die Zeiten-Kaskade lief auf
+    # dieser falschen Phase (inkl. Paid-Eskalation). Fuer heute aendert sich nichts.
+    _alf_live = alf if _live_ok else {}
     _status_blob = ' '.join(str(x or '').lower() for x in (
-        alf.get('status'), alf.get('status_category'), facts.get('dep_status'),
-        _gated_arr, facts.get('actual_arr')))
+        _alf_live.get('status'), _alf_live.get('status_category'),
+        facts.get('dep_status'), _gated_arr, facts.get('actual_arr')))
     _landed = bool(facts.get('actual_arr') or any(x in _status_blob for x in (
         'landed', 'arrived', 'gelandet', 'angekommen')))
     _airborne = bool(not _landed and (
-        alf.get('on_ground') is False or any(x in _status_blob for x in (
+        _alf_live.get('on_ground') is False or any(x in _status_blob for x in (
             'airborne', 'enroute', 'en route', 'departed', 'abgeflogen',
             'gestartet'))))
-    _live_lat = lat if lat is not None else alf.get('lat')
-    _live_lon = lon if lon is not None else alf.get('lon')
+    _live_lat = lat if lat is not None else _alf_live.get('lat')
+    _live_lon = lon if lon is not None else _alf_live.get('lon')
     _fr_card = None
     if (_airborne or _landed) and _live_lat is not None and _live_lon is not None:
         _fr_card = _fr24_live_card_cached(
@@ -6250,6 +6304,16 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
         or (_landed and not (facts.get('actual_arr')
                              or _fr_times.get('actual_arr'))))
     if _needs_fr_times:
+        # SPUR FUER DEN NAECHSTEN QUOTEN-VORFALL (2026-08-13): dieser Zweig
+        # eskaliert bei `allow_paid` bis in den bezahlten FR24-Tier — bisher
+        # lautlos. Ein fliegender Flug OHNE lat/lon (kein gRPC-Kartenmatch)
+        # landet hier bei JEDEM Poll. Ohne Log war im Nachhinein nicht
+        # zuzuordnen, welcher Flug die Credits verbrannt hat.
+        if allow_paid:
+            _log.info('[flightdata] paid-Eskalation Zeiten: %s %s grund=%s',
+                      flight_no or callsign, date,
+                      'airborne_ohne_fr24_zeiten' if _airborne
+                      else 'gelandet_ohne_ist_ankunft')
         try:
             _fallback_times = _flight_times_free_first(
                 flight_no, date, origin, dest, callsign=callsign,
@@ -10384,20 +10448,52 @@ def ax_flight_live(token):
     arr_fields = _live_arrival_facts(flight_no, date, dep, dest, merged)
     in_flight = bool(pos and not pos.get('on_ground'))
     try:
-        _official = _flight_facts_from_obs(
+        _ff = _flight_facts_from_obs(
             flight_no, date, dep_iata=dep, arr_iata=dest,
             lh_cached_only=True) or {}
     except Exception:
-        _official = {}
-    _official = dict(_official)
+        _ff = {}
+    # KEINE GESTRIGEN IST-ZEITEN IN DER LIVE-KARTE (2026-08-13): findet
+    # `_flight_facts_from_obs` fuer den angefragten Tag nichts, faellt es
+    # transparent auf den Vortag zurueck und markiert das mit `stale`. Genau
+    # diese Marke wurde hier nie gelesen — die Karte eines noch nicht
+    # abgeflogenen Fluges trug dann die Ist-Zeiten der GESTRIGEN Instanz.
+    if _ff.get('stale'):
+        _ff = {}
+    # EINE ZEITBASIS PRO ANTWORT (2026-08-13): `sched_*`/`esti_*` aus dem
+    # Board-Merge sind STATIONSLOKAL, `actual_*_iso` ist dagegen ein absoluter
+    # UTC-Instant (LH `ActualTimeUTC`). Ungewandelt standen in DERSELBEN Karte
+    # „Soll 12:20" (Ortszeit) und „Ist 10:41" (UTC) untereinander — auf
+    # Interkont bis zu 12 h Versatz, der wie eine irre Verspaetung aussah.
+    # Deshalb HIER wandeln, vor dem kanonischen Entscheid: `est_dep`/`est_arr`
+    # erben `actual_*` per Vertrag und waeren sonst genauso verschoben.
+    def _live_station_local(val, iata):
+        if not val:
+            return val
+        try:
+            from datetime import datetime as _dtl
+            _d = _dtl.fromisoformat(str(val).replace('Z', '+00:00'))
+        except Exception:
+            return val
+        if _d.tzinfo is None:
+            return val                  # schon Stationszeit
+        return _epoch_to_local_iso(_d.timestamp(), iata) or val
+
+    # …und der BOARD-MERGE behaelt Vorrang (Vertrag aus `_live_arrival_fields`:
+    # der Merge gewinnt immer, die Fakten liefern NUR, was er nicht hat).
+    # Vorher war es umgekehrt (`if _v and not _official.get(_k)`) — eine alte
+    # Fakten-Zeit schlug die frisch gescrapte Tafel-Zeile.
+    _official = dict(_ff)
     for _k, _v in (
             ('sched_dep', merged.get('sched_dep')),
             ('est_dep', merged.get('esti_dep')),
-            ('actual_dep', merged.get('actual_dep_iso')),
+            ('actual_dep', _live_station_local(
+                merged.get('actual_dep_iso'), dep)),
             ('sched_arr', arr_fields.get('sched_arr')),
             ('est_arr', arr_fields.get('est_arr')),
-            ('actual_arr', merged.get('actual_arr_iso'))):
-        if _v and not _official.get(_k):
+            ('actual_arr', _live_station_local(
+                merged.get('actual_arr_iso'), dest))):
+        if _v:
             _official[_k] = _v
     _live_status_blob = ' '.join(str(x or '').lower() for x in (
         merged.get('status'), merged.get('status_arr'),
@@ -10875,23 +10971,35 @@ def ax_flight_recap(token):
     # ── KEINE ZUKUNFT ALS IST (Keine-Fake-Werte-Regel) ────────────────────
     # Auch die Board-Seite (`esti_*`) kann waehrend des Flugs eine SCHAETZUNG
     # oder ein Plan-Echo tragen. Ein Recap ist die Post-Flight-Wahrheit:
-    # liegt der Ankunfts-Instant in der Zukunft, wird actual_arr (und die
-    # daraus abgeleitete Blockzeit) NICHT ausgeliefert.
+    # liegt der Instant in der Zukunft, wird die Zeit (und die daraus
+    # abgeleitete Blockzeit) NICHT ausgeliefert.
+    # BEIDE Seiten pruefen (2026-08-13): `actual_dep` stammt aus DERSELBEN
+    # `esti_*`-Quelle wie `actual_arr`. Steht der Flug noch am Gate, war die
+    # geschaetzte Abflugzeit von spaeter bisher als „Ist-Abflug" in der Karte —
+    # der Wachhund sah nur die Ankunftsseite.
     from datetime import datetime as _dtc, timezone as _tzc
     _now_utc = _dtc.now(_tzc.utc)
-    if actual_arr:
-        _au_chk = _local_to_utc(actual_arr, dest) if dest else None
-        if _au_chk is None:
+
+    def _recap_is_future(val, iata):
+        """True, wenn `val` (Stationszeit ODER Instant) nach `now` liegt."""
+        if not val:
+            return False
+        _chk = _local_to_utc(val, iata) if iata else None
+        if _chk is None:
             try:
-                _au_chk = _dtc.fromisoformat(
-                    str(actual_arr).replace('Z', '+00:00'))
-                if _au_chk.tzinfo is None:
-                    _au_chk = _au_chk.replace(tzinfo=_tzc.utc)
+                _chk = _dtc.fromisoformat(str(val).replace('Z', '+00:00'))
+                if _chk.tzinfo is None:
+                    _chk = _chk.replace(tzinfo=_tzc.utc)
             except Exception:
-                _au_chk = None
-        if _au_chk is not None and _au_chk > _now_utc:
-            actual_arr = None
-            block_min = None
+                _chk = None
+        return _chk is not None and _chk > _now_utc
+
+    if _recap_is_future(actual_dep, dep):
+        actual_dep = None
+        block_min = None
+    if _recap_is_future(actual_arr, dest):
+        actual_arr = None
+        block_min = None
     # ── EINE GEMESSENE IST-ZEIT SCHLÄGT JEDE SCHÄTZUNG (2026-08-13) ────────
     # Alles oben ist bestenfalls „die letzte Zahl, die die Tafel zeigte"
     # (`esti_*`) oder der eigene Roster-Instant — `actual_*` war damit ein

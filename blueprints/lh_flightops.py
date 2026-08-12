@@ -1182,8 +1182,8 @@ def _lhfo_day_used():
 # Deshalb EIN Takt-Gate für alle Sender DIESES Prozesses, direkt vor dem
 # Request: 0,12 s Mindestabstand ≈ 8/s pro Origin. Zwei Origins zusammen
 # bleiben damit unter 17/s — Luft zur 20er-Drossel, deren 403s sonst selbst
-# auf die Tagesquote zahlen. Warten unter gehaltenem Lock ist Absicht: die
-# Wartenden bilden eine Schlange und verlassen sie im Takt.
+# auf die Tagesquote zahlen. Die Wartenden bilden eine Schlange und verlassen
+# sie im Takt: der SLOT wird unter dem Lock vergeben, GEWARTET wird ohne Lock.
 _API_PACE_LOCK = threading.Lock()
 _api_pace_last = [0.0]
 _API_PACE_MIN_S = 0.12
@@ -1192,11 +1192,19 @@ _API_PACE_MIN_S = 0.12
 def _api_pace(now_fn=time.time, sleep_fn=time.sleep):
     """Blockiert, bis der nächste Sende-Slot frei ist. Injektierbare Uhren
     NUR für die Tests — Produktion ruft ohne Argumente."""
+    # Der Lock schuetzt NUR die Slot-Buchung (2026-08-13). Vorher lag der
+    # `sleep` IM Lock: ein Schlaefer blockierte damit jeden anderen Sender —
+    # auch den, dessen Slot laengst frei gewesen waere. Bei n parallelen
+    # Anfragen wartete jede auf die Summe aller Vorgaenger, statt nur auf den
+    # eigenen Takt; interaktive Taps standen hinter dem Hintergrund-Schwarm.
+    # Die Reihenfolge bleibt identisch — die Schlange wird jetzt nur ohne
+    # gehaltenen Lock abgesessen.
     with _API_PACE_LOCK:
-        wartezeit = _api_pace_last[0] + _API_PACE_MIN_S - now_fn()
-        if wartezeit > 0:
-            sleep_fn(wartezeit)
-        _api_pace_last[0] = now_fn()
+        slot = max(now_fn(), _api_pace_last[0] + _API_PACE_MIN_S)
+        _api_pace_last[0] = slot
+    wartezeit = slot - now_fn()
+    if wartezeit > 0:
+        sleep_fn(wartezeit)
 
 
 def _api_get(user_token, path, params=None, interactive=False, status_out=None,
@@ -1247,6 +1255,12 @@ def _api_get(user_token, path, params=None, interactive=False, status_out=None,
     # Takt NACH den Budget-Gates (abgewiesene Calls brauchen keinen Slot),
     # VOR der Buchung — gebucht wird nur, was wirklich gesendet wird.
     _api_pace()
+    # GEBUCHT WIRD VOR DEM VERSAND, also VOR der Antwort: ein LH-403
+    # („Developer Over QPS"/„Over Rate Limit") verbraucht damit unser EIGENES
+    # Budget mit. Das ist bewusst so gelassen — sicher-aus-Versehen: wir zaehlen
+    # jeden Call, den LH gezaehlt hat. Folge fuer die Auswertung: der effektive
+    # ERFOLGREICHE Durchsatz liegt unter der Deckel-Zahl, die Deckel sind also
+    # keine Ist-Messung des Nutzens (Kontext Quoten-Diaet 29.07./10.08.).
     _flightops_budget_inc(path)
     url = _BASE + path
     if params:

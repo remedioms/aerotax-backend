@@ -315,9 +315,13 @@ def inbound_by_route(from_lat, from_lon, to_lat, to_lon, callsign=None, reg=None
                 "route_from": (route.get("from") or "").strip().upper() or None,
                 "route_to": (route.get("to") or "").strip().upper() or None,
                 "sched_dep": si.get("scheduled_departure"),
-                "actual_dep": si.get("actual_departure"),
+                # `or None` wie in `detail_card`: protobuf liefert fuer ein
+                # NICHT gesetztes Zeitfeld die 0 — ohne die Normalisierung
+                # reicht der Korridor eine „0" als Ist-Zeit weiter.
+                "actual_dep": si.get("actual_departure") or None,
                 "sched_arr": si.get("scheduled_arrival"),
-                "actual_arr": si.get("actual_arrival") or d.get("actual_arrival"),
+                "actual_arr": (si.get("actual_arrival")
+                               or d.get("actual_arrival") or None),
                 "eta": fp.get("eta"),
                 "flight_stage": fp.get("flight_stage"),
                 "reg": (xi.get("reg") or "").strip().upper() or None,

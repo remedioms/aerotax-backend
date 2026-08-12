@@ -191,3 +191,51 @@ def test_today_warehouse_read_is_skipped(monkeypatch):
             patch.object(BP, '_tail_active_guard', return_value=True):
         BP._resolve_unified_flight_core('LH454', _today(), False, None, None, False)
     assert calls == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Derselbe Schnappschuss datiert auch STATUS und POSITION (2026-08-13)
+# ──────────────────────────────────────────────────────────────────────────────
+# `status`/`status_category`/`on_ground`/`lat`/`lon` kamen aus DERSELBEN
+# datumslosen `aircraft_live`-Zeile wie die Reg — nur ohne deren Gate. Für einen
+# Vergangenheits-Tag galt damit der Flug von HEUTE als „airborne", samt heutiger
+# Position: die FR24-Livekarte wurde auf fremde Koordinaten gematcht und die
+# Zeiten-Kaskade (bis hin zur bezahlten Eskalation) lief auf der falschen Phase.
+# ══════════════════════════════════════════════════════════════════════════════
+_ALF_AIRBORNE = dict(_ALF_TODAY, status='Airborne', status_category='enroute',
+                     on_ground=False, lat=48.1, lon=11.6)
+
+
+def _resolve_mit_live(date):
+    """Wie `_resolve`, protokolliert aber jeden FR24-Livekarten-Match."""
+    karten = []
+
+    def _karte(**kw):
+        karten.append(kw)
+        return None
+
+    with patch.object(BP, '_aircraft_live_flight', return_value=dict(_ALF_AIRBORNE)), \
+            patch.object(WR, 'route_for_flight', return_value={}), \
+            patch.object(BP, '_flight_facts_from_obs', return_value={}), \
+            patch.object(BP, '_warehouse_day_tail', return_value=None), \
+            patch.object(BP, '_tail_active_guard', return_value=True), \
+            patch.object(BP, '_flight_times_free_first', return_value={}), \
+            patch.object(BP, '_fr24_live_card_cached', side_effect=_karte):
+        res = BP._resolve_unified_flight_core('LH454', date, False, None, None,
+                                              False)
+    return res, karten
+
+
+def test_past_day_does_not_inherit_todays_airborne_state():
+    """DER Kern: für einen vergangenen Tag darf die heutige Position den Flug
+    weder in der Luft zeigen noch eine FR24-Karte anfordern."""
+    _res, karten = _resolve_mit_live(_past())
+    assert karten == [], 'Vergangenheits-Tag matchte auf die HEUTIGE Position'
+
+
+def test_today_still_matches_the_live_position():
+    """Regressions-Riegel: für heute bleibt der Schnappschuss die Quelle —
+    Position und Phase kommen unverändert an."""
+    _res, karten = _resolve_mit_live(_today())
+    assert len(karten) == 1, karten
+    assert karten[0]['lat'] == 48.1 and karten[0]['lon'] == 11.6
