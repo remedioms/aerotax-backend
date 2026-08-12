@@ -208,8 +208,15 @@ def _try_parsers(path):
     Deshalb entscheidet der Dokumenttext, welcher Parser zuständig ist; seine
     ValueErrors sind danach ausnahmslos echte Kontroll-Verletzungen."""
     import pdfplumber
-    from pdfminer.pdfexceptions import PDFException
-    from pdfplumber.utils.exceptions import PdfminerException
+    from pdfminer.pdfparser import PDFSyntaxError
+    try:
+        # pdfplumber >=0.11 kapselt pdfminer-Fehler; die Produktionsversion
+        # reicht PDFSyntaxError noch direkt durch. Beide Varianten abdecken,
+        # ohne einen nur in neuem pdfminer vorhandenen Modulpfad zu importieren.
+        from pdfplumber.utils.exceptions import PdfminerException
+        pdf_errors = (PDFSyntaxError, PdfminerException)
+    except ImportError:  # pragma: no cover - Produktions-Altversion
+        pdf_errors = (PDFSyntaxError,)
     import parse_duties_v8
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
@@ -229,7 +236,7 @@ def _try_parsers(path):
     try:
         with pdfplumber.open(path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-    except (PDFException, PdfminerException, OSError):
+    except pdf_errors + (OSError,):
         # Beschädigte/unvollständige PDFs sind ein endgültiger Dateifehler,
         # kein transienter Backendfehler. ``unsupported`` setzt processed=true
         # und bittet den Nutzer idempotent einmal um einen erneuten Upload.
