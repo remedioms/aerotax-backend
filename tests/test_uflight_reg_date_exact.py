@@ -239,3 +239,35 @@ def test_today_still_matches_the_live_position():
     _res, karten = _resolve_mit_live(_today())
     assert len(karten) == 1, karten
     assert karten[0]['lat'] == 48.1 and karten[0]['lon'] == 11.6
+
+
+def test_today_status_delay_matches_the_fr24_eta(monkeypatch):
+    """Auch der Unified-/Detail-Vertrag darf neben der sichtbaren 14:38 nicht
+    den alten Board-Versatz -33 ausliefern: 15:05→14:38 sind -27 Minuten."""
+    facts = {
+        'sched_arr': '2026-08-13T15:05:00-07:00',
+        'est_arr': '2026-08-13T14:32:00-07:00',
+        'arr_delay_min': -33,
+        'delay_known': True,
+    }
+    live = dict(_ALF_AIRBORNE, flightid=123456)
+    monkeypatch.setattr(BP, '_aircraft_live_flight', lambda **kw: live)
+    monkeypatch.setattr(WR, 'route_for_flight', lambda **kw: {})
+    monkeypatch.setattr(BP, '_flight_facts_from_obs', lambda *a, **kw: facts)
+    monkeypatch.setattr(BP, '_tail_active_guard', lambda reg: True)
+    monkeypatch.setattr(BP, '_flight_times_free_first', lambda *a, **kw: {})
+    monkeypatch.setattr(
+        BP, '_fr24_live_card_cached',
+        lambda **kw: {
+            'actual_dep': '2026-08-12T21:31:00+02:00',
+            'sched_arr': '2026-08-13T15:05:00-07:00',
+            'eta': '2026-08-13T14:38:00-07:00',
+        })
+
+    res = BP._resolve_unified_flight_core(
+        'LH454', _today(), False, None, None, False)
+
+    assert res['times']['est_arr'] == '2026-08-13T14:38:00'
+    assert res['times']['arr_delay_min'] == -27
+    assert res['status']['arr_delay_min'] == -27
+    assert res['status']['delay_known'] is True

@@ -234,6 +234,38 @@ def test_route_serves_arrival_from_facts_when_board_is_blind(client, monkeypatch
     assert b['dep_gate'] == 'Z66'
 
 
+def test_route_delay_matches_the_displayed_fr24_arrival(client, monkeypatch):
+    """LH732-Repro bis zur HTTP-Antwort: Board hatte 14:32/-33, dieselbe
+    sichtbare Karte bekam aber die neuere FR24-ETA 14:38. Wenn 14:38 angezeigt
+    wird, muss der ausgelieferte Versatz aus 15:05→14:38 entstehen: -27."""
+    board = dict(
+        _BOARD_BLIND,
+        sched_arr='2026-07-30T15:05:00-07:00',
+        esti_arr='2026-07-30T14:32:00-07:00',
+        arr_delay_min=-33,
+        delay_known=True,
+    )
+    facts = {
+        'sched_arr': '2026-07-30T15:05:00-07:00',
+        'est_arr': '2026-07-30T14:32:00-07:00',
+        'arr_delay_min': -33,
+    }
+    _patch_route(monkeypatch, board, facts)
+    monkeypatch.setattr(
+        BP, '_fr24_live_card_cached',
+        lambda **kwargs: {
+            'sched_arr': '2026-07-30T15:05:00-07:00',
+            'eta': '2026-07-30T14:38:00-07:00',
+        })
+
+    b = client.get(_LIVE_URL).get_json()
+
+    assert b['sched_arr'] == '2026-07-30T15:05:00-07:00'
+    # API-Vertrag: FR24-Instant wird als stationslokale Wanduhr ausgegeben.
+    assert b['est_arr'] == '2026-07-30T14:38:00'
+    assert b['arr_delay_min'] == -27
+
+
 def test_route_keeps_none_when_no_source_knows_the_arrival(client, monkeypatch):
     """Ohne Quelle bleibt die Ankunft None — die Karte lässt die Zeile weg,
     statt eine Landung aus progress/Großkreis zu erfinden."""

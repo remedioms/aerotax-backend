@@ -5723,8 +5723,13 @@ def _canonical_operational_times(official, fr24, airborne=False, landed=False):
             from datetime import datetime as _dt5
             cur = _dt5.fromisoformat(str(current).replace('Z', '+00:00'))
             sch = _dt5.fromisoformat(str(scheduled).replace('Z', '+00:00'))
-            if (cur.tzinfo is None) != (sch.tzinfo is None):
-                return None
+            # Beide Werte wurden vor diesem Entscheid bereits als Wandzeit der
+            # Ankunftsstation normalisiert. Board/LH behalten dabei teils ihren
+            # Offset, `_epoch_to_local_iso` gibt fuer FR24 dagegen absichtlich
+            # eine naive Stationszeit aus. Fuer den angezeigten Versatz zaehlt
+            # deshalb die identische Ziel-Wanduhr, nicht die Serialisierungsform.
+            cur = cur.replace(tzinfo=None)
+            sch = sch.replace(tzinfo=None)
             minutes = int(round((cur - sch).total_seconds() / 60.0))
             return minutes if abs(minutes) <= 20 * 60 else None
         except Exception:
@@ -6478,8 +6483,14 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
             'arr_gate': facts.get('arr_gate'), 'arr_terminal': facts.get('arr_terminal'),
             'dep_status': facts.get('dep_status'), 'arr_status': _gated_arr,
             'dep_delay_min': facts.get('dep_delay_min'),
-            'arr_delay_min': facts.get('arr_delay_min'),
-            'delay_known': bool(facts.get('delay_known')),
+            # Der Versatz muss zu GENAU den kanonischen Soll-/Ist-Zeiten oben
+            # gehoeren. Bei LH732 kam die ETA bereits frisch von FR24, waehrend
+            # `facts` noch den aelteren Board-Versatz (-33 statt -27) trug.
+            'arr_delay_min': (_canonical_times.get('arr_delay_min')
+                              if _canonical_times.get('arr_delay_min') is not None
+                              else facts.get('arr_delay_min')),
+            'delay_known': bool(facts.get('delay_known')
+                                or _canonical_times.get('arr_delay_min') is not None),
             'cancelled': facts.get('cancelled'),
         },
         'aircraft': {'reg': reg, 'type': ac_type},
@@ -10678,7 +10689,11 @@ def ax_flight_live(token):
         'actual_arr': _canonical_times.get('actual_arr'),
         'dep_time_source': _canonical_times.get('dep_source'),
         'arr_time_source': _canonical_times.get('arr_source'),
-        'arr_delay_min': arr_fields['arr_delay_min'],
+        # Dieselbe Zeitwahrheit wie `sched_arr`/`est_arr`: sobald deren Paar
+        # berechenbar ist, darf kein alter Board-Versatz daneben stehen.
+        'arr_delay_min': (_canonical_times.get('arr_delay_min')
+                          if _canonical_times.get('arr_delay_min') is not None
+                          else arr_fields['arr_delay_min']),
         'dest_gate': arr_fields['dest_gate'],
         'live': pos,
         'in_flight': in_flight,
