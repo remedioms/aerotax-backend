@@ -51887,6 +51887,13 @@ def moderation_block_by_content(token):
                         author_token = r.get('author_token'); break
             except Exception: pass
             if author_token: break
+    elif kind == 'news_comment':
+        # News-Kommentare leben in Supabase (ax_news_comments) — Auflösung
+        # im News-Blueprint, damit die Store-Details an EINER Stelle bleiben.
+        # Ohne diesen Zweig lief „Autor blockieren" bei News-Kommentaren mit
+        # author_not_found ins Leere (Befund iOS-Client 12.08.).
+        from blueprints.news_blueprint import news_comment_author_token
+        author_token = news_comment_author_token(target_id)
     if not author_token:
         return jsonify({'ok': False, 'error': 'author_not_found'}), 404
     if author_token == token:

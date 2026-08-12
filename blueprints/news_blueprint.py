@@ -3936,6 +3936,28 @@ def news_delete_comment(article_id, comment_id):
     return jsonify({'ok': True, 'id': cid})
 
 
+def news_comment_author_token(comment_id):
+    """Autor-Token eines News-Kommentars — für app.moderation_block_by_content
+    (kind=news_comment). None bei unbekannter ID oder Store-Ausfall; der
+    Aufrufer antwortet dann 404 (author_not_found), genau wie bei den anderen
+    kinds. Bewusst KEINE Exception nach außen: Blockieren ist ein Nebenpfad,
+    ein DB-Hickup darf ihn nicht 500en."""
+    cid = str(comment_id or '').strip()
+    if not cid:
+        return None
+    sb, ok = _news_sb()
+    if not ok:
+        return None
+    try:
+        res = (sb.table('ax_news_comments').select('author_token')
+               .eq('id', cid).limit(1).execute())
+        rows = getattr(res, 'data', None) or []
+    except Exception as exc:
+        _log_warn(f'[news-interactions] block author lookup failed: {exc!r}')
+        return None
+    return (rows[0].get('author_token') or None) if rows else None
+
+
 @news_bp.route('/api/news/redaktion', methods=['GET'])
 def get_news_redaktion():
     """AeroX-eigene, KI-umgeschriebene Kurzartikel (deutsch, faktenbasiert).
