@@ -241,10 +241,34 @@ def test_arrival_push_is_localized_for_all_supported_languages():
         'Logbook import received', 'Processing now.')
 
 
+def test_failure_push_copy_is_short_and_actionable_in_all_languages():
+    """Der Wächter pusht bei `failed` nur den Schlüssel — der Text kommt hier
+    aus _PUSH_SYSTEM_COPY (siehe logbook_watchdog._push_failed)."""
+    copy = A._PUSH_SYSTEM_COPY['logbook_import_failed']
+    assert set(copy) == set(A._PUSH_LANGUAGES)
+    assert copy['de'] == ('Flugbuch-Import fehlgeschlagen',
+                          'Bitte lade die Datei noch einmal hoch.')
+    for lang, (title, body) in copy.items():
+        assert title and body, lang
+        assert len(title) <= 60 and len(body) <= 60, lang
+    data = {'type': 'logbook_import_failed',
+            'localization_key': 'logbook_import_failed'}
+    assert A._push_localize_system_copy(*copy['de'], data, 'fr') == copy['fr']
+    # Der Fertig-Push bleibt unangetastet — drei Zustände, drei Texte.
+    assert set(A._PUSH_SYSTEM_COPY['logbook_import_completed']) == set(
+        A._PUSH_LANGUAGES)
+
+
 def test_batch_of_files_dedupes_to_a_single_arrival_push(monkeypatch):
     """Fünf Monatsübersichten in einem Rutsch = EIN Push, nicht fünf."""
     A._LOGBOOK_IMPORT_TS.clear()
     pushes = _capture_pushes(monkeypatch)
+    # Uhr festnageln: sonst hinge der Test daran, ob die echte Uhr während des
+    # Laufs zufällig über eine Fenstergrenze springt.
+    real_push = A._logbook_import_received_push
+    fixed = _dt.datetime(2026, 8, 12, 10, 3, tzinfo=_dt.timezone.utc)
+    monkeypatch.setattr(A, '_logbook_import_received_push',
+                        lambda tok, now=None: real_push(tok, now=fixed))
     c = _client()
     for i in range(5):
         r, _ = _post(c, 'tok_push_batch', f'monat{i}.csv', b'a,b\n',
@@ -256,14 +280,17 @@ def test_batch_of_files_dedupes_to_a_single_arrival_push(monkeypatch):
     assert len({_outbox_key(p) for p in pushes}) == 1
 
 
-def test_arrival_push_key_is_per_user_and_per_hour_window():
-    base = _dt.datetime(2026, 8, 12, 10, 5, tzinfo=_dt.timezone.utc)
+def test_arrival_push_key_is_per_user_and_per_upload_session():
+    """10-Minuten-Fenster: ein Schub = ein Push, ein späterer Upload meldet
+    sich WIEDER (Owner 12.08.: „nicht jede Stunde eine Push")."""
+    base = _dt.datetime(2026, 8, 12, 10, 2, tzinfo=_dt.timezone.utc)
     keys = {}
     for label, tok, now in (
-            ('a_10h', 'tok_a', base),
-            ('a_10h_late', 'tok_a', base.replace(minute=59)),
-            ('a_11h', 'tok_a', base + _dt.timedelta(hours=1)),
-            ('b_10h', 'tok_b', base)):
+            ('a_session', 'tok_a', base),
+            ('a_session_late', 'tok_a', base.replace(minute=9, second=59)),
+            ('a_next_session', 'tok_a', base + _dt.timedelta(minutes=10)),
+            ('a_afternoon', 'tok_a', base + _dt.timedelta(hours=4)),
+            ('b_session', 'tok_b', base)):
         captured = []
         original = A._push_notify_async
         A._push_notify_async = (
@@ -275,10 +302,14 @@ def test_arrival_push_key_is_per_user_and_per_hour_window():
         finally:
             A._push_notify_async = original
         keys[label] = captured[0]
-    assert keys['a_10h'] == keys['a_10h_late'] == (
-        'logbook-import-received:tok_a:2026-08-12-10')
-    assert keys['a_11h'] == 'logbook-import-received:tok_a:2026-08-12-11'
-    assert keys['b_10h'] == 'logbook-import-received:tok_b:2026-08-12-10'
+    assert keys['a_session'] == keys['a_session_late'] == (
+        'logbook-import-received:tok_a:2026-08-12-1000')
+    # Zweiter Upload später → eigener Push, nicht verschluckt.
+    assert keys['a_next_session'] == (
+        'logbook-import-received:tok_a:2026-08-12-1010')
+    assert keys['a_afternoon'] == (
+        'logbook-import-received:tok_a:2026-08-12-1400')
+    assert keys['b_session'] == 'logbook-import-received:tok_b:2026-08-12-1000'
 
 
 def test_rejected_uploads_never_push(monkeypatch):

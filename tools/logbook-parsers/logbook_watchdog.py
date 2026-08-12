@@ -28,14 +28,17 @@ FAIL-SAFE (Owner 2026-08-12: „wenn nicht 100 % sicher → nochmal überprüfen
   * Gleicher Leg-Schlüssel mit ABWEICHENDER Blockzeit beim Merge → kompletter
     Batch auf `review`, nichts geschrieben. Lieber liegen lassen als raten.
   * sha256-Mismatch → `review` (Datei unterwegs beschädigt?).
-  * KEIN Parser erkennt das Format → ehrliches `failed` + Push an den Nutzer
-    („Datei enthält keine einzelnen Flüge / Format unbekannt") + Owner-Mail.
+  * KEIN Parser erkennt das Format → ehrliches `failed` + kurzer Push an den
+    Nutzer („Flugbuch-Import fehlgeschlagen — bitte lade die Datei noch einmal
+    hoch.") + Owner-Mail. `review` pusht NICHTS: dort prüft der Betreiber,
+    ein zweiter Upload würde nicht helfen.
   * Jede unerwartete Exception → Zeile bleibt `pending` (nächster Lauf
     versucht es erneut), Owner-Mail mit Traceback-Kopf.
 
 Idempotenz: Alle Schritte sind wiederholbar — der Merge ist eine Union, der
 Push läuft über `enqueue_push_outbox` mit fester Idempotenz-Key
-(`logbook-import-completed:<upload_id>` wie beim manuellen Werkzeug).
+(`logbook-import-completed:<upload_id>` wie beim manuellen Werkzeug,
+`logbook-import-failed:<upload_id>` für den Fehlerfall).
 """
 
 import base64
@@ -393,14 +396,25 @@ def _push_completed(token, anchor_upload_id):
     }, expect_json=False)
 
 
-def _push_unsupported(token, anchor_upload_id):
+def _push_failed(token, anchor_upload_id):
+    """Endgültig gescheitert → EINE kurze, handlungsfähige Nachricht.
+
+    Owner 12.08.: „wenn es nicht ging sagen bitte nochmal hochladen". Der
+    alte Text erklärte das Dateiformat in drei Zeilen — auf dem Sperrbildschirm
+    liest das niemand. Die Übersetzungen hängen am `localization_key`
+    (_PUSH_SYSTEM_COPY in app.py), `data` bleibt deshalb frei von variablen
+    Feldern: der Ankunfts-Push hat gezeigt, dass eine wandernde job_id im
+    `data` die Dedupe der Outbox aushebelt, sobald der Payload je über
+    `_push_outbox_enqueue` läuft.
+
+    NUR für Endzustand `failed`. `review` bekommt bewusst nichts: dort prüft
+    der Betreiber, und „bitte nochmal hochladen" wäre schlicht falsch.
+    """
     payload = {
-        "title": "Flugbuch-Import: Datei nicht geeignet",
-        "body": ("Die hochgeladene Datei enthält keine einzelnen Flüge "
-                 "(oder ein unbekanntes Format). Bitte lade einen Export mit "
-                 "Datum, Flugnummer und Strecke pro Flug hoch."),
+        "title": "Flugbuch-Import fehlgeschlagen",
+        "body": "Bitte lade die Datei noch einmal hoch.",
         "data": {"type": "logbook_import_failed",
-                 "job_id": anchor_upload_id,
+                 "localization_key": "logbook_import_failed",
                  "deep_link": "aerox://more/logbook"},
     }
     _rest("POST", "rpc/enqueue_push_outbox", {
@@ -511,7 +525,6 @@ def process_token_batch(token, rows, events, terminal=None):
 
     if unsupported:
         _status(unsupported, STATUS_FAILED, processed=True)
-        _push_unsupported(token, max(unsupported))
         events.append(("unsupported", token, unsupported, "Format unbekannt"))
 
     # Byte-Dubletten erben das Schicksal ihres ORIGINALS — eine Kopie einer
@@ -519,6 +532,7 @@ def process_token_batch(token, rows, events, terminal=None):
     # (Erst-Einsatz 12.08.: #286 = Kopie der unsupported #285). Original
     # außerhalb dieses Laufs (früher verarbeitet) ⇒ Inhalt ist erledigt ⇒
     # completed ohne Push.
+    failed_dups = []
     if dups:
         real_ids = {f["id"] for f in real}
         failed_dups = [f["id"] for f in dups if f["dup_of"] in set(unsupported)]
@@ -531,6 +545,14 @@ def process_token_batch(token, rows, events, terminal=None):
             _status(done_dups, STATUS_COMPLETED, processed=True)
         events.append(("dups", token,
                        {"failed": failed_dups, "completed": done_dups}, ""))
+
+    # Fehler-Push ganz zum Schluss und über ALLE `failed`-Zeilen des Laufs:
+    # eine Datei und ihre Byte-Kopie sind EIN Problem, nicht zwei. Anker ist
+    # die höchste betroffene Upload-ID — derselbe Batch ergibt in jedem Lauf
+    # denselben Idempotenz-Key, ein Wiederholungslauf pusht also nicht erneut.
+    failed_ids = sorted(set(unsupported) | set(failed_dups))
+    if failed_ids:
+        _push_failed(token, max(failed_ids))
 
 
 def main():

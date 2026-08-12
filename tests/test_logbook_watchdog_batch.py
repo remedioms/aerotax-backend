@@ -32,7 +32,7 @@ class Harness:
         self.existing = existing_import
         self.status_calls = []      # (ids, status, processed)
         self.upserts = []           # (token, legs, sims, meta)
-        self.pushes = []            # ("completed"|"unsupported", token, anchor)
+        self.pushes = []            # ("completed"|"failed", token, anchor)
         self.cache_busts = []       # Token, deren Lese-Cache gelöscht wurde
         monkeypatch.setattr(w, "_bust_import_cache",
                             lambda token: self.cache_busts.append(token))
@@ -49,9 +49,9 @@ class Harness:
         monkeypatch.setattr(w, "_push_completed",
                             lambda token, anchor:
                             self.pushes.append(("completed", token, anchor)))
-        monkeypatch.setattr(w, "_push_unsupported",
+        monkeypatch.setattr(w, "_push_failed",
                             lambda token, anchor:
-                            self.pushes.append(("unsupported", token, anchor)))
+                            self.pushes.append(("failed", token, anchor)))
 
     def _parse(self, path):
         blob = open(path, "rb").read()
@@ -107,7 +107,8 @@ def test_dup_of_unsupported_inherits_failed(monkeypatch):
     w.process_token_batch("AT-TEST", [_row(5, b"same"), _row(6, b"same")], events)
     assert h.statuses_for(5)[-1] == (w.STATUS_FAILED, True)
     assert h.statuses_for(6)[-1] == (w.STATUS_FAILED, True)
-    assert h.pushes == [("unsupported", "AT-TEST", 5)]
+    # Datei + Byte-Kopie sind EIN Problem → EIN Fehler-Push, Anker = höchste ID.
+    assert h.pushes == [("failed", "AT-TEST", 6)]
     assert not h.upserts
 
 
@@ -222,4 +223,63 @@ def test_mixed_batch_imports_good_and_fails_unsupported(monkeypatch):
     assert h.statuses_for(10)[-1] == (w.STATUS_COMPLETED, True)
     assert h.statuses_for(11)[-1] == (w.STATUS_FAILED, True)
     kinds = {p[0] for p in h.pushes}
-    assert kinds == {"completed", "unsupported"}
+    assert kinds == {"completed", "failed"}
+
+
+# ── Fehler-Push („bitte nochmal hochladen") ────────────────────────────────
+
+def test_unsupported_batch_gets_exactly_one_failure_push(monkeypatch):
+    """Drei unlesbare Dateien in einem Schub = EIN Push, Anker = höchste ID."""
+    h = Harness(monkeypatch, {20: (b"a", "unsupported"),
+                              21: (b"b", "unsupported"),
+                              22: (b"c", "unsupported")})
+    events = []
+    w.process_token_batch("AT-TEST", [_row(20, b"a"), _row(21, b"b"),
+                                      _row(22, b"c")], events)
+    assert h.pushes == [("failed", "AT-TEST", 22)]
+    for rid in (20, 21, 22):
+        assert h.statuses_for(rid)[-1] == (w.STATUS_FAILED, True)
+
+
+def test_review_never_pushes_upload_again(monkeypatch):
+    """`review` heißt: der Betreiber schaut. „Bitte nochmal hochladen" wäre
+    dort schlicht falsch — die Datei ist womöglich völlig in Ordnung."""
+    h = Harness(monkeypatch, {30: (b"pdf-30", "control")})
+    events = []
+    w.process_token_batch("AT-TEST", [_row(30, b"pdf-30")], events)
+    assert h.statuses_for(30)[-1] == (w.STATUS_REVIEW, None)
+    assert h.pushes == []
+
+
+def test_failure_push_payload_is_short_keyed_and_idempotent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(w, "_rest",
+                        lambda method, path, payload=None, headers=None,
+                        expect_json=True: calls.append((method, path, payload)))
+    w._push_failed("AT-TEST", 42)
+    assert len(calls) == 1
+    method, path, payload = calls[0]
+    assert (method, path) == ("POST", "rpc/enqueue_push_outbox")
+    assert payload["p_idempotency_key"] == "logbook-import-failed:42"
+    assert payload["p_user_token"] == "AT-TEST"
+    body = payload["p_payload"]
+    assert body["title"] == "Flugbuch-Import fehlgeschlagen"
+    assert body["body"] == "Bitte lade die Datei noch einmal hoch."
+    assert body["data"] == {"type": "logbook_import_failed",
+                            "localization_key": "logbook_import_failed",
+                            "deep_link": "aerox://more/logbook"}
+    # Keine wandernden Felder im `data` — sonst hebelt der Hash in
+    # app._push_outbox_key die Dedupe aus, sobald der Payload dort durchläuft.
+    assert "job_id" not in body["data"]
+
+
+def test_completed_push_is_unchanged_and_separate(monkeypatch):
+    """Regel 3 der Nacharbeit: den Fertig-Push nur verifizieren, nicht doppeln."""
+    calls = []
+    monkeypatch.setattr(w, "_rest",
+                        lambda method, path, payload=None, headers=None,
+                        expect_json=True: calls.append(payload))
+    w._push_completed("AT-TEST", 7)
+    assert calls[0]["p_idempotency_key"] == "logbook-import-completed:7"
+    assert calls[0]["p_payload"]["data"]["localization_key"] == (
+        "logbook_import_completed")

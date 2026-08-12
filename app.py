@@ -12899,6 +12899,19 @@ _PUSH_SYSTEM_COPY = {
         'fr': ('Import du carnet de vol reçu', 'Traitement en cours.'),
         'pt': ('Importação do diário de voo recebida', 'Em processamento.'),
     },
+    'logbook_import_failed': {
+        'de': ('Flugbuch-Import fehlgeschlagen',
+               'Bitte lade die Datei noch einmal hoch.'),
+        'en': ('Logbook import failed', 'Please upload the file again.'),
+        'it': ('Importazione del registro non riuscita',
+               'Carica di nuovo il file.'),
+        'es': ('Error en la importación del libro de vuelo',
+               'Vuelve a subir el archivo.'),
+        'fr': ('Échec de l\'import du carnet de vol',
+               'Merci de téléverser le fichier à nouveau.'),
+        'pt': ('Falha na importação do diário de voo',
+               'Carregue o ficheiro novamente.'),
+    },
     'logbook_import_completed': {
         'de': ('Flugbuch-Import fertig',
                'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.'),
@@ -23751,18 +23764,27 @@ def _logbook_import_mail(token, filename, blob, note, stored=False):
         return False
 
 
+_LOGBOOK_IMPORT_PUSH_WINDOW_MIN = 10
+
+
 def _logbook_import_received_push(token, now=None):
-    """EIN kurzer „angekommen"-Push pro Upload-Schub.
+    """EIN kurzer „angekommen"-Push pro Upload-SITZUNG.
 
     Die Route nimmt EINE Datei pro Request an — wer fünf Monatsübersichten
     nachträgt, erzeugt fünf Requests. Ein Push je Datei wäre Spam, deshalb
-    dedupliziert der Outbox-Idempotenz-Key über ein grobes UTC-Stundenfenster:
-    `logbook-import-received:<token>:<YYYY-MM-DD-HH>`. Ein Schub, der über die
-    Stundengrenze läuft, kostet im schlechtesten Fall EINEN zweiten Push — die
-    Alternative (Batch-Anker aus der Inbox lesen) wäre ein zusätzlicher
-    SB-Read pro Upload, der bei degradiertem Read genau die Dopplung erzeugt,
-    die er verhindern soll. Der Key wandert gehasht in die DB (siehe
-    _push_outbox_key), der Token steht dort also nie im Klartext.
+    dedupliziert der Outbox-Idempotenz-Key über ein kurzes Sitzungsfenster:
+    `logbook-import-received:<token>:<YYYY-MM-DD-HHMM>`, Minute auf
+    10 abgerundet. Ein Stundenfenster (erster Anlauf 12.08.) war falsch — es
+    wirkte wie „höchstens ein Push pro Stunde" und verschluckte den zweiten
+    Upload am Nachmittag (Owner: „nicht jede Stunde eine Push, sondern ist
+    angekommen"). Zehn Minuten decken einen Datei-Schub ab, ein späterer
+    Upload ist eine eigene Sitzung und meldet sich wieder.
+
+    Ein Schub, der über die Fenstergrenze läuft, kostet im schlechtesten Fall
+    EINEN zweiten Push — die Alternative (Batch-Anker aus der Inbox lesen)
+    wäre ein zusätzlicher SB-Read pro Upload, der bei degradiertem Read genau
+    die Dopplung erzeugt, die er verhindern soll. Der Key wandert gehasht in
+    die DB (siehe _push_outbox_key), der Token steht dort nie im Klartext.
 
     WICHTIG: `data` darf KEIN datei-spezifisches Feld (job_id) tragen —
     _push_outbox_key hasht Titel, Body und `data` in den Schlüssel mit ein,
@@ -23773,7 +23795,11 @@ def _logbook_import_received_push(token, now=None):
     """
     if not token:
         return None
-    stamp = (now or datetime.now(timezone.utc)).strftime('%Y-%m-%d-%H')
+    moment = now or datetime.now(timezone.utc)
+    window = moment.replace(
+        minute=(moment.minute // _LOGBOOK_IMPORT_PUSH_WINDOW_MIN)
+        * _LOGBOOK_IMPORT_PUSH_WINDOW_MIN)
+    stamp = window.strftime('%Y-%m-%d-%H%M')
     try:
         return _push_notify_async(
             token,
