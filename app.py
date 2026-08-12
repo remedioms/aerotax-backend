@@ -45378,6 +45378,12 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
         # Landung NICHT wieder zurückdreht (Live-vs-Test-Diskrepanz LH890: die Regel
         # feuerte im Test, wurde live aber vom Engine-Override überschrieben).
         _stale_forced_landed = False
+        # `_overdue` wird unten im try gesetzt und WEITER UNTEN im Engine-Block
+        # nochmal gelesen → hier explizit pro Sektor zurücksetzen. Ohne das
+        # trägt eine Schleifen-Iteration den Wert der vorigen weiter (Python hat
+        # keinen Block-Scope), sobald der try-Zweig vorzeitig endet (cancelled /
+        # Exception) — der Sektor würde über den Nachbarn geurteilt.
+        _overdue = False
         try:
             _bucket = _flight_status_bucket(_raw_status)
             _has_est_arr = bool(s.get('est_arr_iso')
@@ -45624,7 +45630,9 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                         _ENGINE_PHASE_TO_LEGACY as _fs_phase_vocab)
                     from blueprints.leg_status_gate import (
                         gated_leg_status as _gate_status2)
-                    _canon_phase = _fs_proj(_fs).get('status')
+                    _fs_projected = _fs_proj(_fs)
+                    _canon_phase = _fs_projected.get('status')
+                    _canon_conf = _fs_projected.get('phase_conf')
                     _canon_status = _fs_phase_vocab.get(_canon_phase)
                     if _canon_status and _canon_status != 'unknown':
                         # terminale Engine-Landung DERSELBEN Physik-Prüfung wie der
@@ -45645,9 +45653,61 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                             # „airborne/grounded" kennt — die überfällige Landung nicht
                             # wieder auf einen nicht-terminalen Status senken. Nur ein
                             # ebenfalls terminaler Engine-Status (landed) darf gewinnen.
+                            #
+                            # ZWEITE LEICHE, GLEICHE KLASSE (Sweep-Befund
+                            # 2026-08-12, LH594 ABV→PHC vom 07.08.): der Riegel
+                            # oben schützt NUR einen Status, den die Staleness-
+                            # Regel selbst gehoben hat. Kommt der Status schon
+                            # TERMINAL aus der Quelle (LH FlightOps
+                            # `dep_status='Flight Landed'`), feuert weder (A)
+                            # noch (B) — `_stale_forced_landed` bleibt False —
+                            # und die Engine senkte die belegte Landung fünf
+                            # Tage später zurück auf 'grounded' (iOS „Erwartet").
+                            # ABV/PHC werden von keinem Board und keinem ADS-B
+                            # gesehen: die Engine hat KEINE Beobachtung, ihre
+                            # SCHEDULED-Projektion ist der Default, nicht ein
+                            # Befund (`phase_conf='estimated'`). Eine beleglose
+                            # Vermutung darf einen Beleg nicht überschreiben.
+                            # ENG GEFASST, damit Live-/Zukunfts-Verhalten
+                            # byte-gleich bleibt: nur wenn (1) die Plan-Ankunft
+                            # > 6 h vorbei ist (`_overdue` — dieselbe Schranke
+                            # wie (A)/(B); für einen künftigen oder gerade
+                            # laufenden Flug gewinnt die Engine unverändert),
+                            # (2) der gegatete Status wirklich terminal ist und
+                            # (3) die Engine NICHT beobachtet hat. Sieht die
+                            # Engine den Flieger (phase_conf='observed', z.B.
+                            # stark verspätet noch in der Luft), gewinnt sie
+                            # weiterhin.
                             _canon_bucket = _flight_status_bucket(_gated_canon)
-                            if _stale_forced_landed and _canon_bucket != 'landed':
-                                pass        # Stale-'landed' behalten
+                            _aged_terminal_locked = (
+                                _overdue
+                                and _flight_status_bucket(s.get('status'))
+                                == 'landed'
+                                and _canon_conf != 'observed')
+                            if _canon_bucket != 'landed' and (
+                                    _stale_forced_landed
+                                    or _aged_terminal_locked):
+                                if _aged_terminal_locked:
+                                    # VOKABULAR KANONISIEREN (iOS-Befund
+                                    # 2026-08-12): `BoardPhase.landedStates`
+                                    # (Shared/BoardPhase.swift) ist ein
+                                    # EXACT-MATCH-Set — 'Flight Landed' fällt
+                                    # dort auf `.unknown` und liefert weder
+                                    # Status-Chip noch Standort-Kopplung noch
+                                    # Live-Activity-Umschaltung; nur die
+                                    # Substring-Matcher der Kalender-Zeile
+                                    # (TourTimeline.isLanded) verstehen ihn.
+                                    # Hier steht per Konstruktion schon ein
+                                    # Status im 'landed'-Bucket (physik-
+                                    # gegatet) — 'landed' ist damit dieselbe
+                                    # Aussage in dem Wort, das JEDER Consumer
+                                    # kennt, keine neue Behauptung. Dieselbe
+                                    # Kanonisierung schreiben (A)/(B) oben.
+                                    s['status'] = 'landed'
+                                # sonst: Stale-'landed' aus (A)/(B) unverändert
+                                # stehen lassen (es ist bereits kanonisch, und
+                                # ein vom Gate verworfener Status darf hier
+                                # NICHT wiederbelebt werden).
                             else:
                                 s['status'] = _gated_canon
                 except Exception:

@@ -694,6 +694,82 @@ def test_enrich_status_engine_bogus_landing_still_rejected(monkeypatch):
     assert not is_terminal_landed(secs[0].get('status'))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SWEEP-BEFUND 2026-08-12 (R1 stale-status, LH594 ABV→PHC vom 07.08.):
+# ein fünf Tage altes Leg wurde als `status='grounded'` (iOS „Erwartet")
+# ausgeliefert, obwohl LH FlightOps es terminal meldete
+# (`dep_status='Flight Landed'`, est_dep/est_arr vorhanden).
+# URSACHE: die Staleness-Riegel (A)/(B) greifen nur bei NICHT-terminalem
+# Rohstatus → `_stale_forced_landed` blieb False → die FlightState-Engine, die
+# für ABV/PHC (kein Board, kein ADS-B) mangels Beobachtung auf SCHEDULED
+# defaultet, senkte die belegte Landung zurück.
+# ══════════════════════════════════════════════════════════════════════════════
+def test_enrich_aged_terminal_status_survives_blind_engine(monkeypatch):
+    # 1:1 der Prod-Pfad des Befunds: KEIN Board-Merge (ABV/PHC werden nicht
+    # geharvestet → `_flight_obs_merged` = None), aber persistente LH-FlightOps-
+    # Fakten mit TERMINALEM `dep_status` + Ist-Zeiten. Die Engine hat mangels
+    # Beobachtung nichts als ihren Default (phase_conf='estimated').
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FRIENDS', '1')
+    dep = _now() - timedelta(days=5)
+    arr = dep + timedelta(hours=1)
+    day = dep.strftime('%Y-%m-%d')
+    secs = [_sector(flight='LH400', frm='FRA', to='MUC',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+
+    # Mock spiegelt die ECHTE Signatur (inkl. lh_cached_only) — sonst schluckt
+    # der try/except im Enricher den TypeError still.
+    def _facts(fn, date, dep_iata=None, arr_iata=None, lh_cached_only=False):
+        return {'dep_status': 'Flight Landed', 'arr_status': None,
+                'est_dep': _iso(dep), 'est_arr': _iso(arr),
+                'sched_arr': _iso(arr), 'dep_delay_min': -9,
+                'arr_delay_min': -8, 'reg': None}
+
+    import blueprints.aerox_data_blueprint as ADB
+    monkeypatch.setattr(ADB, '_aircraft_live_pos',
+                        lambda **k: (None, None, None, None))
+    with _patch_coords(), \
+            patch.object(A, '_flight_obs_merged', return_value=None), \
+            patch.object(ADB, '_flight_facts_from_obs', side_effect=_facts), \
+            patch.object(A, '_board_local_to_utc_iso',
+                         side_effect=lambda v, ap: v):
+        A._enrich_leg_delays(secs, day, free_only=True,
+                             past_horizon_h=24 * 35)
+    from blueprints.leg_status_gate import is_terminal_landed
+    assert is_terminal_landed(secs[0].get('status')), secs[0].get('status')
+    # … und genau das, was der Wächter prüft: KEIN 'grounded' auf einem Leg,
+    # dessen Plan-Ankunft Tage zurückliegt.
+    assert secs[0].get('status') != 'grounded'
+    # KANONISCHES VOKABULAR: iOS `BoardPhase.landedStates` ist Exact-Match —
+    # 'Flight Landed' verstünde nur die Kalender-Zeile, nicht Chip/Standort/
+    # Live-Activity. Dieselbe Aussage, das Wort, das jeder Consumer kennt.
+    assert secs[0]['status'] == 'landed'
+
+
+def test_enrich_live_leg_engine_still_overrides_terminal_raw(monkeypatch):
+    # SCOPE-RIEGEL (Gegenprobe zum Test darüber): der neue Schutz gilt NUR für
+    # überfällige Legs (Plan-Ankunft > 6 h vorbei). Ein LAUFENDES Leg (Ankunft
+    # erst in einer Stunde) verhält sich unverändert — die Engine-Projektion
+    # gewinnt weiterhin über einen terminalen Rohstatus, damit ein früh
+    # umklappendes Board keine Landung behauptet, solange der Flug läuft.
+    monkeypatch.setenv('FLIGHTSTATE_LIVE_FRIENDS', '1')
+    dep = _now() - timedelta(hours=1)
+    arr = _now() + timedelta(hours=1)
+    secs = [_sector(flight='LH400', frm='FRA', to='MUC',
+                    dep_iso=_iso(dep), arr_iso=_iso(arr))]
+    m = _merged_sided(status='Flight Landed', delay_known=False)
+    import blueprints.aerox_data_blueprint as ADB
+    monkeypatch.setattr(ADB, '_aircraft_live_pos',
+                        lambda **k: (None, None, None, None))
+    with _patch_coords(), patch.object(A, '_flight_obs_merged', return_value=m):
+        A._enrich_leg_delays(secs, dep.strftime('%Y-%m-%d'))
+    # Der Alters-Riegel hat NICHT gefeuert: er hätte den Status auf das
+    # kanonische 'landed' festgeschrieben. Welche Phase die Engine für ein
+    # laufendes Leg projiziert (airborne/grounded/keine), ist hier egal und
+    # bewusst nicht mitgeprüft — geprüft wird nur, dass der neue Riegel an
+    # einem nicht-überfälligen Leg schweigt.
+    assert secs[0].get('status') != 'landed'
+
+
 def test_enrich_status_raw_gated_when_flag_off():
     # GEGENPROBE: ohne das Flag bleibt das bisherige Verhalten — der (physik-
     # gegatete) ROHE Board-Status wird durchgereicht, KEINE Engine-Phase. Sichert
