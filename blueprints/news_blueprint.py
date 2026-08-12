@@ -4210,6 +4210,51 @@ def news_comment_author_token(comment_id):
     return (rows[0].get('author_token') or None) if rows else None
 
 
+def news_comment_admin_view(comment_id):
+    """Betreiber-Sicht auf einen (evtl. anonymen) News-Kommentar fuer das
+    Moderations-Panel (Gegenpruefung 13.08.: gemeldete News-Kommentare waren
+    weder aufloesbar noch loeschbar — die einzige Kontrolle fuer anonyme
+    Kommentare war damit betreiberseitig hohl). Liefert {text, author_token,
+    author_name, is_anonymous} oder None. Die Anonymitaet nach AUSSEN bleibt
+    unberuehrt — das ist ausschliesslich der Admin-Pfad (wie bei Wall/Forum)."""
+    cid = str(comment_id or '').strip()
+    if not cid:
+        return None
+    sb, ok = _news_sb()
+    if not ok:
+        return None
+    try:
+        res = (sb.table('ax_news_comments')
+               .select('body,author_token,anon_handle,is_anonymous')
+               .eq('id', cid).limit(1).execute())
+        rows = getattr(res, 'data', None) or []
+    except Exception as exc:
+        _log_warn(f'[news-interactions] admin view failed: {exc!r}')
+        return None
+    if not rows:
+        return None
+    r = rows[0]
+    return {'text': r.get('body') or '', 'author_token': r.get('author_token') or '',
+            'anon_handle': r.get('anon_handle') or '',
+            'is_anonymous': bool(r.get('is_anonymous'))}
+
+
+def news_comment_admin_delete(comment_id):
+    """Betreiber-Loeschung eines News-Kommentars (Admin-Override, kein
+    Author-Check). (ok, detail)."""
+    cid = str(comment_id or '').strip()
+    if not cid:
+        return False, 'invalid_id'
+    sb, ok = _news_sb()
+    if not ok:
+        return False, 'storage_unavailable'
+    try:
+        sb.table('ax_news_comments').delete().eq('id', cid).execute()
+    except Exception as exc:
+        return False, str(exc)[:120]
+    return True, 'deleted'
+
+
 @news_bp.route('/api/news/redaktion', methods=['GET'])
 def get_news_redaktion():
     """AeroX-eigene, KI-umgeschriebene Kurzartikel (deutsch, faktenbasiert).

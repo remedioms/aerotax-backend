@@ -308,3 +308,45 @@ def test_block_by_content_lehnt_news_comment_ab():
                         headers={'Authorization': 'Bearer AT-0123456789ABCDEF'})
     assert r.status_code == 400
     assert r.get_json().get('error') == 'block_not_supported_for_kind'
+
+
+# ── Moderations-Review-Befunde (13.08.) ─────────────────────────────────────
+
+def test_block_by_content_wall_comment_loest_autor_auf():
+    """Befund 1: die UI zeigte 'Autor blockieren' fuer wall_comment, aber
+    block-by-content kannte den kind nicht -> author_not_found -> iOS fakte
+    Erfolg. Jetzt loest der geteilte Resolver den Autor auf."""
+    _ok = A._TokenValidationResult(A._TokenValidationState.VALID, 'x@e.de')
+    saved = {}
+    with patch.object(A, '_validate_token', return_value=_ok), \
+         patch.object(A, '_request_bearer_matches', return_value=True), \
+         patch.object(A, '_content_author_token', return_value='AT-AABBCCDDEEFF0011'), \
+         patch.object(A, '_blocked_by', return_value=set()), \
+         patch.object(A, '_save_set_file', side_effect=lambda p, s2: saved.update({'s': s2})), \
+         patch.object(A, '_blocks_path', return_value='/tmp/b.json'):
+        client = A.app.test_client()
+        r = client.post('/api/moderation/AT-0123456789ABCDEF/block-by-content',
+                        json={'kind': 'wall_comment', 'target_id': 'wc1'},
+                        headers={'Authorization': 'Bearer AT-0123456789ABCDEF'})
+    assert r.status_code == 200
+    assert r.get_json()['ok'] is True
+    assert 'AT-AABBCCDDEEFF0011' in saved['s']
+
+
+def test_blocks_liste_unterdrueckt_guest_family_rohtoken():
+    """Befund 3: _public_user_ref gibt Guest/Family-Token bytegleich roh
+    zurueck -> der Rohtoken-Pfad war fuer diese Formen noch offen. Solche
+    Eintraege werden aus der auslieferbaren Liste unterdrueckt."""
+    _ok = A._TokenValidationResult(A._TokenValidationState.VALID, 'x@e.de')
+    guest = 'AT-GUEST-abc123'
+    with patch.object(A, '_validate_token', return_value=_ok), \
+         patch.object(A, '_request_bearer_matches', return_value=True), \
+         patch.object(A, '_blocked_by', return_value={guest}), \
+         patch.object(A, '_user_profile_path', return_value='/nonexistent'):
+        client = A.app.test_client()
+        r = client.get('/api/moderation/AT-0123456789ABCDEF/blocks',
+                       headers={'Authorization': 'Bearer AT-0123456789ABCDEF'})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert guest not in str(body)
+    assert body['blocks'] == []

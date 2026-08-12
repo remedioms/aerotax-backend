@@ -9533,6 +9533,49 @@ def _admin_resolve_anon_author_name(token):
         return None
 
 
+def _content_author_token(kind, target_id):
+    """NUR das rohe Author-Token eines Inhalts — OHNE jede Namens-/Anon-
+    Aufloesung (Gegenpruefung 13.08.). Getrennt von _resolve_reported_content,
+    das den anonymen NAMEN aufloest und deshalb per AST-Wachtest an Admin-
+    Pfade gebunden ist. block-by-content braucht nur den Token (zum Blocken)
+    und darf keine Anon-Namen anfassen. news_comment ist bewusst NICHT dabei
+    (Anonymitaet). None, wenn nicht aufloesbar."""
+    try:
+        raw = target_id or ''
+        tid = raw[5:] if raw.startswith('wall:') else raw
+        if kind == 'wall_post' or (kind == 'forum_thread' and raw.startswith('wall:')):
+            p_ = next((x for x in _wall_load_posts() if x.get('id') == tid), None)
+            return (p_ or {}).get('author_token') or None
+        if kind == 'forum_thread':
+            t = next((x for x in _forum_load_threads() if x.get('id') == tid), None)
+            return (t or {}).get('author_token') or None
+        if kind == 'forum_reply':
+            import glob
+            for fp in glob.glob(os.path.join(_forum_dir(), 'replies_*.json')):
+                try:
+                    with open(fp) as f:
+                        reps = json.load(f) or []
+                except Exception:
+                    continue
+                r = next((x for x in reps if x.get('id') == tid), None)
+                if r:
+                    return r.get('author_token') or None
+        if kind == 'wall_comment':
+            import glob
+            for fp in glob.glob(os.path.join(_wall_dir(), 'comments_*.json')):
+                try:
+                    with open(fp) as f:
+                        cs = json.load(f) or []
+                except Exception:
+                    continue
+                c = next((x for x in cs if x.get('id') == tid), None)
+                if c:
+                    return c.get('author_token') or None
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_reported_content(kind, target_id):
     """Best-effort: holt den tatsächlichen Text eines gemeldeten Items, damit man
     in Mail/Panel SIEHT was gemeldet wurde. Returns {text, author_token,
@@ -9594,6 +9637,17 @@ def _resolve_reported_content(kind, target_id):
                     return _with_anon_fallback(
                         c.get('text') or c.get('body') or '', c.get('author_token'),
                         c.get('author_name') or c.get('author_short'), c.get('is_anonymous'))
+        if kind == 'news_comment':
+            # (Gegenpruefung 13.08.) News-Kommentare leben in Supabase; das
+            # Admin-Panel loest hier Text + echten Autor auf — bei anonymen
+            # ueber _admin_resolve_anon_author_name, exakt wie Wall/Forum. Nach
+            # AUSSEN bleibt der Kommentar anonym.
+            from blueprints.news_blueprint import news_comment_admin_view
+            v = news_comment_admin_view(tid)
+            if v:
+                return _with_anon_fallback(
+                    v.get('text') or '', v.get('author_token'),
+                    v.get('anon_handle'), v.get('is_anonymous'))
     except Exception:
         pass
     return None
@@ -9686,6 +9740,9 @@ def _admin_delete_content(kind, target_id):
                             pass
                     return True, 'deleted'
             return False, 'not_found'
+        if kind == 'news_comment':
+            from blueprints.news_blueprint import news_comment_admin_delete
+            return news_comment_admin_delete(tid)
     except Exception as e:
         return False, str(e)[:120]
     return False, 'unsupported_kind'
@@ -52575,7 +52632,17 @@ def moderation_list_blocks(token):
     # reversible AXU-Public-Ref; das Entblocken nimmt sie zurueck.
     enriched = []
     for t in blocks:
-        info = {'ref': _public_user_ref(t)}
+        ref = _public_user_ref(t)
+        # _public_user_ref verschluesselt NUR Standard-AT-Credentials; Guest-/
+        # Family-Tokens (AT-GUEST-…, AT-FAM-…) gibt es bytegleich ROH zurueck
+        # (Gegenpruefung 13.08.: Rohtoken-Leak fuer Nicht-Standard-Formen).
+        # Solche Eintraege werden hier uebersprungen — das Token verlaesst den
+        # Server nie. Sie bleiben serverseitig geblockt und ueber den rohen
+        # Alt-Token entblockbar (unblock nimmt target_token weiter an); sie
+        # tauchen nur nicht in der auslieferbaren Liste auf.
+        if not ref or not ref.startswith(_PUBLIC_USER_REF_PREFIX):
+            continue
+        info = {'ref': ref}
         try:
             with open(_user_profile_path(t)) as f:
                 pr = json.load(f).get('profile', {})
@@ -52626,37 +52693,21 @@ def moderation_block_by_content(token):
     target_id = (body.get('target_id') or '').strip()
     if not kind or not target_id:
         return jsonify({'ok': False, 'error': 'kind_and_target_required'}), 400
+    # Autor-Token serverseitig aufloesen. Wall-/Forum-Inhalte UND
+    # Wall-Kommentare kann `_resolve_reported_content` bereits (Gegenpruefung
+    # 13.08.: die Menue zeigte „Autor blockieren" fuer wall_comment, aber
+    # block-by-content kannte den kind nicht -> author_not_found -> iOS fakte
+    # trotzdem Erfolg = Apple-1.2-Bruch). news_comment bleibt bewusst
+    # ausgenommen (Anonymitaet). Alles, was der Resolver nicht kennt
+    # (layoverrec*), faellt weiter auf author_not_found; der Client versteckt
+    # den Knopf dort und faked keinen Erfolg mehr.
     author_token = None
-    if kind == 'wall_post':
-        for p in _wall_load_posts():
-            if p.get('id') == target_id:
-                author_token = p.get('author_token'); break
-    elif kind == 'forum_thread':
-        for t in _forum_load_threads():
-            if t.get('id') == target_id:
-                author_token = t.get('author_token'); break
-    elif kind == 'forum_reply':
-        # Reply-ID kollidiert evtl. zwischen Threads — wir durchsuchen alle
-        for t in _forum_load_threads():
-            try:
-                replies_p = os.path.join(_USER_HISTORY_DIR, 'forum',
-                                          f'replies_{t.get("id")}.json')
-                with open(replies_p) as f: replies = json.load(f) or []
-                for r in replies:
-                    if r.get('id') == target_id:
-                        author_token = r.get('author_token'); break
-            except Exception: pass
-            if author_token: break
-    elif kind == 'news_comment':
-        # KEIN „Autor blockieren" fuer News-Kommentare (Codex-Zweitpass 13.08.):
-        # Kommentare koennen ANONYM sein. Ein Block muesste den Autor in
-        # `_blocked_by` legen — und ueber die zurueckgegebene AXU-Ref (bzw. den
-        # oeffentlichen Profil-GET) liesse sich der anonyme Kommentator dann
-        # deanonymisieren. Melden bleibt der richtige Kanal (das Moderations-
-        # Panel loest den echten Namen serverseitig auf, ohne ihn je
-        # auszuliefern). Bewusst nicht unterstuetzt, statt die Anonymitaet zu
-        # brechen.
+    if kind == 'news_comment':
+        # KEIN „Autor blockieren" fuer News-Kommentare (koennen anonym sein) —
+        # ein Block wuerde den Autor ueber Blockliste/AXU-Ref deanonymisierbar
+        # machen. Melden bleibt der Kanal.
         return jsonify({'ok': False, 'error': 'block_not_supported_for_kind'}), 400
+    author_token = _content_author_token(kind, target_id)
     if not author_token:
         return jsonify({'ok': False, 'error': 'author_not_found'}), 404
     if author_token == token:
