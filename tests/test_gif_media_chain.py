@@ -821,12 +821,13 @@ def test_import_download_folgt_keinem_redirect():
         t.join(timeout=5)
 
 
-def test_block_by_content_antwortet_ohne_das_author_token():
-    """Gegenprüfung 13.08.: die Antwort trug `blocked_token` — das ROHE
-    Author-Token, also das Bearer-Credential des Blockierten (Owner-Regel
-    „Token = Credential"). Über kind='news_comment' hätte damit JEDER einen
-    anonymen Kommentar per Block-Aufruf deanonymisieren und das Konto
-    übernehmen können. Blockiert wird weiter — aber ohne Token im Body."""
+def test_block_by_content_lehnt_news_comment_ganz_ab():
+    """Codex-Zweitpass 13.08.: „Autor blockieren" bei (evtl. anonymen)
+    News-Kommentaren wurde ganz entfernt — ein Block haette den Autor ueber
+    die Blockliste/AXU-Ref deanonymisierbar gemacht (der erste Fix entfernte
+    nur `blocked_token` aus der SofortAntwort, /blocks leakte weiter). Melden
+    bleibt der richtige Kanal. Der Endpoint lehnt kind='news_comment' ab und
+    fasst den Block-Store gar nicht erst an."""
     import json as _json
     from unittest.mock import patch as _patch
 
@@ -834,18 +835,15 @@ def test_block_by_content_antwortet_ohne_das_author_token():
         A.app.test_request_context(
             method='POST',
             json={'kind': 'news_comment', 'target_id': 'c-1'}),
-        _patch.object(nb, 'news_comment_author_token',
-                      return_value='AT-GEHEIMES-AUTOR-TOKEN'),
-        _patch.object(A, '_blocked_by', return_value=set()),
-        _patch.object(A, '_save_set_file'),
-        _patch.object(A, '_blocks_path', return_value='/tmp/blocks.json'),
+        _patch.object(A, '_save_set_file') as _save,
     ):
         resp = A.moderation_block_by_content('AT-DER-MELDER')
 
-    body = resp.get_json() if not isinstance(resp, tuple) else resp[0].get_json()
-    assert body['ok'] is True
-    assert body['blocked_count'] == 1
-    assert 'blocked_token' not in body
+    status = resp[1] if isinstance(resp, tuple) else 200
+    body = resp[0].get_json() if isinstance(resp, tuple) else resp.get_json()
+    assert status == 400
+    assert body['error'] == 'block_not_supported_for_kind'
+    _save.assert_not_called()
     assert 'AT-GEHEIMES-AUTOR-TOKEN' not in _json.dumps(body)
 
 
@@ -859,3 +857,11 @@ def test_ssrf_allowlist_nur_media_hosts_und_443():
     assert G._allowed_media_url("https://media0.giphy.com:8443/x.gif") is None
     assert G._allowed_media_url("http://media0.giphy.com/x.gif") is None
     assert G._allowed_media_url("https://evil-giphy.com/x.gif") is None
+
+
+def test_ssrf_kaputter_port_wird_abgewiesen_nicht_500():
+    """Codex-Zweitpass: p.port wirft ValueError bei ':abc' — muss im try
+    stehen, sonst 500 statt sauberer Ablehnung."""
+    import blueprints.gif_search_blueprint as G
+    assert G._allowed_media_url("https://media0.giphy.com:abc/x.gif") is None
+    assert G._allowed_media_url("https://media0.giphy.com:99999/x.gif") is None

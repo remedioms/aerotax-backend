@@ -293,3 +293,18 @@ def test_blocks_liste_liefert_keine_rohen_tokens():
     assert ref and ref != blocked
     # Die Ref muss serverseitig zurueck aufloesen (fuers Entblocken).
     assert A._token_from_public_user_ref(ref) == blocked
+
+
+def test_block_by_content_lehnt_news_comment_ab():
+    """Codex-Zweitpass 13.08.: 'Autor blockieren' bei (evtl. anonymen)
+    News-Kommentaren wuerde den Autor deanonymisierbar in die Blockliste
+    legen. Der Endpoint lehnt kind=news_comment jetzt ab; Melden bleibt."""
+    _ok = A._TokenValidationResult(A._TokenValidationState.VALID, 'x@e.de')
+    with patch.object(A, '_validate_token', return_value=_ok), \
+         patch.object(A, '_request_bearer_matches', return_value=True):
+        client = A.app.test_client()
+        r = client.post('/api/moderation/AT-0123456789ABCDEF/block-by-content',
+                        json={'kind': 'news_comment', 'target_id': 'c1'},
+                        headers={'Authorization': 'Bearer AT-0123456789ABCDEF'})
+    assert r.status_code == 400
+    assert r.get_json().get('error') == 'block_not_supported_for_kind'

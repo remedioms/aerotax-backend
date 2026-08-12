@@ -281,6 +281,10 @@ def _allowed_media_url(u):
         return None
     try:
         p = urllib.parse.urlsplit(s)
+        # p.port wirft ValueError bei kaputtem Port (":abc", ausserhalb 0-65535)
+        # — MUSS im try stehen (Codex-Zweitpass: sonst HTTP 500 statt sauberer
+        # Ablehnung).
+        port = p.port
     except Exception:
         return None
     if p.scheme != 'https' or not p.hostname:
@@ -288,7 +292,7 @@ def _allowed_media_url(u):
     host = p.hostname.lower()
     if not _ALLOWED_MEDIA_HOST_RE.match(host):
         return None
-    if p.port not in (None, 443):
+    if port not in (None, 443):
         return None
     return s
 

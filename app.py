@@ -52475,12 +52475,15 @@ def moderation_block_by_content(token):
             except Exception: pass
             if author_token: break
     elif kind == 'news_comment':
-        # News-Kommentare leben in Supabase (ax_news_comments) — Auflösung
-        # im News-Blueprint, damit die Store-Details an EINER Stelle bleiben.
-        # Ohne diesen Zweig lief „Autor blockieren" bei News-Kommentaren mit
-        # author_not_found ins Leere (Befund iOS-Client 12.08.).
-        from blueprints.news_blueprint import news_comment_author_token
-        author_token = news_comment_author_token(target_id)
+        # KEIN „Autor blockieren" fuer News-Kommentare (Codex-Zweitpass 13.08.):
+        # Kommentare koennen ANONYM sein. Ein Block muesste den Autor in
+        # `_blocked_by` legen — und ueber die zurueckgegebene AXU-Ref (bzw. den
+        # oeffentlichen Profil-GET) liesse sich der anonyme Kommentator dann
+        # deanonymisieren. Melden bleibt der richtige Kanal (das Moderations-
+        # Panel loest den echten Namen serverseitig auf, ohne ihn je
+        # auszuliefern). Bewusst nicht unterstuetzt, statt die Anonymitaet zu
+        # brechen.
+        return jsonify({'ok': False, 'error': 'block_not_supported_for_kind'}), 400
     if not author_token:
         return jsonify({'ok': False, 'error': 'author_not_found'}), 404
     if author_token == token:
