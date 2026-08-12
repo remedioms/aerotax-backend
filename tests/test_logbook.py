@@ -221,6 +221,32 @@ def test_get_logbook_never_materializes_plan_only_month_rows(monkeypatch):
     assert 'LH3' not in [w[1] for w in queued]  # Zukunft kostet keinen API-Call.
 
 
+def test_get_logbook_reads_large_import_blob_only_once(monkeypatch):
+    calls = []
+    imported = {'legs': [{
+        'date': '2020-01-01', 'flight': 'LH1', 'from': 'FRA', 'to': 'MUC',
+        'dep_iso': '2020-01-01T10:00:00Z',
+        'arr_iso': '2020-01-01T11:00:00Z', 'block_min': 60,
+    }], 'sim': []}
+
+    def load_import(_token):
+        calls.append(True)
+        return imported
+
+    monkeypatch.setattr(backend, '_manual_briefings_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_ical_briefings_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_import_load', load_import)
+    monkeypatch.setattr(backend, '_logbook_overlay_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_facts_load', lambda _t: {})
+    monkeypatch.setattr(backend, '_logbook_enrich_async', lambda _t, _w: None)
+
+    with backend.app.test_request_context():
+        response = backend.get_logbook(TOKEN).get_json()
+
+    assert response['totals']['legs'] == 1
+    assert len(calls) == 1
+
+
 def test_logbook_entries_and_totals():
     _seed()
     r = _get()

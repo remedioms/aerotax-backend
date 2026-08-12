@@ -215,6 +215,32 @@ Flight time 09:21 Off days 14
     assert meta["verified_source_block_total"] == 561
 
 
+def test_condor_individual_plan_accepts_column_prefix_day_and_role_suffix():
+    """Five valid rows touched adjacent-column text in a real long roster."""
+    header = """Individual duty plan for [redacted]
+NetLine/Crew(CFG) printed by CREWLINK 01Feb26 12:00 Page 1
+Period: 01Jan26 - 31Jan26
+Flight time 51:01 Off days 14
+"""
+    segments = [
+        ":00] Sat03 Pick Up 1300\n"
+        ":00] DE 2315 R MRU 1511 0310 FRA 339\n",
+        ":08] Mon05 Pick Up 2005\n"
+        ":58] DE 3807 MBJ 2208 0720 FRA 339\n",
+        "Fri09 C/I FRA 0400\n"
+        "DE 2116 FRA 0955 2143 CUN 339 ST\n",
+        "Sun11 DE 2115 CUN 0042 1014 FRA 339 ST\n",
+        "Tue13 DE 3827 R LRM 0034 0904 FRA 339\n"
+        "DH/DE 2227 PUJ 0310 1225 FRA\n",
+    ]
+    legs, meta = PARSER.parse_condor_individual_segments(
+        header, segments, "PU")
+    assert [leg["flight"] for leg in legs] == [
+        "DE2315", "DE3807", "DE2116", "DE2115", "DE3827"]
+    assert sum(leg["block_min"] for leg in legs) == 3061
+    assert meta["verified_source_block_total"] == 3061
+
+
 def test_merge_prefers_newest_document_revision():
     old = {
         "date": "2026-01-01", "flight": "LH84", "from": "FRA", "to": "DUS",
