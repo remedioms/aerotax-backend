@@ -52481,8 +52481,13 @@ def moderation_block_by_content(token):
     blocks = _blocked_by(token)
     blocks.add(author_token)
     _save_set_file(_blocks_path(token), blocks)
-    return jsonify({'ok': True, 'blocked_token': author_token,
-                    'blocked_count': len(blocks)})
+    # KEIN `blocked_token` in der Antwort (Gegenprüfung 13.08.): der Wert war
+    # das ROHE Author-Token — also das Bearer-Credential des Blockierten
+    # (Owner-Regel „Token = Credential"). Über kind='news_comment' hätte damit
+    # JEDER einen anonymen Kommentar per Block-Aufruf deanonymisieren und das
+    # Konto übernehmen können. Kein Client hat das Feld je gelesen (iOS
+    # `ModerationResp` kennt es nicht); der Server löst weiter serverseitig auf.
+    return jsonify({'ok': True, 'blocked_count': len(blocks)})
 
 
 # ── Friend-Requests (statt symmetrisch-add: invite/accept-Flow) ───────

@@ -778,3 +778,72 @@ def test_importiertes_gif_ist_ueberall_einsetzbar(import_client, monkeypatch,
                          json={'media_url': url})
     assert r.status_code == 200
     assert r.get_json()['comment']['media_url'] == url
+
+
+def test_import_download_folgt_keinem_redirect():
+    """SSRF-Klammer, Teil 2 (Gegenprüfung 13.08.): `_allowed_media_url` prüft
+    nur die START-URL. Würde der Download einem 30x folgen, könnte ein
+    Redirect von *.giphy.com den Server auf beliebige — auch interne — Hosts
+    schicken. Deshalb: Redirect = Import-Fehler, das Ziel wird NIE geholt."""
+    import http.server
+    import threading
+
+    hits = {'ziel': 0}
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/start.gif':
+                self.send_response(302)
+                self.send_header(
+                    'Location',
+                    f'http://127.0.0.1:{self.server.server_port}/ziel.gif')
+                self.end_headers()
+            else:
+                hits['ziel'] += 1
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'GIF89a-nicht-erreichbar')
+
+        def log_message(self, *_a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), _H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        data, err = gs._download_limited(
+            f'http://127.0.0.1:{srv.server_port}/start.gif')
+        assert data is None
+        assert err == 'gif_import_failed'
+        assert hits['ziel'] == 0, 'Redirect-Ziel wurde geholt — SSRF offen!'
+    finally:
+        srv.shutdown()
+        t.join(timeout=5)
+
+
+def test_block_by_content_antwortet_ohne_das_author_token():
+    """Gegenprüfung 13.08.: die Antwort trug `blocked_token` — das ROHE
+    Author-Token, also das Bearer-Credential des Blockierten (Owner-Regel
+    „Token = Credential"). Über kind='news_comment' hätte damit JEDER einen
+    anonymen Kommentar per Block-Aufruf deanonymisieren und das Konto
+    übernehmen können. Blockiert wird weiter — aber ohne Token im Body."""
+    import json as _json
+    from unittest.mock import patch as _patch
+
+    with (
+        A.app.test_request_context(
+            method='POST',
+            json={'kind': 'news_comment', 'target_id': 'c-1'}),
+        _patch.object(nb, 'news_comment_author_token',
+                      return_value='AT-GEHEIMES-AUTOR-TOKEN'),
+        _patch.object(A, '_blocked_by', return_value=set()),
+        _patch.object(A, '_save_set_file'),
+        _patch.object(A, '_blocks_path', return_value='/tmp/blocks.json'),
+    ):
+        resp = A.moderation_block_by_content('AT-DER-MELDER')
+
+    body = resp.get_json() if not isinstance(resp, tuple) else resp[0].get_json()
+    assert body['ok'] is True
+    assert body['blocked_count'] == 1
+    assert 'blocked_token' not in body
+    assert 'AT-GEHEIMES-AUTOR-TOKEN' not in _json.dumps(body)

@@ -289,12 +289,28 @@ def _allowed_media_url(u):
     return s
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Der Import folgt KEINEM Redirect (Gegenprüfung 13.08.).
+
+    `_allowed_media_url` prüft nur die START-URL. `urlopen` folgt 30x aber
+    per Default auf JEDEN Host — ein Redirect von *.giphy.com auf eine
+    interne Adresse (oder http://) hätte die SSRF-Allowlist ausgehebelt.
+    Die echten Medien-URLs (media*.giphy.com/media/…) liefern direkt aus;
+    ein 30x ist hier also nie legitim ⇒ Fehler statt folgen."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
 def _download_limited(url):
     """Lädt höchstens `_DOWNLOAD_HARD_STOP` Bytes. (bytes, None) oder
-    (None, fehlercode)."""
+    (None, fehlercode). Folgt keinem Redirect (siehe _NoRedirectHandler)."""
     req = urllib.request.Request(url, headers={'User-Agent': 'AeroX/1.0'})
     try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+        with _NO_REDIRECT_OPENER.open(req, timeout=_HTTP_TIMEOUT) as r:
             data = r.read(_DOWNLOAD_HARD_STOP)
     except Exception as e:
         print(f'[gif-search] import_fetch_fail: {type(e).__name__}: '
