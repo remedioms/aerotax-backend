@@ -7134,7 +7134,11 @@ def ax_flown_track():
                     callsign=flight_no, lat=t_lat, lon=t_lon)
             except Exception:
                 trail = None
-        if trail is None and not q_hex:
+        # AUCH mit hex in den flightid-Fallback: der live_feed-Match scheitert
+        # bei weit entfernten Fliegern (Owner 12.08., LH713 ICN→FRA: mit hex
+        # 40 great_circle-Punkte, ohne hex 1177 echte) — ein mitgeliefertes
+        # hex darf Tier 2 nicht sperren, wenn Tier 2a nichts fand.
+        if trail is None:
             fid = _aircraft_live_flightid(
                 reg or None, flight_no, max_age_h=(72 if story_mode else 20))
             if fid:
