@@ -18590,6 +18590,14 @@ def get_friends_today(token):
                                 arr_iata=_arr_ia, lh_cached_only=True) or {}
                         except Exception:
                             _friend_facts = {}
+                        # STALE = VORTAGS-FALLBACK der Obs-Quelle. Dieselbe
+                        # physikalische Schranke wie `_flights_live_obs_wrong_
+                        # day` eine Zeile höher — die dort verworfene Fremd-Tag-
+                        # Instanz wäre hier durch die Hintertür wieder
+                        # eingezogen (gestrige actual_arr ⇒ „gelandet" für alle
+                        # Freunde). Lieber keine Fakten als die von gestern.
+                        if _friend_facts.get('stale'):
+                            _friend_facts = {}
                         # ECHTE Live-Position dieses Legs aus dem NAS-Harvester-Store
                         # (aircraft_live/FR24-gRPC) — reale Süd-Route (LH meidet
                         # Russland!). Owner 2026-07-09: Crew wurde sonst per Großkreis
@@ -26207,9 +26215,18 @@ def _rc_marker_short(day):
         seg = ''
         for p in segs:
             up = p.upper()
-            if (re.search(r'\b[A-Z]{3}\s*-\s*[A-Z]{3}\b', up)
-                    and not up.startswith('LAYOVER')
-                    and 'BRIEFING' not in up):
+            # DIENST-KÜRZEL-WÄCHTER (Daniel, SWISS-Kabine, 12.08.2026) —
+            # derselbe wie in `_ev_is_flight_leg`. Ein aktivierter Standby-Tag
+            # („SBY-BCS · LX1830 ZRH 0927 ATH 1259") las sonst `SBY-BCS` als
+            # Route: alt UND neu ergaben dasselbe Kurzlabel, der Push meldete
+            # „Dienst geändert" und verschwieg genau den neu zugeteilten Flug.
+            up_clean = _strip_swiss_duty_codes(up)
+            if up.startswith('LAYOVER') or 'BRIEFING' in up:
+                continue
+            # Zweiter Zweig: die SWISS-Flug-Form ist space-separiert
+            # („LX1830 ZRH 0927 ATH 1259") und trägt gar keine `XXX-XXX`-Route.
+            if (re.search(r'\b[A-Z]{3}\s*-\s*[A-Z]{3}\b', up_clean)
+                    or re.match(r'^[A-Z]{2}\s?\d{1,4}\b', up_clean)):
                 seg = p
                 break
         if not seg:
@@ -29769,6 +29786,17 @@ def _sanitize_user_text(text, max_len=None):
     gerendert wird (Wall-Posts, Comments, Forum-Threads/Replies, DMs). iOS
     rendert mit Text() safe, aber sobald wir einen Web-Client oder ein PDF
     ausliefern, ist <script>-Stored-XSS möglich. Daher zentral hier blocken.
+
+    REIHENFOLGE (Fix 13.08.2026): erst KÜRZEN, dann escapen. Vorher lief der
+    Schnitt auf dem escapten Text — ein `'` ist dort `&#x27;`, also sechs
+    Zeichen. Ein Kommentar mit vielen Apostrophen wurde deshalb still mitten
+    im Text (und mitten in einer Entity, `&#x2` → Render-Müll) abgeschnitten,
+    OBWOHL alle Aufrufer ihre 413-Schranke auf dem ROHTEXT messen. Genau
+    diese Länge ist jetzt auch hier die Wahrheit; `max_len` ist die
+    Not-Schranke hinter dem 413, kein zweiter, strengerer Deckel.
+    Kein Aufrufer verlässt sich auf die alte Reihenfolge (Wall 2000, Forum
+    200/5000/3000, News 2000 — alle gaten roh); die einzige Längen-Prüfung in
+    der DB (ax_news_comments.body) ist mit 20260812 auf 12000 gehoben.
     """
     if not text:
         return ''
@@ -29776,10 +29804,10 @@ def _sanitize_user_text(text, max_len=None):
     s = str(text)
     # Control-Chars (außer \n, \t) entfernen — diese können Render brechen.
     s = ''.join(c for c in s if c == '\n' or c == '\t' or ord(c) >= 32)
-    # HTML-Escape — &<>" werden in Entities umgewandelt.
-    s = _html.escape(s, quote=True)
     if max_len:
         s = s[:max_len]
+    # HTML-Escape — &<>" werden in Entities umgewandelt.
+    s = _html.escape(s, quote=True)
     return s.strip()
 
 
@@ -53880,17 +53908,60 @@ _SWISS_DUTY_CODE_STEMS = frozenset({
 })
 
 
+# Bekannte SWISS-FLOTTEN-Suffixe. Sie sehen aus wie IATA-Codes, sind aber
+# Qualifikations-Kennungen — Beleg je Eintrag, nichts geraten:
+#   • 32S  A320-Familie   — SWISS-iCal, Ivan Delcev 2026-07-18
+#   • BCS  A220/C-Series  — Jan Pronk 2026-08-10, Daniel 2026-08-12
+# Der Satz ist die AUSNAHME vom IATA-Wächter unten: `SBY-BCS` bleibt Standby,
+# obwohl `BCS` (Belle Chasse) in der Flughafen-Tabelle steht.
+_SWISS_FLEET_SUFFIXES = frozenset({'32S', 'BCS'})
+
+
+def _swiss_word_is_real_routing(tokens):
+    """True ⇒ das Wort `<A>-<B>` ist plausibel eine ECHTE Flug-Route und darf
+    NICHT als Dienst-Kürzel weggeworfen werden.
+
+    Hintergrund: zwei Dienst-Stämme sind zugleich echte IATA-Codes — `SBY`
+    (Salisbury, USA) und `RES` (Resistencia, AR). Ohne diesen Wächter hätte der
+    Stripper ein Leg `SBY-JFK` verschluckt (Fehlerklasse „Dienst-Kürzel wurden
+    Flughäfen", nur andersherum). Geprüft wird der KONTEXT, nie der Code allein:
+    nur wenn BEIDE Seiten bekannte Flughäfen sind UND die rechte Seite kein
+    bekanntes Flotten-Suffix ist, gilt das Wort als Route."""
+    if len(tokens) < 2:
+        return False
+    left, right = tokens[0], tokens[1]
+    if right in _SWISS_FLEET_SUFFIXES:
+        return False
+    if len(left) != 3 or len(right) != 3:
+        return False
+    try:
+        airports = _airports_compact_lookup()
+    except Exception:
+        return False
+    return bool(airports) and left in airports and right in airports
+
+
 def _strip_swiss_duty_codes(text):
     """Entfernt SWISS-Dienst-Kürzel-WÖRTER der Paar-Form `<STAMM>-<SUFFIX>`
-    aus einem (bereits uppercased) Marker/Summary — der Token-Wächter, damit
-    Flug-Erkenner die Flotten-Kennung nicht als Zielflughafen lesen.
+    aus einem Marker/Summary — der Token-Wächter, damit Flug-Erkenner die
+    Flotten-Kennung nicht als Zielflughafen lesen.
 
     Wörter OHNE Trenner (nacktes `SBY`, `RESX`) bleiben unangetastet: sie
     können nie als Route gelesen werden. Flug-Segmente im selben gemergten
     Summary bleiben stehen — ein aus dem Standby aktivierter Tag zählt seinen
     Block also weiterhin (`SBY-BCS · LX1830 ZRH 0927 ATH 1259`).
-    Spiegel von `SwissRoster.strippingDutyCodes` (iOS)."""
-    up = text or ''
+
+    Spiegel von `SwissRoster.strippingDutyCodes` (iOS) mit ZWEI dokumentierten
+    Unterschieden (13.08.2026):
+      • Der Server uppercased selbst. Vorher war „bereits uppercased" eine
+        stille Annahme — bei gemischter Schreibweise (`Sby-Bcs`) tat die
+        Funktion nichts und der Aufrufer merkte es nie.
+      • Der Server hat den IATA-Wächter (`_swiss_word_is_real_routing`); iOS
+        strippt bislang bedingungslos. Beide Seiten liefern für alle belegten
+        SWISS-Codes dasselbe Ergebnis, der Server ist nur bei einem echten
+        `SBY-…`/`RES-…`-Leg vorsichtiger. Beim Nachziehen der iOS-Tabelle
+        diesen Wächter mitnehmen."""
+    up = (text or '').upper()
     if '-' not in up:
         return up
     out = []
@@ -53898,7 +53969,8 @@ def _strip_swiss_duty_codes(text):
         if '-' in word:
             tokens = [t for t in re.split(r'[^A-Z0-9]+',
                                           word.replace('A/P', 'AP')) if t]
-            if tokens and tokens[0] in _SWISS_DUTY_CODE_STEMS:
+            if (tokens and tokens[0] in _SWISS_DUTY_CODE_STEMS
+                    and not _swiss_word_is_real_routing(tokens)):
                 continue
         out.append(word)
     return ' '.join(out)

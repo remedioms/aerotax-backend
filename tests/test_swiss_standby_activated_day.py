@@ -165,6 +165,55 @@ def test_duty_code_guard_strips_only_the_duty_word():
         'SBY-BCS · LX1830 ZRH 0927 ATH 1259')
 
 
+def test_stripper_arbeitet_auch_auf_gemischter_schreibweise():
+    """Der Stripper uppercased selbst (13.08.). Vorher war „bereits
+    uppercased" eine stille Annahme — bei `Sby-Bcs` tat er NICHTS und der
+    Aufrufer merkte es nie (die Regex danach lief auf Grossbuchstaben)."""
+    assert backend._strip_swiss_duty_codes('Sby-Bcs') == ''
+    assert backend._strip_swiss_duty_codes('sby-bcs · LX1830 ZRH') == \
+        '· LX1830 ZRH'
+    # Für Grossbuchstaben-Eingaben unverändert (der ganze Bestandspfad).
+    assert backend._strip_swiss_duty_codes('MIA-BCS') == 'MIA-BCS'
+
+
+def test_echtes_leg_mit_dienst_stamm_als_iata_bleibt_stehen():
+    """IATA-WÄCHTER (13.08.): `SBY` (Salisbury) und `RES` (Resistencia) sind
+    ECHTE IATA-Codes. Ein Leg von dort darf der Dienst-Kürzel-Wächter nicht
+    verschlucken — sonst wäre es dieselbe Fehlerklasse, nur andersherum.
+    Entscheidend ist wieder der KONTEXT: beide Seiten bekannte Flughäfen UND
+    rechts KEINE bekannte Flotten-Kennung."""
+    assert backend._strip_swiss_duty_codes('SBY-JFK') == 'SBY-JFK'
+    assert backend._strip_swiss_duty_codes('RES-EZE') == 'RES-EZE'
+    assert backend._ev_is_flight_leg('SBY-JFK')
+    # Die belegten SWISS-Codes bleiben trotzdem Dienst (BCS/32S sind
+    # Flotten-Suffixe, kein Ziel) — Daniels/Jans Fälle unangetastet.
+    assert backend._strip_swiss_duty_codes('SBY-BCS') == ''
+    assert backend._strip_swiss_duty_codes('RES-32S') == ''
+    assert not backend._ev_is_flight_leg('SBY-BCS')
+    # Unbekanntes Suffix (kein Flughafen) ⇒ weiterhin Dienst-Kürzel.
+    assert backend._strip_swiss_duty_codes('SBY-77W') == ''
+
+
+def test_aktivierter_standby_zeigt_im_push_den_neuen_flug():
+    """PUSH-TEXT (Daniel 12.08.): der aktivierte Standby-Tag trägt Standby UND
+    Flug im gemergten Marker. Ohne den Wächter las `_rc_marker_short` auf
+    BEIDEN Seiten `SBY-BCS` als Route → gleiches Kurzlabel → der Push meldete
+    nur „Dienst geändert" und verschwieg genau den neu zugeteilten Flug."""
+    alt = {'marker': 'SBY-BCS'}
+    neu = {'marker': 'SBY-BCS · LX1830 ZRH 0927 ATH 1259'}
+    assert backend._rc_marker_short(alt) == 'SBY-BCS'
+    assert backend._rc_marker_short(neu).startswith('LX1830')
+    summary = backend._roster_change_summary(
+        {'kind': 'changed', 'old': alt, 'new': neu})
+    assert summary != 'Dienst geändert'
+    assert 'LX1830' in summary and 'SBY-BCS' in summary
+    # Klassische LH-Form bleibt unverändert (Regressions-Riegel).
+    assert backend._rc_marker_short({'marker': 'LH 752: FRA-HYD'}) == \
+        'LH 752: FRA-HYD'
+    assert backend._rc_marker_short(
+        {'marker': '08:15 LT Briefing · LAYOVER HYD'}) == 'LAYOVER HYD'
+
+
 def test_daniels_komplette_swiss_code_liste_wird_erkannt():
     """SWISS OPS Manual Kap. 7.2 (Daniel, 12.08.2026) — jeder Code der
     Tabelle ist ein Dienst-Code, kein Flug-Leg. BCS/32S sind Flotten-

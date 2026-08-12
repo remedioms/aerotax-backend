@@ -3468,7 +3468,16 @@ _NEWS_LIKE_RATE = (120, 3600)         # Toggles/Stunde — Doppel-Tap ist normal
 _NEWS_COMMENT_RATE = (20, 3600)       # wie forum_create_reply
 # Ein einziger Warn-Log, wenn die Migration auf einem Origin noch nicht durch
 # ist (Lehre fcm_token 01.08.: eine fehlende Spalte darf nicht still alles töten).
-_NEWS_COUNTS_RPC_OK = {'ok': True, 'warned': False}
+#
+# ZWEI SPERR-ARTEN, bewusst getrennt (13.08.): früher latchte JEDE Exception
+# den RPC für die Prozess-Lebensdauer aus — ein einziger Netz-Hickup schickte
+# den Zähler dauerhaft auf den SELECT-Pfad (der bei > 5000 Zeilen aufgibt).
+#   • 'ok'=False + retry_at=0   → Funktion existiert nicht (42883). Harte
+#     Sperre; sie endet erst mit dem Deploy, der die Migration mitbringt.
+#   • 'ok'=False + retry_at>now → transienter Fehler, heilt nach der Abkühlzeit
+#     von selbst.
+_NEWS_COUNTS_RPC_OK = {'ok': True, 'warned': False, 'retry_at': 0.0}
+_NEWS_COUNTS_RPC_COOLDOWN_S = 600
 
 
 def _app_attr(name, default=None):
@@ -3649,52 +3658,100 @@ def _news_counts(id_groups, viewer_token=None):
     all_ids = sorted({i for ids in id_groups.values() for i in ids if i})
     if not all_ids:
         return empty, True
-    per_id = None
-    if _NEWS_COUNTS_RPC_OK['ok']:
-        per_id = _news_counts_rpc(sb, all_ids, viewer_token)
-    if per_id is None:
-        per_id = _news_counts_select(sb, all_ids, viewer_token)
+    if _news_counts_rpc_enabled():
+        grouped = _news_counts_rpc(sb, id_groups, viewer_token)
+        if grouped is not None:
+            return grouped, True
+    per_id = _news_counts_select(sb, all_ids, viewer_token)
     if per_id is None:
         return empty, False
     out = {}
     for key, ids in id_groups.items():
         rows = [per_id.get(i) or {} for i in ids]
+        # EIN Like ist ein MENSCH, keine Zeile: wer zwei Artikel derselben
+        # Story geliked hat, zählt einmal (Story-Cluster-Dedupe wie in der
+        # RPC). Kommentare bleiben additiv.
+        tokens = set()
+        for r in rows:
+            tokens |= set(r.get('like_tokens') or ())
         out[key] = {
-            'like_count': sum(int(r.get('like_count') or 0) for r in rows),
+            'like_count': len(tokens),
             'comment_count': sum(int(r.get('comment_count') or 0) for r in rows),
             'liked_by_me': any(bool(r.get('liked_by_me')) for r in rows),
         }
     return out, True
 
 
-def _news_counts_rpc(sb, all_ids, viewer_token):
-    """Exaktes Aggregat in Postgres. None ⇒ Funktion (noch) nicht vorhanden."""
+def _news_counts_rpc_enabled():
+    """False ⇒ RPC ist gesperrt. Eine WEICHE Sperre (transienter Fehler) läuft
+    nach der Abkühlzeit von selbst wieder an — nur eine fehlende Funktion
+    sperrt bis zum nächsten Deploy."""
+    if _NEWS_COUNTS_RPC_OK['ok']:
+        return True
+    retry_at = _NEWS_COUNTS_RPC_OK.get('retry_at') or 0.0
+    if retry_at and time.time() >= retry_at:
+        _NEWS_COUNTS_RPC_OK.update({'ok': True, 'retry_at': 0.0})
+        return True
+    return False
+
+
+def _news_counts_rpc_missing(exc):
+    """True ⇒ die Funktion gibt es nicht (Migration fehlt). PostgREST meldet
+    das als 404/PGRST202, Postgres als 42883 „function … does not exist"."""
+    txt = f'{type(exc).__name__}: {exc}'.lower()
+    return any(m in txt for m in ('42883', 'pgrst202', 'does not exist',
+                                  'could not find the function',
+                                  'not find function', '404'))
+
+
+def _news_counts_rpc(sb, id_groups, viewer_token):
+    """Exaktes Aggregat je Story-Cluster in Postgres.
+    None ⇒ nicht ermittelt (Funktion fehlt oder transienter Fehler)."""
+    groups = {str(k): [i for i in (ids or []) if i]
+              for k, ids in (id_groups or {}).items()}
     try:
-        res = sb.rpc('ax_news_interaction_counts',
-                     {'p_article_ids': all_ids,
+        res = sb.rpc('ax_news_interaction_counts_grouped',
+                     {'p_groups': groups,
                       'p_viewer_token': viewer_token}).execute()
     except Exception as exc:
+        missing = _news_counts_rpc_missing(exc)
         _NEWS_COUNTS_RPC_OK['ok'] = False
-        if not _NEWS_COUNTS_RPC_OK['warned']:
+        _NEWS_COUNTS_RPC_OK['retry_at'] = (
+            0.0 if missing else time.time() + _NEWS_COUNTS_RPC_COOLDOWN_S)
+        if missing and not _NEWS_COUNTS_RPC_OK['warned']:
             _NEWS_COUNTS_RPC_OK['warned'] = True
-            _log_warn('[news-interactions] RPC ax_news_interaction_counts nicht '
-                      f'verfügbar ({type(exc).__name__}) — SELECT-Fallback aktiv, '
-                      'Migration 20260812_news_interactions.sql einspielen')
+            _log_warn('[news-interactions] RPC ax_news_interaction_counts_'
+                      f'grouped nicht verfügbar ({type(exc).__name__}) — '
+                      'SELECT-Fallback aktiv, Migration '
+                      '20260812_news_interactions.sql einspielen')
+        elif not missing:
+            _log_warn('[news-interactions] Zähl-RPC transient gescheitert '
+                      f'({type(exc).__name__}) — Fallback, Neuversuch in '
+                      f'{_NEWS_COUNTS_RPC_COOLDOWN_S}s')
         return None
     out = {}
     for row in (getattr(res, 'data', None) or []):
-        aid = row.get('article_id')
-        if aid:
-            out[aid] = row
+        key = row.get('group_key')
+        if key is None:
+            continue
+        out[key] = {'like_count': int(row.get('like_count') or 0),
+                    'comment_count': int(row.get('comment_count') or 0),
+                    'liked_by_me': bool(row.get('liked_by_me'))}
+    for key in id_groups:
+        out.setdefault(key, {'like_count': 0, 'comment_count': 0,
+                             'liked_by_me': False})
     return out
 
 
 def _news_counts_select(sb, all_ids, viewer_token):
     """Fallback ohne RPC. Bewusst mit hartem Limit: PostgREST liefert sonst
     still nur 1000 Zeilen und der Zähler wäre ZU KLEIN, ohne dass es jemand
-    merkt. Wird das Limit erreicht, gilt die Zählung als NICHT ermittelbar."""
+    merkt. Wird das Limit erreicht, gilt die Zählung als NICHT ermittelbar.
+
+    Likes werden als TOKEN-MENGE je Artikel zurückgegeben — erst der Aufrufer
+    kennt den Story-Cluster und kann über ihn deduplizieren."""
     cap = 5000
-    out = {i: {'article_id': i, 'like_count': 0, 'comment_count': 0,
+    out = {i: {'article_id': i, 'like_tokens': set(), 'comment_count': 0,
                'liked_by_me': False} for i in all_ids}
     try:
         likes = (sb.table('ax_news_likes').select('article_id,user_token')
@@ -3706,7 +3763,7 @@ def _news_counts_select(sb, all_ids, viewer_token):
             slot = out.get(row.get('article_id'))
             if slot is None:
                 continue
-            slot['like_count'] += 1
+            slot['like_tokens'].add(row.get('user_token') or '')
             if viewer_token and row.get('user_token') == viewer_token:
                 slot['liked_by_me'] = True
         comments = (sb.table('ax_news_comments').select('article_id')

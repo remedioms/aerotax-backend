@@ -60,8 +60,16 @@ class _Table:
         self.filters = {}
         self.ins = {}
         self._limit = None
+        self._cols = ''
+        self._update = None
 
     def select(self, _cols):
+        self._cols = _cols or ''
+        return self
+
+    def update(self, values):
+        """`_store_last_state` schreibt den zuletzt gesendeten Zustand zurück."""
+        self._update = dict(values or {})
         return self
 
     def eq(self, key, value):
@@ -77,9 +85,22 @@ class _Table:
         return self
 
     def execute(self):
-        rows = [dict(r) for r in getattr(self.sb, self.attr)
+        # Fehlende Migration 20260813: PostgREST antwortet auf eine unbekannte
+        # Spalte mit 42703 — der Read WIRFT, er liefert keine leere Liste.
+        if (getattr(self.sb, 'no_last_state_column', False)
+                and ('last_content_state' in (self._cols or '')
+                     or 'last_content_state' in (self._update or {}))):
+            raise RuntimeError(
+                'column live_activities.last_content_state does not exist '
+                '(42703)')
+        live = [r for r in getattr(self.sb, self.attr)
                 if all(r.get(k) == v for k, v in self.filters.items())
                 and all(r.get(k) in v for k, v in self.ins.items())]
+        if self._update is not None:
+            for r in live:
+                r.update(self._update)
+            return _Res([dict(r) for r in live])
+        rows = [dict(r) for r in live]
         if self._limit is not None:
             rows = rows[:self._limit]
         return _Res(rows)
@@ -104,6 +125,8 @@ class _FakeSB:
         self.rpc_calls = []
         self._seq = 0
         self.fail_rpc = set()
+        # True = DB ohne Migration 20260813_live_activity_last_state.sql.
+        self.no_last_state_column = False
 
     # ── Client-Oberfläche ────────────────────────────────────────────────
     def table(self, name):
@@ -152,6 +175,9 @@ class _FakeSB:
             if rotated:
                 row['failure_count'] = 0
                 row['content_digest'] = None
+                # Migration 20260813b: ein rotierter Token gehört zu einer
+                # anderen Karte — sein Zustand hat keine Vergangenheit.
+                row['last_content_state'] = None
             return row['id']
         self._seq += 1
         row_id = f'row-{self._seq}'
@@ -177,6 +203,9 @@ class _FakeSB:
                 row['active'] = False
                 row['ended_at'] = 'now'
                 row['end_reason'] = p.get('p_reason') or 'client'
+                # Migration 20260813b: die Karte ist weg, ihr Zustand darf die
+                # nächste (dieselbe Zeile!) nicht mehr befüllen.
+                row['last_content_state'] = None
                 n += 1
         return n
 
@@ -347,7 +376,7 @@ def test_register_start_and_update(client, sb, auth):
     r1 = _register(client, kind='start', la_token=LA_TOKEN_A, activity_id=None)
     assert r1.status_code == 200, r1.get_json()
     assert r1.get_json() == {'ok': True, 'kind': 'start', 'activity_id': None,
-                             'stored': True}
+                             'stored': True, 'content_state_stored': False}
 
     r2 = _register(client, kind='update', la_token=LA_TOKEN_B)
     assert r2.status_code == 200
@@ -2092,3 +2121,145 @@ def test_end_event_erhaelt_nichts(sb, auth, apns):
                                       kicker='GELANDET'), event='end')
     cs = apns['client'].sent[-1]['payload']['aps']['content-state']
     assert 'chain' not in cs
+
+
+def test_explizites_null_loescht_das_feld_endgueltig(sb, auth, apns):
+    """GRABSTEIN (F2b): ohne ihn wäre die Erhaltung eine Einbahnstrasse — ein
+    einmal gesendetes Feld liesse sich NIE wieder löschen, die Kette des
+    letzten Dienstes klebte auf dem Sperrbildschirm. `null` heisst „weg", und
+    zwar auch beim NÄCHSTEN Teil-Absender."""
+    _seed_row(sb)
+    basis = {'stateVersion': 2, 'generatedAt': '2026-08-12T00:30:00Z',
+             'mainTime': '2026-08-12T09:50:00+09:00', 'phase': 'briefing'}
+    kette = [{'label': 'Pickup', 'time': '2026-08-12T09:50:00+09:00',
+              'state': 'current'}]
+    LA.push_live_activity(TOKEN, dict(basis, kicker='PICKUP', chain=kette,
+                                      displayTZIdentifier='Asia/Seoul'))
+    # Absender leert die Kette BEWUSST (JSON-null), Zone sagt er nicht.
+    LA.push_live_activity(TOKEN, dict(basis, kicker='ABFLUG', chain=None))
+    cs = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert 'chain' not in cs, 'Grabstein missachtet — Kette wieder eingesetzt'
+    assert cs['displayTZIdentifier'] == 'Asia/Seoul', 'zu viel gelöscht'
+
+    # Und der Grabstein hält: der nächste Absender ohne chain bekommt sie
+    # nicht aus dem gespeicherten Zustand zurück.
+    LA.push_live_activity(TOKEN, dict(basis, kicker='BOARDING'))
+    assert 'chain' not in apns['client'].sent[-1]['payload']['aps'][
+        'content-state']
+
+
+def test_normalize_meldet_die_geleerten_keys():
+    """Wire-Kompatibilität: die alte 2-Tupel-Signatur bleibt, `cleared` gibt es
+    nur auf Anfrage."""
+    roh = _state(chain=None, fromCity=None, toCity='Frankfurt')
+    assert len(LA._normalize_content_state(roh)) == 2
+    state, problems, cleared = LA._normalize_content_state(roh,
+                                                           with_cleared=True)
+    assert cleared == {'chain', 'fromCity'}
+    assert 'chain' not in state and state['toCity'] == 'Frankfurt'
+    assert not LA._fatal_problems(problems)
+
+
+# ── Registrierung lädt den App-Zustand hoch (F2a, 13.08.2026) ───────────────
+
+def test_register_nimmt_content_state_als_erhaltungs_grundlage(client, sb,
+                                                               auth, apns):
+    """OHNE diesen Weg war die Feld-Erhaltung in Produktion wirkungslos: der
+    Server kann nur erhalten, was er selbst schon einmal GESENDET hat — die
+    Karte baut aber die App. Der erste Teil-Absender (MQTT-Fanout) löschte
+    deshalb weiterhin die Dienst-Kette."""
+    kette = [{'label': 'Pickup', 'time': '2026-08-12T09:50:00+09:00',
+              'state': 'current'}]
+    body = {'token': TOKEN, 'la_token': LA_TOKEN_A, 'kind': 'update',
+            'bundle_id': BUNDLE, 'apns_env': 'prod', 'platform': 'ios',
+            'activity_id': ACT_ID,
+            'content_state': _state(chain=kette,
+                                    displayTZIdentifier='Asia/Seoul')}
+    r = client.post('/api/push/register-live-activity', json=body,
+                    headers=_auth_hdr())
+    assert r.status_code == 200 and r.get_json()['content_state_stored'] is True
+    # Gespeichert wird der NORMALISIERTE Zustand (Datum = Apple-Sekunden) —
+    # exakt das, was auch ein eigener Push gesendet hätte.
+    gespeichert = sb.row(kind='update')['last_content_state']
+    assert [s['label'] for s in gespeichert['chain']] == ['Pickup']
+    assert gespeichert['chain'][0]['time'] == LA._to_apple_date(
+        '2026-08-12T09:50:00+09:00')
+
+    # Der Fanout schickt sein handgebautes Teil-Dict — die Kette überlebt.
+    res = LA.push_live_activity(TOKEN, _state(kicker='ABFLUG'))
+    assert res['sent'] == 1
+    cs = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert [s['label'] for s in cs['chain']] == ['Pickup']
+    assert cs['displayTZIdentifier'] == 'Asia/Seoul'
+
+
+def test_register_mit_kaputtem_content_state_registriert_trotzdem(client, sb,
+                                                                  auth):
+    """Der TOKEN ist das Wichtige. Ein Typ-Fehler im mitgelieferten Zustand
+    kostet nur die Erhaltung, nie die Registrierung (sonst wäre die Karte gar
+    nicht mehr erreichbar)."""
+    body = {'token': TOKEN, 'la_token': LA_TOKEN_A, 'kind': 'update',
+            'apns_env': 'prod', 'activity_id': ACT_ID,
+            'content_state': _state(progress='schnell')}
+    r = client.post('/api/push/register-live-activity', json=body,
+                    headers=_auth_hdr())
+    assert r.status_code == 200
+    assert r.get_json() == {'ok': True, 'kind': 'update',
+                            'activity_id': ACT_ID, 'stored': True,
+                            'content_state_stored': False}
+    assert not sb.row(kind='update').get('last_content_state')
+
+
+def test_end_wirft_den_zustand_weg(client, sb, auth, apns):
+    """Registry-ZEILEN werden über Activities hinweg wiederverwendet. Ohne
+    Reset erbte die NÄCHSTE Karte die Kette der alten (Ketten-Geist) — hier
+    in beiden Speichern: DB-Spalte (Migration 20260813b) und In-Process."""
+    _seed_row(sb)
+    kette = [{'label': 'Pickup', 'time': '2026-08-12T09:50:00+09:00',
+              'state': 'current'}]
+    LA.push_live_activity(TOKEN, _state(chain=kette))
+    assert sb.row(kind='update')['last_content_state']
+    r = client.post('/api/live-activity/end',
+                    json={'token': TOKEN, 'activity_id': ACT_ID},
+                    headers=_auth_hdr())
+    assert r.status_code == 200 and r.get_json()['ended'] == 1
+    assert sb.row(kind='update')['last_content_state'] is None
+    assert not [s for s in LA._LAST_SENT.values() if s.get('state')]
+
+
+# ── Fehlende Migration 20260813 darf keine Pushes verschlucken (F1) ─────────
+
+def test_fehlende_spalte_stoppt_die_pushes_nicht(sb, auth, apns, caplog):
+    """DEPLOY-GEFAHR (Klasse fcm_token 01.08.): läuft der Code gegen eine DB
+    ohne `last_content_state`, wirft der Registry-Read 42703. Vorher lieferte
+    er dann [] — JEDER Push wäre still übersprungen worden, obwohl Tokens da
+    sind. Jetzt: EIN Retry mit dem alten Spaltensatz, lauter Warn-Log, Feature
+    läuft (nur die Erhaltung kommt bis zur Migration aus dem Prozess)."""
+    _seed_row(sb)
+    sb.no_last_state_column = True
+    LA._ROW_SELECT_FALLBACK['until'] = 0.0
+    with caplog.at_level('WARNING'):
+        res = LA.push_live_activity(TOKEN, _state())
+    assert res['sent'] == 1, res
+    assert len(apns['client'].sent) == 1
+    assert any('20260813_live_activity_last_state' in r.message % r.args
+               for r in caplog.records if r.levelname == 'WARNING')
+    # Zweiter Push geht ohne den Fehlversuch direkt auf den Alt-Satz.
+    assert LA._ROW_SELECT_FALLBACK['until'] > 0
+    assert LA.push_live_activity(TOKEN, _state(kicker='ABFLUG'))['sent'] == 1
+
+
+def test_echter_store_ausfall_bleibt_ein_ausfall(sb, auth, apns, monkeypatch):
+    """Gegenprobe: der Retry darf einen echten Ausfall nicht in ein „alles gut"
+    umdeuten — ohne Zeilen wird nichts gesendet."""
+    _seed_row(sb)
+    LA._ROW_SELECT_FALLBACK['until'] = 0.0
+
+    def boom(_name):
+        raise RuntimeError('connection refused')
+
+    monkeypatch.setattr(sb, 'table', boom)
+    res = LA.push_live_activity(TOKEN, _state())
+    assert res == {'ok': True, 'sent': 0, 'skipped': 'no_target',
+                   'event': 'update'}
+    assert apns['client'].sent == []

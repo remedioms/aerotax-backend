@@ -124,7 +124,8 @@ class _SB:
     def __init__(self):
         self.tables = {'ax_news_likes': [], 'ax_news_comments': []}
         self.rpc_calls = []
-        self.rpc_broken = False
+        self.rpc_broken = False      # Funktion existiert nicht (Migration fehlt)
+        self.rpc_flaky = False       # transienter Fehler (Netz/Timeout)
 
     def table(self, name):
         assert name in self.tables, name
@@ -137,19 +138,24 @@ class _SB:
         class _RPC:
             def execute(self_inner):
                 if sb.rpc_broken:
-                    raise RuntimeError(
-                        'function ax_news_interaction_counts does not exist')
-                assert name == 'ax_news_interaction_counts'
+                    raise RuntimeError('function ax_news_interaction_counts_'
+                                       'grouped does not exist')
+                if sb.rpc_flaky:
+                    raise RuntimeError('server closed the connection')
+                assert name == 'ax_news_interaction_counts_grouped'
                 viewer = params.get('p_viewer_token')
                 out = []
-                for aid in params.get('p_article_ids') or []:
+                for key, ids in (params.get('p_groups') or {}).items():
                     likes = [r for r in sb.tables['ax_news_likes']
-                             if r.get('article_id') == aid]
+                             if r.get('article_id') in ids]
                     comments = [r for r in sb.tables['ax_news_comments']
-                                if r.get('article_id') == aid]
+                                if r.get('article_id') in ids]
                     out.append({
-                        'article_id': aid,
-                        'like_count': len(likes),
+                        'group_key': key,
+                        # count(distinct user_token) über den ganzen Cluster —
+                        # ein Like ist ein MENSCH, keine Zeile.
+                        'like_count': len({r.get('user_token')
+                                           for r in likes}),
                         'comment_count': len(comments),
                         'liked_by_me': any(r.get('user_token') == viewer
                                            for r in likes),
@@ -160,9 +166,11 @@ class _SB:
 
 @pytest.fixture(autouse=True)
 def _reset_rpc_flag():
-    nb._NEWS_COUNTS_RPC_OK.update({'ok': True, 'warned': False})
+    nb._NEWS_COUNTS_RPC_OK.update({'ok': True, 'warned': False,
+                                   'retry_at': 0.0})
     yield
-    nb._NEWS_COUNTS_RPC_OK.update({'ok': True, 'warned': False})
+    nb._NEWS_COUNTS_RPC_OK.update({'ok': True, 'warned': False,
+                                   'retry_at': 0.0})
 
 
 @pytest.fixture(autouse=True)
@@ -562,6 +570,57 @@ def test_select_fallback_wenn_rpc_fehlt(monkeypatch, sb):
     assert counts[ART_A]['like_count'] == 1
     assert counts[ART_A]['liked_by_me'] is True
     assert nb._NEWS_COUNTS_RPC_OK['ok'] is False
+    # Fehlende Funktion = HARTE Sperre (kein Neuversuch bis zum Deploy).
+    assert nb._NEWS_COUNTS_RPC_OK['retry_at'] == 0.0
+
+
+def test_transienter_rpc_fehler_sperrt_nicht_fuer_immer(monkeypatch, sb):
+    """Ein Netz-Hickup darf den exakten Zähler nicht für die Prozess-Laufzeit
+    abschalten (der SELECT-Fallback gibt bei > 5000 Zeilen auf). Nur die
+    FEHLENDE Funktion sperrt hart; alles andere heilt nach der Abkühlzeit."""
+    sb.rpc_flaky = True
+    sb.tables['ax_news_likes'].append(
+        {'article_id': ART_A, 'user_token': TOKEN_A, 'created_at': 'a'})
+    monkeypatch.setattr(nb, '_news_sb', lambda: (sb, True))
+    counts, ok = nb._news_counts({ART_A: [ART_A]}, viewer_token=TOKEN_A)
+    assert ok is True and counts[ART_A]['like_count'] == 1   # Fallback trägt
+    assert nb._NEWS_COUNTS_RPC_OK['ok'] is False
+    assert nb._NEWS_COUNTS_RPC_OK['retry_at'] > 0.0
+    # Solange die Abkühlzeit läuft: kein weiterer RPC-Versuch.
+    vorher = len(sb.rpc_calls)
+    nb._news_counts({ART_A: [ART_A]}, viewer_token=TOKEN_A)
+    assert len(sb.rpc_calls) == vorher
+    # Danach wieder — und der RPC ist inzwischen gesund.
+    sb.rpc_flaky = False
+    nb._NEWS_COUNTS_RPC_OK['retry_at'] = 1.0
+    counts2, ok2 = nb._news_counts({ART_A: [ART_A]}, viewer_token=TOKEN_A)
+    assert ok2 is True and len(sb.rpc_calls) > vorher
+    assert nb._NEWS_COUNTS_RPC_OK['ok'] is True
+
+
+def test_ein_mensch_ist_ein_like_auch_ueber_zwei_cluster_ids(monkeypatch, sb):
+    """DOPPELZÄHLUNG (Fix 13.08.): derselbe User hat zwei Artikel derselben
+    Story geliked (völlig legal — der Like-PK ist (article_id, user_token)).
+    Die Karte muss trotzdem EINEN Like zeigen, nicht zwei — auf BEIDEN Wegen
+    (Cluster-RPC und SELECT-Fallback)."""
+    for aid in (ART_A, ART_B):
+        sb.tables['ax_news_likes'].append(
+            {'article_id': aid, 'user_token': TOKEN_A, 'created_at': 'a'})
+    sb.tables['ax_news_likes'].append(
+        {'article_id': ART_B, 'user_token': TOKEN_B, 'created_at': 'b'})
+    monkeypatch.setattr(nb, '_news_sb', lambda: (sb, True))
+
+    counts, ok = nb._news_counts({ART_B: [ART_B, ART_A]}, viewer_token=TOKEN_A)
+    assert ok is True
+    assert counts[ART_B]['like_count'] == 2      # A (2 Zeilen) + B = 2 Menschen
+    assert counts[ART_B]['liked_by_me'] is True
+
+    sb.rpc_broken = True
+    nb._NEWS_COUNTS_RPC_OK.update({'ok': True, 'warned': False,
+                                   'retry_at': 0.0})
+    counts2, ok2 = nb._news_counts({ART_B: [ART_B, ART_A]},
+                                   viewer_token=TOKEN_A)
+    assert ok2 is True and counts2[ART_B]['like_count'] == 2
 
 
 def test_news_comment_ist_ein_gueltiger_meldegrund():

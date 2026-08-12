@@ -452,8 +452,9 @@ def _normalize_chain(raw, problems):
     return out
 
 
-def _normalize_content_state(d):
-    """Roh-Dict → APNs-taugliches `content-state`. Returns (state, problems).
+def _normalize_content_state(d, with_cleared=False):
+    """Roh-Dict → APNs-taugliches `content-state`. Returns (state, problems)
+    bzw. (state, problems, cleared) mit `with_cleared=True`.
 
     Regeln (alle drei sind Bugfixes, keine Kosmetik):
       • `None` wird GEDROPPT, nie als JSON-`null` gesendet. Ein `null` auf einem
@@ -466,10 +467,20 @@ def _normalize_content_state(d):
       • Date-Felder werden in Apple-Referenzdatum-Sekunden umgerechnet (siehe
         Modul-Docstring).
     Fatal (⇒ Caller antwortet 400) sind nur `missing:` und `bad_type:`.
+
+    GRABSTEIN (`cleared`, 2026-08-13): ein explizites JSON-`null` wird zwar
+    weiterhin GEDROPPT (s.o. — Swift verträgt kein `null`), sein Key landet
+    aber in `cleared`. Nur so kann die Feld-Erhaltung unten zwischen „kennt
+    das Feld nicht" (⇒ alten Wert behalten) und „hat es BEWUSST geleert"
+    (⇒ nicht wieder einsetzen) unterscheiden; ohne den Grabstein klebte eine
+    einmal gesendete Dienst-Kette für immer auf dem Sperrbildschirm.
+    Der `with_cleared`-Schalter hält die bestehende 2-Tupel-Signatur intakt.
     """
     problems = []
+    cleared = set()
     if not isinstance(d, dict):
-        return None, ['bad_type:content_state']
+        return ((None, ['bad_type:content_state'], cleared) if with_cleared
+                else (None, ['bad_type:content_state']))
     state = {}
     for key, value in d.items():
         kind = _CONTENT_FIELDS.get(key)
@@ -477,6 +488,7 @@ def _normalize_content_state(d):
             problems.append(f'unknown_key:{key}')
             continue
         if value is None:
+            cleared.add(key)
             continue
         if kind == 'chain':
             chain = _normalize_chain(value, problems)
@@ -496,7 +508,7 @@ def _normalize_content_state(d):
     if refused:
         log.warning('[live-activity] content-state refused unknown keys: %s',
                     ','.join(sorted(refused)))
-    return state, problems
+    return (state, problems, cleared) if with_cleared else (state, problems)
 
 
 def _normalize_attributes(d):
@@ -544,9 +556,26 @@ def _content_digest(state):
 
 # ── Registry ────────────────────────────────────────────────────────────────
 
-_ROW_SELECT = ('id,user_token,kind,activity_id,la_token,bundle_id,environment,'
-               'active,content_digest,last_timestamp,failure_count,'
-               'last_content_state')
+# Der ALTE Spaltensatz (vor Migration 20260813_live_activity_last_state.sql).
+_ROW_SELECT_LEGACY = ('id,user_token,kind,activity_id,la_token,bundle_id,'
+                      'environment,active,content_digest,last_timestamp,'
+                      'failure_count')
+_ROW_SELECT = _ROW_SELECT_LEGACY + ',last_content_state'
+# DEPLOY-SCHUTZ (Lehre fcm_token 01.08.): fehlt die Spalte, antwortet PostgREST
+# mit 42703 und der Read lieferte [] — JEDER Push wäre still übersprungen
+# gewesen, obwohl Tokens da sind. Ein fehlendes Feld darf ein Feature bremsen,
+# nie abschalten. `until` = weiche Sperre; sie heilt von selbst, sobald die
+# Migration durch ist (kein Neustart nötig).
+_ROW_SELECT_FALLBACK = {'until': 0.0}
+_ROW_SELECT_FALLBACK_S = 10 * 60
+
+
+def _rows_query(client, select, user_token, kind, activity_id=None):
+    q = (client.table('live_activities').select(select)
+         .eq('user_token', user_token).eq('kind', kind).eq('active', True))
+    if activity_id:
+        q = q.eq('activity_id', activity_id)
+    return q
 
 
 def _active_rows(user_token, kind, activity_id=None):
@@ -554,18 +583,32 @@ def _active_rows(user_token, kind, activity_id=None):
     client = _sb()
     if client is None or not user_token:
         return []
+    legacy_first = time.time() < (_ROW_SELECT_FALLBACK.get('until') or 0.0)
     try:
-        q = (client.table('live_activities').select(_ROW_SELECT)
-             .eq('user_token', user_token).eq('kind', kind)
-             .eq('active', True))
-        if activity_id:
-            q = q.eq('activity_id', activity_id)
-        rows = (q.execute().data or [])
+        rows = (_rows_query(client,
+                            _ROW_SELECT_LEGACY if legacy_first else _ROW_SELECT,
+                            user_token, kind, activity_id).execute().data or [])
         return [r for r in rows if (r or {}).get('la_token')]
     except Exception as exc:
+        if legacy_first:
+            log.warning('[live-activity] rows read failed user_ref=%s kind=%s: '
+                        '%s', _token_ref(user_token), kind, type(exc).__name__)
+            return []
+    # EIN Retry ohne die neue Spalte — schlägt der auch fehl, ist es ein echter
+    # Store-Ausfall und nicht die fehlende Migration.
+    try:
+        rows = (_rows_query(client, _ROW_SELECT_LEGACY, user_token, kind,
+                            activity_id).execute().data or [])
+    except Exception as exc2:
         log.warning('[live-activity] rows read failed user_ref=%s kind=%s: %s',
-                    _token_ref(user_token), kind, type(exc).__name__)
+                    _token_ref(user_token), kind, type(exc2).__name__)
         return []
+    _ROW_SELECT_FALLBACK['until'] = time.time() + _ROW_SELECT_FALLBACK_S
+    log.warning('[live-activity] SPALTE last_content_state FEHLT — Migration '
+                'supabase_migrations/20260813_live_activity_last_state.sql '
+                'einspielen! Pushes laufen weiter, die Feld-Erhaltung ist bis '
+                'dahin nur In-Process.')
+    return [r for r in rows if (r or {}).get('la_token')]
 
 
 def _rpc(name, params):
@@ -591,6 +634,10 @@ def _mark_result(row, ok, digest=None, timestamp=None, dead=False,
             _LAST_SENT.clear()
         slot = _LAST_SENT.setdefault(row_id, {})
         slot['activity_id'] = (row or {}).get('activity_id')
+        # Besitzer merken: beim /end müssen auch die Slots dieses Users fallen,
+        # die (noch) keine activity_id tragen — sonst erbt die NÄCHSTE Activity
+        # derselben Zeile den Zustand der alten (Ketten-Geist).
+        slot['user_token'] = (row or {}).get('user_token')
         if timestamp is not None:
             slot['ts'] = max(int(timestamp), int(slot.get('ts') or 0))
         if ok and digest:
@@ -664,6 +711,37 @@ def _store_last_state(sent_row_ids, state):
     except Exception as exc:
         log.warning('[live-activity] last_state write failed: %s',
                     type(exc).__name__)
+
+
+def _store_registered_state(row_id, raw_state, user_token=None):
+    """Vom CLIENT hochgeladenen ContentState als Erhaltungs-Grundlage ablegen.
+    True ⇒ gespeichert. Wirft nie — die Registrierung darf daran nie scheitern.
+
+    Bewusst TOLERANT gegenüber `missing:`: dieser Zustand wird NIE gesendet, er
+    ist nur der Steinbruch für `_MERGE_PRESERVED_FIELDS`. Ein Typ-Fehler
+    (`bad_type:`) ist dagegen Contract-Drift und wird abgelehnt statt still
+    übernommen."""
+    if not isinstance(raw_state, dict) or not raw_state:
+        return False
+    rid = row_id
+    if isinstance(rid, list):
+        rid = (rid or [None])[0]
+    if isinstance(rid, dict):
+        rid = rid.get('id')
+    if not rid:
+        return False
+    try:
+        state, problems = _normalize_content_state(raw_state)
+    except Exception:                                   # pragma: no cover
+        return False
+    bad = [p for p in (problems or []) if p.startswith('bad_type:')]
+    if bad or not state:
+        log.warning('[live-activity] register content_state verworfen '
+                    'user_ref=%s problems=%s', _token_ref(user_token),
+                    ','.join(bad[:4]) or 'empty')
+        return False
+    _store_last_state([rid], state)
+    return True
 
 
 def _next_timestamp(row):
@@ -929,7 +1007,8 @@ def push_live_activity(user_token, content_state, event='update',
     Returns dict {'ok', 'sent', 'unchanged', 'failed', 'dead', 'event', ...}.
     Wirft nie.
     """
-    state, problems = _normalize_content_state(content_state)
+    state, problems, cleared = _normalize_content_state(content_state,
+                                                        with_cleared=True)
     fatal = _fatal_problems(problems)
     if fatal:
         return {'ok': False, 'error': 'invalid_content_state',
@@ -946,10 +1025,15 @@ def push_live_activity(user_token, content_state, event='update',
     # NICHT setzt, bleiben stehen. Bewusst NUR phasen-UNABHÄNGIGE Felder —
     # eine alte Beschriftung (mainLabel/…) zur neuen Phase wäre eine Lüge,
     # dafür hat der Client Fallbacks.
+    # GRABSTEIN: ein Absender, der einen Key explizit auf `null` setzt, LÖSCHT
+    # ihn bewusst (Kette zu Ende, Roster-Notiz weg). Ohne diese Ausnahme wäre
+    # die Erhaltung eine Einbahnstrasse — einmal gesetzt, nie wieder löschbar.
     if event != 'end':
         preserved = _stored_state(rows)
         if preserved:
             for key in _MERGE_PRESERVED_FIELDS:
+                if key in cleared:
+                    continue
                 if key not in state and preserved.get(key) is not None:
                     state[key] = preserved[key]
     used_event = event if event in ('update', 'end') else 'update'
@@ -1009,12 +1093,20 @@ def push_live_activity(user_token, content_state, event='update',
 @live_activity_bp.route('/api/push/register-live-activity', methods=['POST'])
 def register_live_activity():
     """Body: {token, la_token, kind, bundle_id, apns_env, platform,
-    activity_id?, device_id?} + `Authorization: Bearer <token>`.
+    activity_id?, device_id?, content_state?} + `Authorization: Bearer <token>`.
 
     Shape 1:1 aus iOS `PushService.uploadLiveActivityToken`. Der Client setzt
     seinen lastSent-Marker NUR bei 2xx — ein 503 hier heißt also „nächster
     Launch versucht es erneut", genau richtig bei SB-Ausfall. Deshalb wird hier
     NIE ein Erfolg vorgetäuscht.
+
+    `content_state` (optional, seit 2026-08-13) ist der Zustand, den die APP
+    beim Start der Activity SELBST gebaut hat. Ohne ihn war die Feld-Erhaltung
+    in `push_live_activity` in Produktion wirkungslos: erhalten werden kann nur,
+    was der Server vorher schon einmal GESENDET hat — die Dienst-Kette der
+    App-Seite hat er nie gesehen, und genau sie löschte der erste Teil-Absender
+    (Vorfall Nr. 4). Ungültige Felder kosten NUR die Erhaltung, nie die
+    Registrierung: der Token ist das Wichtige.
     """
     body = request.get_json(silent=True) or {}
     user_token = (body.get('token') or '').strip()
@@ -1048,12 +1140,14 @@ def register_live_activity():
     if not ok:
         return jsonify({'ok': False,
                         'error': 'live_activity_store_unavailable'}), 503
+    state_stored = _store_registered_state(row_id, body.get('content_state'),
+                                           user_token)
     log.info('[live-activity] registered user_ref=%s kind=%s env=%s '
-             'token_ref=%s activity=%s', _token_ref(user_token), kind,
+             'token_ref=%s activity=%s state=%s', _token_ref(user_token), kind,
              _normalized_env(body.get('apns_env')), _token_ref(la_token),
-             (activity_id or '-')[:24])
+             (activity_id or '-')[:24], state_stored)
     return jsonify({'ok': True, 'kind': kind, 'activity_id': activity_id,
-                    'stored': True})
+                    'stored': True, 'content_state_stored': state_stored})
 
 
 @live_activity_bp.route('/api/live-activity/optout', methods=['POST'])
@@ -1118,6 +1212,14 @@ def end_live_activity():
     with _state_lock:
         for key, slot in list(_LAST_SENT.items()):
             if slot.get('activity_id') == activity_id:
+                _LAST_SENT.pop(key, None)
+                continue
+            # Registry-Zeilen werden über Activities hinweg WIEDERVERWENDET.
+            # Ein Slot dieses Users ohne (bekannte) activity_id kann zu der
+            # gerade beendeten Karte gehören — sein Zustand darf die nächste
+            # nicht mehr befüllen (DB-Seite: 20260813b-Migration).
+            if (user_token and slot.get('user_token') == user_token
+                    and not slot.get('activity_id')):
                 _LAST_SENT.pop(key, None)
     log.info('[live-activity] ended user_ref=%s activity=%s rows=%d',
              _token_ref(user_token), activity_id[:24], ended)

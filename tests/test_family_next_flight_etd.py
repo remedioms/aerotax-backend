@@ -78,8 +78,8 @@ def test_resolver_abflug_schlaegt_tagesstart(monkeypatch):
     calls = {}
 
     def fake_resolver(fno, date=None, dep_iata=None, arr_iata=None,
-                      free_only=False):
-        calls['args'] = (fno, date, dep_iata, arr_iata, free_only)
+                      free_only=False, live=True):
+        calls['args'] = (fno, date, dep_iata, arr_iata, free_only, live)
         return {'sched_dep': '2026-08-12T03:35:00+00:00'}
 
     monkeypatch.setattr(A, '_flight_obs_merged', fake_resolver, raising=False)
@@ -87,8 +87,29 @@ def test_resolver_abflug_schlaegt_tagesstart(monkeypatch):
                                       'ICN', 'FRA', TAGESSTART)
     assert out == '2026-08-12T03:35:00Z'
     # Flugnummer normalisiert, Leg-Paar exakt, IMMER free-only (Family-Fan-out
-    # darf keinen bezahlten Spend auslösen).
-    assert calls['args'] == ('LH713', '2026-08-12', 'ICN', 'FRA', True)
+    # darf keinen bezahlten Spend auslösen) UND cached-only (`live=False`):
+    # der Family-Status ist ein Hot Path, er darf auf kein Live-Board warten.
+    assert calls['args'] == ('LH713', '2026-08-12', 'ICN', 'FRA', True, False)
+
+
+def test_hot_path_wartet_nie_auf_ein_live_board(monkeypatch):
+    """Gegenprobe zum Default: NUR mit `cached_only=False` darf der Resolver
+    live scannen. Ohne diesen Riegel hing der Family-Status an fremden
+    HTTP-Timeouts (ein Board-Scan pro Freund/Tag)."""
+    seen = {}
+
+    def fake_resolver(fno, date=None, dep_iata=None, arr_iata=None,
+                      free_only=False, live=True):
+        seen['live'] = live
+        return None
+
+    monkeypatch.setattr(A, '_flight_obs_merged', fake_resolver, raising=False)
+    FW._next_flight_etd_refined(TIBOR_SUMMARY, '2026-08-12', 'ICN', 'FRA',
+                                TAGESSTART)
+    assert seen['live'] is False
+    FW._next_flight_etd_refined(TIBOR_SUMMARY, '2026-08-12', 'ICN', 'FRA',
+                                TAGESSTART, cached_only=False)
+    assert seen['live'] is True
 
 
 def test_est_schlaegt_sched(monkeypatch):

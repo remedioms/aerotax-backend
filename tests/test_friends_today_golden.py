@@ -192,10 +192,13 @@ def _pin_app_module():
 
 
 def _call_endpoint(token='AT-GOLDEN-VIEWER-000', raw_response=False,
-                   snapshot_reader=None):
+                   snapshot_reader=None, facts_fn=None):
     """Der ECHTE Endpoint mit komplett injizierten Daten + Frozen-Clock."""
     snapshot_reader = snapshot_reader or (lambda fr: SNAPSHOTS.get(fr))
-    with patch.object(_dt_mod, 'datetime', _FrozenDatetime), \
+    facts_fn = facts_fn or (lambda *a, **k: {})
+    with patch('blueprints.aerox_data_blueprint._flight_facts_from_obs',
+               side_effect=facts_fn), \
+         patch.object(_dt_mod, 'datetime', _FrozenDatetime), \
          patch.object(A, 'datetime', _FrozenDatetime), \
          patch.dict(os.environ, {'FLIGHTSTATE_SHADOW': '',
                                  'FLIGHTSTATE_LIVE_FRIENDS': ''}), \
@@ -276,6 +279,34 @@ def test_worker_failure_marks_partial_and_is_never_memoized():
         'Pia Sommer', 'Ole Nord', 'Mia Berg'
     }
     assert A._FRIENDS_TODAY_MEMO == {}
+
+
+def test_veraltete_vortags_fakten_veraendern_die_antwort_nicht():
+    """WRONG-DAY-HINTERTÜR (Fix 13.08.): `_flight_obs_merged` wird eine Zeile
+    weiter oben durch `_flights_live_obs_wrong_day` gegen Fremd-Tag-Treffer
+    abgesichert — die Fakten-Quelle `_flight_facts_from_obs` daneben aber
+    NICHT. Ihr Overnight-Fallback markiert sich ehrlich als `stale`; ungeprüft
+    übernommen hätte eine GESTRIGE Landung Kai für alle Freunde als „gelandet"
+    gezeigt, obwohl er fliegt. Stale ⇒ verwerfen: die Antwort bleibt exakt das
+    Golden."""
+    stale_facts = {
+        'stale': True, 'obs_date': '2026-07-08',
+        # Gestern gelandet — genau die Zeile, die den Zustand kippen würde.
+        'actual_arr': '2026-07-08T16:12:00Z', 'arr_status': 'landed',
+        'est_dep': '2026-07-08T08:30:00Z', 'est_arr': '2026-07-08T16:10:00Z',
+    }
+    got = _call_endpoint(facts_fn=lambda *a, **k: dict(stale_facts))
+    assert got == _golden(), (
+        'veraltete Vortags-Fakten sind in die Antwort gesickert:\n'
+        + json.dumps(got, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+def test_frische_fakten_werden_weiterhin_genutzt():
+    """Gegenprobe zum stale-Riegel: OHNE die Markierung dürfen dieselben
+    Fakten wirken — sonst hätte der Fix die Quelle einfach abgeklemmt."""
+    frisch = {'actual_arr': '2026-07-09T16:12:00Z', 'arr_status': 'landed'}
+    got = _call_endpoint(facts_fn=lambda *a, **k: dict(frisch))
+    assert got != _golden()
 
 
 def test_golden_fixture_semantics_pinned():

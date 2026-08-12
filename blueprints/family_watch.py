@@ -481,7 +481,7 @@ def _status_has_signal(status):
 
 
 def _next_flight_etd_refined(summ, datum, dep, arr, fallback_iso,
-                             raw_event=None):
+                             raw_event=None, cached_only=True):
     """ETD des ERSTEN Legs statt Tagesbeginn (Owner 11.08.: „family sagt tibor
     fliegt um 12 aber er fliegt um 04"). `ical_start` ist der DIENST-Beginn —
     bei Tibors ICN-Rückflug der Pickup 09:50 LT, fast 3 h vor dem Abflug
@@ -492,7 +492,14 @@ def _next_flight_etd_refined(summ, datum, dep, arr, fallback_iso,
          die Leg-Abflugzeit als Instant; immer verfügbar, exakt.
       2. Zentraler Dual-Side-Resolver (free-only, memoisiert — derselbe wie
          today_*), Est vor Plan. Greift z.B. wenn Sektoren fehlen.
-      3. Bisheriger Tagesstart — keine erfundenen Zeiten."""
+      3. Bisheriger Tagesstart — keine erfundenen Zeiten.
+
+    `cached_only=True` (Default, 13.08.2026) ⇒ Schritt 2 liest NUR das
+    Warehouse/den In-Memory-Store (`live=False`), nie ein Live-Board. Grund:
+    diese Funktion hängt im HOT PATH des Family-Status — ein Board-Scan pro
+    Freund/Tag hätte den Endpoint an fremden HTTP-Timeouts festgehalten
+    (dieselbe Regel wie `lh_cached_only` im Freunde-Fan-out). Ein Miss kostet
+    nur die Verfeinerung: es bleibt beim Tagesstart, nichts wird erfunden."""
     try:
         sectors = (raw_event or {}).get('ical_sectors') \
             if isinstance(raw_event, dict) else None
@@ -513,7 +520,7 @@ def _next_flight_etd_refined(summ, datum, dep, arr, fallback_iso,
             if m:
                 fno = m.group(1).replace(' ', '').upper()
                 obs = resolver(fno, date=datum, dep_iata=dep, arr_iata=arr,
-                               free_only=True)
+                               free_only=True, live=not cached_only)
                 st = (obs or {}).get('esti_dep') or (obs or {}).get('sched_dep')
                 if st:
                     return _iso_utc_z(st)
