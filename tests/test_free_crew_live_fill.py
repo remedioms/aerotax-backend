@@ -60,6 +60,7 @@ def test_targeted_free_corridor_refreshes_and_warms_store(monkeypatch):
         'speed': 472, 'route_from': 'FRA', 'route_to': 'BOS',
         'reg': 'D-ABYH', 'callsign': 'DLH7K', 'obs_ts': 1784061240,
         'eta': 1784071800, 'flight_stage': 'AIRBORNE',
+        'flight_id': 987654321,
     }
     monkeypatch.setattr(DATA, '_sb', lambda: sb)
     monkeypatch.setattr(DATA, '_iata_latlon', _airports)
@@ -73,6 +74,7 @@ def test_targeted_free_corridor_refreshes_and_warms_store(monkeypatch):
     assert pos['_fr24_card']['route_from'] == 'FRA'
     assert pos['_fr24_card']['route_to'] == 'BOS'
     assert pos['_fr24_card']['eta'] == 1784071800
+    assert pos['flightid'] == 987654321
     assert pos['seen_ts'] and route == ('FRA', 'BOS')
     assert reg == 'D-ABYH' and typ == 'B748'
     assert len(calls) == 1
@@ -93,6 +95,7 @@ def test_nas_live_position_preserves_real_callsign(monkeypatch):
         'alt_ft': 37000, 'on_ground': False,
         'origin': 'FRA', 'dest': 'PVG', 'reg_display': 'D-AIXF',
         'callsign': 'dlh732', 'seen_ts': '2026-08-12T20:41:48Z',
+        'flightid': 987654321,
     }}
 
     class _Response:
@@ -109,6 +112,7 @@ def test_nas_live_position_preserves_real_callsign(monkeypatch):
         flight='LH732', dep='PVG')
 
     assert pos['callsign'] == 'DLH732'
+    assert pos['flightid'] == 987654321
     assert route == ('FRA', 'PVG') and reg == 'D-AIXF'
 
 

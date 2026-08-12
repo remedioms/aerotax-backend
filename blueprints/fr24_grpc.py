@@ -484,12 +484,14 @@ def tap_detail(callsign=None, hex=None, reg=None, lat=None, lon=None):
     return None
 
 
-def detail_card(callsign=None, hex=None, reg=None, lat=None, lon=None):
-    """Normalisierte REICHE Karte für den Live-Map-Tap (Increment #32): ETA,
-    Progress, Delay-Ampel (GREEN/YELLOW/RED), Muster-Langname, Airline, Foto,
-    sched/actual-Zeiten, Gate/Terminal. Nur echte Felder — None wird entfernt."""
-    td = tap_detail(callsign=callsign, hex=hex, reg=reg, lat=lat, lon=lon)
-    if not td:
+def _detail_card_from_response(td):
+    """FR24 ``{row, detail}`` → normalisierte Live-Karte.
+
+    Geteilt vom räumlichen Tap-Match und dem exakten Flight-ID-Abruf. Dadurch
+    können Feed/Radar dieselbe Detailantwort nutzen, ohne die Normalisierung
+    oder Zeitfelder an zwei Stellen auseinanderlaufen zu lassen.
+    """
+    if not isinstance(td, dict):
         return None
     row = td.get("row") or {}
     d = td.get("detail") or {}
@@ -536,6 +538,14 @@ def detail_card(callsign=None, hex=None, reg=None, lat=None, lon=None):
     return {k: v for k, v in card.items() if v is not None}
 
 
+def detail_card(callsign=None, hex=None, reg=None, lat=None, lon=None):
+    """Normalisierte REICHE Karte für den Live-Map-Tap (Increment #32): ETA,
+    Progress, Delay-Ampel (GREEN/YELLOW/RED), Muster-Langname, Airline, Foto,
+    sched/actual-Zeiten, Gate/Terminal. Nur echte Felder — None wird entfernt."""
+    return _detail_card_from_response(
+        tap_detail(callsign=callsign, hex=hex, reg=reg, lat=lat, lon=lon))
+
+
 async def _detail_by_fid_async(provider, fid):
     """flight_details DIREKT per FR24-flightid — kein live_feed-Matching."""
     from fr24 import FR24  # noqa: F811
@@ -544,6 +554,35 @@ async def _detail_by_fid_async(provider, fid):
             f.flight_details.fetch(flight_id=fid), timeout=_TIMEOUT_S)
         d = det.to_dict()
         return {"row": {}, "detail": d} if d else None
+
+
+def detail_card_by_flightid(fid):
+    """Live-Detail direkt über die exakte FR24-Flight-ID, ohne Geo-Match.
+
+    ``aircraft_live.flightid`` stammt aus genau der LiveFeed-Zeile, die auch
+    Position, Funkname und Route geliefert hat. Das ist stabiler als den Flug
+    Minuten später in einer kleinen Box um einen inzwischen alten Fix erneut zu
+    suchen (LH732: Position vorhanden, räumlicher Detail-Miss, Feed-ETA veraltet).
+    Gratis/anonym, mit denselben Rate-/Provider-Gates wie alle gRPC-Abrufe.
+    """
+    try:
+        fid = int(fid)
+    except (TypeError, ValueError):
+        return None
+    if fid <= 0 or not available() or not _allow_call():
+        return None
+    for provider in _providers():
+        try:
+            td = _run(_detail_by_fid_async(provider, fid))
+        except Exception as ex:
+            log.warning("fr24 detail-by-flightid provider=%s: %s", provider, ex)
+            td = None
+        card = _detail_card_from_response(td)
+        if card:
+            _note_result(True)
+            return card
+    _note_result(False)
+    return None
 
 
 async def _historic_detail_by_fid_async(provider, fid, timestamp):

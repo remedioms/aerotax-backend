@@ -436,7 +436,8 @@ def _nas_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_s=2100
            # Der NAS speichert den echten ICAO-Funknamen bereits. Ihn hier
            # wegzulassen zwang Friends/Feed später zu einem unsicheren Match
            # nur über Flugnummer/Reg, während Radar exakt `DLH732` verwendete.
-           'callsign': ((p.get('callsign') or '').strip().upper() or None)}
+           'callsign': ((p.get('callsign') or '').strip().upper() or None),
+           'flightid': p.get('flightid')}
     reg_disp = (p.get('reg_display') or p.get('reg') or '').strip().upper() or None
     ac_type = (p.get('ac_type') or '').strip().upper() or None
     return pos, (src, dst), reg_disp, ac_type
@@ -721,7 +722,8 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
     # und `_fr24_live_card_cached` längst.
     fn = re.sub(r'\s+', '', (flight or '')).upper() or None
     cs = re.sub(r'\s+', '', (callsign or '')).upper() or None
-    sel = 'reg,reg_display,callsign,flight,lat,lon,track,gs_kt,alt_ft,origin,dest,ac_type,on_ground,seen_ts'
+    sel = ('reg,reg_display,callsign,flight,flightid,lat,lon,track,gs_kt,'
+           'alt_ft,origin,dest,ac_type,on_ground,seen_ts')
     dep_n = _norm_iata(dep) if dep else None
 
     def _query(col, val):
@@ -797,6 +799,7 @@ def _aircraft_live_pos(reg=None, flight=None, callsign=None, dep=None, max_age_m
         # adsb.lol ins Leere. Mit durchgereichtem Callsign pollt der Client
         # die echte Kennung.
         'callsign': (r.get('callsign') or '').strip().upper() or None,
+        'flightid': r.get('flightid'),
     })
     if not _live_pos_instance_ok(pos, sched_dep_iso):
         return _fallback()                       # 24-h-Nachbar → verwerfen
@@ -840,8 +843,8 @@ def _free_crew_live_pos(flight, dep_iata, arr_iata):
         # Höchstens der heutige Umlauf: verhindert, dass eine gleich nummerierte
         # saisonale Alt-Route als Identität für den Korridor dient.
         cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - 12 * 3600))
-        sel = ('reg,reg_display,callsign,flight,lat,lon,track,gs_kt,alt_ft,'
-               'origin,dest,ac_type,on_ground,seen_ts,updated_at')
+        sel = ('reg,reg_display,callsign,flight,flightid,lat,lon,track,gs_kt,'
+               'alt_ft,origin,dest,ac_type,on_ground,seen_ts,updated_at')
         try:
             rows = (sb.table('aircraft_live').select(sel)
                     .eq('flight', fn).eq('origin', dep).eq('dest', arr)
@@ -886,6 +889,7 @@ def _free_crew_live_pos(flight, dep_iata, arr_iata):
                     'source': 'fr24_grpc_corridor', 'seen_ts': seen,
                     'callsign': (str(live.get('callsign') or callsign or '')
                                  .strip().upper() or None),
+                    'flightid': live.get('flight_id'),
                 })
                 # `inbound_by_route` hat für diesen einen freien Abruf bereits
                 # dieselbe FR24-Detailantwort (inkl. ETA) geladen. Intern an den
@@ -930,6 +934,7 @@ def _free_crew_live_pos(flight, dep_iata, arr_iata):
                             'flight': fn, 'lat': pos['lat'], 'lon': pos['lon'],
                             'track': pos.get('track'), 'gs_kt': pos.get('gs'),
                             'alt_ft': pos.get('alt'), 'origin': dep, 'dest': arr,
+                            'flightid': live.get('flight_id'),
                             'ac_type': ac_type, 'on_ground': pos.get('on_ground'),
                             'source': 'fr24_grpc_corridor', 'seen_ts': seen,
                             'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ',
@@ -948,6 +953,7 @@ def _free_crew_live_pos(flight, dep_iata, arr_iata):
             'alt': stale.get('alt_ft'), 'on_ground': bool(stale.get('on_ground')),
             'source': 'aircraft_live_last_known', 'seen_ts': stale.get('seen_ts'),
             'callsign': callsign,
+            'flightid': stale.get('flightid'),
         })
         result = (pos, (dep, arr), stale_reg,
                   ((stale.get('ac_type') or '').strip().upper() or None))
@@ -1028,7 +1034,7 @@ def _aircraft_live_flight(flight=None, callsign=None, max_age_min=40):
     cutoff = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                            time.gmtime(time.time() - max_age_min * 60))
     sel = ('flight,callsign,reg,reg_display,ac_type,origin,dest,'
-           'lat,lon,on_ground,seen_ts')
+           'lat,lon,on_ground,seen_ts,flightid')
     try:
         q = sb.table('aircraft_live').select(sel).gt('updated_at', cutoff)
         q = q.eq('flight', fn) if fn else q.eq('callsign', cs)
@@ -1056,6 +1062,7 @@ def _aircraft_live_flight(flight=None, callsign=None, max_age_min=40):
         'status_category': '', 'aircraft': typ, 'reg': reg,
         'lat': a.get('lat'), 'lon': a.get('lon'),
         'on_ground': a.get('on_ground'), 'seen_ts': a.get('seen_ts'),
+        'flightid': a.get('flightid'),
         'dep_delay_min': None, 'arr_delay_min': None,
         'delay_min': None, 'delay_side': None, 'source': 'aircraft_live',
     }
@@ -5546,14 +5553,21 @@ _FR24_LIVE_CARD_MISS_TTL = 15.0
 
 def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
                            lat=None, lon=None, origin=None, dest=None,
-                           hexid=None):
+                           hexid=None, flightid=None):
     """Eine route-geprüfte FR24-Livekarte, geteilt über alle Consumer.
 
-    Position ist Pflicht: dadurch bleibt die gRPC-Box klein und ein Treffer
-    kann an Flug/Funkname/Reg gebunden werden. Ein explizit abweichendes
+    Mit ``flightid`` wird die exakt beobachtete FR24-Instanz direkt geladen.
+    Ohne ID bleibt Position Pflicht: dadurch bleibt die gRPC-Box klein und ein
+    Treffer kann an Flug/Funkname/Reg gebunden werden. Ein explizit abweichendes
     Start/Ziel wird verworfen, statt die Zeiten eines Nachbarflugs zu zeigen.
     """
-    if lat is None or lon is None:
+    try:
+        fid = int(flightid) if flightid is not None else None
+        if fid is not None and fid <= 0:
+            fid = None
+    except (TypeError, ValueError):
+        fid = None
+    if fid is None and (lat is None or lon is None):
         return None
     fn = (flight_no or '').replace(' ', '').upper().strip() or None
     cs = (callsign or '').replace(' ', '').upper().strip() or None
@@ -5561,19 +5575,24 @@ def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
     hx = (str(hexid or '').lower().strip() or None)
     dep = (origin or '').upper().strip() or None
     arr = (dest or '').upper().strip() or None
-    identity = cs or fn or rg or hx
+    identity = fid or cs or fn or rg or hx
     if not identity:
         return None
-    try:
-        lat_f, lon_f = float(lat), float(lon)
-    except (TypeError, ValueError):
-        return None
+    lat_f = lon_f = None
+    if lat is not None and lon is not None:
+        try:
+            lat_f, lon_f = float(lat), float(lon)
+        except (TypeError, ValueError):
+            if fid is None:
+                return None
     # Der Schluessel MUSS die Identitaeten tragen, mit denen FR24 tatsaechlich
     # MATCHT (Funkname/Reg/Hex) — die Flugnummer geht gar nicht in `detail_card`.
     # Mit `cs or fn or rg or hx` als Schluessel konnte ein Aufruf, der nur die
     # Flugnummer kannte (zwangslaeufig MISS), 15 s lang den Treffer verdecken,
     # den derselbe Flug unter seiner Reg gerade geliefert hatte.
-    key = (cs, rg, hx, fn, dep, arr, round(lat_f, 2), round(lon_f, 2))
+    key = (fid, cs, rg, hx, fn, dep, arr,
+           round(lat_f, 2) if lat_f is not None else None,
+           round(lon_f, 2) if lon_f is not None else None)
     now = time.time()
     with _FR24_LIVE_CARD_LOCK:
         hit = _FR24_LIVE_CARD_MEMO.get(key)
@@ -5584,8 +5603,10 @@ def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
                 return dict(hit[1]) if hit[1] else None
     try:
         from blueprints import fr24_grpc
-        card = fr24_grpc.detail_card(callsign=cs, hex=hx, reg=rg,
-                                     lat=lat_f, lon=lon_f)
+        card = (fr24_grpc.detail_card_by_flightid(fid) if fid else None)
+        if not card and lat_f is not None and lon_f is not None:
+            card = fr24_grpc.detail_card(callsign=cs, hex=hx, reg=rg,
+                                         lat=lat_f, lon=lon_f)
     except Exception:
         card = None
     if card:
@@ -6414,7 +6435,8 @@ def _resolve_unified_flight_core(q, date, callsign_query, lat, lon, allow_paid,
     if (_airborne or _landed) and _live_lat is not None and _live_lon is not None:
         _fr_card = _fr24_live_card_cached(
             flight_no=flight_no, callsign=callsign, reg=reg,
-            lat=_live_lat, lon=_live_lon, origin=origin, dest=dest)
+            lat=_live_lat, lon=_live_lon, origin=origin, dest=dest,
+            flightid=_alf_live.get('flightid'))
     _fr_times = _fr24_operational_times(_fr_card, origin, dest)
     _needs_fr_times = bool(
         (_airborne and not (_fr_times.get('actual_dep')
@@ -9814,7 +9836,8 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
         card = _fr24_live_card_cached(
             flight_no=inbound_fn, callsign=cs, reg=reg,
             lat=pos.get('lat'), lon=pos.get('lon'),
-            origin=inbound_origin, dest=dep)
+            origin=inbound_origin, dest=dep,
+            flightid=pos.get('flightid'))
         _creg = re.sub(r'[^A-Z0-9]', '', ((card or {}).get('reg') or '').upper())
         _treg = re.sub(r'[^A-Z0-9]', '', (reg or '').upper())
         if card and _creg and _creg == _treg:
@@ -10628,7 +10651,7 @@ def ax_flight_live(token):
         _fr_card = _fr24_live_card_cached(
             flight_no=flight_no, callsign=cs, reg=reg,
             lat=pos.get('lat'), lon=pos.get('lon'), origin=dep, dest=dest,
-            hexid=hexid)
+            hexid=hexid, flightid=pos.get('flightid'))
     _fr_times = _fr24_operational_times(_fr_card, dep, dest)
     _canonical_times = _canonical_operational_times(
         _official, _fr_times, airborne=in_flight, landed=_is_landed)

@@ -18730,7 +18730,9 @@ def get_friends_today(token):
                                                 reg=(m.get('reg') or _crg),
                                                 lat=(_cp or {}).get('lat'),
                                                 lon=(_cp or {}).get('lon'),
-                                                origin=_dep_ia, dest=_arr_ia))
+                                                origin=_dep_ia, dest=_arr_ia,
+                                                flightid=(_cp or {}).get(
+                                                    'flightid')))
                             _friend_fr = _fr24_operational_times(
                                 _friend_card, _dep_ia, _arr_ia)
                         except Exception:

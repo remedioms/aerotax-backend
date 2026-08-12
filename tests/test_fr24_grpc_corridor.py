@@ -2,6 +2,7 @@
 Endpunkt-Rechteck — Nordrouten (FRA→HND über Sibirien, Kulmination ~66°N)
 lagen sonst ausserhalb der Box. Reine Mathe-Tests, kein fr24-Netz."""
 import blueprints.fr24_grpc as G
+import blueprints.aerox_data_blueprint as DATA
 
 FRA = (50.03, 8.57)
 HND = (35.55, 139.78)
@@ -101,3 +102,72 @@ def test_detail_card_ohne_ist_ankunft_bleibt_ohne_feld(monkeypatch):
     card = G.detail_card(callsign='DLH400', lat=50.0, lon=8.5)
     assert 'actual_arr' not in card
     assert card['actual_dep'] == 1_783_580_600
+
+
+def test_detail_card_by_flightid_uses_exact_instance_without_livefeed(monkeypatch):
+    """LH732-Repro: eine alte Position kann ausserhalb der kleinen Tap-Box
+    liegen. Die bereits bekannte Flight-ID lädt die ETA ohne räumliches Raten."""
+    async def _exact(_provider, fid):
+        assert fid == 987654321
+        return {'row': {}, 'detail': {
+            'schedule_info': {
+                'flight_number': 'LH732',
+                'scheduled_arrival': 1_786_591_500,
+            },
+            'flight_progress': {
+                'eta': 1_786_589_160,
+                'flight_stage': 'AIRBORNE',
+            },
+        }}
+
+    monkeypatch.setattr(G, 'available', lambda: True)
+    monkeypatch.setattr(G, '_allow_call', lambda: True)
+    monkeypatch.setattr(G, '_providers', lambda: ['direct'])
+    monkeypatch.setattr(G, '_detail_by_fid_async', _exact)
+
+    card = G.detail_card_by_flightid(987654321)
+
+    assert card['flight_number'] == 'LH732'
+    assert card['eta'] == 1_786_589_160
+    assert card['flight_stage'] == 'AIRBORNE'
+
+
+def test_shared_live_card_prefers_exact_flightid(monkeypatch):
+    exact = {
+        'route_from': 'FRA', 'route_to': 'PVG',
+        'reg': 'D-AIXF', 'eta': 1_786_589_160,
+    }
+    calls = []
+    monkeypatch.setattr(G, 'detail_card_by_flightid',
+                        lambda fid: calls.append(('id', fid)) or dict(exact))
+    monkeypatch.setattr(G, 'detail_card',
+                        lambda **kw: calls.append(('geo', kw)) or None)
+    DATA._FR24_LIVE_CARD_MEMO.clear()
+
+    card = DATA._fr24_live_card_cached(
+        flight_no='LH732', callsign='DLH732', reg='D-AIXF',
+        lat=42.56, lon=32.23, origin='FRA', dest='PVG',
+        flightid=987654321)
+
+    assert card['eta'] == 1_786_589_160
+    assert calls == [('id', 987654321)]
+
+
+def test_shared_live_card_falls_back_to_geo_after_exact_id_miss(monkeypatch):
+    calls = []
+    monkeypatch.setattr(G, 'detail_card_by_flightid',
+                        lambda fid: calls.append(('id', fid)) or None)
+    monkeypatch.setattr(G, 'detail_card',
+                        lambda **kw: calls.append(('geo', kw)) or {
+                            'route_from': 'FRA', 'route_to': 'PVG',
+                            'reg': 'D-AIXF', 'eta': 1_786_589_160,
+                        })
+    DATA._FR24_LIVE_CARD_MEMO.clear()
+
+    card = DATA._fr24_live_card_cached(
+        flight_no='LH732', callsign='DLH732', reg='D-AIXF',
+        lat=42.56, lon=32.23, origin='FRA', dest='PVG',
+        flightid=987654321)
+
+    assert card['eta'] == 1_786_589_160
+    assert [kind for kind, _ in calls] == ['id', 'geo']
