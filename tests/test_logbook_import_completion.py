@@ -57,6 +57,9 @@ def test_pending_upload_completes_and_enqueues_one_scoped_push():
     payload = json.loads(push_params[2])
     assert payload['data'] == {
         'type': 'logbook_import_completed',
+        # L10n-Durchgang 2026-08-12: der Push trägt den Schlüssel, damit die
+        # App Titel/Text in der Gerätesprache rendert (wie die übrigen Pushes).
+        'localization_key': 'logbook_import_completed',
         'job_id': 9,
         'deep_link': 'aerox://more/logbook',
     }

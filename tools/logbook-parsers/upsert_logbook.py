@@ -61,7 +61,8 @@ def _complete_upload_after_verified(cur, upload_id, token):
     payload = json.dumps({
         'title': 'Flugbuch-Import fertig',
         'body': 'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.',
-        'data': {'type': 'logbook_import_completed', 'job_id': upload_id,
+        'data': {'type': 'logbook_import_completed',
+                 'localization_key': 'logbook_import_completed', 'job_id': upload_id,
                  'deep_link': 'aerox://more/logbook'},
     }, ensure_ascii=False)
     cur.execute('select * from public.enqueue_push_outbox(%s, %s, %s::jsonb)',
