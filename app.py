@@ -38619,13 +38619,23 @@ def auth_apple():
     (RS256 via Apple JWKS). identity_token ist PFLICHT — kein Legacy-Pfad
     (sonst koennte jeder mit beliebigem apple_sub einen Account uebernehmen).
 
-    Body: {apple_sub, email?, name?, identity_token}
+    Body: {apple_sub, email?, name?, identity_token, account_type?}
+
+    `account_type` bleibt für alte Clients optional. Neue Clients reichen ihn
+    nach, wenn der Server `needs_account_type=true` meldet. Ein bereits
+    festgelegter Kontotyp wird dabei niemals durch einen späteren Apple-Login
+    überschrieben.
     """
     body = request.get_json(silent=True) or {}
     apple_sub = (body.get('apple_sub') or '').strip()
     email = (body.get('email') or '').strip().lower()
     name = (body.get('name') or '').strip()
     identity_token = (body.get('identity_token') or '').strip()
+    requested_account_type = body.get('account_type')
+    if requested_account_type is not None:
+        requested_account_type = str(requested_account_type).strip().lower()
+        if requested_account_type not in ('crew', 'family'):
+            return jsonify({'ok': False, 'error': 'invalid_account_type'}), 400
     if not apple_sub:
         return jsonify({'ok': False, 'error': 'apple_sub_required'}), 400
     # identity_token ist Pflicht — Security-Hardening (kein anonymes
@@ -38653,7 +38663,33 @@ def auth_apple():
             _auth_upsert_user(ex_email, ex_user)
         except Exception:
             pass
-        return jsonify(_auth_success_payload(ex_email, ex_user))
+        profile = dict(((_profile_load(ex_user.get('token')) or {})
+                        .get('profile') or {}))
+        current_type = str(profile.get('account_type') or '').strip().lower()
+        # Ein altes Apple-Konto mit bereits ausgefülltem Crew-Profil ist
+        # eindeutig Crew, auch wenn frühe App-Versionen `account_type` noch
+        # nicht persistiert haben. Solche Bestandsnutzer werden nicht plötzlich
+        # nach ihrem Kontotyp gefragt.
+        has_crew_profile = any(profile.get(k) for k in
+                               ('homebase', 'airline', 'position'))
+        needs_account_type = current_type not in ('crew', 'family') \
+            and not has_crew_profile
+        # Nur einen noch wirklich offenen Typ setzen. Damit kann der zweite,
+        # von derselben verifizierten Apple-Anmeldung autorisierte Request den
+        # neuen Account abschließen, aber nie ein bestehendes Crew-/Family-
+        # Konto umschalten.
+        if requested_account_type and needs_account_type:
+            profile['account_type'] = requested_account_type
+            if name and not profile.get('name'):
+                profile['name'] = name
+            if not _profile_save(ex_user.get('token'), profile):
+                return jsonify({'ok': False,
+                                'error': 'profile_save_unavailable'}), 503
+            needs_account_type = False
+        payload = _auth_success_payload(ex_email, ex_user)
+        payload.update({'created': False,
+                        'needs_account_type': needs_account_type})
+        return jsonify(payload)
     # Existing user via email match: NICHT automatisch linken — Sicherheit.
     # Jemand koennte sonst per Apple-Sign-In Zugriff auf einen fremden
     # Email/Password-Account erlangen, falls die Email zufaellig matched.
@@ -38678,14 +38714,22 @@ def auth_apple():
     except Exception: pass
     # Keine Echtzeit-Owner-Mail mehr pro Signup (2026-07-25) — täglicher
     # Digest-Cron auf dem Host übernimmt, siehe auth_signup.
-    # Wenn Apple einen name geliefert hat (nur beim ersten Login) · ins Profile vorbefüllen
+    # Name und optional bereits gewählter Kontotyp gehen über den kanonischen
+    # Profil-Store (Supabase primary + Disk-Fallback), nicht mehr nur in eine
+    # lokale Worker-Datei. Alte Clients senden keinen Typ und funktionieren wie
+    # bisher; neue sehen `needs_account_type=true` und schließen die Auswahl in
+    # einem zweiten, erneut Apple-verifizierten Request ab.
+    profile = {}
     if name:
-        try:
-            with open(_user_profile_path(token), 'w') as f:
-                json.dump({'profile': {'name': name}, '_updated_at': datetime.now().isoformat()}, f)
-        except Exception:
-            pass
-    return jsonify(_auth_success_payload(email, rec))
+        profile['name'] = name
+    if requested_account_type:
+        profile['account_type'] = requested_account_type
+    if profile and not _profile_save(token, profile):
+        return jsonify({'ok': False, 'error': 'profile_save_unavailable'}), 503
+    payload = _auth_success_payload(email, rec)
+    payload.update({'created': True,
+                    'needs_account_type': requested_account_type is None})
+    return jsonify(payload)
 
 
 def _send_password_reset_email(to_email, reset_token):
