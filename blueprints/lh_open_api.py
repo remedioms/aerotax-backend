@@ -1081,6 +1081,25 @@ _STALE_MAX_AGE = 6 * 3600
 # trifft denselben Flug in Sekunden dutzendfach: ohne das würde jeder dieser
 # Treffer einen eigenen Supabase-Read auslösen.
 _STALE_MEMO_TTL = 300
+# KALTER MEMO-MISS (Owner-Befund 12.08., LH713 ICN→FRA 30 min vor der Landung):
+# `cached_only` ist der Fan-out-Pfad — er darf nie blockieren und fragt deshalb
+# NUR das Prozess-Memo. Genau dieses Memo ist nach jedem Deploy leer und läuft
+# im Betriebsfenster alle 120 s ab. Für einen Langstrecken-Anflug ist die LH-
+# Antwort in diesem Moment die EINZIGE Quelle einer laufenden Ankunft (das
+# Ankunfts-Board am Ziel führt einen Flug erst NACH seiner Sollzeit, die
+# Abflug-Row der Outstation ist Stunden alt) — der leere Rückgabewert liess die
+# Karte deshalb auf die PLANZEIT zurückfallen, während der Flieger im Sinkflug
+# war. Der geteilte Cache trug die echte LH-Ankunft die ganze Zeit weiter; er
+# wurde auf diesem Pfad nur nie gelesen. Genau das holt `_stale_on_deny(...,
+# denied=False)` nach — dieselben Grenzen, dieselbe `facts_stale`-Markierung,
+# KEIN LH-Call und kein Quota-Slot.
+#
+# Der Read kostet ~40 ms. Ein TREFFER memoisiert sich über `_STALE_MEMO_TTL`
+# selbst; ein MISS hätte ohne Gegenmassnahme jeden Leg jedes Fan-outs erneut
+# gelesen — dafür dieses Negativ-Ledger (der Warm bleibt davon unberührt, er
+# wird VOR dem Read eingereiht).
+_STALE_COLD_MISS_TTL = 60
+_stale_cold_miss = {}          # (fn,d,dep,arr) -> ts des letzten Leer-Reads
 
 
 def _shared_stale_variants(fn, d):
@@ -1145,13 +1164,21 @@ def _pick_stale_variant(variants, dep, arr):
     return min(variants, key=lambda fa: fa[1])
 
 
-def _stale_on_deny(fn, d, dep, arr, caller, now):
+def _stale_on_deny(fn, d, dep, arr, caller, now, denied=True):
     """Letzte echte Antwort für einen am Budget abgewiesenen User-Call, oder
     None. Bucht `lhopen_stale_served`. Wirft nie.
 
     Der Denial-Zähler bleibt unangetastet — `_get` hat ihn schon gebucht. Beide
     Zahlen zusammen sind die Wahrheit: „wie oft war das Gate zu" UND „wie oft
-    konnten wir es auffangen"."""
+    konnten wir es auffangen".
+
+    `denied=False` ist derselbe Rückfall für einen KALTEN Memo-Miss auf dem
+    `cached_only`-Pfad (s. `_STALE_COLD_MISS_TTL`): dort stand niemand am Gate,
+    die Frage wurde nur nicht gestellt. Deshalb darf weder `last_call_denied()`
+    True werden (Batch-Aufrufer wie `lh_mqtt._legs_regs` brechen daraufhin ab,
+    und `_warm_one` würde den Flug prozessübergreifend sperren) noch der
+    Zähler `lhopen_stale_served` wachsen — der misst die aufgefangenen
+    ABWEISUNGEN und wäre sonst unlesbar. Eigene Familie: `lhopen_stale_cold`."""
     try:
         if _caller_class(caller) == _CLASS_WARM:
             return None                     # Spekulation verhungert, Punkt.
@@ -1177,11 +1204,38 @@ def _stale_on_deny(fn, d, dep, arr, caller, now):
         out = dict(facts)
         out['facts_stale'] = age > 0
         out['facts_age_s'] = age
-        _note_answer(False, denied=True, stale_age=age)
+        _note_answer(False, denied=bool(denied), stale_age=age)
         with _facts_lock:
             _facts_memo[(fn, d, dep, arr)] = (now + _STALE_MEMO_TTL, dict(out),
                                               False)
-        budget_inc('lhopen_stale_served', caller)
+        budget_inc('lhopen_stale_served' if denied else 'lhopen_stale_cold',
+                   caller)
+        return out
+    except Exception:
+        return None
+
+
+def _stale_on_cold_memo(fn, d, dep, arr, caller, now):
+    """Rückfall für den `cached_only`-Pfad: letzte echte LH-Antwort aus dem
+    GETEILTEN Cache statt `{}`, wenn das Prozess-Memo kalt/abgelaufen ist.
+    None, wenn der geteilte Cache auch nichts hat. Wirft nie.
+
+    Der ergebnislose Read wird kurz gemerkt (`_STALE_COLD_MISS_TTL`), damit ein
+    Freunde-Fan-out über viele Legs nicht pro Leg und Request einen Supabase-
+    Read auslöst. Ein TREFFER braucht das Ledger nicht — den memoisiert
+    `_stale_on_deny` bereits selbst."""
+    key = (fn, d, dep, arr)
+    try:
+        with _facts_lock:
+            last = _stale_cold_miss.get(key)
+        if last is not None and (now - last) < _STALE_COLD_MISS_TTL:
+            return None
+        out = _stale_on_deny(fn, d, dep, arr, caller, now, denied=False)
+        if out is None:
+            with _facts_lock:
+                if len(_stale_cold_miss) > _FACTS_MAX:
+                    _stale_cold_miss.clear()
+                _stale_cold_miss[key] = now
         return out
     except Exception:
         return None
@@ -1528,7 +1582,14 @@ def lh_flight_facts(flight_no, date, dep_iata=None, arr_iata=None, force=False,
                              stale_age=int(_hf.get('facts_age_s') or 0))
                 return dict(hit[1])
     if cached_only:
+        # Warm ZUERST einreihen (die frische Antwort bleibt das Ziel), dann den
+        # geteilten Cache als Rückfall lesen — sonst fällt eine offene Karte für
+        # die Dauer des Warms auf die Planzeit zurück, obwohl die letzte echte
+        # LH-Ankunft prozessübergreifend längst vorliegt (s. `_STALE_COLD_MISS_TTL`).
         _warm_async(fn, d, dep, arr, caller)
+        _cold = _stale_on_cold_memo(fn, d, dep, arr, caller, now)
+        if _cold is not None:
+            return _cold
         _note_answer(False)          # „noch nicht bekannt", kein Fakt
         return {}
 

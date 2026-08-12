@@ -50,6 +50,7 @@ def _reset(monkeypatch):
     lh._hour_window = 0
     lh._hour_count = 0
     lh._rate_penalty_until = 0.0
+    lh._stale_cold_miss.clear()
     monkeypatch.setattr(lh, '_shared_sb', lambda: None)
     monkeypatch.setattr(lh, 'budget_inc', lambda *a, **k: None)
 
@@ -924,3 +925,127 @@ def test_variant_fallback_is_never_used_by_warm(monkeypatch):
     _deny_setup(monkeypatch)
     assert lh.lh_flight_facts('LH400', '2026-07-31',
                               caller='warm_obs_overlay') == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KALTER MEMO-MISS auf dem `cached_only`-Pfad (Owner 2026-08-12, LH713 ICN→FRA)
+#
+# Der Freunde-Fan-out fragt NUR das Prozess-Memo. Das ist nach jedem Deploy leer
+# und läuft im Betriebsfenster alle 120 s ab. Für einen Langstrecken-Anflug ist
+# die LH-Antwort dort die EINZIGE Quelle einer laufenden Ankunft — der leere
+# Rückgabewert liess die Freunde-Karte auf die PLANZEIT zurückfallen, während
+# der Flieger im Sinkflug war. Der geteilte Cache hatte die echte Ankunft.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cached_only_cold_memo_serves_stale_instead_of_nothing(monkeypatch):
+    """DER Kernfall: Memo kalt/abgelaufen, geteilter Eintrag abgelaufen aber
+    echt — statt `{}` (⇒ Planzeit) die letzte echte LH-Ankunft, markiert."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIXF', 'est_arr': '2026-07-31T18:17:00+02:00'},
+              300)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_warm_async', lambda *a, **k: None)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             cached_only=True, caller='obs_overlay')
+    assert out['est_arr'] == '2026-07-31T18:17:00+02:00'
+    assert out['facts_stale'] is True
+    assert out['facts_age_s'] >= 240
+
+
+def test_cached_only_cold_memo_costs_no_lh_call(monkeypatch):
+    """Der Rückfall liest nur den geteilten Cache — kein Call, kein Quota-Slot."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIXF'}, 300)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_warm_async', lambda *a, **k: None)
+    got = []
+    monkeypatch.setattr(lh, '_get', lambda *a, **k: got.append(a) or None)
+    assert lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                              cached_only=True, caller='obs_overlay')['reg'] \
+        == 'D-AIXF'
+    assert got == []
+
+
+def test_cached_only_cold_memo_does_not_claim_a_denial(monkeypatch):
+    """Hier stand niemand am Gate. Würde `last_call_denied()` True, brächen
+    Batch-Aufrufer ab und `_warm_one` sperrte den Flug prozessübergreifend."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIXF'}, 300)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_warm_async', lambda *a, **k: None)
+    fams = []
+    monkeypatch.setattr(lh, 'budget_inc',
+                        lambda fam, caller=None, **k: fams.append(fam))
+    lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                       cached_only=True, caller='obs_overlay')
+    assert lh.last_call_denied() is False
+    # eigene Zähler-Familie — `stale_served` misst aufgefangene ABWEISUNGEN
+    assert 'lhopen_stale_cold' in fams
+    assert 'lhopen_stale_served' not in fams
+
+
+def test_cached_only_picks_up_a_still_valid_shared_entry_after_restart(monkeypatch):
+    """Direkt nach einem Deploy ist das Memo leer, der geteilte Eintrag aber
+    noch gültig — den gab der Fan-out-Pfad bisher trotzdem nicht heraus."""
+    _reset(monkeypatch)
+    fake = _FakeSB()
+    now = time.time()
+    k = lh._shared_key('lhfacts', 'LH400', '2026-07-31', 'FRA', 'JFK')
+    fake.store[k] = _row(k, {'reg': 'D-AIXF'}, _iso(now + 90), _iso(now - 30))
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_warm_async', lambda *a, **k: None)
+    out = lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                             cached_only=True, caller='obs_overlay')
+    assert out['reg'] == 'D-AIXF'
+    assert out.get('facts_stale') is False
+
+
+def test_cached_only_still_schedules_the_warm(monkeypatch):
+    """Die frische Antwort bleibt das Ziel — der Rückfall darf den Warm nicht
+    ersetzen, sondern nur die Lücke bis dahin füllen."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIXF'}, 300)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    warmed = []
+    monkeypatch.setattr(lh, '_warm_async',
+                        lambda *a, **k: warmed.append(a))
+    lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                       cached_only=True, caller='obs_overlay')
+    assert warmed == [('LH400', '2026-07-31', 'FRA', 'JFK', 'obs_overlay')]
+
+
+def test_cached_only_empty_cache_is_read_once_per_ledger_window(monkeypatch):
+    """Ein Freunde-Fan-out über viele Legs darf nicht pro Leg und Request einen
+    Supabase-Read auslösen, wenn der geteilte Cache ohnehin nichts hat."""
+    _reset(monkeypatch)
+    fake = _FakeSB()
+    monkeypatch.setattr(lh, '_shared_sb', lambda: fake)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_warm_async', lambda *a, **k: None)
+    for _ in range(4):
+        assert lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                                  cached_only=True, caller='obs_overlay') == {}
+    assert len(fake.log) <= 2, fake.log
+
+
+def test_cached_only_warm_class_never_gets_the_cold_fallback(monkeypatch):
+    """Die Spekulation soll verhungern — sonst hätte die Priorisierung keinen
+    Zahn mehr (gleiche Grenze wie beim Abweisungs-Rückfall)."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIXF'}, 300)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_warm_async', lambda *a, **k: None)
+    assert lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                              cached_only=True,
+                              caller='warm_obs_overlay') == {}
+
+
+def test_cached_only_too_old_stays_honestly_empty(monkeypatch):
+    """Jenseits von `_STALE_MAX_AGE` lieber gar nichts als ein alter Wert."""
+    _reset(monkeypatch)
+    _stale_sb(monkeypatch, {'reg': 'D-AIXF'}, lh._STALE_MAX_AGE + 600)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(lh, '_warm_async', lambda *a, **k: None)
+    assert lh.lh_flight_facts('LH400', '2026-07-31', 'FRA', 'JFK',
+                              cached_only=True, caller='obs_overlay') == {}

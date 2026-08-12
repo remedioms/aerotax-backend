@@ -1631,6 +1631,11 @@ def lh_quota_snapshot(hours=6):
       lhopen_skip:<YYYYMMDDHH>[:<grund>]     GAR NICHT ERST GEFRAGT (2026-07-30)
       lhopen_stale_served:<...>[:<caller>]   Abweisung mit ALTER echter Antwort
                                              aufgefangen (2026-07-31)
+      lhopen_stale_cold:<...>[:<caller>]     KALTER Memo-Miss (nach Deploy /
+                                             nach TTL-Ablauf) mit alter echter
+                                             Antwort aufgefangen (2026-08-12) —
+                                             hier stand niemand am Gate, darum
+                                             NICHT mit `stale_served` mischen
       lhfo:<YYYYMMDDHH>[:<service>]          LH FlightOps (EIGENER LH-Key!)
 
     `lhopen_skip` ist bewusst eine EIGENE Familie und keine Unterart von
@@ -1658,7 +1663,7 @@ def lh_quota_snapshot(hours=6):
     if sb is not None:
         for st in stamps:
             for fam in ('lhopen', 'lhopen_denied', 'lhopen_skip',
-                        'lhopen_stale_served', 'lhfo'):
+                        'lhopen_stale_served', 'lhopen_stale_cold', 'lhfo'):
                 try:
                     r = (sb.table('ax_api_budget').select('month,n')
                          .like('month', f'{fam}:{st}%')
