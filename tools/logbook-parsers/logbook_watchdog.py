@@ -13,10 +13,11 @@ Ablauf pro Lauf:
   2. Offene Zeilen holen (ohne Roster-PDFs — die gehören der Roster-Pipeline)
      und pro Token bündeln: EIN Nutzer-Batch = EIN Import + EIN Push.
   3. Je Datei: sha256 gegen die gespeicherte Prüfsumme, Byte-Dubletten im
-     Batch aussortieren, dann Format-Erkennung über die STRIKTEN Parser
-     (LH-Flugstundenübersicht Cockpit+Kabine, Condor/CFG). Jeder Parser prüft
-     seine Monatssummen selbst und bricht bei Abweichung ab — der Wächter
-     erbt diese Garantien, statt eigene Leseheuristik zu erfinden.
+     Batch aussortieren, dann inhaltsbasierte Format-Erkennung über die
+     STRIKTEN Parser (OffBlock-Duties-CSV, LH-Flugstundenübersicht
+     Cockpit+Kabine, Condor/CFG). Jeder Parser prüft seine Summen selbst und
+     bricht bei Abweichung ab — der Wächter erbt diese Garantien, statt eigene
+     Leseheuristik zu erfinden.
   4. Legs werden mit einem BESTEHENDEN Import VERSCHMOLZEN (Union über
      Leg-Schlüssel) — `ax_logbook_import` ist eine Zeile pro Token, ein
      naives Upsert würde die Historie des Nutzers löschen.
@@ -207,10 +208,32 @@ def _try_parsers(path):
     Deshalb entscheidet der Dokumenttext, welcher Parser zuständig ist; seine
     ValueErrors sind danach ausnahmslos echte Kontroll-Verletzungen."""
     import pdfplumber
+    from pdfminer.pdfexceptions import PDFException
+    from pdfplumber.utils.exceptions import PdfminerException
+    import parse_duties_v8
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
-    with pdfplumber.open(path) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    # Der Upload-Endpunkt nimmt CSV/Excel/PDF/JSON/ZIP an. Vorher bekam jede
+    # Datei trotzdem die Endung .pdf und lief blind in pdfplumber. Ein valides
+    # Duties-CSV endete dadurch als unerwarteter ``No /Root object``-Crash,
+    # wurde auf pending zurückgesetzt und erzeugte alle zehn Minuten dieselbe
+    # Owner-Mail. Deshalb zuerst die belegte CSV-Signatur prüfen und PDFs nur
+    # anhand ihrer Magic Bytes öffnen; die Dateiendung ist nicht vertrauenswürdig.
+    if parse_duties_v8.matches_csv(path):
+        legs, sims, report = parse_duties_v8.parse_csv(path)
+        return "offblock_duties", legs, sims, report
+    with open(path, "rb") as handle:
+        if not handle.read(5).startswith(b"%PDF-"):
+            return "unsupported", None, None, None
+    try:
+        with pdfplumber.open(path) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except (PDFException, PdfminerException, OSError):
+        # Beschädigte/unvollständige PDFs sind ein endgültiger Dateifehler,
+        # kein transienter Backendfehler. ``unsupported`` setzt processed=true
+        # und bittet den Nutzer idempotent einmal um einen erneuten Upload.
+        return "unsupported", None, None, None
     if not parse_lh_flugstunden.RE_HEADER.search(text):
         return "unsupported", None, None, None
     if "Condor" in text:
@@ -461,7 +484,10 @@ def process_token_batch(token, rows, events, terminal=None):
             parsed_files.append({"id": rid, "dup_of": seen_sha[sha]})
             continue
         seen_sha[sha] = rid
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        # Format-Routing arbeitet mit Content-Signaturen. Die neutrale Endung
+        # verhindert zusätzlich, dass Aufrufer sie versehentlich als Typbeleg
+        # missverstehen.
+        with tempfile.NamedTemporaryFile(suffix=".upload", delete=False) as tmp:
             tmp.write(blob)
             path = tmp.name
         try:

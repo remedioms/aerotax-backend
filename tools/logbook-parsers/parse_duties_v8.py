@@ -118,6 +118,15 @@ TIME_CLASS_COLS = ('pic_time', 'Single pilot', 'Multi pilot', 'Dual')
 TYPE_FLIGHT = {'flug', 'flight'}
 TYPE_SIM = {'simulator'}
 
+# Minimale Signatur des OffBlock-Duties-Exports. Der Upload-Watchdog benutzt
+# sie für echtes Content-Routing; eine bloße .csv-Endung reicht nicht, weil
+# der öffentliche Import bewusst auch Exporte anderer Logbuch-Apps annimmt.
+REQUIRED_HEADERS = {
+    'Type', 'Date', 'Function', 'Departure place', 'Departure time',
+    'Arrival place', 'Arrival time', 'Total time', 'Flight number',
+    'Aircraft registration', 'Aircraft ICAO',
+}
+
 # Felder, die beim Cluster-Merge aus schwächeren Zeilen nachgefüllt werden
 # dürfen (Zeiten/Blockzeit NICHT — die kommen ausschließlich vom Gewinner).
 FILL_FIELDS = ('reg', 'type', 'pic_name', 'remarks', 'night_min',
@@ -394,22 +403,34 @@ def merge_clusters(legs, window_min, report):
     return out
 
 
-def main():
-    argv = [a for a in sys.argv[1:]]
-    keep_planned = '--keep-planned' in argv
-    keep_sim_as_flight = '--keep-sim-as-flight' in argv
-    keep_duplicates = '--keep-duplicates' in argv
-    window = 15
-    if '--dup-window' in argv:
-        window = int(argv[argv.index('--dup-window') + 1])
-    cutoff = date.today()
-    if '--cutoff' in argv:
-        cutoff = datetime.strptime(argv[argv.index('--cutoff') + 1],
-                                   '%Y-%m-%d').date()
-    pos = [a for a in argv if not a.startswith('--')
-           and not re.match(r'^\d{4}-\d{2}-\d{2}$', a) and not a.isdigit()]
-    src, dst = pos[0], pos[1]
-    rows = list(csv.DictReader(open(src, encoding='utf-8-sig'), delimiter=';'))
+def matches_csv(path):
+    """True nur für das belegte OffBlock-Duties-Schema.
+
+    Dekodier-/CSV-Fehler sind hier ein schlichtes Nicht-Match; die eigentliche
+    Parse-Funktion bleibt streng und wirft bei einem erkannten, aber kaputten
+    Export einen ValueError zur manuellen Prüfung.
+    """
+    try:
+        with open(path, encoding='utf-8-sig', newline='') as handle:
+            fields = set(csv.DictReader(handle, delimiter=';').fieldnames or [])
+        return REQUIRED_HEADERS <= fields
+    except (OSError, UnicodeError, csv.Error):
+        return False
+
+
+def parse_csv(src, *, cutoff=None, keep_planned=False,
+              keep_sim_as_flight=False, keep_duplicates=False, window=15):
+    """OffBlock-Duties-Datei für eingebettete Aufrufer parsen.
+
+    Rückgabe entspricht den PDF-Parsern des Watchdogs: ``legs, sims, report``.
+    Der CLI-Pfad darunter nutzt exakt dieselbe Funktion und behält damit seine
+    bisherigen Schutzregeln und Kontrollsummen.
+    """
+    cutoff = cutoff or date.today()
+    if not matches_csv(src):
+        raise ValueError('kein OffBlock-Duties-CSV-Kopf')
+    with open(src, encoding='utf-8-sig', newline='') as handle:
+        rows = list(csv.DictReader(handle, delimiter=';'))
 
     legs, sims = [], []
     skipped = {'kein_datum': 0, 'summenzeile': 0, 'platzhalter': 0,
@@ -570,24 +591,68 @@ def main():
     from legkeys import dedupe_keys
     collisions = dedupe_keys(legs)
 
-    out = {'legs': legs, 'sim': sims}
-    json.dump(out, open(dst, 'w'), ensure_ascii=False)
-
     # ── Report ───────────────────────────────────────────────────────────
     block = sum(l.get('block_min', 0) for l in legs)
     ldg = sum(l.get('ldg_day', 0) + l.get('ldg_night', 0) for l in legs)
     simmin = sum(x.get('duration_min') or 0 for x in sims)
     merged_block = sum(m['dropped_block'] for m in merged)
     merged_ldg = src_ldg - ldg
+    ok_block = (src_block - merged_block) == block
+    ok_ldg = (src_ldg - merged_ldg) == ldg
+    if not ok_block or not ok_ldg:
+        raise ValueError(
+            'OffBlock-Kontrollsumme abweichend: '
+            f'Block={ok_block}, Landungen={ok_ldg}'
+        )
+    report = {
+        'filename': src.rsplit('/', 1)[-1],
+        'month': (f'{legs[0]["date"][:7]}–{legs[-1]["date"][:7]}'
+                  if legs else 'leer'),
+        'rows': len(rows),
+        'legs': len(legs),
+        'raw_legs': n_raw,
+        'sim_sessions': len(sims),
+        'block_min': block,
+        'sim_min': simmin,
+        'landings': ldg,
+        'merged': merged,
+        'merged_block_min': merged_block,
+        'collisions': collisions,
+        'skipped': skipped,
+        'planned_rows': planned_rows,
+        'unflown_past': unflown_past,
+        'sim_as_flight': sim_as_flight,
+        'cutoff': cutoff.isoformat(),
+        'dup_window_min': window,
+        'control': 'OK',
+    }
+    return legs, sims, report
+
+
+def _print_report(src, report):
+    """Menschenlesbarer Bericht des historischen CLI-Werkzeugs."""
+    legs = report['legs']
+    block = report['block_min']
+    ldg = report['landings']
+    simmin = report['sim_min']
+    n_raw = report['raw_legs']
+    merged = report['merged']
+    merged_block = report['merged_block_min']
+    collisions = report['collisions']
+    planned_rows = report['planned_rows']
+    unflown_past = report['unflown_past']
+    sim_as_flight = report['sim_as_flight']
+    merged_ldg = sum(m.get('dropped_landings', 0) for m in merged)
     print(f'Quelle      : {src}')
-    print(f'CSV-Zeilen  : {len(rows)}   Cutoff geplant: {cutoff}   '
-          f'Dup-Fenster: {window} min')
-    print(f'Legs        : {len(legs)}   {block // 60}:{block % 60:02d} Block'
-          f'   (roh {n_raw}, zusammengelegt {n_raw - len(legs)})')
+    print(f'CSV-Zeilen  : {report["rows"]}   '
+          f'Cutoff geplant: {report["cutoff"]}   '
+          f'Dup-Fenster: {report["dup_window_min"]} min')
+    print(f'Legs        : {legs}   {block // 60}:{block % 60:02d} Block'
+          f'   (roh {n_raw}, zusammengelegt {n_raw - legs})')
     print(f'Landungen   : {ldg}')
-    print(f'Sims        : {len(sims)}   {simmin // 60}:{simmin % 60:02d}')
-    print(f'Zeitraum    : {legs[0]["date"]} → {legs[-1]["date"]}' if legs else '')
-    print(f'Übersprungen: {skipped}')
+    print(f'Sims        : {report["sim_sessions"]}   '
+          f'{simmin // 60}:{simmin % 60:02d}')
+    print(f'Übersprungen: {report["skipped"]}')
     if planned_rows:
         print(f'GEPLANT (nicht importiert, {len(planned_rows)}): '
               f'{planned_rows[0][0]} → {planned_rows[-1][0]}')
@@ -614,16 +679,31 @@ def main():
     print(f'Key-Kollisionen aufgeloest: {len(collisions)}')
     for c in collisions:
         print(f'   {c[0]}  {c[1]}  {c[2]}  dep {c[3]}  -> Suffix ({c[4]})')
-    ok_block = (src_block - merged_block) == block
-    ok_ldg = (src_ldg - merged_ldg) == ldg
-    print('KONTROLLE   : Block aus Quelle direkt = '
-          f'{src_block // 60}:{src_block % 60:02d} '
-          f'− zusammengelegt {merged_block // 60}:{merged_block % 60:02d} = '
-          f'{(src_block - merged_block) // 60}:'
-          f'{(src_block - merged_block) % 60:02d} '
-          f'({"OK" if ok_block else "ABWEICHUNG"}), '
-          f'Landungen Quelle = {src_ldg} − {merged_ldg} '
-          f'({"OK" if ok_ldg else "ABWEICHUNG"})')
+    print('KONTROLLE   : OK')
+
+
+def main():
+    argv = [a for a in sys.argv[1:]]
+    keep_planned = '--keep-planned' in argv
+    keep_sim_as_flight = '--keep-sim-as-flight' in argv
+    keep_duplicates = '--keep-duplicates' in argv
+    window = 15
+    if '--dup-window' in argv:
+        window = int(argv[argv.index('--dup-window') + 1])
+    cutoff = date.today()
+    if '--cutoff' in argv:
+        cutoff = datetime.strptime(argv[argv.index('--cutoff') + 1],
+                                   '%Y-%m-%d').date()
+    pos = [a for a in argv if not a.startswith('--')
+           and not re.match(r'^\d{4}-\d{2}-\d{2}$', a) and not a.isdigit()]
+    src, dst = pos[0], pos[1]
+    legs, sims, report = parse_csv(
+        src, cutoff=cutoff, keep_planned=keep_planned,
+        keep_sim_as_flight=keep_sim_as_flight,
+        keep_duplicates=keep_duplicates, window=window)
+    with open(dst, 'w', encoding='utf-8') as handle:
+        json.dump({'legs': legs, 'sim': sims}, handle, ensure_ascii=False)
+    _print_report(src, report)
 
 
 if __name__ == '__main__':

@@ -171,28 +171,74 @@ def _cfg_pdf():
     return _FakePDF([_FakePage(text, words)])
 
 
-def test_try_parsers_unpacks_both_real_parser_signatures(monkeypatch):
+def test_try_parsers_unpacks_both_real_parser_signatures(monkeypatch, tmp_path):
     # Der Wächter entpackte fest dreistellig — die Condor-Variante gibt aber
     # nur (legs, report) zurück. Jeder Condor-Upload starb deshalb an einem
     # ValueError, der als „Kontrolle verletzt" in `review` gedeutet wurde.
     # Bewusst gegen die ECHTEN Parser: nur die PDF-Ebene ist synthetisch.
-    docs = {"lh.pdf": _lh_pdf(), "condor.pdf": _cfg_pdf()}
+    lh = tmp_path / "lh.upload"
+    condor = tmp_path / "condor.upload"
+    lh.write_bytes(b"%PDF-fake-lh")
+    condor.write_bytes(b"%PDF-fake-condor")
+    docs = {str(lh): _lh_pdf(), str(condor): _cfg_pdf()}
     monkeypatch.setattr(pdfplumber, "open", lambda path: docs[path])
 
-    name, legs, sims, report = logbook_watchdog._try_parsers("lh.pdf")
+    name, legs, sims, report = logbook_watchdog._try_parsers(str(lh))
     assert (name, legs, sims) == ("lh_flugstunden", [], [])
     assert report["month"] == "2022-07"
 
-    name, legs, sims, report = logbook_watchdog._try_parsers("condor.pdf")
+    name, legs, sims, report = logbook_watchdog._try_parsers(str(condor))
     assert (name, legs, sims) == ("cfg_flugstunden", [], [])
     assert report["month"] == "2026-05"
 
 
-def test_try_parsers_reports_unknown_format_without_touching_a_parser(
-        monkeypatch):
+def test_try_parsers_reports_unknown_pdf_without_touching_a_parser(
+        monkeypatch, tmp_path):
+    path = tmp_path / "unknown.upload"
+    path.write_bytes(b"%PDF-fake-unknown")
     monkeypatch.setattr(pdfplumber, "open",
                         lambda path: _FakePDF([_FakePage("Bordkarte", [])]))
-    assert logbook_watchdog._try_parsers("x.pdf") == \
+    assert logbook_watchdog._try_parsers(str(path)) == \
+        ("unsupported", None, None, None)
+
+
+def test_try_parsers_routes_offblock_csv_by_content(tmp_path):
+    path = tmp_path / "duties.upload"
+    path.write_text(
+        "Type;Date;Function;Departure place;Departure time;Arrival place;"
+        "Arrival time;Total time;Flight number;Aircraft registration;"
+        "Aircraft ICAO;Pilot flying;Landing day (count)\n"
+        "Flight;01.01.24;First Officer;FRA;08:00;MUC;09:10;01:10;"
+        "LH100;D-AIZI;A320;Yes;1\n",
+        encoding="utf-8",
+    )
+    name, legs, sims, report = logbook_watchdog._try_parsers(str(path))
+    assert name == "offblock_duties"
+    assert sims == [] and report["control"] == "OK"
+    assert legs == [{
+        "date": "2024-01-01", "flight": "LH100", "from": "FRA",
+        "to": "MUC", "dep_iso": "2024-01-01T08:00:00Z",
+        "arr_iso": "2024-01-01T09:10:00Z", "block_min": 70,
+        "reg": "D-AIZI", "type": "A320", "pf": True,
+        "ldg_day": 1, "role": "FO",
+    }]
+
+
+def test_try_parsers_turns_corrupt_pdf_into_terminal_unsupported(tmp_path):
+    path = tmp_path / "broken.upload"
+    path.write_bytes(b"%PDF-this-is-not-a-real-pdf")
+    assert logbook_watchdog._try_parsers(str(path)) == \
+        ("unsupported", None, None, None)
+
+
+def test_try_parsers_does_not_send_arbitrary_csv_to_pdfplumber(
+        monkeypatch, tmp_path):
+    path = tmp_path / "other.upload"
+    path.write_text("foo,bar\n1,2\n", encoding="utf-8")
+    monkeypatch.setattr(pdfplumber, "open",
+                        lambda _path: (_ for _ in ()).throw(
+                            AssertionError("pdfplumber darf nicht laufen")))
+    assert logbook_watchdog._try_parsers(str(path)) == \
         ("unsupported", None, None, None)
 
 
