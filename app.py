@@ -38678,10 +38678,31 @@ def auth_forgot():
     user = _auth_get_user(email)
     if user is not None:
         import uuid as _u
-        reset_token = _u.uuid4().hex[:24]
+        # Wiederholtes Tippen darf die gerade verschickte Mail nicht entwerten.
+        # Solange der vorhandene Token unbenutzt und noch gültig ist, schicken
+        # wir exakt denselben Code erneut. Erst nach Ablauf/Verwendung entsteht
+        # ein neuer. Das bleibt vollständig kompatibel mit allen alten Builds.
+        reset_token = None
+        existing_token = str(user.get('reset_token') or '').strip()
+        if existing_token and not user.get('reset_used_at'):
+            try:
+                existing_expiry = datetime.fromisoformat(
+                    str(user.get('reset_expires') or '1970-01-01T00:00:00'))
+                comparison_now = (datetime.now(existing_expiry.tzinfo)
+                                  if existing_expiry.tzinfo else datetime.now())
+                if existing_expiry > comparison_now:
+                    reset_token = existing_token
+            except (TypeError, ValueError):
+                pass
+        if not reset_token:
+            reset_token = _u.uuid4().hex[:24]
+            user['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
         user['reset_token'] = reset_token
-        user['reset_expires'] = (datetime.now() + timedelta(hours=2)).isoformat()
-        user.pop('reset_used_at', None)  # alter used_at-Marker entfernen, neuer Token
+        # WICHTIG explizites None statt pop(): Supabase-UPSERT lässt eine nicht
+        # gesendete Spalte unverändert. Mit pop() blieb der alte used_at-Marker
+        # serverseitig stehen und ein frisch versandter Code galt sofort als
+        # bereits verwendet.
+        user['reset_used_at'] = None
         _auth_upsert_user(email, user)
         sent_ok = _send_password_reset_email(email, reset_token)
         if not sent_ok:
@@ -38716,11 +38737,13 @@ def auth_reset():
         pass
     user['password_hash'] = _password_hash(new_pw)
     user['reset_used_at'] = datetime.now().isoformat()  # Audit-Marker
-    user.pop('reset_token', None)
-    user.pop('reset_expires', None)
-    # SCALE-FIX: Single-Row-Upsert statt Full-Table-Save. ON-CONFLICT-Verhalten
-    # identisch zum alten Bulk-Save (gepoppte Spalten bleiben SB-seitig stehen,
-    # Replay-Schutz greift über reset_used_at — unverändert).
+    # Auch hier explizit NULL persistieren. Fehlende Keys löschen bei einem
+    # Supabase-Upsert keine bestehenden Spaltenwerte.
+    user['reset_token'] = None
+    user['reset_expires'] = None
+    # SCALE-FIX: Single-Row-Upsert statt Full-Table-Save. Die beiden expliziten
+    # NULLs räumen die Einmal-Credential ab; reset_used_at bleibt als Audit- und
+    # Replay-Marker bestehen.
     _auth_upsert_user(email, user)
     # A password reset is an account-recovery boundary: every modern device
     # session is revoked. Legacy AT clients stay compatible during rollout.
