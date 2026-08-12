@@ -18028,6 +18028,85 @@ def _friends_today_response(payload):
     return resp
 
 
+def _reconcile_crew_state_with_flights_live(crew_state, flights_live):
+    """Ein Feed-Response darf pro Flug nur eine operative Zeitwahrheit tragen.
+
+    ``crew_state`` wird vor ``flights_live`` berechnet und kann deshalb noch die
+    Board-ETA enthalten, während ``flights_live`` im selben Request bereits die
+    exakte FR24-ETA geladen hat. Zustand/Position bleiben autoritativ aus dem
+    State-Resolver; nur die passenden operativen Leg-Felder und der fertige
+    Flug-Subtitle werden an den reicheren Snapshot angeglichen.
+    """
+    if not isinstance(crew_state, dict) or not isinstance(flights_live, list):
+        return crew_state
+    original_leg = crew_state.get('current_leg')
+    if not isinstance(original_leg, dict):
+        return crew_state
+
+    def _digits(value):
+        m = re.search(r'(\d+)[A-Z]?$', str(value or '').replace(' ', '').upper())
+        return str(int(m.group(1))) if m else None
+
+    flight = original_leg.get('flight_no') or original_leg.get('flight')
+    dep = str(original_leg.get('dep') or original_leg.get('dep_iata') or '').upper()
+    arr = str(original_leg.get('arr') or original_leg.get('arr_iata') or '').upper()
+    match = None
+    for candidate in flights_live:
+        if not isinstance(candidate, dict) or _digits(candidate.get('flight')) != _digits(flight):
+            continue
+        cdep = str(candidate.get('dep_iata') or '').upper()
+        carr = str(candidate.get('arr_iata') or '').upper()
+        if (dep and cdep and dep != cdep) or (arr and carr and arr != carr):
+            continue
+        match = candidate
+        break
+    if match is None:
+        return crew_state
+
+    out = dict(crew_state)
+    leg = dict(original_leg)
+    for key in ('est_dep_iso', 'actual_dep_iso', 'est_arr_iso',
+                'actual_arr_iso', 'dep_time_source', 'arr_time_source'):
+        if match.get(key) is not None:
+            leg[key] = match.get(key)
+    if match.get('sched_dep_iso'):
+        leg['dep_iso'] = match.get('sched_dep_iso')
+    if match.get('sched_arr_iso'):
+        leg['arr_iso'] = match.get('sched_arr_iso')
+    if match.get('delay_known') is True:
+        delay_side = match.get('delay_side')
+        delay_value = match.get('delay_min')
+        # ``flights_live.delay_min`` ist absichtlich der Ankunftsversatz und
+        # damit bei einem reinen Abflug-Update leer. Das Crew-Leg besitzt nur
+        # ein generisches Delay-Feld und muss den Wert seiner deklarierten
+        # Seite behalten.
+        if delay_side == 'dep':
+            delay_value = match.get('dep_delay_min')
+        elif delay_side == 'arr':
+            delay_value = match.get('arr_delay_min', delay_value)
+        leg['delay_min'] = delay_value
+        leg['delay_side'] = delay_side
+        leg['delay_known'] = True
+    out['current_leg'] = leg
+
+    if str(out.get('state') or '').lower() == 'flying':
+        arrival = (leg.get('actual_arr_iso') or leg.get('est_arr_iso')
+                   or leg.get('arr_iso'))
+        station = leg.get('arr') or match.get('arr_iata')
+        try:
+            hhmm = _ics_iso_to_station_hhmm(arrival, station) if arrival else None
+        except Exception:
+            hhmm = None
+        route_dep = leg.get('dep') or match.get('dep_iata')
+        route_arr = leg.get('arr') or match.get('arr_iata')
+        if route_dep and route_arr:
+            text = dict(out.get('text') or {})
+            route = f'{route_dep} → {route_arr}'
+            text['subtitle'] = (f'{route} · Ankunft {hhmm}' if hhmm else route)
+            out['text'] = text
+    return out
+
+
 def _friend_briefing_day_sectors(fr, datum):
     """(ical_sectors, imported_at, ical_summary, ical_start_iso) des Tages
     DIREKT aus user_ical_briefings (1 gefilterter SB-Read). Der serverseitige
@@ -19074,6 +19153,11 @@ def get_friends_today(token):
                                 crew_state_next = cs2
             except Exception:
                 crew_state_next = None
+        # `flights_live` hat im selben Request ggf. bereits eine frischere,
+        # exakte FR24-ETA als der vorher berechnete State-Resolver. Vor Ausgabe
+        # EINMAL zusammenführen, damit current_leg/Text/Delay nicht divergieren.
+        crew_state = _reconcile_crew_state_with_flights_live(
+            crew_state, flights_live)
         return (_idx, {
             'token': _public_user_ref_or_legacy_display(fr),
             # Stabile match_id (Hash) statt vollem Token — iOS matcht Friend↔

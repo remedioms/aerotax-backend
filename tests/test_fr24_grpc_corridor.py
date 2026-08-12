@@ -142,6 +142,9 @@ def test_shared_live_card_prefers_exact_flightid(monkeypatch):
                         lambda fid: calls.append(('id', fid)) or dict(exact))
     monkeypatch.setattr(G, 'detail_card',
                         lambda **kw: calls.append(('geo', kw)) or None)
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_read', lambda fid: None)
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_acquire',
+                        lambda fid: ('unavailable', None, None))
     DATA._FR24_LIVE_CARD_MEMO.clear()
 
     card = DATA._fr24_live_card_cached(
@@ -162,6 +165,9 @@ def test_shared_live_card_falls_back_to_geo_after_exact_id_miss(monkeypatch):
                             'route_from': 'FRA', 'route_to': 'PVG',
                             'reg': 'D-AIXF', 'eta': 1_786_589_160,
                         })
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_read', lambda fid: None)
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_acquire',
+                        lambda fid: ('unavailable', None, None))
     DATA._FR24_LIVE_CARD_MEMO.clear()
 
     card = DATA._fr24_live_card_cached(
@@ -171,3 +177,60 @@ def test_shared_live_card_falls_back_to_geo_after_exact_id_miss(monkeypatch):
 
     assert card['eta'] == 1_786_589_160
     assert [kind for kind, _ in calls] == ['id', 'geo']
+
+
+def test_shared_worker_cache_wins_without_another_fr24_call(monkeypatch):
+    cached = {'reg': 'D-AIXF', 'eta': 1_786_589_160}
+    calls = []
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_read',
+                        lambda fid: dict(cached))
+    monkeypatch.setattr(G, 'detail_card_by_flightid',
+                        lambda fid: calls.append(('id', fid)) or None)
+    DATA._FR24_LIVE_CARD_MEMO.clear()
+
+    card = DATA._fr24_live_card_cached(
+        flight_no='LH732', lat=40.5, lon=48.4,
+        origin='FRA', dest='PVG', flightid=987654321)
+
+    assert card == cached
+    assert calls == []
+
+
+def test_exact_flightid_memo_does_not_change_with_position(monkeypatch):
+    calls = []
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_read', lambda fid: None)
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_acquire',
+                        lambda fid: ('unavailable', None, None))
+    monkeypatch.setattr(G, 'detail_card_by_flightid',
+                        lambda fid: calls.append(fid) or {'eta': 1_786_589_160})
+    DATA._FR24_LIVE_CARD_MEMO.clear()
+
+    first = DATA._fr24_live_card_cached(
+        flight_no='LH732', lat=40.5, lon=48.4,
+        origin='FRA', dest='PVG', flightid=987654321)
+    second = DATA._fr24_live_card_cached(
+        flight_no='LH732', lat=41.7, lon=51.2,
+        origin='FRA', dest='PVG', flightid=987654321)
+
+    assert first == second
+    assert calls == [987654321]
+
+
+def test_busy_worker_waits_for_shared_winner(monkeypatch):
+    cached = {'reg': 'D-AIXF', 'eta': 1_786_589_160}
+    calls = []
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_read', lambda fid: None)
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_acquire',
+                        lambda fid: ('busy', None, None))
+    monkeypatch.setattr(DATA, '_fr24_shared_live_card_wait',
+                        lambda fid: dict(cached))
+    monkeypatch.setattr(G, 'detail_card_by_flightid',
+                        lambda fid: calls.append(fid) or None)
+    DATA._FR24_LIVE_CARD_MEMO.clear()
+
+    card = DATA._fr24_live_card_cached(
+        flight_no='LH732', lat=40.5, lon=48.4,
+        origin='FRA', dest='PVG', flightid=987654321)
+
+    assert card == cached
+    assert calls == []

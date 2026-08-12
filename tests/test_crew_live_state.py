@@ -455,6 +455,63 @@ def test_friends_today_payload_traegt_crew_state():
         assert k in data['friends_today'][0]
 
 
+def test_crew_state_is_reconciled_to_same_live_eta(monkeypatch):
+    """LH732-Repro innerhalb EINER friends-today-Antwort: crew_state war noch
+    14:26/-39, flights_live bereits 14:28/-37. Danach müssen Leg, Text und Delay
+    alle denselben reicheren Snapshot tragen."""
+    monkeypatch.setattr(A, '_ics_iso_to_station_hhmm',
+                        lambda iso, iata: '14:28')
+    state = {
+        'state': 'flying',
+        'current_leg': {
+            'flight_no': 'LH732', 'dep': 'FRA', 'arr': 'PVG',
+            'dep_iso': '2026-08-12T19:30:00Z',
+            'arr_iso': '2026-08-13T07:05:00Z',
+            'est_arr_iso': '2026-08-13T06:26:00Z',
+            'delay_min': -39, 'delay_side': 'arr', 'delay_known': True,
+        },
+        'position': {'lat': 40.5, 'lon': 48.4},
+        'text': {'title': 'Fliegt gerade',
+                 'subtitle': 'FRA → PVG · Ankunft 14:26'},
+    }
+    live = [{
+        'flight': 'LH732', 'dep_iata': 'FRA', 'arr_iata': 'PVG',
+        'sched_arr_iso': '2026-08-13T07:05:00Z',
+        'est_arr_iso': '2026-08-13T06:28:00Z',
+        'arr_time_source': 'fr24',
+        'delay_min': -37, 'delay_side': 'arr', 'delay_known': True,
+    }]
+
+    out = A._reconcile_crew_state_with_flights_live(state, live)
+
+    assert out['current_leg']['est_arr_iso'] == '2026-08-13T06:28:00Z'
+    assert out['current_leg']['delay_min'] == -37
+    assert out['current_leg']['arr_time_source'] == 'fr24'
+    assert out['text']['subtitle'] == 'FRA → PVG · Ankunft 14:28'
+    assert out['position'] == state['position']
+    assert state['current_leg']['est_arr_iso'] == '2026-08-13T06:26:00Z'
+
+
+def test_crew_state_reconcile_keeps_departure_side_delay():
+    state = {
+        'state': 'pre_flight',
+        'current_leg': {
+            'flight_no': 'LH1137', 'dep': 'BCN', 'arr': 'FRA',
+            'delay_known': True, 'delay_side': 'dep', 'delay_min': 15,
+        },
+    }
+    live = [{
+        'flight': 'LH1137', 'dep_iata': 'BCN', 'arr_iata': 'FRA',
+        'delay_known': True, 'delay_side': 'dep', 'delay_min': None,
+        'dep_delay_min': 15, 'arr_delay_min': None,
+    }]
+
+    out = A._reconcile_crew_state_with_flights_live(state, live)
+
+    assert out['current_leg']['delay_min'] == 15
+    assert out['current_leg']['delay_side'] == 'dep'
+
+
 def test_family_status_traegt_crew_state_ohne_sb():
     # SB down → Roster-Zweig läuft nicht (prim/active_day undefiniert) —
     # der crew_state-Block darf trotzdem nie werfen und liefert den ehrlichen

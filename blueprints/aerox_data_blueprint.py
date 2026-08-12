@@ -5549,6 +5549,106 @@ _FR24_LIVE_CARD_MEMO = {}
 _FR24_LIVE_CARD_LOCK = threading.Lock()
 _FR24_LIVE_CARD_HIT_TTL = 45.0
 _FR24_LIVE_CARD_MISS_TTL = 15.0
+_FR24_SHARED_CARD_TTL = 45
+
+
+def _fr24_shared_live_card_read(flightid):
+    """Worker-übergreifender Kurzcache einer EXAKTEN FR24-Fluginstanz.
+
+    Gunicorn-Worker haben getrennte Python-Memos. Ohne diese Ebene konnten zwei
+    nahezu gleichzeitige App-Flächen für dieselbe Flight-ID verschiedene,
+    Sekunden später aktualisierte ETAs sehen. Fail-open: Supabase-Miss/-Fehler
+    führt einfach zum bisherigen direkten Gratisabruf.
+    """
+    try:
+        from datetime import datetime as _dtc, timezone as _tzc
+        sb = _sb()
+        if sb is None:
+            return None
+        key = f'fr24live:{int(flightid)}'
+        rows = (sb.table('ax_paid_call_cache')
+                .select('result,result_until').eq('call_key', key)
+                .limit(1).execute()).data or []
+        if not rows:
+            return None
+        until = _dtc.fromisoformat(
+            str(rows[0].get('result_until') or '').replace('Z', '+00:00'))
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=_tzc.utc)
+        if until <= _dtc.now(_tzc.utc):
+            return None
+        card = (rows[0].get('result') or {}).get('card')
+        return dict(card) if isinstance(card, dict) and card else None
+    except Exception:
+        return None
+
+
+def _fr24_shared_live_card_acquire(flightid):
+    """Atomare Worker-Lease → (status, card|None, owner|None).
+
+    Nutzt dieselbe generische Singleflight-RPC wie die budgetierten Provider,
+    aber ohne jede Budgetreservierung. Dadurch kann nur ein Worker die freie
+    FR24-Antwort schreiben; ein langsamer älterer Fetch überschreibt nie einen
+    bereits frischeren Sieger.
+    """
+    try:
+        sb = _sb()
+        if sb is None:
+            return 'unavailable', None, None
+        key = f'fr24live:{int(flightid)}'
+        owner = f'{os.getpid()}-{threading.get_ident()}-{time.time_ns()}'
+        resp = sb.rpc('ax_paid_call_acquire', {
+            'p_call_key': key,
+            'p_owner': owner,
+            'p_lease_seconds': 10,
+        }).execute()
+        data = getattr(resp, 'data', None)
+        if isinstance(data, list) and len(data) == 1:
+            data = data[0]
+        if not isinstance(data, dict):
+            return 'unavailable', None, None
+        status = str(data.get('status') or 'unavailable')
+        result = data.get('result') or {}
+        card = result.get('card') if isinstance(result, dict) else None
+        if status == 'hit' and isinstance(card, dict) and card:
+            return status, dict(card), None
+        return status, None, (owner if status == 'acquired' else None)
+    except Exception:
+        return 'unavailable', None, None
+
+
+def _fr24_shared_live_card_complete(flightid, owner, card):
+    """Lease atomar abschließen; ein Nicht-Sieger kann nichts überschreiben."""
+    try:
+        sb = _sb()
+        if sb is None or not owner:
+            return False
+        ok = isinstance(card, dict) and bool(card)
+        resp = sb.rpc('ax_paid_call_complete', {
+            'p_call_key': f'fr24live:{int(flightid)}',
+            'p_owner': owner,
+            'p_result': ({'card': dict(card)} if ok else None),
+            'p_result_ttl_seconds': _FR24_SHARED_CARD_TTL,
+            'p_negative_reason': (None if ok else 'upstream_error'),
+            'p_negative_ttl_seconds': 1,
+        }).execute()
+        data = getattr(resp, 'data', None)
+        if isinstance(data, list) and len(data) == 1:
+            data = data[0]
+        return bool(data)
+    except Exception:
+        return False
+
+
+def _fr24_shared_live_card_wait(flightid, timeout_s=2.0):
+    """Kurz auf den anderen Worker warten; danach fail-open zum Geo-Fallback."""
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while time.monotonic() < deadline:
+        card = _fr24_shared_live_card_read(flightid)
+        if card:
+            return card
+        time.sleep(0.1)
+    return None
 
 
 def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
@@ -5590,9 +5690,13 @@ def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
     # Mit `cs or fn or rg or hx` als Schluessel konnte ein Aufruf, der nur die
     # Flugnummer kannte (zwangslaeufig MISS), 15 s lang den Treffer verdecken,
     # den derselbe Flug unter seiner Reg gerade geliefert hatte.
-    key = (fid, cs, rg, hx, fn, dep, arr,
-           round(lat_f, 2) if lat_f is not None else None,
-           round(lon_f, 2) if lon_f is not None else None)
+    # Eine FR24-flightid bezeichnet die Instanz bereits eindeutig. Koordinaten
+    # im Key machten den Cache beim Weiterflug alle ~1° erneut kalt und ließen
+    # Feed/Radar unnötig verschiedene ETA-Snapshots laden.
+    key = ((fid, dep, arr) if fid else
+           (None, cs, rg, hx, fn, dep, arr,
+            round(lat_f, 2) if lat_f is not None else None,
+            round(lon_f, 2) if lon_f is not None else None))
     now = time.time()
     with _FR24_LIVE_CARD_LOCK:
         hit = _FR24_LIVE_CARD_MEMO.get(key)
@@ -5603,7 +5707,24 @@ def _fr24_live_card_cached(flight_no=None, callsign=None, reg=None,
                 return dict(hit[1]) if hit[1] else None
     try:
         from blueprints import fr24_grpc
-        card = (fr24_grpc.detail_card_by_flightid(fid) if fid else None)
+        card = None
+        if fid:
+            card = _fr24_shared_live_card_read(fid)
+            if not card:
+                _claim, _claimed_card, _owner = \
+                    _fr24_shared_live_card_acquire(fid)
+                card = _claimed_card
+                if _claim == 'acquired':
+                    card = fr24_grpc.detail_card_by_flightid(fid)
+                    _fr24_shared_live_card_complete(fid, _owner, card)
+                elif _claim == 'busy':
+                    card = _fr24_shared_live_card_wait(fid)
+                elif _claim == 'unavailable':
+                    # DB/RPC-Ausfall ändert die bisherige Verfügbarkeit nicht.
+                    # Bewusst NICHT ungeleast in den Shared Cache schreiben:
+                    # zwei Worker könnten sonst in umgekehrter Reihenfolge
+                    # fertig werden und der ältere Snapshot den neueren schlagen.
+                    card = fr24_grpc.detail_card_by_flightid(fid)
         if not card and lat_f is not None and lon_f is not None:
             card = fr24_grpc.detail_card(callsign=cs, hex=hx, reg=rg,
                                          lat=lat_f, lon=lon_f)
