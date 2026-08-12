@@ -5,6 +5,7 @@ only redundant operator notification and can never turn an ephemeral upload
 into a successful, trackable job.
 """
 import base64
+import datetime as _dt
 import os
 import sys
 
@@ -39,6 +40,27 @@ def _post(client, token, filename, blob, mail_ok=True, store_ok=101,
         'data_b64': base64.b64encode(blob).decode(),
     })
     return r, sent
+
+
+def _capture_pushes(monkeypatch):
+    """Sammelt jeden Outbox-Auftrag der Route (Enqueue statt echtem Versand)."""
+    pushes = []
+
+    def fake_notify(tok, title, body, data=None, thread_id=None, badge=None,
+                    category=None, idempotency_key=None, actor_token=None):
+        pushes.append({'token': tok, 'title': title, 'body': body,
+                       'data': data, 'idempotency_key': idempotency_key})
+        return 'outbox-1'
+
+    monkeypatch.setattr(A, '_push_notify_async', fake_notify)
+    return pushes
+
+
+def _outbox_key(push):
+    """Der echte Dedupe-Schlüssel der Outbox — inkl. Titel/Body/data-Hash."""
+    return A._push_outbox_key(push['token'], push['title'], push['body'],
+                              push['data'], None, None, None,
+                              idempotency_key=push['idempotency_key'])
 
 
 def test_upload_csv_sends_mail_and_acks(monkeypatch):
@@ -178,3 +200,115 @@ def test_upload_status_hides_foreign_or_missing_job(monkeypatch):
     r = _client().get('/api/user/logbook/tok_upload_status/import-upload/999')
     assert r.status_code == 404
     assert r.get_json()['error'] == 'not_found'
+
+
+# ── Ankunfts-Push („angekommen — wird verarbeitet") ────────────────────────
+
+def test_accepted_upload_enqueues_one_short_arrival_push(monkeypatch):
+    A._LOGBOOK_IMPORT_TS.clear()
+    pushes = _capture_pushes(monkeypatch)
+    r, _ = _post(_client(), 'tok_push_1', 'Export.csv', b'a,b\n',
+                 monkeypatch=monkeypatch)
+    assert r.status_code == 200
+    assert len(pushes) == 1
+    push = pushes[0]
+    assert push['token'] == 'tok_push_1'
+    assert push['title'] == 'Flugbuch-Import angekommen'
+    assert push['body'] == 'Wird verarbeitet.'
+    assert push['data'] == {
+        'type': 'logbook_import_received',
+        'localization_key': 'logbook_import_received',
+        'deep_link': 'aerox://more/logbook',
+    }
+    # Kein datei-spezifisches Feld im Payload: job_id im `data` würde den
+    # Outbox-Hash pro Datei ändern und die Dedupe still aushebeln.
+    assert 'job_id' not in push['data']
+    assert push['idempotency_key'].startswith(
+        'logbook-import-received:tok_push_1:')
+
+
+def test_arrival_push_is_localized_for_all_supported_languages():
+    copy = A._PUSH_SYSTEM_COPY['logbook_import_received']
+    assert set(copy) == set(A._PUSH_LANGUAGES)
+    for lang, (title, body) in copy.items():
+        assert title and body, lang
+        # „was kurzes" (Owner): Ankunft ist eine Zeile, kein Aufsatz.
+        assert len(title) <= 60 and len(body) <= 60, lang
+    data = {'type': 'logbook_import_received',
+            'localization_key': 'logbook_import_received'}
+    assert A._push_localize_system_copy(
+        'Flugbuch-Import angekommen', 'Wird verarbeitet.', data, 'en') == (
+        'Logbook import received', 'Processing now.')
+
+
+def test_batch_of_files_dedupes_to_a_single_arrival_push(monkeypatch):
+    """Fünf Monatsübersichten in einem Rutsch = EIN Push, nicht fünf."""
+    A._LOGBOOK_IMPORT_TS.clear()
+    pushes = _capture_pushes(monkeypatch)
+    c = _client()
+    for i in range(5):
+        r, _ = _post(c, 'tok_push_batch', f'monat{i}.csv', b'a,b\n',
+                     monkeypatch=monkeypatch)
+        assert r.status_code == 200, (i, r.get_json())
+    assert len(pushes) == 5, 'jede Datei stellt in die Outbox ein …'
+    # … und die Outbox liefert genau EINEN aus: identischer Idempotenz-Key.
+    assert len({p['idempotency_key'] for p in pushes}) == 1
+    assert len({_outbox_key(p) for p in pushes}) == 1
+
+
+def test_arrival_push_key_is_per_user_and_per_hour_window():
+    base = _dt.datetime(2026, 8, 12, 10, 5, tzinfo=_dt.timezone.utc)
+    keys = {}
+    for label, tok, now in (
+            ('a_10h', 'tok_a', base),
+            ('a_10h_late', 'tok_a', base.replace(minute=59)),
+            ('a_11h', 'tok_a', base + _dt.timedelta(hours=1)),
+            ('b_10h', 'tok_b', base)):
+        captured = []
+        original = A._push_notify_async
+        A._push_notify_async = (
+            lambda tok_, title, body, data=None, thread_id=None, badge=None,
+            category=None, idempotency_key=None, actor_token=None:
+            captured.append(idempotency_key))
+        try:
+            A._logbook_import_received_push(tok, now=now)
+        finally:
+            A._push_notify_async = original
+        keys[label] = captured[0]
+    assert keys['a_10h'] == keys['a_10h_late'] == (
+        'logbook-import-received:tok_a:2026-08-12-10')
+    assert keys['a_11h'] == 'logbook-import-received:tok_a:2026-08-12-11'
+    assert keys['b_10h'] == 'logbook-import-received:tok_b:2026-08-12-10'
+
+
+def test_rejected_uploads_never_push(monkeypatch):
+    A._LOGBOOK_IMPORT_TS.clear()
+    pushes = _capture_pushes(monkeypatch)
+    c = _client()
+    # Falsches Format …
+    assert _post(c, 'tok_push_rej', 'malware.exe', b'MZ',
+                 monkeypatch=monkeypatch)[0].status_code == 415
+    # … zu groß …
+    assert _post(c, 'tok_push_rej', 'big.csv',
+                 b'0' * (A._LOGBOOK_IMPORT_MAX_BYTES + 1),
+                 monkeypatch=monkeypatch)[0].status_code == 413
+    # … keine Datei …
+    assert c.post('/api/user/logbook/tok_push_rej/import-upload',
+                  json={'filename': 'x.csv', 'data_b64': ''}).status_code == 400
+    # … und kein durabler Job (SB-Store down).
+    assert _post(c, 'tok_push_rej', 'export.csv', b'x,y\n', store_ok=None,
+                 monkeypatch=monkeypatch)[0].status_code == 502
+    assert pushes == [], 'abgelehnter Upload darf nie „angekommen" pushen'
+
+
+def test_arrival_push_failure_never_breaks_the_upload(monkeypatch):
+    A._LOGBOOK_IMPORT_TS.clear()
+
+    def boom(*_a, **_kw):
+        raise RuntimeError('outbox down')
+
+    monkeypatch.setattr(A, '_push_notify_async', boom)
+    r, sent = _post(_client(), 'tok_push_boom', 'export.csv', b'a,b\n',
+                    monkeypatch=monkeypatch)
+    assert r.status_code == 200 and r.get_json()['job_id'] == 101
+    assert sent['filename'] == 'export.csv'

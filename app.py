@@ -12891,6 +12891,14 @@ _PUSH_USER_CONTENT_TYPES = frozenset((
     'wall_comment_reply', 'family_message', 'family_reply', 'goodflight',
 ))
 _PUSH_SYSTEM_COPY = {
+    'logbook_import_received': {
+        'de': ('Flugbuch-Import angekommen', 'Wird verarbeitet.'),
+        'en': ('Logbook import received', 'Processing now.'),
+        'it': ('Importazione del registro ricevuta', 'In elaborazione.'),
+        'es': ('Importación del libro de vuelo recibida', 'Se está procesando.'),
+        'fr': ('Import du carnet de vol reçu', 'Traitement en cours.'),
+        'pt': ('Importação do diário de voo recebida', 'Em processamento.'),
+    },
     'logbook_import_completed': {
         'de': ('Flugbuch-Import fertig',
                'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.'),
@@ -23743,6 +23751,45 @@ def _logbook_import_mail(token, filename, blob, note, stored=False):
         return False
 
 
+def _logbook_import_received_push(token, now=None):
+    """EIN kurzer „angekommen"-Push pro Upload-Schub.
+
+    Die Route nimmt EINE Datei pro Request an — wer fünf Monatsübersichten
+    nachträgt, erzeugt fünf Requests. Ein Push je Datei wäre Spam, deshalb
+    dedupliziert der Outbox-Idempotenz-Key über ein grobes UTC-Stundenfenster:
+    `logbook-import-received:<token>:<YYYY-MM-DD-HH>`. Ein Schub, der über die
+    Stundengrenze läuft, kostet im schlechtesten Fall EINEN zweiten Push — die
+    Alternative (Batch-Anker aus der Inbox lesen) wäre ein zusätzlicher
+    SB-Read pro Upload, der bei degradiertem Read genau die Dopplung erzeugt,
+    die er verhindern soll. Der Key wandert gehasht in die DB (siehe
+    _push_outbox_key), der Token steht dort also nie im Klartext.
+
+    WICHTIG: `data` darf KEIN datei-spezifisches Feld (job_id) tragen —
+    _push_outbox_key hasht Titel, Body und `data` in den Schlüssel mit ein,
+    eine wechselnde job_id würde die Dedupe still aushebeln.
+
+    Gates (Ruhezeiten, Push-Einstellungen) gelten unverändert: der Push läuft
+    über denselben `_push_notify_async` → Outbox-Weg wie alle System-Pushes.
+    """
+    if not token:
+        return None
+    stamp = (now or datetime.now(timezone.utc)).strftime('%Y-%m-%d-%H')
+    try:
+        return _push_notify_async(
+            token,
+            'Flugbuch-Import angekommen',
+            'Wird verarbeitet.',
+            data={'type': 'logbook_import_received',
+                  'localization_key': 'logbook_import_received',
+                  'deep_link': 'aerox://more/logbook'},
+            idempotency_key=f'logbook-import-received:{token}:{stamp}')
+    except Exception as ex:
+        app.logger.warning(
+            '[logbook-import] arrival-push fail tok=%s err=%s: %s',
+            token[:8], type(ex).__name__, str(ex)[:160])
+        return None
+
+
 @app.route('/api/user/logbook/<token>/import-upload', methods=['POST'])
 def upload_logbook_import(token):
     """Nimmt EINE Export-Datei entgegen (multipart `file` ODER JSON
@@ -23820,6 +23867,10 @@ def upload_logbook_import(token):
         return jsonify({'ok': False, 'error': 'delivery_failed',
                         'message': 'Übertragung fehlgeschlagen — bitte später '
                                    'erneut versuchen.'}), 502
+    # Erst ab hier ist der Upload angenommen (durable Zeile existiert) —
+    # abgelehnte Dateien (415/413/429/502) haben oben schon geantwortet und
+    # lösen deshalb nie einen Push aus.
+    _logbook_import_received_push(token)
     _logbook_import_mail(token, filename, blob, note, stored=True)
     return jsonify({'ok': True,
                     'job_id': job_id,
