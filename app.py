@@ -44743,7 +44743,7 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                           and _mess_zeitstempel_ok)
         if _arr_vorbei and not _freie_messung:
             # Stufe 3 — FR24 (bezahlt). `flight-summary` trägt die ECHTE
-            # Landezeit (`datetime_landed`, hier als `sched_arr`). Der Call ist
+            # Landezeit (`datetime_landed`, hier als `actual_arr`). Der Call ist
             # singleflight-gecacht und budget-gegated; die Route wird gegen das
             # Leg geprüft, damit nie eine fremde Rotation angehängt wird.
             try:
@@ -44775,19 +44775,27 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                 except Exception:
                     _f24_day = leg_date
                 _f24 = _fr24_flight_by_number(op_fn, _f24_day)
-                if (isinstance(_f24, dict) and _f24.get('sched_arr')
+                # KOPPLUNG zu 954a62b: `_fr24_flight_by_number` meldet keine
+                # Soll-Zeiten mehr (sched==actual war ein fabrizierter
+                # 0-Delay) — die gemessene Landung steht jetzt in
+                # `actual_arr`. `sched_arr` bleibt als Fallback stehen, damit
+                # ein alter Cache-Eintrag/Aufrufer diesen Zweig nicht still
+                # leerlaufen lässt.
+                _f24_land = (_f24.get('actual_arr') or _f24.get('sched_arr')
+                             if isinstance(_f24, dict) else None)
+                if (isinstance(_f24, dict) and _f24_land
                         # INSTANZ-RIEGEL: `flight-summary` liefert weder
                         # `dep_iata` noch `arr_iata` (beide null im Prod-Cache)
                         # — die Routen-Prüfung unten läuft dann LEER. Der
                         # einzige belastbare Beleg ist die Zeit selbst: die
                         # Landung muss im Instanz-Fenster um die Soll-Ankunft
                         # des Legs liegen, sonst ist es eine fremde Rotation.
-                        and _est_time_same_instance(_f24.get('sched_arr'),
+                        and _est_time_same_instance(_f24_land,
                                                     s.get('arr_iso'))
                         and (not _f24.get('arr_iata') or _f24.get('arr_iata') == to)
                         and (not _f24.get('dep_iata') or _f24.get('dep_iata') == frm)):
                     _facts = dict(_facts or {})
-                    _facts['est_arr'] = _f24.get('sched_arr')
+                    _facts['est_arr'] = _f24_land
                     # Die Board-Zeitstempel beschrieben die eben ERSETZTE
                     # Uhrzeit — sie dürfen der FR24-Landung nicht anhaften.
                     _facts.pop('arr_esti_changed_at', None)
@@ -44798,7 +44806,7 @@ def _enrich_leg_delays(sectors, date, free_only=True, homebase=None,
                     # Ohne belastbare Soll-Zeit lieber KEINE Zahl als eine
                     # widersprüchliche.
                     _sa = (m or {}).get('sched_arr')
-                    _facts['arr_delay_min'] = _minutes_between(_sa, _f24.get('sched_arr'))
+                    _facts['arr_delay_min'] = _minutes_between(_sa, _f24_land)
                     # FR24 liefert `datetime_landed` nur für beendete Flüge —
                     # das IST die Messung. Terminal markieren, damit weiter
                     # unten Phase und Beschriftung darauf aufbauen können.
