@@ -3825,6 +3825,28 @@ def get_adsb_area():
                 source = "fr24_grpc"
             tried.append({"upstream": "fr24_grpc", "ok": True, "count": len(g_ac)})
 
+    # ─── Mirror-Blackout-Fallback: EIGENE Ernte statt leerer Karte ───
+    # 13.08.2026: adsb.lol, adsb.fi UND airplanes.live lieferten gleichzeitig
+    # 0 Flieger über FRA (HTTP 200 + leere Liste, koordinierter Upstream-
+    # Ausfall) — der Nah-Zoom war komplett leer, obwohl aircraft_live >1200
+    # geharvestete Maschinen hatte; der gRPC-Fill griff wegen des 90-NM-
+    # Mindest-Radius nicht. Eine leere Mirror-Antwort ist ein AUSFALL-Signal,
+    # kein Fakt über den Himmel: eigene Welt-Tabelle lesen, egal wie klein
+    # der Radius ist. Echte Flieger aus eigener Ernte schlagen eine leere
+    # Karte immer (Fehler darf nicht wie Leere aussehen).
+    if not aircraft:
+        try:
+            own_ac = _area_from_aircraft_live(lat, lon, radius)
+        except Exception as e:
+            own_ac = None
+            tried.append({"upstream": "aircraft_live_fallback", "ok": False,
+                          "reason": str(e)[:80]})
+        if own_ac:
+            aircraft = own_ac
+            source = "aircraft_live-fallback"
+            tried.append({"upstream": "aircraft_live_fallback", "ok": True,
+                          "count": len(own_ac)})
+
     if aircraft is None:
         return jsonify({"ok": False, "error": "all_upstreams_failed",
                         "lat": lat, "lon": lon, "radius_nm": radius,
