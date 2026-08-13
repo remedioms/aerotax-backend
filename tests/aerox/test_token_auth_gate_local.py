@@ -37,6 +37,7 @@ PII_GET_ROUTES = [
     f"/api/user/voice-note/{FAKE}/2026-06-02",
     f"/api/user/flight-notes/{FAKE}",
     f"/api/user/flight-notes/{FAKE}/2026-06-02",
+    f"/api/user/trip-memos/{FAKE}",
     f"/api/user/flight-ops/{FAKE}",
     f"/api/user/briefing/{FAKE}",
     f"/api/user/roster-changes/{FAKE}",

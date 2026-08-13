@@ -611,6 +611,7 @@ _BUG004_GET_PII_PREFIXES = (
     '/api/user/voice-note/',
     '/api/user/flight-notes/',
     '/api/user/destination-notes/',  # private Ortsnotiz (nur Token-Owner)
+    '/api/user/trip-memos/',  # private Zimmer-/Parkplatz-Erinnerungen
     '/api/user/flight-ops/',
     '/api/user/briefing/',
     '/api/user/roster-changes/',
@@ -27451,6 +27452,172 @@ def put_destination_note(token, iata):
                         'len': len(note)})
     except Exception:
         app.logger.exception('[destination-notes] put_failed')
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
+
+
+# ─── Trip-Memos (private Zimmer-/Parkplatz-Erinnerungen) ───────────────────
+# Die öffentliche Zimmerbewertung bleibt bewusst im bestehenden
+# `hotel_room_reports`-Pfad. Hier liegen ausschließlich die persönlichen
+# Erinnerungen des Account-Owners. Wie Destination-Notes werden sie im
+# `user_profiles.metadata`-JSON gesichert: kein neues Schema, SB primary +
+# Disk-Fallback, DSGVO-Export/-Löschung automatisch über das Profil.
+
+_TRIP_MEMO_KINDS = {'room', 'parking'}
+_TRIP_MEMO_VALUE_MAX = 160
+_TRIP_MEMO_LOCATION_MAX = 80
+_TRIP_MEMO_HOTEL_MAX = 120
+
+
+def _trip_memo_timestamp(value):
+    """ISO-8601 → UTC datetime; ungültige Fremdwerte sind kein LWW-Signal."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trip_memos_read(token):
+    """Normalisiertes Dict der privaten Trip-Memos; toleriert kaputte Altwerte."""
+    full = _profile_load(token) or {}
+    prof = full.get('profile') or {}
+    raw = prof.get('trip_memos')
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for raw_key, raw_rec in raw.items():
+        if not isinstance(raw_rec, dict):
+            continue
+        kind = str(raw_rec.get('kind') or '').strip().lower()
+        anchor = str(raw_rec.get('anchor') or '').strip()
+        date = str(raw_rec.get('date') or anchor).strip()
+        value = _sanitize_flight_note(raw_rec.get('value'))[:_TRIP_MEMO_VALUE_MAX]
+        if kind not in _TRIP_MEMO_KINDS or not _FLIGHT_NOTE_DATUM_RE.match(anchor) \
+                or not _FLIGHT_NOTE_DATUM_RE.match(date) or not value:
+            continue
+        iata = str(raw_rec.get('iata') or '').strip().upper()
+        if iata and not _DESTINATION_NOTE_IATA_RE.match(iata):
+            iata = ''
+        if kind == 'room' and not iata:
+            continue
+        location = _sanitize_flight_note(raw_rec.get('location'))[:_TRIP_MEMO_LOCATION_MAX]
+        hotel = _sanitize_flight_note(raw_rec.get('hotel_name'))[:_TRIP_MEMO_HOTEL_MAX]
+        stamp = raw_rec.get('updated_at')
+        key = f'room|{anchor}|{iata}' if kind == 'room' else f'parking|{anchor}'
+        out[key] = {
+            'kind': kind,
+            'anchor': anchor,
+            'date': date,
+            'iata': iata or None,
+            'location': location or None,
+            'value': value,
+            'hotel_name': hotel or None,
+            'updated_at': stamp if isinstance(stamp, str) else None,
+        }
+    return out
+
+
+@app.route('/api/user/trip-memos/<token>', methods=['GET'])
+def list_trip_memos(token):
+    """Alle privaten Zimmer-/Parkplatz-Erinnerungen des Account-Owners."""
+    if not token:
+        return jsonify({'error': 'invalid token'}), 400
+    try:
+        items = sorted(_trip_memos_read(token).values(),
+                       key=lambda rec: (rec.get('date') or '',
+                                        rec.get('updated_at') or ''),
+                       reverse=True)
+        return jsonify({'items': items, 'count': len(items)})
+    except Exception:
+        app.logger.exception('[trip-memos] list_failed')
+        return jsonify({'error': 'internal_error'}), 500
+
+
+@app.route('/api/user/trip-memos/<token>', methods=['PUT'],
+           defaults={'path_kind': None, 'path_anchor': None, 'path_scope': None})
+@app.route('/api/user/trip-memos/<token>/<path_kind>/<path_anchor>/<path_scope>',
+           methods=['PUT'])
+def put_trip_memo(token, path_kind=None, path_anchor=None, path_scope=None):
+    """Upsert einer privaten Erinnerung; leerer `value` löscht nur diesen Key.
+
+    Body: kind, anchor, date, value sowie optional iata/location/hotel_name und
+    updated_at. Zimmer und Parkplatz haben getrennte Keys und können sich daher
+    weder gegenseitig noch einen früheren Aufenthalt überschreiben.
+    """
+    if not token:
+        return jsonify({'ok': False, 'error': 'invalid token'}), 400
+    body = request.get_json(silent=True) or {}
+    kind = str(path_kind or body.get('kind') or '').strip().lower()
+    anchor = str(path_anchor or body.get('anchor') or '').strip()
+    date = str(body.get('date') or anchor).strip()
+    if kind not in _TRIP_MEMO_KINDS:
+        return jsonify({'ok': False, 'error': 'invalid kind'}), 400
+    if not _FLIGHT_NOTE_DATUM_RE.match(anchor) or not _FLIGHT_NOTE_DATUM_RE.match(date):
+        return jsonify({'ok': False, 'error': 'invalid date'}), 400
+    raw_value = body.get('value') if isinstance(body.get('value'), str) else ''
+    if len(raw_value) > _TRIP_MEMO_VALUE_MAX * 4:
+        return jsonify({'ok': False, 'error': 'value_too_long'}), 413
+    value = _sanitize_flight_note(raw_value)[:_TRIP_MEMO_VALUE_MAX]
+    iata = str(body.get('iata') or '').strip().upper()
+    if kind == 'room' and not _DESTINATION_NOTE_IATA_RE.match(iata):
+        return jsonify({'ok': False, 'error': 'invalid iata'}), 400
+    if iata and not _DESTINATION_NOTE_IATA_RE.match(iata):
+        return jsonify({'ok': False, 'error': 'invalid iata'}), 400
+    # Der ressourcenspezifische PUT-Pfad ist absichtlich eindeutig, damit zwei
+    # Offline-Writes (z.B. Zimmer UND Parkplatz) in der iOS-SyncQueue einander
+    # nicht superseden. Body/Pfad dürfen dabei nie unterschiedliche Ressourcen
+    # benennen.
+    if path_kind is not None:
+        if body.get('kind') not in (None, kind) or body.get('anchor') not in (None, anchor):
+            return jsonify({'ok': False, 'error': 'resource_mismatch'}), 400
+        expected_scope = iata if kind == 'room' else 'parking'
+        if str(path_scope or '').upper() != expected_scope.upper():
+            return jsonify({'ok': False, 'error': 'resource_mismatch'}), 400
+    location = _sanitize_flight_note(body.get('location'))[:_TRIP_MEMO_LOCATION_MAX]
+    hotel = _sanitize_flight_note(body.get('hotel_name'))[:_TRIP_MEMO_HOTEL_MAX]
+    stamp_dt = _trip_memo_timestamp(body.get('updated_at')) or datetime.now(timezone.utc)
+    stamp = stamp_dt.isoformat().replace('+00:00', 'Z')
+    key = f'room|{anchor}|{iata}' if kind == 'room' else f'parking|{anchor}'
+    try:
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        full = _profile_load(token) or {}
+        prof = dict(full.get('profile') or {})
+        memos = _trip_memos_read(token)
+        existing = memos.get(key)
+        existing_stamp = _trip_memo_timestamp((existing or {}).get('updated_at'))
+        # Persistente iOS-Offline-Writes können später wiederholt werden. Ein
+        # alter Queue-Eintrag darf dabei weder eine neuere Erinnerung
+        # überschreiben noch sie löschen: serverseitiges Last-Write-Wins.
+        if existing_stamp is not None and existing_stamp > stamp_dt:
+            return jsonify({'ok': True, 'key': key, 'item': existing,
+                            'deleted': False, 'stale_ignored': True})
+        if value:
+            memos[key] = {
+                'kind': kind,
+                'anchor': anchor,
+                'date': date,
+                'iata': iata or None,
+                'location': location or None,
+                'value': value,
+                'hotel_name': hotel or None,
+                'updated_at': stamp,
+            }
+        else:
+            memos.pop(key, None)
+        prof['trip_memos'] = memos
+        disk_full['token'] = token
+        disk_full['profile'] = prof
+        disk_full['_updated_at'] = datetime.now(timezone.utc).isoformat()
+        if not _profile_save(token, prof, full_disk_payload=disk_full):
+            return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+        return jsonify({'ok': True, 'key': key, 'item': memos.get(key),
+                        'deleted': not bool(value), 'stale_ignored': False})
+    except Exception:
+        app.logger.exception('[trip-memos] put_failed')
         return jsonify({'ok': False, 'error': 'internal_error'}), 500
 
 
