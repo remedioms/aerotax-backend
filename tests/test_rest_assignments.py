@@ -120,6 +120,12 @@ def _seams(monkeypatch):
     tbl = _Tbl()
     RA._table_ok[0] = None
     monkeypatch.setattr(RA, '_sb', lambda: tbl)
+    # Die Instanz dieser Regression ist absichtlich auf 09.08. gepinnt. Ohne
+    # eingefrorenes "heute" loescht der produktive Alters-Pruner die gerade
+    # geschriebene Fixture nach einigen Tagen (bzw. mitten im Volltest beim
+    # UTC-Tageswechsel) und die Bereichs-/Autorisierungs-Tests werden
+    # kalenderabhaengig. Der Pruner selbst hat eigene Tests.
+    monkeypatch.setattr(RA, '_today', lambda: TAG)
     monkeypatch.setattr(RA, '_profile_of', lambda t: dict(POSITIONEN.get(t, {})))
     monkeypatch.setattr(RA, '_bearer_ok', lambda t: True)
     # Das globale Auth-Gate (`_bug004_token_auth_gate`) prüft jeden AT-Token

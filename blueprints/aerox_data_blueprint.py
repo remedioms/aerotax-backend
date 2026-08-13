@@ -5873,6 +5873,65 @@ def _canonical_operational_times(official, fr24, airborne=False, landed=False):
     }
 
 
+def _reconcile_flight_detail_operational_times(resolve_flight, info, card,
+                                               airborne=False, landed=False):
+    """Bindet beide Detail-Unterobjekte an denselben FR24-Live-Snapshot.
+
+    Das Detail-Aggregat liefert aus Kompatibilitaetsgruenden sowohl ``resolve``
+    als auch ``info``. Beide wurden bisher vor dem separaten Live-Fan-out aus
+    Board-Daten gebaut. Freundekarten konnten deshalb bereits die exakte
+    Flight-ID-ETA tragen, waehrend ein Radar-Tap im selben Moment die aeltere
+    Board-ETA zeigte. Der gemeinsame kanonische Entscheid wird hier genau
+    einmal berechnet und anschliessend auf beide Legacy-Shapes projiziert.
+    """
+    if not isinstance(resolve_flight, dict) or not isinstance(card, dict):
+        return resolve_flight, info
+    origin = resolve_flight.get('dep_iata') or (info or {}).get('origin')
+    dest = resolve_flight.get('arr_iata') or (info or {}).get('dest')
+    if not (origin and dest):
+        return resolve_flight, info
+    fr24 = _fr24_operational_times(card, origin, dest)
+    if not fr24:
+        return resolve_flight, info
+
+    i = info if isinstance(info, dict) else {}
+    official = {
+        'sched_dep': resolve_flight.get('sched_dep'),
+        'est_dep': resolve_flight.get('est_dep'),
+        'actual_dep': (resolve_flight.get('actual_dep')
+                       or i.get('actual_dep')),
+        'sched_arr': (resolve_flight.get('sched_arr')
+                      or i.get('sched_arr')),
+        'est_arr': (resolve_flight.get('est_arr') or i.get('esti_arr')),
+        'actual_arr': (resolve_flight.get('actual_arr')
+                       or i.get('actual_arr')),
+    }
+    times = _canonical_operational_times(
+        official, fr24, airborne=airborne, landed=landed)
+    resolved = dict(resolve_flight)
+    for key in ('sched_dep', 'est_dep', 'actual_dep',
+                'sched_arr', 'est_arr', 'actual_arr'):
+        if times.get(key) is not None:
+            resolved[key] = times[key]
+    resolved['dep_time_source'] = times.get('dep_source')
+    resolved['arr_time_source'] = times.get('arr_source')
+    if times.get('arr_delay_min') is not None:
+        resolved['arr_delay_min'] = times['arr_delay_min']
+
+    enriched_info = dict(i) if i else info
+    if isinstance(enriched_info, dict):
+        for source_key, info_key in (
+                ('actual_dep', 'actual_dep'),
+                ('sched_arr', 'sched_arr'),
+                ('est_arr', 'esti_arr'),
+                ('actual_arr', 'actual_arr')):
+            if times.get(source_key) is not None:
+                enriched_info[info_key] = times[source_key]
+        if times.get('arr_delay_min') is not None:
+            enriched_info['arr_delay_min'] = times['arr_delay_min']
+    return resolved, enriched_info
+
+
 # status_category-Alphabet dieser Fläche (iOS `schedule.info.status_category`):
 # nur diese drei Legacy-Werte werden je gesetzt — Vorzustände (geplant/boarding/
 # rollt/unbekannt) bleiben leer, exakt wie die alte Substring-Ableitung. Das
@@ -8329,7 +8388,8 @@ def ax_flight_detail(query):
 
     # Kein `with` (= shutdown(wait=True) würde auf den hängenden Worker warten
     # und den result-Timeout entwerten) — Worker laufen ggf. im Hintergrund aus.
-    ex = ThreadPoolExecutor(max_workers=5)
+    ex = ThreadPoolExecutor(max_workers=6)
+    exact_card = None
     try:
         # Phase A: resolve + (flight-info schon jetzt, wenn die IATA-Nummer feststeht —
         # bei Flugnummer-Suche = die Query selbst; bei Funkname-Suche erst nach resolve).
@@ -8462,6 +8522,22 @@ def ax_flight_detail(query):
                 sched_dep_iso=_live_sched_dep)
         f_live = (None if _live_past else
                   ex.submit(_detail_executor_task, _live_call))
+        # Exakte Flight-ID-Zeiten laufen PARALLEL im bestehenden Gesamtbudget.
+        # So erbt das Detail denselben workeruebergreifenden 45-s-Snapshot wie
+        # Feed/flight-live, ohne den frueher langsamen gRPC-Pfad wieder seriell
+        # vor den Fan-out zu setzen.
+        _detail_fid = (resolve_flight or {}).get('flightid')
+        _detail_lat = (resolve_flight or {}).get('lat')
+        _detail_lon = (resolve_flight or {}).get('lon')
+
+        def _exact_card_call():
+            return _fr24_live_card_cached(
+                flight_no=fn_iata, callsign=real_cs, reg=reg,
+                lat=_detail_lat, lon=_detail_lon,
+                origin=origin, dest=dest, flightid=_detail_fid)
+
+        f_exact_card = (ex.submit(_detail_executor_task, _exact_card_call)
+                        if (_detail_fid and origin and dest) else None)
         if f_route is not None:
             route = _res(f_route)
         history = _res(f_hist)
@@ -8471,6 +8547,7 @@ def ax_flight_detail(query):
         # Folge-Aufruf (Foto ist hart in ax_photo_cache gecacht) trägt es dann.
         photo = _res(f_photo, timeout=2.5)
         live_res = _res(f_live, timeout=5)
+        exact_card = _res(f_exact_card, timeout=2.5)
         # Freie gRPC-Zeiten mit HARTEM Timeout (1.5 s AB Task-Start): kommen sie
         # rechtzeitig, in resolve_flight mergen (nur leere Felder); dauert der
         # Korridor länger (Langstrecke/Miss → Riesenbox), NICHT blocken — die
@@ -8491,6 +8568,7 @@ def ax_flight_detail(query):
 
     # Live-Position → schlankes Objekt (nur echte Werte; airborne = Pos + nicht am Boden).
     live = None
+    _pos = None
     try:
         _pos, _od, _rd, _act = live_res or (None, None, None, None)
         if _pos and _pos.get('lat') is not None and _pos.get('lon') is not None:
@@ -8503,6 +8581,26 @@ def ax_flight_detail(query):
             }
     except Exception:
         live = None
+
+    # ``resolve`` und ``info`` sind zwei Legacy-Projektionen derselben Karte.
+    # Beide muessen vor der Ausgabe denselben exakten Live-Zeitentscheid tragen.
+    _detail_status = ' '.join(str(x or '').lower() for x in (
+        (resolve_flight or {}).get('status'),
+        (resolve_flight or {}).get('status_category'),
+        (info or {}).get('status'), (info or {}).get('arr_status')))
+    _detail_landed = bool(
+        (resolve_flight or {}).get('actual_arr')
+        or (info or {}).get('actual_arr')
+        or any(x in _detail_status for x in (
+            'landed', 'arrived', 'gelandet', 'angekommen')))
+    _detail_airborne = bool(not _detail_landed and (
+        ((_pos or {}).get('on_ground') is False)
+        or (resolve_flight or {}).get('on_ground') is False
+        or any(x in _detail_status for x in (
+            'airborne', 'enroute', 'en route', 'departed', 'abgeflogen'))))
+    resolve_flight, info = _reconcile_flight_detail_operational_times(
+        resolve_flight, info, exact_card,
+        airborne=_detail_airborne, landed=_detail_landed)
 
     out['resolve'] = resolve_flight
     out['callsign'] = real_cs

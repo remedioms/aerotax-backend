@@ -178,6 +178,42 @@ def test_complete_board_times_skip_grpc(client, monkeypatch):
     assert wall < 3.0
 
 
+def test_detail_reuses_exact_live_snapshot_for_both_time_shapes(
+        client, monkeypatch):
+    """LH732-Repro: Feed und Radar muessen dieselbe Flight-ID-ETA tragen.
+
+    Board: 15:05/14:32. Gemeinsamer Live-Snapshot: 14:38. Das Aggregat darf
+    weder in ``resolve`` noch in ``info`` beim Board-Wert stehen bleiben.
+    """
+    _install(monkeypatch)
+    monkeypatch.setattr(BP, '_aircraft_live_flight', lambda *a, **k: {
+        'flight': 'LH732', 'callsign': 'DLH732', 'reg': 'DAIXF',
+        'dep_iata': 'FRA', 'arr_iata': 'PVG',
+        'sched_dep': '2026-08-12T21:30:00+02:00',
+        'est_dep': '2026-08-12T21:31:00+02:00',
+        'sched_arr': '2026-08-13T15:05:00+08:00',
+        'est_arr': '2026-08-13T14:32:00+08:00',
+        'status': 'enroute', 'status_category': 'enroute',
+        'lat': 41.17, 'lon': 57.94, 'on_ground': False,
+        'flightid': 1092897984,
+    })
+    monkeypatch.setattr(BP, '_aircraft_live_pos', lambda *a, **k: (
+        {'lat': 41.17, 'lon': 57.94, 'on_ground': False,
+         'flightid': 1092897984}, ('FRA', 'PVG'), 'DAIXF', 'A359'))
+    monkeypatch.setattr(BP, '_fr24_live_card_cached', lambda **k: {
+        'sched_arr': '2026-08-13T15:05:00+08:00',
+        'eta': '2026-08-13T14:38:00+08:00',
+    })
+
+    body = client.get(
+        '/api/ax/flight-detail/LH732?date=2026-08-12&fresh=1').get_json()
+
+    assert body['resolve']['est_arr'] == '2026-08-13T14:38:00'
+    assert body['resolve']['arr_delay_min'] == -27
+    assert body['info']['esti_arr'] == '2026-08-13T14:38:00'
+    assert body['info']['arr_delay_min'] == -27
+
+
 def test_resolve_subcall_sets_nogrpc(client, monkeypatch):
     """Der resolve-Subcall des Aggregats setzt nogrpc=1 → der synchrone gRPC-
     Zeiten-Nachschlag im Enrich läuft NICHT (er wäre der blockierende Pol)."""
