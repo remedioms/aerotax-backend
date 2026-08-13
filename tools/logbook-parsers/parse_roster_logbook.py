@@ -120,7 +120,12 @@ CONDOR_INDIVIDUAL_FLIGHT = re.compile(
     # cannot become operating legs.
     r"^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\d{2}\s+)?"
     r"(?:[^\s]{1,12}\]\s+)?DE\s+"
-    r"(?P<number>\d{3,4}[A-Z]?)\s+(?:R\s+)?"
+    # Condor also operates two-digit designators (for example DE30/DE31).
+    r"(?P<number>\d{2,4}[A-Z]?)\s+(?:R\s+)?"
+    # On an overnight UTC row NetLine can print the station-local departure
+    # day between the designator and origin (``DE 2403 /06 YYZ ...``). The
+    # leading weekday/day anchor remains the authoritative UTC roster day.
+    r"(?:/\d{2}\s+)?"
     r"(?P<frm>[A-Z]{3})\s+(?P<start>\d{4})\s+"
     r"(?P<end>\d{4})\s+(?P<to>[A-Z]{3})\s+"
     # At the right edge of a printed column CREWLINK can append the duty's

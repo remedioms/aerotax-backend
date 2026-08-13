@@ -241,6 +241,26 @@ Flight time 51:01 Off days 14
     assert meta["verified_source_block_total"] == 3061
 
 
+def test_condor_individual_plan_accepts_two_digit_flights_and_local_day_note():
+    """Real roster rows account exactly for the formerly missing 17:42."""
+    header = """Individual duty plan for [redacted]
+NetLine/Crew(CFG) printed by CREWLINK 08Jan26 12:00 Page 1
+Period: 01Jan26 - 31Jan26
+Flight time 17:42 Off days 14
+"""
+    legs, meta = PARSER.parse_condor_individual_segments(
+        header,
+        ["Mon05 C/I FRA 0800\n"
+         "DE 30 FRA 1000 1424 HRG 75T\n"
+         "DE 31 HRG 1528 2103 FRA 75T\n",
+         "Wed07 DE 2403 /06 YYZ 0007 0750 FRA 339\n"
+         "DH/DE 2254 FRA 1110 2144 TAB\n"],
+        "PU")
+    assert [leg["flight"] for leg in legs] == ["DE30", "DE31", "DE2403"]
+    assert sum(leg["block_min"] for leg in legs) == 1062
+    assert meta["verified_source_block_total"] == 1062
+
+
 def test_merge_prefers_newest_document_revision():
     old = {
         "date": "2026-01-01", "flight": "LH84", "from": "FRA", "to": "DUS",
