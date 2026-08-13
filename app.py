@@ -9539,16 +9539,27 @@ def _content_author_token(kind, target_id):
     das den anonymen NAMEN aufloest und deshalb per AST-Wachtest an Admin-
     Pfade gebunden ist. block-by-content braucht nur den Token (zum Blocken)
     und darf keine Anon-Namen anfassen. news_comment ist bewusst NICHT dabei
-    (Anonymitaet). None, wenn nicht aufloesbar."""
+    (Anonymitaet). None, wenn nicht aufloesbar.
+
+    ANONYMITAETS-GUARD (Schluss-Review 13.08.): fuer Inhalte mit
+    `is_anonymous=True` wird KEIN Token geliefert. Sonst landete das echte
+    Author-Token eines anonymen Posts/Kommentars in `_blocked_by`, und
+    GET /blocks laege ueber die Profilfelder (name/airline/homebase) den echten
+    Namen offen — genau die Deanonymisierung, die fuer news_comment schon zu
+    ist. Der eine Guard deckt Wall-Kommentar (neu) UND die alt-bestehende
+    Luecke bei anon Wall-Posts/Forum-Threads/-Replies in einem ab."""
+    def _tok(rec):
+        # Anonymer Inhalt ⇒ nicht blockbar (kein Token ⇒ Autor bleibt anonym).
+        if not rec or rec.get('is_anonymous'):
+            return None
+        return rec.get('author_token') or None
     try:
         raw = target_id or ''
         tid = raw[5:] if raw.startswith('wall:') else raw
         if kind == 'wall_post' or (kind == 'forum_thread' and raw.startswith('wall:')):
-            p_ = next((x for x in _wall_load_posts() if x.get('id') == tid), None)
-            return (p_ or {}).get('author_token') or None
+            return _tok(next((x for x in _wall_load_posts() if x.get('id') == tid), None))
         if kind == 'forum_thread':
-            t = next((x for x in _forum_load_threads() if x.get('id') == tid), None)
-            return (t or {}).get('author_token') or None
+            return _tok(next((x for x in _forum_load_threads() if x.get('id') == tid), None))
         if kind == 'forum_reply':
             import glob
             for fp in glob.glob(os.path.join(_forum_dir(), 'replies_*.json')):
@@ -9559,7 +9570,7 @@ def _content_author_token(kind, target_id):
                     continue
                 r = next((x for x in reps if x.get('id') == tid), None)
                 if r:
-                    return r.get('author_token') or None
+                    return _tok(r)
         if kind == 'wall_comment':
             import glob
             for fp in glob.glob(os.path.join(_wall_dir(), 'comments_*.json')):
@@ -9570,7 +9581,7 @@ def _content_author_token(kind, target_id):
                     continue
                 c = next((x for x in cs if x.get('id') == tid), None)
                 if c:
-                    return c.get('author_token') or None
+                    return _tok(c)
     except Exception:
         pass
     return None

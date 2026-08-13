@@ -350,3 +350,18 @@ def test_blocks_liste_unterdrueckt_guest_family_rohtoken():
     body = r.get_json()
     assert guest not in str(body)
     assert body['blocks'] == []
+
+
+def test_content_author_token_verweigert_anonyme_inhalte():
+    """Schluss-Review 13.08.: ein anonymer Wall-Kommentar darf NICHT blockbar
+    sein - sonst laege GET /blocks den echten Namen offen. Named -> Token."""
+    import json as _j
+    from unittest.mock import mock_open
+    anon = [{"id": "wc1", "author_token": "AT-AABBCCDDEEFF0011", "is_anonymous": True}]
+    named = [{"id": "wc2", "author_token": "AT-1122334455667788", "is_anonymous": False}]
+    with patch("glob.glob", return_value=["/fake/comments_x.json"]), \
+         patch("builtins.open", mock_open(read_data=_j.dumps(anon))):
+        assert A._content_author_token("wall_comment", "wc1") is None
+    with patch("glob.glob", return_value=["/fake/comments_x.json"]), \
+         patch("builtins.open", mock_open(read_data=_j.dumps(named))):
+        assert A._content_author_token("wall_comment", "wc2") == "AT-1122334455667788"
