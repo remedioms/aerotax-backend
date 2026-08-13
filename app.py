@@ -11340,6 +11340,14 @@ def _public_profile_projection(token):
     # nächste iOS-Build leitet daraus „Familie" statt „Crew-Mitglied" ab.
     if _is_family_account(prof):
         public['role'] = 'family'
+    # Stabile Public-ID mitgeben (additiv): der Client braucht sie, um den
+    # Blockstatus zu pruefen — GET /blocks liefert aus Credential-/Anonymitaets-
+    # Schutz NUR AXU-Refs, nie das Roh-Token. Aus dem bereits vom Caller
+    # adressierten Token abgeleitet ⇒ kein neues Leak. Fail-closed → '' wird
+    # weggelassen.
+    _ref = _public_user_ref(token)
+    if _ref:
+        public['ref'] = _ref
     return {'token': token, 'profile': public}
 
 

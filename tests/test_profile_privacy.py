@@ -64,5 +64,25 @@ def test_die_erlaubten_felder_bleiben_erhalten():
 
 def test_whitelist_ist_abschliessend():
     """Kein Feld darf sich unbemerkt hineinschleichen: die Projektion gibt
-    ausschliesslich Schluessel aus der Whitelist zurueck."""
-    assert set(_public()).issubset(set(A._PUBLIC_PROFILE_FIELDS) | {'role'})
+    ausschliesslich Schluessel aus der Whitelist zurueck. `ref` ist die
+    opake, viewer-unabhaengige Public-ID (AXU/echo des adressierten Tokens) —
+    keine PII, additiv fuer den Blockstatus-Vergleich freigegeben."""
+    assert set(_public()).issubset(set(A._PUBLIC_PROFILE_FIELDS) | {'role', 'ref'})
+
+
+def test_projektion_liefert_stabile_public_ref_fuer_standard_token():
+    """Blockstatus-Fix 13.08.: die Projektion muss eine Public-Ref mitgeben,
+    sonst kann der Client den Blockstatus nicht pruefen (GET /blocks liefert
+    nur AXU-Refs). Fuer ein Standard-Credential ist das die VERSCHLUESSELTE
+    AXU-Form — nie das Roh-Token."""
+    std = 'AT-0123456789ABCDEF'  # AT- + 16 Hex = Standard-Credential
+    prof = {'token': std, 'profile': {'name': 'Max Muster', 'homebase': 'MUC'}}
+    with patch.object(A, '_profile_load', return_value=prof):
+        out = A._public_profile_projection(std)['profile']
+    assert out.get('ref', '').startswith(A._PUBLIC_USER_REF_PREFIX)
+    assert out['ref'] != std  # niemals das Roh-Credential
+    # deterministisch + reversibel serverseitig (gleiche Ref bei erneutem Aufruf)
+    with patch.object(A, '_profile_load', return_value=prof):
+        again = A._public_profile_projection(std)['profile']
+    assert again['ref'] == out['ref']
+    assert A._token_from_public_user_ref(out['ref']) == std
