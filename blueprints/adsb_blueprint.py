@@ -3834,7 +3834,14 @@ def get_adsb_area():
     # kein Fakt über den Himmel: eigene Welt-Tabelle lesen, egal wie klein
     # der Radius ist. Echte Flieger aus eigener Ernte schlagen eine leere
     # Karte immer (Fehler darf nicht wie Leere aussehen).
-    if not aircraft:
+    #
+    # PLAUSIBILITÄT statt nur Leere (Nachtrag, gleicher Vorfall): bei 120 NM
+    # um FRA lieferten die Mirrors „ok:true, count 2" — 2 > 0, also griff der
+    # Leere-Fallback nicht, obwohl 2 Flieger auf der Fläche genauso ein
+    # Ausfall-Signal sind wie 0. Unter der Schwelle wird die eigene Ernte
+    # dazu-GEMERGED (Mirror-Rows behalten Vorrang pro Identität), nie ersetzt.
+    _plausible_min = 5 if radius >= 30 else 1
+    if not aircraft or len(aircraft) < _plausible_min:
         try:
             own_ac = _area_from_aircraft_live(lat, lon, radius)
         except Exception as e:
@@ -3842,8 +3849,22 @@ def get_adsb_area():
             tried.append({"upstream": "aircraft_live_fallback", "ok": False,
                           "reason": str(e)[:80]})
         if own_ac:
-            aircraft = own_ac
-            source = "aircraft_live-fallback"
+            if aircraft:
+                # Merge, nie Ersetzen: Mirror-Rows (Echtzeit) gewinnen pro
+                # Identität, die eigene Ernte füllt nur auf.
+                _m = {}
+                for ac in list(own_ac) + list(aircraft):
+                    _hx = str(ac.get('hex') or '').strip().lower()
+                    _rg = re.sub(r'[^A-Z0-9]', '', str(ac.get('reg') or '').upper())
+                    _id = ('h:' + _hx if _hx else
+                           ('r:' + _rg if _rg else
+                            f"p:{ac.get('lat')}:{ac.get('lon')}"))
+                    _m[_id] = ac
+                aircraft = list(_m.values())
+                source = f"{source}+aircraft_live"
+            else:
+                aircraft = own_ac
+                source = "aircraft_live-fallback"
             tried.append({"upstream": "aircraft_live_fallback", "ok": True,
                           "count": len(own_ac)})
 
