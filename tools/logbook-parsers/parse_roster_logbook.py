@@ -667,7 +667,12 @@ def parse_condor_individual_pdf(pdf):
         (page.extract_text(x_tolerance=2, y_tolerance=2) or "")
         for page in pdf.pages)
     first = pdf.pages[0]
-    role_text = first.crop((70, 50, 280, 130)).extract_text(
+    # NetLine revisions do not keep the personal-header columns at one fixed
+    # x-position. A real 8-page export placed the unambiguous role at x=56.9;
+    # the previous x=70 crop removed it completely and the strict gate then
+    # reported an "ambiguous" role. Stop at y=130 so role abbreviations inside
+    # the actual schedule still cannot influence the personal role.
+    role_text = first.crop((40, 50, 280, 130)).extract_text(
         x_tolerance=2, y_tolerance=2) or ""
     roles = set(re.findall(r"\b(?:CP|FO|PU|ST)\b", role_text))
     if len(roles) != 1:

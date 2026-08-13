@@ -261,6 +261,46 @@ Flight time 17:42 Off days 14
     assert meta["verified_source_block_total"] == 1062
 
 
+def test_condor_individual_pdf_role_crop_includes_shifted_personal_header():
+    class TextCrop:
+        def __init__(self, text):
+            self.text = text
+
+        def extract_text(self, **_kwargs):
+            return self.text
+
+    class Page:
+        width = 842
+        height = 595
+
+        def __init__(self, index):
+            self.index = index
+
+        def extract_text(self, **_kwargs):
+            if self.index == 0:
+                return ("Individual duty plan\nNetLine/Crew(CFG) "
+                        "printed by CREWLINK 03Aug26 19:18\n"
+                        "Period: 01Jul26 - 31Aug26\nFlight time 01:00")
+            return ""
+
+        def crop(self, box):
+            # Role is at x=56.9: visible to the new x=40 crop, invisible to
+            # the former x=70 crop. Schedule columns remain otherwise valid.
+            if box == (40, 50, 280, 130):
+                return TextCrop("Personal header PU")
+            if box[1] == self.height * 0.15:
+                return TextCrop(
+                    "Fri10 C/I DUS 0235\n"
+                    "DE 1616 DUS 0417 0517 HER 32N\nFlight time")
+            return TextCrop("")
+
+    legs, meta = PARSER.parse_condor_individual_pdf(
+        type("PDF", (), {"pages": [Page(0), Page(1), Page(2)]})())
+
+    assert [leg["flight"] for leg in legs] == ["DE1616"]
+    assert meta["source_role"] == "PU"
+
+
 def test_merge_prefers_newest_document_revision():
     old = {
         "date": "2026-01-01", "flight": "LH84", "from": "FRA", "to": "DUS",
