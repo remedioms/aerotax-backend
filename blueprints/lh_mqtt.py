@@ -1478,6 +1478,7 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
         dep_local = dep.astimezone(tz).strftime('%H:%M') if tz else None
         if kind == 'departed':
             title = f'Dein Flieger ist gestartet · {user_flight}'
+            loc_key = 'push_title_inbound_departed'
             body = f'{reg} kommt als {event_flight}'
             if origin:
                 body += f' aus {origin}'
@@ -1490,6 +1491,7 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
             est_dep = _hhmm_station(facts.get('est_dep'), origin)
             dep_delay = facts.get('dep_delay_min')
             title = f'Dein Flieger verspätet sich · {user_flight}'
+            loc_key = 'push_title_inbound_delay'
             body = f'{reg} ({event_flight}) startet'
             if origin:
                 body += f' in {origin}'
@@ -1503,6 +1505,7 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
                    f'{est_dep}:{tok}')
         else:
             title = f'Dein Flieger ist gelandet · {user_flight}'
+            loc_key = 'push_title_inbound_arrived'
             body = f'{reg} ist in {arr} gelandet{delay_txt}'
             if dep_local:
                 body += f' — dein {user_flight} geht um {dep_local}'
@@ -1522,6 +1525,11 @@ def _push_inbound(kind, event_flight, topic_date, facts=None,
                            # die generische Vorlage ERSETZEN — auch für
                            # Deutsch. Mehrsprachigkeit braucht eigene
                            # per-Kind-Vorlagen mit Args, nicht die Generik.
+                           # GENAU DIE gibt es seit 15.08.: per-Kind-Titel-
+                           # Template (body=None → der komponierte, fakten-
+                           # reiche Body bleibt IMMER unangetastet, auch de).
+                           'localization_key': loc_key,
+                           'localization_args': {'flight': user_flight},
                            'kind': kind},
                      idempotency_key=key)
             pushed += 1

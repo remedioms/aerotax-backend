@@ -12969,6 +12969,35 @@ _PUSH_USER_CONTENT_TYPES = frozenset((
     'wall_comment_reply', 'family_message', 'family_reply', 'goodflight',
 ))
 _PUSH_SYSTEM_COPY = {
+    # ── Titel-Templates der User-Content-Pushes (L10n-Welle 15.08.) ────────
+    # NUR 'de' eingetragen — Nicht-de-Sprachen fallen bis zur Übersetzung
+    # (Codex) auf 'de' zurück, das Verhalten ist damit byte-identisch zu
+    # vorher. Body ist None: bei User-Content bleibt der Nutzer-Text, bei den
+    # Inbound-Pushes der (noch deutsche) zusammengesetzte Body.
+    'push_title_commented': {
+        'de': ('{name} hat kommentiert', None),
+    },
+    'push_title_replied': {
+        'de': ('{name} hat geantwortet', None),
+    },
+    'push_title_replied_to_comment': {
+        'de': ('{name} hat auf deinen Kommentar geantwortet', None),
+    },
+    'push_title_replied_to_you': {
+        'de': ('{name} hat dir geantwortet', None),
+    },
+    'push_title_mentioned': {
+        'de': ('{name} hat dich erwähnt', None),
+    },
+    'push_title_inbound_departed': {
+        'de': ('Dein Flieger ist gestartet · {flight}', None),
+    },
+    'push_title_inbound_delay': {
+        'de': ('Dein Flieger verspätet sich · {flight}', None),
+    },
+    'push_title_inbound_arrived': {
+        'de': ('Dein Flieger ist gelandet · {flight}', None),
+    },
     'logbook_import_received': {
         'de': ('Flugbuch-Import angekommen', 'Wird verarbeitet.'),
         'en': ('Logbook import received', 'Processing now.'),
@@ -31383,7 +31412,9 @@ def add_comment(token, post_id):
             _push_notify_async(post_author,
                                f'{commenter_name} hat kommentiert',
                                (text or '')[:120],
-                               data={'type': 'wall_comment', 'post_id': post_id},
+                               data={'type': 'wall_comment', 'post_id': post_id,
+                                     'title_localization_key': 'push_title_commented',
+                                     'localization_args': {'name': commenter_name}},
                                idempotency_key=f'wall-comment:{c.get("id")}:{post_author}',
                                actor_token=token)
         # ANTWORT AUF EINEN KOMMENTAR (Florian 2026-07-24, gleiches Loch wie im
@@ -31400,7 +31431,9 @@ def add_comment(token, post_id):
                 _push_notify_async(parent_author,
                                    f'{commenter_name} hat auf deinen Kommentar geantwortet',
                                    (text or '')[:120],
-                                   data={'type': 'wall_comment', 'post_id': post_id},
+                                   data={'type': 'wall_comment', 'post_id': post_id,
+                                         'title_localization_key': 'push_title_replied_to_comment',
+                                         'localization_args': {'name': commenter_name}},
                                    idempotency_key=f'wall-comment-parent:{c.get("id")}:{parent_author}',
                                    actor_token=token)
     except Exception:
@@ -32840,7 +32873,9 @@ def forum_create_reply(token, thread_id):
             _push_notify_async(thread_author_token,
                                f'{author_name} hat geantwortet',
                                (text or '')[:120],
-                               data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
+                               data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or ''),
+                                     'title_localization_key': 'push_title_replied',
+                                     'localization_args': {'name': author_name}},
                                idempotency_key=(
                                    f'forum-reply:{reply.get("id")}:{thread_author_token}'),
                                actor_token=token)
@@ -32849,7 +32884,9 @@ def forum_create_reply(token, thread_id):
             _push_notify_async(mentioned_token,
                                f'{author_name} hat dich erwähnt',
                                (text or '')[:120],
-                               data={'type': 'forum_mention', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
+                               data={'type': 'forum_mention', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or ''),
+                                     'title_localization_key': 'push_title_mentioned',
+                                     'localization_args': {'name': author_name}},
                                idempotency_key=(
                                    f'forum-mention:{reply.get("id")}:{mentioned_token}'),
                                actor_token=token)
@@ -32871,7 +32908,9 @@ def forum_create_reply(token, thread_id):
                 _push_notify_async(parent_author,
                                    f'{author_name} hat auf deinen Kommentar geantwortet',
                                    (text or '')[:120],
-                                   data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or '')},
+                                   data={'type': 'forum_reply', 'thread_id': str(thread_id), 'reply_id': str(reply.get('id') or ''), 'category_id': str(target.get('category_id') or ''),
+                                         'title_localization_key': 'push_title_replied_to_comment',
+                                         'localization_args': {'name': author_name}},
                                    idempotency_key=(
                                        f'forum-reply-parent:{reply.get("id")}:{parent_author}'),
                                    actor_token=token)
@@ -34518,7 +34557,9 @@ def layover_rec_add_comment(token, rec_id):
                 _push_notify_async(parent_token,
                                    f'{commenter} hat dir geantwortet',
                                    (text or '')[:120],
-                                   data={'type': 'wall_comment_reply', 'post_id': str(rec_id), 'comment_id': str(comment.get('id') or ''), 'parent_comment_id': str(parent_comment_id or '')},
+                                   data={'type': 'wall_comment_reply', 'post_id': str(rec_id), 'comment_id': str(comment.get('id') or ''), 'parent_comment_id': str(parent_comment_id or ''),
+                                         'title_localization_key': 'push_title_replied_to_you',
+                                         'localization_args': {'name': commenter}},
                                    idempotency_key=(
                                        f'layover-comment:{comment.get("id")}:{parent_token}'),
                                    actor_token=token)
