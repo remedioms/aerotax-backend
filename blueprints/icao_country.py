@@ -68,12 +68,15 @@ _RANGES = [
     (0x488000, 0x48FFFF, "PL", "Polen", "🇵🇱"),
     (0x490000, 0x497FFF, "PT", "Portugal", "🇵🇹"),
     (0x498000, 0x49FFFF, "CZ", "Tschechien", "🇨🇿"),
-    (0x4A0000, 0x4A7FFF, "SE", "Schweden", "🇸🇪"),
-    (0x4A8000, 0x4AFFFF, "CH", "Schweiz", "🇨🇭"),
-    (0x4B0000, 0x4B7FFF, "TR", "Türkei", "🇹🇷"),
-    (0x4B8000, 0x4BFFFF, "RS", "Serbien", "🇷🇸"),
-    (0x4C0000, 0x4C7FFF, "CY", "Zypern", "🇨🇾"),
-    (0x4C8000, 0x4C83FF, "IE", "Irland", "🇮🇪"),
+    # Europa 4A–4C. Diese sechs Bloecke waren um genau einen Slot
+    # verschoben: Schweizer HB-Registrierungen (4B0…) wurden dadurch als
+    # Tuerkei ausgegeben — im Radar sichtbar bei SWISS und Edelweiss.
+    (0x4A0000, 0x4A7FFF, "RO", "Rumänien", "🇷🇴"),
+    (0x4A8000, 0x4AFFFF, "SE", "Schweden", "🇸🇪"),
+    (0x4B0000, 0x4B7FFF, "CH", "Schweiz", "🇨🇭"),
+    (0x4B8000, 0x4BFFFF, "TR", "Türkei", "🇹🇷"),
+    (0x4C0000, 0x4C7FFF, "RS", "Serbien", "🇷🇸"),
+    (0x4C8000, 0x4C83FF, "CY", "Zypern", "🇨🇾"),
     (0x4CA000, 0x4CAFFF, "IE", "Irland", "🇮🇪"),
     (0x4CC000, 0x4CCFFF, "IS", "Island", "🇮🇸"),
     (0x4D0000, 0x4D03FF, "LU", "Luxemburg", "🇱🇺"),

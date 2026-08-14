@@ -3841,7 +3841,12 @@ def get_adsb_area():
     # Ausfall-Signal sind wie 0. Unter der Schwelle wird die eigene Ernte
     # dazu-GEMERGED (Mirror-Rows behalten Vorrang pro Identität), nie ersetzt.
     _plausible_min = 5 if radius >= 30 else 1
-    if not aircraft or len(aircraft) < _plausible_min:
+    # Beim Overview wurde `aircraft_live` oben bereits als Primärquelle gelesen.
+    # Nach einem additiven gRPC-Fill darf die Plausibilitätsprüfung denselben
+    # Store nicht ein zweites Mal anfügen (Quelle wurde sonst z.B.
+    # `aircraft_live+fr24_grpc+aircraft_live`, ohne eine neue Datenquelle).
+    _already_has_own_store = "aircraft_live" in (source or "").split("+")
+    if (not aircraft or len(aircraft) < _plausible_min) and not _already_has_own_store:
         try:
             own_ac = _area_from_aircraft_live(lat, lon, radius)
         except Exception as e:
