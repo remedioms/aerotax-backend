@@ -402,8 +402,16 @@ def test_inbound_far_departure_with_confirmed_feeder_pushes(client, monkeypatch)
 
 def test_inbound_push_keeps_rich_body_no_localization_key(client, monkeypatch):
     """Florian/FO 11.08.: „seit neuestem ist die Meldung geheimnisvoll" — der
-    localization_key 'flight_update' ließ den faktenreichen Text durch die
-    generische Vorlage ersetzen. Die reichen Pushes tragen KEINEN Schlüssel."""
+    generische localization_key 'flight_update' ließ den faktenreichen Text
+    durch die Vorlage ersetzen.
+
+    Seit 15.08. tragen die Pushes wieder einen Schlüssel — aber die
+    PER-KIND-Titel-Vorlage (Body-Slot None), wie es der Code-Kommentar vom
+    11.08. selbst gefordert hat. Die Zusicherung dieses Tests bleibt dieselbe,
+    nur am ERGEBNIS geprüft statt am Mechanismus: der komponierte, fakten-
+    reiche Body übersteht die Lokalisierung UNVERÄNDERT (jede Sprache), und
+    der deutsche Titel bleibt byte-identisch. Der generische 'flight_update'-
+    Schlüssel bleibt verboten."""
     from datetime import datetime as dt, timezone as tz
     now = dt.now(tz.utc)
     pushes = []
@@ -416,10 +424,25 @@ def test_inbound_push_keeps_rich_body_no_localization_key(client, monkeypatch):
     monkeypatch.setattr(lh_mqtt, '_do_push',
                         lambda tok, title, body, data=None, idempotency_key=None:
                         pushes.append(data))
+    titles = []
+    bodies = []
+    monkeypatch.setattr(lh_mqtt, '_do_push',
+                        lambda tok, title, body, data=None, idempotency_key=None:
+                        (pushes.append(data), titles.append(title),
+                         bodies.append(body)))
     d = client.post('/api/internal/lh-mqtt/event',
                     json=_event_body('Departed', flight='LH123')).get_json()
     assert d['pushed'] == 1
-    assert 'localization_key' not in (pushes[0] or {})
+    data = pushes[0] or {}
+    assert data.get('localization_key') != 'flight_update'
+    assert data.get('localization_key') == 'push_title_inbound_departed'
+    from app import _push_localize_system_copy
+    for lang in ('de', 'en', 'it', 'es', 'fr', 'pt'):
+        loc_title, loc_body = _push_localize_system_copy(
+            titles[0], bodies[0], data, lang)
+        assert loc_body == bodies[0], lang        # reicher Body IMMER erhalten
+    de_title, _ = _push_localize_system_copy(titles[0], bodies[0], data, 'de')
+    assert de_title == titles[0]                  # Deutsch byte-identisch
 
 
 def test_inbound_reg_mismatch_no_push(client, monkeypatch):
