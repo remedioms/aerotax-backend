@@ -255,7 +255,6 @@ def _try_parsers(path):
     import parse_foreflight_easa
     import parse_foreflight_csv
     import parse_simple_flights_csv
-    import parse_edw_xlsx
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
     import parse_roster_logbook
@@ -275,17 +274,24 @@ def _try_parsers(path):
     if parse_simple_flights_csv.matches_csv(path):
         legs, sims, report = parse_simple_flights_csv.parse_csv(path)
         return "simple_flight_history", legs, sims, report
-    if parse_edw_xlsx.matches_workbook(path):
-        result, controls = parse_edw_xlsx.parse_workbook(path)
-        legs = result["legs"]
-        first, last = legs[0]["date"], legs[-1]["date"]
-        report = dict(controls)
-        report["month"] = (first[:7] if first[:7] == last[:7]
-                           else f"{first[:7]}–{last[:7]}")
-        return "edelweiss_xlsx", legs, result["sim"], report
     with open(path, "rb") as handle:
-        if not handle.read(5).startswith(b"%PDF-"):
-            return "unsupported", None, None, None
+        magic = handle.read(5)
+    # openpyxl is intentionally loaded only after the ZIP/XLSX signature was
+    # established. A missing optional spreadsheet runtime must never prevent
+    # unrelated CSV/PDF imports from reaching their own parser.
+    if magic.startswith(b"PK\x03\x04"):
+        import parse_edw_xlsx
+        if parse_edw_xlsx.matches_workbook(path):
+            result, controls = parse_edw_xlsx.parse_workbook(path)
+            legs = result["legs"]
+            first, last = legs[0]["date"], legs[-1]["date"]
+            report = dict(controls)
+            report["month"] = (first[:7] if first[:7] == last[:7]
+                               else f"{first[:7]}–{last[:7]}")
+            return "edelweiss_xlsx", legs, result["sim"], report
+        return "unsupported", None, None, None
+    if not magic.startswith(b"%PDF-"):
+        return "unsupported", None, None, None
     if parse_fcl050_v2.matches_pdf(path):
         legs, sims, report = parse_fcl050_v2.parse_pdf(path)
         return "offblock_fcl050", legs, sims, report
