@@ -206,7 +206,9 @@ def _purge_expired_payloads():
     bytes for 14 days; after that the reason remains visible but the document
     itself is removed automatically.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    # Embedded into a PostgREST query below. An unescaped `+00:00` is decoded
+    # as a space and makes the timestamp filter invalid; `Z` is URL-safe UTC.
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = {"data_b64": None, "payload_purged_at": now}
     _rest("PATCH",
           "ax_logbook_upload?data_b64=not.is.null"

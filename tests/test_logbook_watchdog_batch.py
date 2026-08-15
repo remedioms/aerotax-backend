@@ -381,3 +381,20 @@ def test_completed_push_is_unchanged_and_separate(monkeypatch):
     assert calls[0]["p_idempotency_key"] == "logbook-import-completed:7"
     assert calls[0]["p_payload"]["data"]["localization_key"] == (
         "logbook_import_completed")
+
+
+def test_retention_query_uses_url_safe_utc_timestamp(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        w, "_rest",
+        lambda method, path, payload=None, headers=None, expect_json=True:
+        calls.append((method, path, payload)),
+    )
+
+    w._purge_expired_payloads()
+
+    assert len(calls) == 2
+    review_path = calls[1][1]
+    assert "purge_after=lt." in review_path
+    assert "+" not in review_path
+    assert review_path.endswith("Z")
