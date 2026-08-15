@@ -31,6 +31,7 @@
 import base64
 import concurrent.futures
 import hmac
+import hashlib
 import json
 import math
 import os
@@ -732,6 +733,17 @@ def _opensky_oauth_token():
     if not cid or not secret:
         return None
 
+    # A 401/403 at the token endpoint means these exact credentials are not a
+    # valid OpenSky API client. Persist only a one-way fingerprint so all web
+    # and poll processes stop retrying the same dead secret every 30 minutes.
+    # Rotating either value changes the fingerprint and immediately retries.
+    credential_key = hashlib.sha256(
+        (cid + "\0" + secret).encode("utf-8")).hexdigest()
+    rejected = _poll_state_get('oauth_rejected_credentials')
+    if rejected and hmac.compare_digest(
+            str(rejected.get('credential_key') or ''), credential_key):
+        return None
+
     now = time.time()
     # 1) In-Process-Cache (inkl. Negativ-Cache nach Fehlschlag).
     with _OAUTH_CACHE["lock"]:
@@ -780,6 +792,11 @@ def _opensky_oauth_token():
             pause = (_OAUTH_FAIL_PAUSE_AUTH_S if code in (401, 403)
                      else _OAUTH_FAIL_PAUSE_NET_S)
             _OAUTH_CACHE["fail_until"] = time.time() + pause
+            if code in (401, 403):
+                _poll_state_put('oauth_rejected_credentials', {
+                    'credential_key': credential_key,
+                    'rejected_at_unix': time.time(),
+                })
             try:
                 current_app.logger.warning(
                     f'[adsb] oauth_token_fetch_FAIL {type(e).__name__}: '

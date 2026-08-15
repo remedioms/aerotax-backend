@@ -53,7 +53,7 @@ import traceback
 import urllib.request
 import urllib.error
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,7 +65,7 @@ ALERT_FROM = "noreply@aerosteuer.de"
 MAX_BATCH_FILES = 40          # Schutz vor Amok-Uploads in einem Lauf
 STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
-STATUS_REVIEW = "review"      # wartet auf Menschen; App pollt weiter „queued"
+STATUS_REVIEW = "review"      # wartet auf Menschen; terminal, App pollt nicht
 STATUS_FAILED = "failed"
 STATUS_COMPLETED = "completed"
 # Endzustände: einmal erreicht, NIE von der Notbremse in main() zurückgedreht.
@@ -173,17 +173,47 @@ def _pending_rows():
     return _rest("GET", q) or []
 
 
-def _set_status(ids, status, processed=None):
+def _set_status(ids, status, processed=None, error_code=None,
+                error_message=None):
     if not ids:
         return
     payload = {"status": status}
     if processed is not None:
         payload["processed"] = processed
+    payload["error_code"] = error_code
+    payload["error_message"] = (str(error_message)[:1000]
+                                if error_message else None)
     if status in (STATUS_COMPLETED, STATUS_FAILED):
-        payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        payload.update({
+            "completed_at": now,
+            "data_b64": None,
+            "payload_purged_at": now,
+            "purge_after": None,
+        })
+    elif status == STATUS_REVIEW:
+        payload["purge_after"] = (
+            datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
     id_list = ",".join(str(i) for i in ids)
     _rest("PATCH", f"ax_logbook_upload?id=in.({id_list})", payload,
           expect_json=False)
+
+
+def _purge_expired_payloads():
+    """Delete sensitive source bytes after their useful processing window.
+
+    Terminal rows are metadata/audit records only.  Review rows retain their
+    bytes for 14 days; after that the reason remains visible but the document
+    itself is removed automatically.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {"data_b64": None, "payload_purged_at": now}
+    _rest("PATCH",
+          "ax_logbook_upload?data_b64=not.is.null"
+          "&status=in.(completed,failed)", payload, expect_json=False)
+    _rest("PATCH",
+          "ax_logbook_upload?data_b64=not.is.null&status=eq.review"
+          f"&purge_after=lt.{now}", payload, expect_json=False)
 
 
 def _download(upload_id):
@@ -221,6 +251,9 @@ def _try_parsers(path):
     import parse_faa_logbook
     import parse_fcl050_v2
     import parse_foreflight_easa
+    import parse_foreflight_csv
+    import parse_simple_flights_csv
+    import parse_edw_xlsx
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
     import parse_roster_logbook
@@ -234,6 +267,20 @@ def _try_parsers(path):
     if parse_duties_v8.matches_csv(path):
         legs, sims, report = parse_duties_v8.parse_csv(path)
         return "offblock_duties", legs, sims, report
+    if parse_foreflight_csv.matches_csv(path):
+        legs, sims, report = parse_foreflight_csv.parse_csv(path)
+        return "foreflight_csv", legs, sims, report
+    if parse_simple_flights_csv.matches_csv(path):
+        legs, sims, report = parse_simple_flights_csv.parse_csv(path)
+        return "simple_flight_history", legs, sims, report
+    if parse_edw_xlsx.matches_workbook(path):
+        result, controls = parse_edw_xlsx.parse_workbook(path)
+        legs = result["legs"]
+        first, last = legs[0]["date"], legs[-1]["date"]
+        report = dict(controls)
+        report["month"] = (first[:7] if first[:7] == last[:7]
+                           else f"{first[:7]}–{last[:7]}")
+        return "edelweiss_xlsx", legs, result["sim"], report
     with open(path, "rb") as handle:
         if not handle.read(5).startswith(b"%PDF-"):
             return "unsupported", None, None, None
@@ -605,11 +652,12 @@ def _push_failed(token, anchor_upload_id):
 def process_token_batch(token, rows, events, terminal=None):
     ids = [r["id"] for r in rows]
 
-    def _status(target_ids, status, processed=None):
+    def _status(target_ids, status, processed=None, error_code=None,
+                error_message=None):
         """Statuswechsel + Merkzettel `terminal`: Zeilen in einem Endzustand
         darf die Notbremse in main() NICHT auf `pending` zurücksetzen — sonst
         hängt eine längst fertige Datei in der App ewig als „in Arbeit"."""
-        _set_status(target_ids, status, processed)
+        _set_status(target_ids, status, processed, error_code, error_message)
         if terminal is None:
             return
         if status in TERMINAL_STATUS:
@@ -656,14 +704,17 @@ def process_token_batch(token, rows, events, terminal=None):
         finally:
             os.unlink(path)
 
+    # Parser-/Kontrollfehler sind dateibezogen.  Ein einzelner korrigierter
+    # Monat darf nicht elf andere, vollständig validierte Monatsdateien
+    # blockieren.  Die betroffene Datei bleibt mit ihrem konkreten Grund im
+    # Review; die unabhängigen guten Dateien laufen unten normal weiter.
+    review_by_id = {rid: message for rid, message in review}
+    for rid, message in review:
+        _status([rid], STATUS_REVIEW, processed=False,
+                error_code="needs_review", error_message=message)
     if review:
-        # Ein einziger unklarer Fall reißt den ganzen Batch in die manuelle
-        # Prüfung — Teilimporte neben offenen Fragen sind schwerer zu
-        # entwirren als ein sauber liegender Batch.
-        _status(ids, STATUS_REVIEW)
-        events.append(("review", token, ids,
+        events.append(("review", token, sorted(review_by_id),
                        "; ".join(f"#{i}: {m}" for i, m in review)))
-        return
 
     informational = [f for f in parsed_files
                      if f.get("parser") == "informational_pdf"]
@@ -686,19 +737,30 @@ def process_token_batch(token, rows, events, terminal=None):
         try:
             merged_legs, added = merge_legs(old_legs, new_legs)
         except ValueError as ex:
-            _status(ids, STATUS_REVIEW)
-            events.append(("review", token, ids, str(ex)))
-            return
-        merged_sims = merge_sims(old_sims, new_sims)
+            real_ids = [f["id"] for f in real]
+            review_by_id.update({rid: str(ex) for rid in real_ids})
+            _status(real_ids, STATUS_REVIEW, processed=False,
+                    error_code="merge_conflict", error_message=str(ex))
+            events.append(("review", token, real_ids, str(ex)))
+            real = []
+            merged_legs = merged_sims = []
+            added = 0
+        if real:
+            merged_sims = merge_sims(old_sims, new_sims)
         faa_sim_twins = 0
-        if any(f["parser"] == "offblock_faa" for f in real):
+        if real and any(f["parser"] == "offblock_faa" for f in real):
             merged_sims, faa_sim_twins = remove_generic_faa_sim_twins(
                 merged_sims)
-        collisions = dedupe_for_reader(merged_legs)
-        months = sorted({f["report"]["month"] for f in real})
-        label = (f"Watchdog: {real[0]['parser']} {months[0]}–{months[-1]}"
-                 if len(months) > 1 else
-                 f"Watchdog: {real[0]['parser']} {months[0]}")
+        collisions = dedupe_for_reader(merged_legs) if real else []
+        if not real:
+            # Informational/unsupported/review siblings still need their own
+            # terminal handling below.
+            pass
+        else:
+            months = sorted({f["report"]["month"] for f in real})
+            label = (f"Watchdog: {real[0]['parser']} {months[0]}–{months[-1]}"
+                     if len(months) > 1 else
+                     f"Watchdog: {real[0]['parser']} {months[0]}")
         prev_meta = (existing[0].get("meta") or {}) if existing else {}
         report_carryovers = {
             int(f["report"]["carryover_min"])
@@ -707,13 +769,17 @@ def process_token_batch(token, rows, events, terminal=None):
             and isinstance(f["report"].get("carryover_min"), int)
         }
         prev_carryover = prev_meta.get("carryover_min")
-        if (len(report_carryovers) > 1
+        if real and (len(report_carryovers) > 1
                 or (report_carryovers and isinstance(prev_carryover, int)
                     and prev_carryover not in report_carryovers)):
-            _status(ids, STATUS_REVIEW)
-            events.append(("review", token, ids,
-                           "widersprüchliche FCL.050-Überträge"))
-            return
+            real_ids = [f["id"] for f in real]
+            message = "widersprüchliche FCL.050-Überträge"
+            review_by_id.update({rid: message for rid in real_ids})
+            _status(real_ids, STATUS_REVIEW, processed=False,
+                    error_code="carryover_conflict",
+                    error_message=message)
+            events.append(("review", token, real_ids, message))
+            real = []
         carryover_min = (next(iter(report_carryovers))
                          if report_carryovers else prev_carryover)
         carryover_landing_fields = {}
@@ -726,18 +792,24 @@ def process_token_batch(token, rows, events, terminal=None):
                 and isinstance(f["report"].get(field), int)
             }
             previous = prev_meta.get(field)
-            if (len(report_values) > 1
+            if real and (len(report_values) > 1
                     or (report_values and isinstance(previous, int)
                         and previous not in report_values)):
-                _status(ids, STATUS_REVIEW)
-                events.append(("review", token, ids,
-                               "widersprüchliche FAA-Landungsüberträge"))
-                return
+                real_ids = [f["id"] for f in real]
+                message = "widersprüchliche FAA-Landungsüberträge"
+                review_by_id.update({rid: message for rid in real_ids})
+                _status(real_ids, STATUS_REVIEW, processed=False,
+                        error_code="carryover_conflict",
+                        error_message=message)
+                events.append(("review", token, real_ids, message))
+                real = []
+                break
             value = (next(iter(report_values))
                      if report_values else previous)
             if isinstance(value, int) and value >= 0:
                 carryover_landing_fields[field] = value
-        label = _capped_source(prev_meta.get("source"), label)
+        if real:
+            label = _capped_source(prev_meta.get("source"), label)
         extra_meta = {
             "watchdog": {"upload_ids": [f["id"] for f in real],
                          "duplicates_skipped": [f["id"] for f in dups],
@@ -751,13 +823,14 @@ def process_token_batch(token, rows, events, terminal=None):
         if isinstance(carryover_min, int) and carryover_min >= 0:
             extra_meta["carryover_min"] = carryover_min
         extra_meta.update(carryover_landing_fields)
-        meta = _meta_for(merged_legs, merged_sims, label, extra_meta)
-        _upsert_import(token, merged_legs, merged_sims, meta)
-        _bust_import_cache(token)
-        _status([f["id"] for f in real], STATUS_COMPLETED, processed=True)
-        _push_completed(token, max(f["id"] for f in real))
-        events.append(("imported", token, [f["id"] for f in real],
-                       f"+{added} Legs (gesamt {len(merged_legs)})"))
+        if real:
+            meta = _meta_for(merged_legs, merged_sims, label, extra_meta)
+            _upsert_import(token, merged_legs, merged_sims, meta)
+            _bust_import_cache(token)
+            _status([f["id"] for f in real], STATUS_COMPLETED, processed=True)
+            _push_completed(token, max(f["id"] for f in real))
+            events.append(("imported", token, [f["id"] for f in real],
+                           f"+{added} Legs (gesamt {len(merged_legs)})"))
 
     if informational:
         info_ids = [f["id"] for f in informational]
@@ -766,7 +839,9 @@ def process_token_batch(token, rows, events, terminal=None):
                        "erkannt; enthält keine einzelnen Flugbuch-Legs"))
 
     if unsupported:
-        _status(unsupported, STATUS_FAILED, processed=True)
+        _status(unsupported, STATUS_FAILED, processed=True,
+                error_code="unsupported_format",
+                error_message="Dateiformat wird noch nicht unterstützt.")
         events.append(("unsupported", token, unsupported, "Format unbekannt"))
 
     # Byte-Dubletten erben das Schicksal ihres ORIGINALS — eine Kopie einer
@@ -777,16 +852,25 @@ def process_token_batch(token, rows, events, terminal=None):
     failed_dups = []
     if dups:
         real_ids = {f["id"] for f in real + informational}
+        review_ids = set(review_by_id)
         failed_dups = [f["id"] for f in dups if f["dup_of"] in set(unsupported)]
+        review_dups = [f["id"] for f in dups if f["dup_of"] in review_ids]
         done_dups = [f["id"] for f in dups
                      if f["dup_of"] in real_ids or f["dup_of"] not in
-                     set(unsupported) | real_ids]
+                     set(unsupported) | real_ids | review_ids]
         if failed_dups:
-            _status(failed_dups, STATUS_FAILED, processed=True)
+            _status(failed_dups, STATUS_FAILED, processed=True,
+                    error_code="unsupported_format",
+                    error_message="Dateiformat wird noch nicht unterstützt.")
+        if review_dups:
+            _status(review_dups, STATUS_REVIEW, processed=False,
+                    error_code="needs_review",
+                    error_message="Identische Datei wartet bereits auf Prüfung.")
         if done_dups:
             _status(done_dups, STATUS_COMPLETED, processed=True)
         events.append(("dups", token,
-                       {"failed": failed_dups, "completed": done_dups}, ""))
+                       {"failed": failed_dups, "review": review_dups,
+                        "completed": done_dups}, ""))
 
     # Fehler-Push ganz zum Schluss und über ALLE `failed`-Zeilen des Laufs:
     # eine Datei und ihre Byte-Kopie sind EIN Problem, nicht zwei. Anker ist
@@ -799,6 +883,7 @@ def process_token_batch(token, rows, events, terminal=None):
 
 def main():
     _recover_stale_processing()
+    _purge_expired_payloads()
     rows = _pending_rows()
     if not rows:
         _log("nichts offen")

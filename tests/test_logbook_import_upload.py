@@ -186,7 +186,8 @@ def test_upload_status_is_owner_scoped_and_returns_durable_fields(monkeypatch):
     assert r.get_json() == {'ok': True, 'job_id': 44, 'status': 'completed',
                             'filename': 'old.csv',
                             'created_at': '2026-08-10T10:00:00Z',
-                            'completed_at': '2026-08-10T10:02:00Z'}
+                            'completed_at': '2026-08-10T10:02:00Z',
+                            'error_code': None, 'message': None}
     assert query.filters == [('id', 44), ('token', 'tok_upload_status')]
 
 
@@ -200,6 +201,26 @@ def test_upload_status_hides_foreign_or_missing_job(monkeypatch):
     r = _client().get('/api/user/logbook/tok_upload_status/import-upload/999')
     assert r.status_code == 404
     assert r.get_json()['error'] == 'not_found'
+
+
+def test_upload_status_exposes_review_reason_without_calling_it_failed(
+        monkeypatch):
+    row = {'id': 45, 'status': 'review', 'filename': 'month.pdf',
+           'created_at': '2026-08-15T10:00:00Z', 'completed_at': None,
+           'error_code': 'needs_review',
+           'error_message': 'Eine Buchungszeile wird geprüft.'}
+    monkeypatch.setattr(A, 'SB_AVAILABLE', True)
+    query = _StatusQuery(row)
+    monkeypatch.setattr(A, 'sb', type('SB', (), {
+        'table': staticmethod(lambda _name: query),
+    })())
+    monkeypatch.setattr(A, '_supabase_execute_with_timeout',
+                        lambda _name, fn, timeout_s=8: (fn(), False))
+    body = _client().get(
+        '/api/user/logbook/tok_upload_status/import-upload/45').get_json()
+    assert body['status'] == 'review'
+    assert body['error_code'] == 'needs_review'
+    assert body['message'] == 'Eine Buchungszeile wird geprüft.'
 
 
 # ── Ankunfts-Push („angekommen — wird verarbeitet") ────────────────────────

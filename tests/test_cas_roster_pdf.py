@@ -280,5 +280,5 @@ def test_roster_queue_reuses_pending_identical_pdf():
                          side_effect=lambda _name, fn: (fn(), False)), \
             patch.object(backend, '_logbook_upload_store') as store:
         assert backend._roster_pdf_upload_store(
-            'AT-TEST-QUEUE', 'same.pdf', b'%PDF-same') is True
+            'AT-TEST-QUEUE', 'same.pdf', b'%PDF-same') == 123
     store.assert_not_called()

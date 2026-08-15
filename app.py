@@ -19541,6 +19541,15 @@ def _aviation_cache_set(key, value, ttl_sec):
             _AVIATION_CACHE.pop(k, None)
 
 
+def _aviation_cache_stale(key, max_stale_sec):
+    """Return an expired value only inside a bounded stale grace window."""
+    import time
+    rec = _AVIATION_CACHE.get(key)
+    if rec and rec[0] + max_stale_sec > time.time():
+        return rec[1]
+    return None
+
+
 def _cache_soft_cap(cache, max_items=500, drop=200):
     """Generischer Soft-Cap für unbounded In-Memory-Caches (gleiches Muster
     wie _aviation_cache_set): über max_items → älteste ~drop Einträge raus.
@@ -20046,6 +20055,20 @@ def get_metar_by_iata(iata):
     if cached is not None:
         return jsonify(cached)
 
+    # aviationweather.gov occasionally stalls.  During a short negative-cache
+    # window return the last successful observation immediately (or an honest
+    # unavailable payload) instead of making every app/device wait again.
+    failure_key = f'metar_failure_v1:{icao}'
+    if _aviation_cache_get(failure_key, 120) is not None:
+        stale = _aviation_cache_stale(cache_key, 24 * 3600)
+        if stale is not None:
+            result = dict(stale)
+            result['stale'] = True
+            return jsonify(result)
+        return jsonify({'iata': iata_clean, 'icao': icao,
+                        'status': 'fetch_failed',
+                        'error': 'upstream_error'}), 200
+
     try:
         import urllib.request as ur
         url = f'https://aviationweather.gov/api/data/metar?ids={icao}&format=json&hours=1'
@@ -20053,14 +20076,23 @@ def get_metar_by_iata(iata):
             'User-Agent': 'AeroX/1.0 (aviation-app; +https://aerosteuer.de)',
             'Accept': 'application/json',
         })
-        with ur.urlopen(req, timeout=8) as r:
+        with ur.urlopen(req, timeout=4) as r:
             raw = json.loads(r.read().decode('utf-8'))
     except Exception as e:
-        # Silent return None mit Status — iOS zeigt dann kein Wetter, ohne crash.
+        # The client timeout is also short; an 8s backend wait previously kept
+        # the Pack Assistant spinner alive while the same failing upstream was
+        # retried by every process. Cache the failure for two minutes and serve
+        # the last good METAR for at most 24h.
         print(f'[airport-weather] fetch fail {icao}: {type(e).__name__}: {str(e)[:200]}')
+        _aviation_cache_set(failure_key, True, 120)
+        stale = _aviation_cache_stale(cache_key, 24 * 3600)
+        if stale is not None:
+            result = dict(stale)
+            result['stale'] = True
+            return jsonify(result)
         return jsonify({'iata': iata_clean, 'icao': icao,
                         'status': 'fetch_failed',
-                        'error': 'upstream_error'}), 502
+                        'error': 'upstream_error'}), 200
 
     if not raw:
         result = {'iata': iata_clean, 'icao': icao, 'status': 'no_data',
@@ -23949,9 +23981,12 @@ def _logbook_upload_store(token, filename, blob, note):
 
 
 def _logbook_import_mail(token, filename, blob, note, stored=False):
-    """Benachrichtigungs-Mail an den Owner (SUPPORT_NOTIFY_EMAIL), mit der
-    Datei als Anhang als Redundanz. Seit 07-24 ist der SB-Upload-Store der
-    primäre Transportweg; die Mail sagt, ob die Datei dort liegt."""
+    """Benachrichtigungs-Mail an den Owner (SUPPORT_NOTIFY_EMAIL).
+
+    Liegt die Datei bereits durabel in der privaten Inbox, enthält die Mail
+    bewusst KEINE zweite Kopie. Nur beim Store-Ausfall bleibt der Anhang als
+    Nottransport erhalten.
+    """
     api_key = os.environ.get('RESEND_API_KEY', '').strip()
     to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL',
                               'miguel.schumann@icloud.com').strip()
@@ -23985,23 +24020,25 @@ def _logbook_import_mail(token, filename, blob, note, stored=False):
             f"<b>Notiz:</b> {e(note or '—')}"
             f"</p>"
             f"<p style='font-family:sans-serif;font-size:12px;color:#888'>"
-            + ("Datei liegt im Upload-Store (SB ax_logbook_upload) — von "
-               "dort einspielen; Anhang ist nur Redundanz."
+            + ("Datei liegt im privaten Upload-Store (SB ax_logbook_upload) — "
+               "von dort einspielen."
                if stored else
                "SB-Store FEHLGESCHLAGEN — Anhang ist der einzige Weg an "
                "die Datei.")
             + " (Kette: Datei → Legs → logbook).</p>"
         )
-        payload = json.dumps({
+        mail = {
             'from': 'AeroX Flugbuch <support@aerosteuer.de>',
             'to': [to_email],
             'subject': subject,
             'html': html_body,
-            'attachments': [{
+        }
+        if not stored:
+            mail['attachments'] = [{
                 'filename': filename,
                 'content': _b64.b64encode(blob).decode(),
-            }],
-        }).encode()
+            }]
+        payload = json.dumps(mail).encode()
         req = urllib.request.Request(
             'https://api.resend.com/emails',
             data=payload,
@@ -24171,7 +24208,8 @@ def get_logbook_import_upload_status(token, job_id):
     try:
         def _load():
             return (sb.table('ax_logbook_upload')
-                    .select('id,status,filename,created_at,completed_at')
+                    .select('id,status,filename,created_at,completed_at,'
+                            'error_code,error_message')
                     .eq('id', job_id).eq('token', token).limit(1).execute())
         result, failed = _supabase_execute_with_timeout(
             'logbook_upload_status', _load, timeout_s=8)
@@ -24181,11 +24219,16 @@ def get_logbook_import_upload_status(token, job_id):
         if not rows:
             return jsonify({'ok': False, 'error': 'not_found'}), 404
         row = rows[0]
+        status = row.get('status') or 'pending'
         return jsonify({'ok': True, 'job_id': row.get('id'),
-                        'status': row.get('status') or 'pending',
+                        'status': status,
                         'filename': row.get('filename'),
                         'created_at': row.get('created_at'),
-                        'completed_at': row.get('completed_at')})
+                        'completed_at': row.get('completed_at'),
+                        'error_code': (row.get('error_code')
+                                       if status in ('review', 'failed') else None),
+                        'message': (row.get('error_message')
+                                    if status in ('review', 'failed') else None)})
     except Exception as ex:
         app.logger.warning('[logbook-import] status fail tok=%s job=%s err=%s',
                            token[:8], job_id, type(ex).__name__)
@@ -26781,6 +26824,41 @@ def _mk_signature(kind, build, top_frames):
     return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
 
 
+def _mk_event_key(body, user_token=None):
+    """Stable identity for one MetricKit delivery.
+
+    MetricKit may hand the same diagnostic to the app more than once and the
+    HTTP client may retry a successful request after a lost response.  The
+    canonical JSON digest makes both cases one database event while still
+    keeping genuinely separate occurrences (their timestamps differ).
+    """
+    # ``ts_begin``/``ts_end`` identify MetricKit's delivery window, not the
+    # diagnostic itself. The same hang was observed in production twice with
+    # byte-identical duration/stack but adjacent one-minute payload windows.
+    # Excluding that envelope deduplicates the event while changes to duration,
+    # exception data or the stack still produce a new identity.
+    identity = {key: value for key, value in body.items()
+                if key not in ('ts_begin', 'ts_end')}
+    canonical = json.dumps(identity, sort_keys=True, separators=(',', ':'),
+                           ensure_ascii=False, default=str)
+    raw = f'{user_token or ""}|{canonical}'.encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _mk_event_exists(event_key):
+    if not event_key or not SB_AVAILABLE:
+        return False
+    try:
+        def _do():
+            return (sb.table('ax_crash_reports').select('id')
+                    .eq('event_key', event_key).limit(1).execute())
+        res, failed = _supabase_execute_with_timeout(
+            'mk_event_exists', _do, timeout_s=4)
+        return False if failed else bool(getattr(res, 'data', None) or [])
+    except Exception:
+        return False
+
+
 def _mk_prior_count(sig):
     """Wie oft wurde diese Signatur schon gespeichert (inkl. der gerade
     eingefügten Zeile)? Liest `payload->>_mk_sig` aus ax_crash_reports.
@@ -27009,6 +27087,8 @@ def post_telemetry_diagnostics():
         if cand.startswith('AT-') and len(cand) <= 256:
             user_token = cand
 
+    event_key = _mk_event_key(body, user_token)
+
     row = {
         'created_at': datetime.now(timezone.utc).isoformat(),
         'user_token': user_token,
@@ -27017,6 +27097,7 @@ def post_telemetry_diagnostics():
         'os': str(body.get('os') or '')[:64],
         'device': str(body.get('device') or '')[:64],
         'kind': kind,
+        'event_key': event_key,
         'payload': body,
     }
 
@@ -27031,15 +27112,25 @@ def post_telemetry_diagnostics():
     # Persistenz best-effort: Supabase-Insert; Tabelle fehlt / SB down →
     # Logging-only-Fallback (Report ist dann wenigstens in Cloud-Run-Logs).
     stored = False
-    if SB_AVAILABLE:
+    duplicate = _mk_event_exists(event_key)
+    if SB_AVAILABLE and not duplicate:
         try:
             def _do():
                 return sb.table('ax_crash_reports').insert(row).execute()
             res, failed = _supabase_execute_with_timeout('mk_diag_insert', _do)
             stored = not failed
         except Exception as e:
-            print(f'[mk-diag] sb insert fail ({type(e).__name__}: {str(e)[:200]}) — logging only')
-    if not stored:
+            detail = str(e).lower()
+            duplicate = ('duplicate key' in detail
+                         or '23505' in detail
+                         or 'event_key' in detail and 'unique' in detail)
+            if not duplicate:
+                print(f'[mk-diag] sb insert fail ({type(e).__name__}: {str(e)[:200]}) — logging only')
+    elif duplicate:
+        stored = True
+    if duplicate:
+        stored = True
+    if not stored and not duplicate:
         try:
             print(f'[mk-diag] FALLBACK-LOG {json.dumps(row, ensure_ascii=False)[:4000]}')
         except Exception:
@@ -27051,14 +27142,15 @@ def post_telemetry_diagnostics():
     has_detail = (body.get('exception_type') is not None
                   or bool(body.get('termination_reason'))
                   or body.get('hang_duration_s') is not None)
-    should, reason = _mk_should_alert(mk_sig, has_detail)
+    should, reason = ((False, 'duplicate') if duplicate
+                      else _mk_should_alert(mk_sig, has_detail))
     if should:
         _mk_send_alert_email(row, top_frames, reason=reason, sig=mk_sig or '')
     else:
         print(f'[mk-diag] keine Mail (kind={kind} build={row["build"]} '
               f'sig={mk_sig or "-"} grund={reason})')
 
-    return jsonify({'ok': True, 'stored': stored})
+    return jsonify({'ok': True, 'stored': stored, 'duplicate': duplicate})
 
 
 # ─── Voice-Notes Storage (Per-Day Audio) ────────────────────────────────────
@@ -59694,8 +59786,8 @@ def _roster_pdf_upload_store(token, filename, blob):
     Reuses the private, service-key-only import inbox that already carries
     logbook uploads.  The exact note marker gives the two consumers disjoint
     queues without a production schema change.  The roster fetch helper
-    deletes a row after verified processing, so these sensitive PDFs are not
-    retained indefinitely.
+    closes and purges the row after verified processing, so these sensitive
+    PDFs are not retained indefinitely. Returns the durable row id or None.
     """
     import hashlib as _hl
     safe_name = re.sub(r'[^A-Za-z0-9._ ()-]', '_', filename or 'roster.pdf')
@@ -59717,10 +59809,11 @@ def _roster_pdf_upload_store(token, filename, blob):
             pending, failed = _supabase_execute_with_timeout(
                 'roster_pdf_queue_dedupe', _find_pending)
             if not failed and (getattr(pending, 'data', None) or []):
+                pending_id = (getattr(pending, 'data', None) or [{}])[0].get('id')
                 app.logger.info(
                     f'[roster-pdf] queue-store-existing tok={token[:8]} '
                     f'sha={sha} bytes={len(blob)}')
-                return True
+                return int(pending_id) if pending_id is not None else None
     except Exception:
         # Monitoring durability wins over dedupe when the read path degrades.
         pass
@@ -59729,7 +59822,42 @@ def _roster_pdf_upload_store(token, filename, blob):
     level = app.logger.info if stored else app.logger.warning
     level(f'[roster-pdf] queue-store-{"ok" if stored else "fail"} '
           f'tok={token[:8]} sha={sha} bytes={len(blob)}')
-    return bool(stored)
+    return int(stored) if stored is not None else None
+
+
+def _roster_pdf_upload_finish(job_ids, status, error_code=None,
+                              error_message=None):
+    """Close roster verification rows and enforce source-file retention."""
+    ids = sorted({value for value in job_ids if type(value) is int and value > 0})
+    if not ids or not SB_AVAILABLE:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    values = {
+        'status': status,
+        'processed': status == 'completed',
+        'completed_at': now if status == 'completed' else None,
+        'error_code': error_code,
+        'error_message': (str(error_message)[:1000]
+                          if error_message else None),
+    }
+    if status == 'completed':
+        values.update({'data_b64': None, 'payload_purged_at': now,
+                       'purge_after': None})
+    elif status == 'review':
+        values['purge_after'] = (
+            datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+    try:
+        def _finish():
+            return (sb.table('ax_logbook_upload').update(values)
+                    .in_('id', ids).execute())
+        _, failed = _supabase_execute_with_timeout(
+            'roster_pdf_queue_finish', _finish, timeout_s=8)
+        return not failed
+    except Exception as exc:
+        app.logger.warning(
+            f'[roster-pdf] queue-finish-fail ids={ids} status={status} '
+            f'err={type(exc).__name__}: {str(exc)[:120]}')
+        return False
 
 
 def _pdf_informational_only_kind(text):
@@ -59797,6 +59925,9 @@ def import_roster_pdf(token):
             app.logger.warning(
                 f'[roster-pdf] extract-fail tok={token[:8]} sha={upload_sha} '
                 f'err={type(e).__name__}: {str(e)[:160]}')
+            _roster_pdf_upload_finish(
+                queued, 'review', 'pdf_extract_failed',
+                'Das Dienstplan-PDF konnte nicht gelesen werden.')
             return jsonify({'ok': False, 'error': 'pdf_extract_failed',
                             'monitoring_queued': all(queued)}), 422
 
@@ -59875,13 +60006,17 @@ def import_roster_pdf(token):
             app.logger.warning(
                 f'[roster-pdf] parse-fail tok={token[:8]} sha={upload_sha} '
                 f'error={perr}')
+            _roster_pdf_upload_finish(
+                queued, 'review', str(perr or 'parse_failed'),
+                'Das Dienstplanformat wird geprüft.')
             return jsonify({'ok': False, 'error': perr,
                             'monitoring_queued': all(queued)}), 422
 
     if informational_documents and len(informational_documents) == len(files):
         # A valid aggregate/tax statement is accepted, but must never become
-        # fake calendar events.  The private verification copy remains queued
-        # until the maintenance sweep confirms this exact classification.
+        # fake calendar events.  The deterministic classification is already
+        # the verification gate, so the private source copy can be purged now.
+        _roster_pdf_upload_finish(queued, 'completed')
         return jsonify({
             'ok': True, 'source': 'pdf', 'events_count': 0,
             'briefings_imported': 0, 'informational_only': True,
@@ -59946,6 +60081,9 @@ def import_roster_pdf(token):
         calendars.append(_stored_calendar_events_to_ics(existing_events))
     ics = _roster_join_ics(calendars)
     if 'BEGIN:VEVENT' not in ics:
+        _roster_pdf_upload_finish(
+            queued, 'review', 'no_roster_days',
+            'Im Dokument wurden keine Dienstplantage erkannt.')
         return jsonify({'ok': False, 'error': 'no_roster_days',
                         'monitoring_queued': all(queued)}), 422
 
@@ -59990,11 +60128,15 @@ def import_roster_pdf(token):
             f'events={payload.get("events_count")} '
             f'briefings={payload.get("briefings_imported")} '
             f'period={payload.get("period") or "?"}')
+        _roster_pdf_upload_finish(queued, 'completed')
     else:
         sha_label = upload_shas[0] if len(upload_shas) == 1 else f'{upload_shas[0]}+{len(upload_shas)-1}'
         app.logger.warning(
             f'[roster-pdf] import-fail tok={token[:8]} sha={sha_label} '
             f'status={status} error={payload.get("error") or "unknown"}')
+        _roster_pdf_upload_finish(
+            queued, 'review', str(payload.get('error') or 'import_failed'),
+            'Der Dienstplanimport wird geprüft.')
     payload['monitoring_queued'] = all(queued)
     return jsonify(payload), status
 
