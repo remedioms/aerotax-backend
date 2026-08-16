@@ -80524,9 +80524,13 @@ def _header_only_body_dispatch(handler):
 
 @app.route('/api/me/profile', methods=['GET', 'PUT'])
 def me_profile():
-    return _header_only_dispatch(
-        get_user_profile if request.method == 'GET' else put_user_profile,
-    )
+    # SEC (Review 16.08.): GET liefert das volle Eigenprofil inkl.
+    # `friend_visibility`, dessen Dict-KEYS fremde AT-Credentials sind. `/api/me`
+    # liegt ausserhalb des URL-Prefix-Redactors -> der GET-Pfad muss die
+    # Public-Ref-Projektion selbst erzwingen. PUT bleibt am Thin-Dispatcher.
+    if request.method == 'GET':
+        return _header_only_public_dispatch(get_user_profile)
+    return _header_only_dispatch(put_user_profile)
 
 
 @app.route('/api/me/avatar', methods=['POST'])
@@ -80687,10 +80691,11 @@ def me_layover_delete(rec_id):
 
 @app.route('/api/me/layover-recs/<rec_id>/comments', methods=['GET', 'POST'])
 def me_layover_comments(rec_id):
-    return _header_only_dispatch(
-        layover_rec_get_comments if request.method == 'GET' else layover_rec_add_comment,
-        rec_id,
-    )
+    # SEC (Review 16.08.): Kommentare tragen `author_token` (volles AT) roh —
+    # GET ueber die Public-Ref-Projektion, POST am Thin-Dispatcher.
+    if request.method == 'GET':
+        return _header_only_public_dispatch(layover_rec_get_comments, rec_id)
+    return _header_only_dispatch(layover_rec_add_comment, rec_id)
 
 
 @app.route('/api/me/layover-recs/<rec_id>/comments/<comment_id>', methods=['DELETE'])
@@ -80705,7 +80710,8 @@ def me_layover_discover():
 
 @app.route('/api/me/hangouts', methods=['GET'])
 def me_hangouts():
-    return _header_only_dispatch(list_hangouts)
+    # SEC (Review 16.08.): Freundes-Pins tragen `owner_token` (fremdes AT) roh.
+    return _header_only_public_dispatch(list_hangouts)
 
 
 @app.route('/api/me/crew-at-destination', methods=['GET'])
@@ -81201,7 +81207,11 @@ def me_roster_changes_decide():
 
 @app.route('/api/me/crew-chat/inbox', methods=['GET'])
 def me_chat_inbox():
-    return _header_only_dispatch(get_dm_inbox)
+    # SEC (Review 16.08.): Inbox-Zeilen tragen `friend_token` (volles AT) roh.
+    # HINWEIS: `channel_id` (dm__AT__AT) bleibt Vorbestand — die Channel-Routen
+    # nehmen ihn roh zurueck; sauber nur mit koordiniertem AXU-Channel-Umbau
+    # loesbar (separates Ticket), nicht hier.
+    return _header_only_public_dispatch(get_dm_inbox)
 
 
 def _me_crew_dm_request_target(ref):
