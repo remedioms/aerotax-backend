@@ -33462,6 +33462,28 @@ def forum_create_reply(token, thread_id):
                  if row.get('id') == parent_reply_id),
                 None,
             )
+        # RE-ROOTING (Owner-Report 16.08.): Die App bietet „Antworten" auch
+        # auf bereits verschachtelten Replies an und schickt dann DEREN ID als
+        # parent_reply_id — die strikte Ein-Ebenen-Regel unten lehnte das mit
+        # 400 ab (für den User: „kann nicht senden"; Build 342, Thread
+        # ec9470a1-6fc). Eine Antwort auf eine Ebene-2-Reply hängt jetzt an
+        # der WURZEL ihrer Kette (Forum bleibt einstufig, kein Client muss
+        # tiefere Bäume rendern), statt den User abzulehnen. Nur wenn auch
+        # die Wurzel nicht auflösbar ist, bleibt es beim 400.
+        if (parent is not None and parent.get('thread_id') == thread_id
+                and parent.get('parent_reply_id')):
+            root_id = parent.get('parent_reply_id')
+            root = _forum_reply_sb_get(root_id)
+            if root is None:
+                root = next(
+                    (row for row in (_forum_replies_load_from_disk(thread_id) or [])
+                     if row.get('id') == root_id),
+                    None,
+                )
+            if (root is not None and root.get('thread_id') == thread_id
+                    and root.get('parent_reply_id') is None):
+                parent_reply_id = root_id
+                parent = root
         if (parent is None or parent.get('thread_id') != thread_id or
                 parent.get('parent_reply_id') is not None):
             return jsonify({'ok': False, 'error': 'invalid_parent_reply_id'}), 400
