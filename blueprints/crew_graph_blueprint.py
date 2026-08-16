@@ -945,6 +945,14 @@ def crew_graph_edges(token):
     })
 
 
+@crew_graph_bp.route('/api/me/crew-graph/edges', methods=['GET'])
+def crew_graph_edges_me():
+    """Header-only owner alias; keeps the established edge serializer intact."""
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else crew_graph_edges(token)
+
+
 @crew_graph_bp.route('/api/crew-graph/<token>/common', methods=['GET'])
 def crew_graph_common(token):
     """Shared History mit einem konkreten Other.

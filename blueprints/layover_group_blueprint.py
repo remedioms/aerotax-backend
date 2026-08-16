@@ -70,18 +70,25 @@ except Exception as _e:
     print(f'[layover_group] SB init failed: {type(_e).__name__}: {_e} → disk-only', flush=True)
 
 
-def _auth_ok(token):
-    """Bearer == path-token (constant-time). Die Gruppen-ID ist die Capability
-    (nur per Invite-Code/QR bekannt) — deckt auch per-Code beigetretene Mitglieder,
-    die NICHT in der Owner-Mitgliederliste stehen (Channel-offen wie der Chat)."""
-    auth = request.headers.get('Authorization', '') or ''
-    parts = auth.split(None, 1)
-    if len(parts) == 2 and parts[0].lower() == 'bearer' and token:
+def _authenticated_owner(path_token=None):
+    """Resolve a real account principal and optionally bind it to legacy path.
+
+    Earlier versions compared a Bearer value only to the caller-controlled
+    path segment.  That made any invented ``AT-...`` string look authenticated.
+    The app helper validates the normalized AXA/AT bearer against auth_users;
+    legacy paths additionally retain their constant-time owner binding.
+    """
+    from app import _header_only_owner
+    principal, error = _header_only_owner()
+    if error is not None:
+        return None, error
+    if path_token is not None:
         try:
-            return hmac.compare_digest(parts[1].strip(), token)
+            if not hmac.compare_digest(principal, path_token):
+                return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
         except Exception:
-            return False
-    return False
+            return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    return principal, None
 
 
 def _safe_id(s):
@@ -273,8 +280,9 @@ def _voter_pseudonym(token):
 
 @layover_group_bp.route('/api/layover-group/<token>/meta/<group_id>', methods=['GET'])
 def get_layover_group_meta(token, group_id):
-    if not _auth_ok(token):
-        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    token, error = _authenticated_owner(token)
+    if error is not None:
+        return error
     gid = _safe_id(group_id)
     if not gid:
         return jsonify({'ok': False, 'error': 'bad_group'}), 400
@@ -284,8 +292,9 @@ def get_layover_group_meta(token, group_id):
 
 @layover_group_bp.route('/api/layover-group/<token>/meta/<group_id>', methods=['PUT'])
 def put_layover_group_meta(token, group_id):
-    if not _auth_ok(token):
-        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    token, error = _authenticated_owner(token)
+    if error is not None:
+        return error
     gid = _safe_id(group_id)
     if not gid:
         return jsonify({'ok': False, 'error': 'bad_group'}), 400
@@ -313,8 +322,9 @@ def put_layover_group_meta(token, group_id):
 
 @layover_group_bp.route('/api/layover-group/<token>/meta/<group_id>/vote', methods=['POST'])
 def vote_layover_group_poll(token, group_id):
-    if not _auth_ok(token):
-        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    token, error = _authenticated_owner(token)
+    if error is not None:
+        return error
     gid = _safe_id(group_id)
     if not gid:
         return jsonify({'ok': False, 'error': 'bad_group'}), 400
@@ -344,3 +354,32 @@ def vote_layover_group_poll(token, group_id):
         stored['updated_at'] = time.time()
         _save(gid, stored)
     return jsonify({'ok': True, 'meta': _mask_voter_tokens(stored, token)})
+
+
+@layover_group_bp.route('/api/me/layover-group/meta/<group_id>', methods=['GET'])
+def get_layover_group_meta_me(group_id):
+    token, error = _authenticated_owner()
+    if error is not None:
+        return error
+    gid = _safe_id(group_id)
+    if not gid:
+        return jsonify({'ok': False, 'error': 'bad_group'}), 400
+    return jsonify({'ok': True, 'meta': _mask_voter_tokens(_load(gid), token)})
+
+
+@layover_group_bp.route('/api/me/layover-group/meta/<group_id>', methods=['PUT'])
+def put_layover_group_meta_me(group_id):
+    token, error = _authenticated_owner()
+    if error is not None:
+        return error
+    # Re-enter the proven legacy implementation through an authenticated,
+    # server-derived principal; its path is never exposed to the client.
+    return put_layover_group_meta(token, group_id)
+
+
+@layover_group_bp.route('/api/me/layover-group/meta/<group_id>/vote', methods=['POST'])
+def vote_layover_group_poll_me(group_id):
+    token, error = _authenticated_owner()
+    if error is not None:
+        return error
+    return vote_layover_group_poll(token, group_id)

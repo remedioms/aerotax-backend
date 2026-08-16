@@ -515,6 +515,14 @@ def list_licenses(token):
     }), 200
 
 
+@license_wallet_bp.route('/api/me/license-wallet/list', methods=['GET'])
+def list_licenses_me():
+    """Credential-free URL alias for authenticated Android clients."""
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else list_licenses(token)
+
+
 @license_wallet_bp.route('/api/license-wallet/<token>/upsert', methods=['POST'])
 def upsert_license(token):
     """Upsert eines einzelnen Items. Body = item-dict.
@@ -564,6 +572,13 @@ def upsert_license(token):
     }), 200
 
 
+@license_wallet_bp.route('/api/me/license-wallet/upsert', methods=['POST'])
+def upsert_license_me():
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else upsert_license(token)
+
+
 @license_wallet_bp.route('/api/license-wallet/<token>/<item_id>', methods=['DELETE'])
 def delete_license(token, item_id):
     """Soft-Delete: setzt deleted=true. Item bleibt physisch erhalten für
@@ -599,6 +614,13 @@ def delete_license(token, item_id):
             'disk': disk_ok,
         },
     }), 200
+
+
+@license_wallet_bp.route('/api/me/license-wallet/<item_id>', methods=['DELETE'])
+def delete_license_me(item_id):
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else delete_license(token, item_id)
 
 
 @license_wallet_bp.route('/api/license-wallet/<token>/bulk-sync', methods=['POST'])

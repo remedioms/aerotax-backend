@@ -7277,6 +7277,49 @@ def ax_observed_track():
     return jsonify({'ok': True, 'written': len(rows)})
 
 
+@aerox_data_bp.route('/api/me/radar/observed-track', methods=['POST'])
+def ax_observed_track_me():
+    """Authenticated Android entry point for an explicitly contributed trail.
+
+    The legacy public endpoint remains for released iOS clients. Android never
+    puts its account credential in a URL: identity is obtained exclusively
+    from the Authorization header, while the mature payload validation and
+    IP-rate limit stay in :func:`ax_observed_track`.
+    """
+    from flask import request
+    from app import _header_only_owner
+    _owner, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or set(body) - {'reg', 'points'}:
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    reg = str(body.get('reg') or '').strip().upper()
+    if not re.fullmatch(r'[A-Z0-9][A-Z0-9 -]{2,11}', reg):
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    points = body.get('points')
+    if not isinstance(points, list) or not 4 <= len(points) <= 100:
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    if any(not isinstance(point, dict) or
+           set(point) - {'lat', 'lon', 'ts', 'alt', 'gs', 'track'}
+           for point in points):
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    try:
+        parsed = [(float(point['lat']), float(point['lon']),
+                   int(float(point['ts'])), float(point['alt']))
+                  for point in points]
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    if any(not (math.isfinite(lat) and math.isfinite(lon) and
+                math.isfinite(alt) and -90 <= lat <= 90 and
+                -180 <= lon <= 180 and -1000 <= alt <= 13000 and ts > 0)
+           for lat, lon, ts, alt in parsed):
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    return ax_observed_track()
+
+
 @aerox_data_bp.route('/api/ax/flown-track', methods=['GET'])
 def ax_flown_track():
     """Die ECHTE geflogene Route eines Legs als Polyline. Kaskade (billig-zuerst):
