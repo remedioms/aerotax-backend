@@ -53,6 +53,73 @@ def test_me_route_rejects_missing_or_non_account_bearer(monkeypatch):
     assert response.get_json()['error'] == 'unauthorized'
 
 
+def test_profile_me_route_is_registered_and_preserves_owner_shape(monkeypatch):
+    """A fresh Android login can classify the existing account via the router."""
+    seen = []
+    profile = {
+        'name': 'Existing Crew',
+        'homebase': 'FRA',
+        'account_type': 'crew',
+    }
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A,
+        'get_user_profile',
+        lambda token: seen.append(('GET', token)) or A.jsonify({'profile': profile}),
+    )
+    monkeypatch.setattr(
+        A,
+        'put_user_profile',
+        lambda token: seen.append(('PUT', token)) or A.jsonify({
+            'ok': True,
+            'profile': profile,
+        }),
+    )
+    client = A.app.test_client()
+    headers = {'Authorization': f'Bearer {TOKEN}'}
+
+    get_response = client.get('/api/me/profile', headers=headers)
+    put_response = client.put('/api/me/profile', headers=headers, json={'name': 'Existing Crew'})
+    anonymous_response = client.get('/api/me/profile')
+
+    assert get_response.status_code == 200
+    assert get_response.get_json() == {'profile': profile}
+    assert put_response.status_code == 200
+    assert put_response.get_json() == {'ok': True, 'profile': profile}
+    assert anonymous_response.status_code == 401
+    assert anonymous_response.get_json() == {'ok': False, 'error': 'unauthorized'}
+    assert seen == [('GET', TOKEN), ('PUT', TOKEN)]
+
+
+def test_entitlement_me_route_is_registered_and_preserves_policy_shape(monkeypatch):
+    entitlement = {
+        'ok': True,
+        'pro_required': True,
+        'family': False,
+        'subscription_active': True,
+        'free_until': None,
+        'subscription_platform': 'google_play',
+        'subscription_valid_until': '2026-09-01T00:00:00Z',
+    }
+    seen = []
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A,
+        'user_entitlement',
+        lambda token: seen.append(token) or A.jsonify(entitlement),
+    )
+    client = A.app.test_client()
+
+    response = client.get(
+        '/api/me/entitlement',
+        headers={'Authorization': f'Bearer {TOKEN}'},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == entitlement
+    assert seen == [TOKEN]
+
+
 def test_crew_map_me_route_uses_bearer_and_redacts_foreign_credentials(monkeypatch):
     """The Android map gets only the legacy handler's gated result and AXU refs."""
     seen = []

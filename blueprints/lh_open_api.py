@@ -1711,6 +1711,7 @@ def lh_flight_debug(flight, date):
 
 _ROUTE_TTL_S = 12 * 3600
 _ROUTE_MEMO_MAX = 256
+_ROUTE_SHARED_KIND = 'lhroute2'   # v2: Zukunft >5 Tage kommt aus schedules
 _route_memo = {}                 # (dep,arr,date) → (expires_ts, list, answered)
 _route_lock = threading.Lock()
 
@@ -1784,6 +1785,73 @@ def parse_route_flights(data):
     return out
 
 
+def parse_schedule_flights(data, dep_iata=None, arr_iata=None):
+    """ScheduleResource → direkte Flug-Optionen im selben Shape wie
+    ``parse_route_flights``.
+
+    Der Flight-Status-Endpunkt beantwortet laut LH nur gestern bis +5 Tage.
+    ``/operations/schedules`` ist dagegen bis +360 Tage gedacht und liefert
+    ``Schedule[]`` mit ``Flight`` wahlweise als Objekt oder Liste. Obwohl der
+    Call ``directFlights=true`` setzt, wird hier nochmals strikt auf genau EIN
+    Leg und die angefragte Strecke gegatet: ein Umsteiger darf nie als ein
+    angeblicher Direktflug in Smart Pickup erscheinen.
+    """
+    out = []
+    schedules = ((data or {}).get('ScheduleResource') or {}).get('Schedule')
+    schedules = (schedules if isinstance(schedules, list)
+                 else ([schedules] if isinstance(schedules, dict) else []))
+    want_dep = str(dep_iata or '').strip().upper()
+    want_arr = str(arr_iata or '').strip().upper()
+    for schedule in schedules:
+        if not isinstance(schedule, dict):
+            continue
+        flights = schedule.get('Flight')
+        flights = (flights if isinstance(flights, list)
+                   else ([flights] if isinstance(flights, dict) else []))
+        if len(flights) != 1 or not isinstance(flights[0], dict):
+            continue
+        f = flights[0]
+        try:
+            mkt = _carrier_designator(f.get('MarketingCarrier'))
+            if not mkt:
+                continue
+            dep_b = f.get('Departure') or {}
+            arr_b = f.get('Arrival') or {}
+            dep_ap = str(dep_b.get('AirportCode') or '').upper() or None
+            arr_ap = str(arr_b.get('AirportCode') or '').upper() or None
+            if want_dep and dep_ap != want_dep:
+                continue
+            if want_arr and arr_ap != want_arr:
+                continue
+            dep_sched, _ = _side_times(dep_b)
+            arr_sched, _ = _side_times(arr_b)
+            op = _carrier_designator(f.get('OperatingCarrier'))
+            row = {
+                'flight': mkt,
+                'dep': dep_ap,
+                'arr': arr_ap,
+                'sched_dep': _ensure_offset(dep_sched, dep_ap),
+                'sched_arr': _ensure_offset(arr_sched, arr_ap),
+            }
+            if op and op != mkt:
+                row['operated_by'] = op
+            out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _route_needs_schedule(date_string, today=None):
+    """True außerhalb des dokumentierten Flight-Status-Fensters (+5 Tage)."""
+    try:
+        from datetime import date as _date, timedelta as _td
+        target = _date.fromisoformat(str(date_string)[:10])
+        base = today if today is not None else _date.today()
+        return target > base + _td(days=5)
+    except Exception:
+        return False
+
+
 def route_flights(dep_iata, arr_iata, date, caller='shuttle_user'):
     """Alle Flüge einer Strecke an einem Tag → (list, answered).
     `answered=False` heißt Lücke (Budget-Gate/5xx) — der Aufrufer darf daraus
@@ -1814,7 +1882,7 @@ def route_flights(dep_iata, arr_iata, date, caller='shuttle_user'):
             now_dt = _dt.now(_tz.utc)
             r = (client.table('ax_paid_call_cache')
                  .select('call_key,result,result_until')
-                 .eq('call_key', _shared_key('lhroute', f'{dep}{arr}', d,
+                 .eq('call_key', _shared_key(_ROUTE_SHARED_KIND, f'{dep}{arr}', d,
                                              None, None))
                  .execute())
             for row in (getattr(r, 'data', None) or []):
@@ -1830,10 +1898,14 @@ def route_flights(dep_iata, arr_iata, date, caller='shuttle_user'):
         except Exception as e:
             log.warning('[lh_open] route shared-read: %s', type(e).__name__)
 
-    data = _get(f'/operations/flightstatus/route/{dep}/{arr}/{d}',
-                caller=caller)
+    use_schedule = _route_needs_schedule(d)
+    path = (f'/operations/schedules/{dep}/{arr}/{d}'
+            '?directFlights=true&limit=100') if use_schedule else (
+            f'/operations/flightstatus/route/{dep}/{arr}/{d}')
+    data = _get(path, caller=caller)
     answered = last_call_answered()          # 404 = „keine Flüge" = Antwort
-    flights = parse_route_flights(data) if data else []
+    flights = (parse_schedule_flights(data, dep, arr) if use_schedule
+               else parse_route_flights(data)) if data else []
     if not answered:
         return [], False                     # Lücke: nichts cachen
     with _route_lock:
@@ -1845,7 +1917,7 @@ def route_flights(dep_iata, arr_iata, date, caller='shuttle_user'):
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     now_dt = _dt.now(_tz.utc)
     _shared_write([{
-        'call_key': _shared_key('lhroute', f'{dep}{arr}', d, None, None),
+        'call_key': _shared_key(_ROUTE_SHARED_KIND, f'{dep}{arr}', d, None, None),
         'provider': _SHARED_PROVIDER,
         'result': {'flights': flights, 'answered': True},
         'result_until': (now_dt + _td(seconds=_ROUTE_TTL_S)).isoformat(),

@@ -257,7 +257,13 @@ def parse_pdf(path):
                     raise ValueError(f"Route fehlt: {date_word['text']} {raw_flight}")
                 dep, arr = _clock_instants(year, month, day, clocks)
                 landing = not legacy_cabin and "L" in _row_values(row, 300, 315)
-                landing_marks += int(landing)
+                # SAP correction sheets retain a positive row and print a
+                # second, otherwise identical row prefixed with ``N`` whose
+                # accounting values carry a trailing minus.  It is a
+                # cancellation, not a flight with a missing FAKT value.
+                cancelled = any(
+                    word.get("text") == "N" and word.get("x0", 999) < date_word["x0"]
+                    for word in row)
 
                 aircraft = ([] if legacy_cabin else
                             "".join(_row_values(row, 468, 560)).split("/"))
@@ -281,7 +287,7 @@ def parse_pdf(path):
                     is_deadhead = legacy_cabin_traffic_code(traffic_code)
                     dh_value = (_one(row, 415, 445, r"\d+[,]\d{2}")
                                 if is_deadhead else None)
-                    if is_deadhead and dh_value is None:
+                    if is_deadhead and dh_value is None and not cancelled:
                         raise ValueError(
                             f"Kabinen-Deadhead-Zeit fehlt: {date_word['text']} "
                             f"{raw_flight}"
@@ -289,18 +295,29 @@ def parse_pdf(path):
                 else:
                     dh_value = _one(row, 380, 405, r"\d+[,]\d{2}")
                 if dh_value:
-                    deadheads.append({
+                    deadhead = {
                         "date": dep.date().isoformat(),
                         "flight": normalized_flight(raw_flight),
                         "from": frm,
                         "to": to,
-                        "duration_min": decimal_hours_minutes(dh_value),
-                    })
+                        "duration_min": decimal_hours_minutes(
+                            dh_value.strip("-")),
+                    }
+                    if cancelled:
+                        match = next((index for index in range(len(deadheads) - 1, -1, -1)
+                                      if deadheads[index] == deadhead), None)
+                        if match is None:
+                            raise ValueError(
+                                f"Kabinen-Storno ohne Ursprungszeile: "
+                                f"{date_word['text']} {raw_flight}")
+                        deadheads.pop(match)
+                    else:
+                        deadheads.append(deadhead)
                     continue
 
-                fact = (_one(row, 315, 350, r"\d+[,]\d{2}")
+                fact = (_one(row, 315, 350, r"-?\d+[,]\d{2}-?")
                         if legacy_cabin else _one(row, 315, 343, r"\d+"))
-                block_min = (decimal_hours_minutes(fact) if legacy_cabin
+                block_min = (decimal_hours_minutes(fact.strip("-")) if legacy_cabin and fact
                              else int(fact or 0))
                 if not fact or block_min <= 0:
                     raise ValueError(
@@ -321,6 +338,23 @@ def parse_pdf(path):
                                 + ("BLOCK-Zeit, OUT/IN UTC" if legacy_cabin
                                    else "FAKT-Minuten, OUT/IN UTC")),
                 }
+                if cancelled:
+                    identity = {
+                        key: leg.get(key) for key in
+                        ("date", "flight", "from", "to", "dep_iso", "arr_iso",
+                         "block_min")
+                    }
+                    match = next((index for index in range(len(legs) - 1, -1, -1)
+                                  if {key: legs[index].get(key) for key in identity}
+                                  == identity), None)
+                    if match is None:
+                        raise ValueError(
+                            f"Kabinen-Storno ohne Ursprungszeile: "
+                            f"{date_word['text']} {raw_flight}")
+                    removed = legs.pop(match)
+                    landing_marks -= removed.get("ldg_day", 0) + removed.get("ldg_night", 0)
+                    continue
+                landing_marks += int(landing)
                 if landing:
                     night = is_civil_night(arr, to)
                     leg["ldg_day"] = 0 if night else 1

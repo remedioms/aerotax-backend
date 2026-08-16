@@ -2,6 +2,7 @@
 import os
 import conftest as _cft
 import re
+import subprocess
 import sys
 import pytest
 
@@ -25,48 +26,47 @@ def _scan_files():
     return paths
 
 
+def _assert_no_secret(pattern, label):
+    """Scan committed release inputs without hydrating cloud-only worktree files.
+
+    macOS may evict old docs from a Documents-backed worktree. Reading every
+    path can then block the release suite on iCloud downloads. `git grep HEAD`
+    scans the authoritative committed blobs instead and never prints a matched
+    secret. The separately deployed site remains an ordinary bounded read.
+    """
+    result = subprocess.run(
+        [
+            'git', '-C', ROOT_DIR, 'grep', '--quiet', '-I', '-E', pattern,
+            'HEAD', '--', 'app.py', 'docs/*.md', 'tests/*.py',
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert result.returncode in (0, 1), (
+        f'{label} scan failed: {result.stderr[:200]}'
+    )
+    assert result.returncode == 1, f'{label} found in committed release inputs'
+    if os.path.isfile(SITE_HTML):
+        with open(SITE_HTML, encoding='utf-8') as site:
+            assert re.search(pattern, site.read()) is None, f'{label} found in site'
+
+
 def test_no_aws_keys():
-    pattern = re.compile(r'AKIA[A-Z0-9]{16}')
-    for p in _scan_files():
-        try:
-            content = open(p, encoding='utf-8').read()
-        except UnicodeDecodeError:
-            continue
-        hits = pattern.findall(content)
-        assert not hits, f'AWS-Key gefunden in {p}: {hits[:1]}'
+    _assert_no_secret(r'AKIA[A-Z0-9]{16}', 'AWS key')
 
 
 def test_no_anthropic_keys():
-    pattern = re.compile(r'sk-ant-api[a-zA-Z0-9_-]{30,}')
-    for p in _scan_files():
-        try:
-            content = open(p, encoding='utf-8').read()
-        except UnicodeDecodeError:
-            continue
-        hits = pattern.findall(content)
-        assert not hits, f'Anthropic-Key in {p}'
+    _assert_no_secret(r'sk-ant-api[a-zA-Z0-9_-]{30,}', 'Anthropic key')
 
 
 def test_no_stripe_keys():
-    pattern = re.compile(r'sk_(test|live)_[a-zA-Z0-9]{20,}')
-    for p in _scan_files():
-        try:
-            content = open(p, encoding='utf-8').read()
-        except UnicodeDecodeError:
-            continue
-        hits = pattern.findall(content)
-        assert not hits
+    _assert_no_secret(r'sk_(test|live)_[a-zA-Z0-9]{20,}', 'Stripe key')
 
 
 def test_no_openai_keys():
-    pattern = re.compile(r'sk-proj-[a-zA-Z0-9_-]{30,}')
-    for p in _scan_files():
-        try:
-            content = open(p, encoding='utf-8').read()
-        except UnicodeDecodeError:
-            continue
-        hits = pattern.findall(content)
-        assert not hits
+    _assert_no_secret(r'sk-proj-[a-zA-Z0-9_-]{30,}', 'OpenAI key')
 
 
 def test_pii_hardening_active():

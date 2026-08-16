@@ -103,6 +103,58 @@ def test_parse_leere_und_kaputte_response():
     assert lh.parse_route_flights({'FlightStatusResource': {}}) == []
 
 
+def _schedule(flights):
+    return {'ScheduleResource': {'Schedule': [
+        {'Flight': f} for f in flights
+    ]}}
+
+
+def test_parse_schedule_flights_direkt_und_offset_hart():
+    direct = _flight('LH', '1963', '2026-08-26T07:20', None,
+                     '2026-08-26T08:30', None,
+                     dep_ap='BER', arr_ap='MUC')
+    out = lh.parse_schedule_flights(_schedule([direct]), 'BER', 'MUC')
+    assert len(out) == 1
+    assert out[0]['flight'] == 'LH1963'
+    assert out[0]['sched_dep'] == '2026-08-26T07:20:00+02:00'
+    assert out[0]['sched_arr'] == '2026-08-26T08:30:00+02:00'
+
+
+def test_parse_schedule_flights_laesst_umsteiger_und_fremde_route_weg():
+    first = _flight('LH', '001', '2026-08-26T07:20', None,
+                    '2026-08-26T08:30', None,
+                    dep_ap='BER', arr_ap='FRA')
+    second = _flight('LH', '002', '2026-08-26T09:20', None,
+                     '2026-08-26T10:30', None,
+                     dep_ap='FRA', arr_ap='MUC')
+    wrong = _flight('LH', '003', '2026-08-26T07:20', None,
+                    '2026-08-26T08:30', None,
+                    dep_ap='BER', arr_ap='FRA')
+    data = {'ScheduleResource': {'Schedule': [
+        {'Flight': [first, second]}, {'Flight': wrong}
+    ]}}
+    assert lh.parse_schedule_flights(data, 'BER', 'MUC') == []
+
+
+def test_route_flights_ferne_zukunft_nutzt_schedule(monkeypatch):
+    _configured(monkeypatch)
+    calls = []
+    direct = _flight('LH', '1963', '2099-08-26T07:20', None,
+                     '2099-08-26T08:30', None,
+                     dep_ap='BER', arr_ap='MUC')
+
+    def fake_get(path, caller=None):
+        calls.append(path)
+        return _schedule([direct])
+
+    monkeypatch.setattr(lh, '_get', fake_get)
+    monkeypatch.setattr(lh, 'last_call_answered', lambda: True)
+    flights, answered = lh.route_flights('BER', 'MUC', '2099-08-26')
+    assert answered and [f['flight'] for f in flights] == ['LH1963']
+    assert calls == ['/operations/schedules/BER/MUC/2099-08-26'
+                     '?directFlights=true&limit=100']
+
+
 # ── _ensure_offset (Zeitzonen-Fehlerklasse) ─────────────────────────────────
 
 def test_ensure_offset_ergaenzt_stations_offset():

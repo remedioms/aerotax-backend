@@ -368,8 +368,18 @@ def test_try_parsers_turns_corrupt_pdf_into_terminal_unsupported(tmp_path):
 
 def test_try_parsers_does_not_send_arbitrary_csv_to_pdfplumber(
         monkeypatch, tmp_path):
+    import builtins
+
     path = tmp_path / "other.upload"
     path.write_text("foo,bar\n1,2\n", encoding="utf-8")
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "parse_edw_xlsx":
+            raise AssertionError("XLSX runtime darf für CSV nicht laden")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
     monkeypatch.setattr(pdfplumber, "open",
                         lambda _path: (_ for _ in ()).throw(
                             AssertionError("pdfplumber darf nicht laufen")))

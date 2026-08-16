@@ -37,9 +37,11 @@ class Harness:
         monkeypatch.setattr(w, "_bust_import_cache",
                             lambda token: self.cache_busts.append(token))
         monkeypatch.setattr(w, "_set_status",
-                            lambda ids, status, processed=None:
+                            lambda ids, status, processed=None,
+                            error_code=None, error_message=None:
                             self.status_calls.append(
-                                (sorted(ids), status, processed)))
+                                (sorted(ids), status, processed,
+                                 error_code, error_message)))
         monkeypatch.setattr(w, "_download", lambda rid: self.files[rid][0])
         monkeypatch.setattr(w, "_try_parsers", self._parse)
         monkeypatch.setattr(w, "_rest", self._rest)
@@ -74,7 +76,7 @@ class Harness:
                 if self.existing is not None else [])
 
     def statuses_for(self, rid):
-        return [(s, p) for ids, s, p in self.status_calls if rid in ids]
+        return [(s, p) for ids, s, p, *_ in self.status_calls if rid in ids]
 
 
 import hashlib
@@ -102,6 +104,21 @@ def test_happy_path_imports_and_completes(monkeypatch):
     assert h.cache_busts == ["AT-TEST"]
 
 
+def test_screenshot_waits_for_review_instead_of_failing(monkeypatch):
+    png = b'\x89PNG\r\n\x1a\n' + b'duty-plan'
+    # Der Parser-Harness kennt den Inhalt absichtlich nicht: die Bild-Magic
+    # muss ihn vorher in den Review-Pfad lenken.
+    h = Harness(monkeypatch, {9: (png, "unsupported")})
+    events = []
+    row = _row(9, png)
+    row["filename"] = "Dienstplan.png"
+    w.process_token_batch("AT-TEST", [row], events)
+    assert h.statuses_for(9)[-1] == (w.STATUS_REVIEW, False)
+    assert h.pushes == []
+    assert not h.upserts
+    assert events[-1][0] == "review"
+
+
 def test_dup_of_unsupported_inherits_failed(monkeypatch):
     # Regression #286: Kopie einer unbrauchbaren Datei muss `failed` sein.
     h = Harness(monkeypatch, {5: (b"same", "unsupported"),
@@ -121,7 +138,7 @@ def test_merge_conflict_sends_whole_batch_to_review(monkeypatch):
                 existing_import=[LEG_A])
     events = []
     w.process_token_batch("AT-TEST", [_row(7, b"pdf-7")], events)
-    assert h.statuses_for(7)[-1] == (w.STATUS_REVIEW, None)
+    assert h.statuses_for(7)[-1] == (w.STATUS_REVIEW, False)
     assert not h.upserts and not h.pushes
     assert events == [("review", "AT-TEST", [7],
                        events[0][3])] and "Merge-Konflikt" in events[0][3]
@@ -131,7 +148,7 @@ def test_control_violation_goes_to_review_not_user_failed(monkeypatch):
     h = Harness(monkeypatch, {8: (b"pdf-8", "control")})
     events = []
     w.process_token_batch("AT-TEST", [_row(8, b"pdf-8")], events)
-    assert h.statuses_for(8)[-1] == (w.STATUS_REVIEW, None)
+    assert h.statuses_for(8)[-1] == (w.STATUS_REVIEW, False)
     assert not h.pushes and not h.upserts
     assert events[0][0] == "review"
 
@@ -192,7 +209,7 @@ def test_fcl_carryover_conflict_goes_to_review(monkeypatch):
                                     "meta": {"carryover_min": 1}}])
     events = []
     w.process_token_batch("AT-TEST", [_row(41, b"fcl")], events)
-    assert h.statuses_for(41)[-1] == (w.STATUS_REVIEW, None)
+    assert h.statuses_for(41)[-1] == (w.STATUS_REVIEW, False)
     assert not h.upserts and not h.pushes
     assert "FCL.050" in events[0][3]
 
@@ -202,7 +219,7 @@ def test_sha_mismatch_goes_to_review(monkeypatch):
     h = Harness(monkeypatch, {9: (b"pdf-9", [LEG_A])})
     events = []
     w.process_token_batch("AT-TEST", [_row(9, sha=wrong)], events)
-    assert h.statuses_for(9)[-1] == (w.STATUS_REVIEW, None)
+    assert h.statuses_for(9)[-1] == (w.STATUS_REVIEW, False)
     assert not h.upserts and not h.pushes
 
 
@@ -234,10 +251,12 @@ def test_crash_after_completion_leaves_finished_rows_alone(monkeypatch):
     # (processed=is.false), die App zeigte sie für immer als „in Arbeit".
     resets = []
     monkeypatch.setattr(w, "_recover_stale_processing", lambda: None)
+    monkeypatch.setattr(w, "_purge_expired_payloads", lambda: None)
     monkeypatch.setattr(w, "_pending_rows",
                         lambda: [_row(1, b"a"), _row(2, b"b")])
     monkeypatch.setattr(w, "_set_status",
-                        lambda ids, status, processed=None:
+                        lambda ids, status, processed=None,
+                        error_code=None, error_message=None:
                         resets.append((sorted(ids), status, processed)))
     monkeypatch.setattr(w, "_alert", lambda *args: None)
 
@@ -257,6 +276,7 @@ def test_batch_cap_never_splits_one_users_upload_group(monkeypatch):
             + [dict(_row(i), token="AT-B") for i in range(31, 51)])
     seen = []
     monkeypatch.setattr(w, "_recover_stale_processing", lambda: None)
+    monkeypatch.setattr(w, "_purge_expired_payloads", lambda: None)
     monkeypatch.setattr(w, "_pending_rows", lambda: rows)
     monkeypatch.setattr(w, "_alert", lambda *args: None)
     monkeypatch.setattr(w, "process_token_batch",
@@ -270,6 +290,7 @@ def test_batch_cap_still_runs_a_single_oversized_group(monkeypatch):
     rows = [dict(_row(i), token="AT-A") for i in range(1, 60)]
     seen = []
     monkeypatch.setattr(w, "_recover_stale_processing", lambda: None)
+    monkeypatch.setattr(w, "_purge_expired_payloads", lambda: None)
     monkeypatch.setattr(w, "_pending_rows", lambda: rows)
     monkeypatch.setattr(w, "_alert", lambda *args: None)
     monkeypatch.setattr(w, "process_token_batch",
@@ -288,6 +309,34 @@ def test_mixed_batch_imports_good_and_fails_unsupported(monkeypatch):
     assert h.statuses_for(11)[-1] == (w.STATUS_FAILED, True)
     kinds = {p[0] for p in h.pushes}
     assert kinds == {"completed", "failed"}
+
+
+def test_mixed_batch_imports_good_while_bad_file_waits_for_review(monkeypatch):
+    """Ein einzelner defekter Monat blockiert nicht mehr den ganzen Upload."""
+    h = Harness(monkeypatch, {13: (b"good", [LEG_A]),
+                              14: (b"bad", "control")})
+    events = []
+    w.process_token_batch(
+        "AT-TEST", [_row(13, b"good"), _row(14, b"bad")], events)
+    assert len(h.upserts) == 1
+    assert h.upserts[0][1] == [LEG_A]
+    assert h.statuses_for(13)[-1] == (w.STATUS_COMPLETED, True)
+    assert h.statuses_for(14)[-1] == (w.STATUS_REVIEW, False)
+    assert h.pushes == [("completed", "AT-TEST", 13)]
+
+
+def test_duplicate_of_merge_conflict_inherits_review(monkeypatch):
+    clash = dict(LEG_A, block_min=999)
+    h = Harness(monkeypatch, {15: (b"same-clash", [clash]),
+                              16: (b"same-clash", [clash])},
+                existing_import=[LEG_A])
+    events = []
+    w.process_token_batch(
+        "AT-TEST", [_row(15, b"same-clash"), _row(16, b"same-clash")],
+        events)
+    assert h.statuses_for(15)[-1] == (w.STATUS_REVIEW, False)
+    assert h.statuses_for(16)[-1] == (w.STATUS_REVIEW, False)
+    assert not h.upserts and not h.pushes
 
 
 # ── Fehler-Push („bitte nochmal hochladen") ────────────────────────────────
@@ -311,7 +360,7 @@ def test_review_never_pushes_upload_again(monkeypatch):
     h = Harness(monkeypatch, {30: (b"pdf-30", "control")})
     events = []
     w.process_token_batch("AT-TEST", [_row(30, b"pdf-30")], events)
-    assert h.statuses_for(30)[-1] == (w.STATUS_REVIEW, None)
+    assert h.statuses_for(30)[-1] == (w.STATUS_REVIEW, False)
     assert h.pushes == []
 
 
@@ -347,3 +396,20 @@ def test_completed_push_is_unchanged_and_separate(monkeypatch):
     assert calls[0]["p_idempotency_key"] == "logbook-import-completed:7"
     assert calls[0]["p_payload"]["data"]["localization_key"] == (
         "logbook_import_completed")
+
+
+def test_retention_query_uses_url_safe_utc_timestamp(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        w, "_rest",
+        lambda method, path, payload=None, headers=None, expect_json=True:
+        calls.append((method, path, payload)),
+    )
+
+    w._purge_expired_payloads()
+
+    assert len(calls) == 2
+    review_path = calls[1][1]
+    assert "purge_after=lt." in review_path
+    assert "+" not in review_path
+    assert review_path.endswith("Z")

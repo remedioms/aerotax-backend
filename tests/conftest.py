@@ -17,6 +17,7 @@ absoluten Pfade mehr enthalten — stattdessen:
 """
 import contextlib
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -122,6 +123,26 @@ def _reset_module_caches():
                     _c.clear()
                     if _seed:
                         _c.update(copy.deepcopy(_seed))
+        # Token-gate tests must not depend on a user created by an earlier
+        # test run remaining in the worktree's disk cache. Treat the current
+        # disk snapshot (including an honestly empty one) as an available
+        # local auth store for each test. Tests for real store outages replace
+        # this state explicitly. This keeps a clean checkout deterministic
+        # without weakening the production fail-closed tri-state behavior.
+        with contextlib.suppress(Exception):
+            _token_cache = getattr(_mod, '_TOKEN_VALIDATE_CACHE', None)
+            _disk_loader = getattr(_mod, '_auth_load_from_disk', None)
+            if isinstance(_token_cache, dict) and callable(_disk_loader):
+                _users = _disk_loader() or {}
+                _tokens = {
+                    str(_record.get('token')): str(_email)
+                    for _email, _record in _users.items()
+                    if isinstance(_record, dict) and _record.get('token')
+                }
+                _now = time.time()
+                _token_cache['tokens'] = _tokens
+                _token_cache['expires'] = _now + 60.0
+                _token_cache['last_force'] = _now
     yield
 
 

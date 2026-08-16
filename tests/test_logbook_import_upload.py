@@ -110,6 +110,15 @@ def test_upload_rejects_unsupported_extension(monkeypatch):
     assert not sent, 'Mail darf bei abgelehnter Datei nie rausgehen'
 
 
+def test_upload_accepts_duty_plan_screenshot(monkeypatch):
+    A._LOGBOOK_IMPORT_TS.clear()
+    png = b'\x89PNG\r\n\x1a\n' + b'screenshot-data'
+    r, sent = _post(_client(), 'tok_upload_image', 'Dienstplan.png', png,
+                    monkeypatch=monkeypatch)
+    assert r.status_code == 200 and r.get_json()['ok'] is True
+    assert sent['filename'] == 'Dienstplan.png'
+
+
 def test_upload_rejects_oversize(monkeypatch):
     A._LOGBOOK_IMPORT_TS.clear()
     big = b'0' * (A._LOGBOOK_IMPORT_MAX_BYTES + 1)
@@ -212,7 +221,8 @@ def test_upload_status_is_owner_scoped_and_returns_durable_fields(monkeypatch):
     assert r.get_json() == {'ok': True, 'job_id': 44, 'status': 'completed',
                             'filename': 'old.csv',
                             'created_at': '2026-08-10T10:00:00Z',
-                            'completed_at': '2026-08-10T10:02:00Z'}
+                            'completed_at': '2026-08-10T10:02:00Z',
+                            'error_code': None, 'message': None}
     assert query.filters == [('id', 44), ('token', 'tok_upload_status')]
 
 
@@ -259,6 +269,26 @@ def test_upload_status_list_is_owner_scoped_and_never_returns_payload(monkeypatc
     assert query.filters == [('token', 'tok_upload_status')]
     assert query.ordering == ('created_at', True)
     assert query.limit_count == A._LOGBOOK_IMPORT_MAX_PER_DAY
+
+
+def test_upload_status_exposes_review_reason_without_calling_it_failed(
+        monkeypatch):
+    row = {'id': 45, 'status': 'review', 'filename': 'month.pdf',
+           'created_at': '2026-08-15T10:00:00Z', 'completed_at': None,
+           'error_code': 'needs_review',
+           'error_message': 'Eine Buchungszeile wird geprüft.'}
+    monkeypatch.setattr(A, 'SB_AVAILABLE', True)
+    query = _StatusQuery(row)
+    monkeypatch.setattr(A, 'sb', type('SB', (), {
+        'table': staticmethod(lambda _name: query),
+    })())
+    monkeypatch.setattr(A, '_supabase_execute_with_timeout',
+                        lambda _name, fn, timeout_s=8: (fn(), False))
+    body = _client().get(
+        '/api/user/logbook/tok_upload_status/import-upload/45').get_json()
+    assert body['status'] == 'review'
+    assert body['error_code'] == 'needs_review'
+    assert body['message'] == 'Eine Buchungszeile wird geprüft.'
 
 
 # ── Ankunfts-Push („angekommen — wird verarbeitet") ────────────────────────

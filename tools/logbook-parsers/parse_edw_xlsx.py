@@ -16,9 +16,11 @@ import argparse
 import json
 import os
 import re
+from zipfile import BadZipFile
 from datetime import date, datetime, time, timedelta, timezone
 
 import openpyxl
+from openpyxl.utils.exceptions import InvalidFileException
 
 from legkeys import dedupe_keys
 
@@ -40,6 +42,28 @@ EXPECTED_HEADERS = (
     "Crew",
     "Crew Remarks",
 )
+
+
+def matches_workbook(path):
+    """Recognize an Edelweiss export by content, not its temporary suffix."""
+    try:
+        with open(path, "rb") as source:
+            if source.read(4) != b"PK\x03\x04":
+                return False
+            source.seek(0)
+            book = openpyxl.load_workbook(
+                source, data_only=True, read_only=True)
+            if book.sheetnames != ["Logbook"]:
+                book.close()
+                return False
+            sheet = book["Logbook"]
+            header = tuple(cell.value for cell in next(
+                sheet.iter_rows(min_row=1, max_row=1)))
+            book.close()
+        return tuple(header[:len(EXPECTED_HEADERS)]) == EXPECTED_HEADERS
+    except (OSError, ValueError, KeyError, TypeError, StopIteration,
+            BadZipFile, InvalidFileException):
+        return False
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 AIRPORTS_PATH = os.path.join(ROOT, "airports_compact.json")
@@ -119,7 +143,10 @@ def aircraft_type(value):
 
 
 def parse_workbook(path):
-    book = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    # The durable worker deliberately gives every payload a neutral suffix.
+    # A binary handle keeps openpyxl from rejecting a valid XLSX as `.upload`.
+    source = open(path, "rb")
+    book = openpyxl.load_workbook(source, data_only=True, read_only=True)
     if book.sheetnames != ["Logbook"]:
         raise ValueError(f"unerwartete Tabellenblaetter: {book.sheetnames!r}")
     sheet = book["Logbook"]
@@ -226,6 +253,8 @@ def parse_workbook(path):
         "landings": source_landings,
         "key_collisions": len(collisions),
     }
+    book.close()
+    source.close()
     return {"legs": legs, "sim": []}, controls
 
 

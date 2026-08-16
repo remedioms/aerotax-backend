@@ -40,16 +40,14 @@ from flask import Blueprint, request, jsonify, current_app
 hotel_rooms_bp = Blueprint('hotel_rooms', __name__)
 
 # ── Supabase-Anbindung (lazy-resolve wie aircraft_health_blueprint) ──
-try:
-    from app import sb as _sb, SB_AVAILABLE as _SB_AVAILABLE
-except ImportError:
-    _sb = None
-    _SB_AVAILABLE = False
-
-try:
-    from app import _token_rate_limited as _rl
-except ImportError:
-    _rl = None
+# Ausschließlich lazy auflösen: Dieses Blueprint wird von ``app`` importiert.
+# Ein ``from app import …`` auf Modulebene startet beim isolierten
+# Blueprint-Import sonst einen zyklischen App-Boot und registriert das erst
+# halb definierte Blueprint. Die folgenden @route-Dekoratoren schlagen dann
+# mit „already registered“ fehl.
+_sb = None
+_SB_AVAILABLE = False
+_rl = None
 
 
 def _sb_client():
@@ -68,8 +66,13 @@ def _sb_client():
 
 def _rate_limited(token, endpoint, limit, window_sec):
     """Wrapper damit der Blueprint laeuft auch ohne app.py Helper."""
+    global _rl
     if _rl is None:
-        return False
+        try:
+            from app import _token_rate_limited as live_rate_limit
+            _rl = live_rate_limit
+        except ImportError:
+            return False
     try:
         return bool(_rl(token, endpoint, limit, window_sec))
     except Exception:
@@ -141,6 +144,14 @@ def _norm_hotel_name(raw):
         return None
     s = raw.strip()[:HOTEL_NAME_MAX]
     return s or None
+
+
+def _norm_client_report_id(raw):
+    """Opaque client retry key; never exposed in community listings."""
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()[:80]
+    return value if re.fullmatch(r'[A-Za-z0-9_-]{8,80}', value) else None
 
 
 def _norm_rating(raw):
@@ -236,6 +247,23 @@ def _sb_insert_report(row):
             f'[hotel-rooms] sb_insert_fail err={type(e).__name__}: {str(e)[:120]}'
         )
         return False
+
+
+def _sb_report_by_client_id(owner_token, client_report_id):
+    if not owner_token or not client_report_id:
+        return None
+    sb, ok = _sb_client()
+    if not ok:
+        return None
+    try:
+        result = (sb.table('hotel_room_reports').select('*')
+                  .eq('reported_by_token', owner_token)
+                  .eq('client_report_id', client_report_id)
+                  .limit(1).execute())
+        rows = result.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
 
 
 def _sb_report_exists(report_id):
@@ -460,13 +488,30 @@ def hotel_rooms_post(token):
     if not safe_tok:
         return jsonify({'ok': False, 'error': 'Ungueltiges Token.'}), 400
 
+    body = request.get_json(silent=True) or {}
+    client_report_id = _norm_client_report_id(body.get('client_report_id'))
+
+    # A lost HTTP response must not turn the user's one rating into two rows
+    # or consume another daily quota slot. Check both durable and fallback
+    # storage before rate limiting or validation.
+    if client_report_id:
+        existing = _sb_report_by_client_id(safe_tok, client_report_id)
+        if existing is None:
+            with _DISK_LOCK:
+                existing = next((row for row in _disk_load(_DISK_REPORTS)
+                                 if row.get('reported_by_token') == safe_tok
+                                 and row.get('client_report_id') == client_report_id),
+                                None)
+        if existing:
+            return jsonify({'ok': True, 'report': _clean_report(existing),
+                            'idempotent': True})
+
     if _rate_limited(safe_tok, 'hotel_room_report', limit=5, window_sec=86400):
         return jsonify({
             'ok': False,
             'error': 'Tageslimit erreicht (5 Reports/Tag).'
         }), 429
 
-    body = request.get_json(silent=True) or {}
     hotel_name = _norm_hotel_name(body.get('hotel_name'))
     if not hotel_name:
         return jsonify({'ok': False, 'error': 'hotel_name fehlt.'}), 400
@@ -514,11 +559,14 @@ def hotel_rooms_post(token):
             'error': 'Mindestens Room-Number, Rating oder Notiz erforderlich.'
         }), 400
 
-    report_id = str(uuid.uuid4())
+    report_id = (str(uuid.uuid5(uuid.NAMESPACE_URL,
+                     f'aerox-hotel:{safe_tok}:{client_report_id}'))
+                 if client_report_id else str(uuid.uuid4()))
     now_iso = datetime.now(timezone.utc).isoformat()
 
     row = {
         'id': report_id,
+        'client_report_id': client_report_id,
         'reported_by_token': safe_tok,
         'hotel_name': hotel_name,
         'hotel_iata': hotel_iata,
@@ -543,7 +591,12 @@ def hotel_rooms_post(token):
     disk_ok = False
     with _DISK_LOCK:
         rows = _disk_load(_DISK_REPORTS)
-        rows.append(row)
+        already = next((saved for saved in rows
+                        if saved.get('id') == report_id), None)
+        if already:
+            row = already
+        else:
+            rows.append(row)
         if len(rows) > 5000:
             rows = rows[-5000:]
         disk_ok = _disk_save(_DISK_REPORTS, rows)

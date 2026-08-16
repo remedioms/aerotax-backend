@@ -677,17 +677,46 @@ def test_roster_queue_uses_dedicated_private_inbox_marker(monkeypatch):
 
     def fake_store(token, filename, blob, note):
         captured.update(token=token, filename=filename, blob=blob, note=note)
-        return True
+        return 321
 
     monkeypatch.setattr(backend, '_logbook_upload_store', fake_store)
     assert backend._roster_pdf_upload_store(
-        'AT-QUEUE', '../unsafe\nroster.pdf', b'%PDF-test') is True
+        'AT-QUEUE', '../unsafe\nroster.pdf', b'%PDF-test') == 321
     assert captured == {
         'token': 'AT-QUEUE',
         'filename': '.._unsafe_roster.pdf',
         'blob': b'%PDF-test',
         'note': backend._ROSTER_PDF_QUEUE_NOTE,
     }
+
+
+def test_roster_queue_completion_purges_private_pdf(monkeypatch):
+    captured = {}
+
+    class Query:
+        def update(self, values):
+            captured['values'] = values
+            return self
+
+        def in_(self, field, values):
+            captured['filter'] = (field, values)
+            return self
+
+        def execute(self):
+            return type('Result', (), {'data': []})()
+
+    monkeypatch.setattr(backend, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(backend, 'sb', type('SB', (), {
+        'table': staticmethod(lambda name: Query()),
+    })())
+    monkeypatch.setattr(backend, '_supabase_execute_with_timeout',
+                        lambda _name, fn, timeout_s=8: (fn(), False))
+    assert backend._roster_pdf_upload_finish([101, 102], 'completed') is True
+    assert captured['filter'] == ('id', [101, 102])
+    assert captured['values']['status'] == 'completed'
+    assert captured['values']['processed'] is True
+    assert captured['values']['data_b64'] is None
+    assert captured['values']['payload_purged_at']
 
 
 # ── Outstation-Origin Overnight Return — Date-Placement Bug (Panu-Regression) ─
