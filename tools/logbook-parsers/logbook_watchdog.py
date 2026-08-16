@@ -29,10 +29,10 @@ FAIL-SAFE (Owner 2026-08-12: „wenn nicht 100 % sicher → nochmal überprüfen
   * Gleicher Leg-Schlüssel mit ABWEICHENDER Blockzeit beim Merge → kompletter
     Batch auf `review`, nichts geschrieben. Lieber liegen lassen als raten.
   * sha256-Mismatch → `review` (Datei unterwegs beschädigt?).
-  * KEIN Parser erkennt das Format → ehrliches `failed` + kurzer Push an den
-    Nutzer („Flugbuch-Import fehlgeschlagen — bitte lade die Datei noch einmal
-    hoch.") + Owner-Mail. `review` pusht NICHTS: dort prüft der Betreiber,
-    ein zweiter Upload würde nicht helfen.
+  * KEIN Parser erkennt das Format → `review` + Owner-Mail. Die Originaldatei
+    bleibt 14 Tage erhalten, damit wir den Parser ergänzen und denselben Upload
+    nachverarbeiten können. KEIN Nutzer-„failed" und KEINE Aufforderung zum
+    erneuten Upload: die Datei ist angekommen, nur unser Parser fehlt noch.
   * Jede unerwartete Exception → Zeile bleibt `pending` (nächster Lauf
     versucht es erneut), Owner-Mail mit Traceback-Kopf.
 
@@ -888,29 +888,28 @@ def process_token_batch(token, rows, events, terminal=None):
                        "erkannt; enthält keine einzelnen Flugbuch-Legs"))
 
     if unsupported:
-        _status(unsupported, STATUS_FAILED, processed=True,
-                error_code="unsupported_format",
-                error_message="Dateiformat wird noch nicht unterstützt.")
-        events.append(("unsupported", token, unsupported, "Format unbekannt"))
+        message = (
+            "Dateiformat wird noch nicht unterstützt; Originaldatei wurde "
+            "für die Parser-Erweiterung aufbewahrt."
+        )
+        _status(unsupported, STATUS_REVIEW, processed=False,
+                error_code="unsupported_format", error_message=message)
+        review_by_id.update({rid: message for rid in unsupported})
+        events.append(("review", token, unsupported, message))
 
-    # Byte-Dubletten erben das Schicksal ihres ORIGINALS — eine Kopie einer
-    # unbrauchbaren Datei ist genauso `failed`, nicht still `completed`
-    # (Erst-Einsatz 12.08.: #286 = Kopie der unsupported #285). Original
+    # Byte-Dubletten erben das Schicksal ihres ORIGINALS — eine Kopie eines
+    # noch unbekannten Formats wartet ebenfalls auf `review`, statt fälschlich
+    # `completed` oder endgültig `failed` zu werden. Original
     # außerhalb dieses Laufs (früher verarbeitet) ⇒ Inhalt ist erledigt ⇒
     # completed ohne Push.
     failed_dups = []
     if dups:
         real_ids = {f["id"] for f in real + informational}
         review_ids = set(review_by_id)
-        failed_dups = [f["id"] for f in dups if f["dup_of"] in set(unsupported)]
         review_dups = [f["id"] for f in dups if f["dup_of"] in review_ids]
         done_dups = [f["id"] for f in dups
                      if f["dup_of"] in real_ids or f["dup_of"] not in
                      set(unsupported) | real_ids | review_ids]
-        if failed_dups:
-            _status(failed_dups, STATUS_FAILED, processed=True,
-                    error_code="unsupported_format",
-                    error_message="Dateiformat wird noch nicht unterstützt.")
         if review_dups:
             _status(review_dups, STATUS_REVIEW, processed=False,
                     error_code="needs_review",
@@ -921,13 +920,8 @@ def process_token_batch(token, rows, events, terminal=None):
                        {"failed": failed_dups, "review": review_dups,
                         "completed": done_dups}, ""))
 
-    # Fehler-Push ganz zum Schluss und über ALLE `failed`-Zeilen des Laufs:
-    # eine Datei und ihre Byte-Kopie sind EIN Problem, nicht zwei. Anker ist
-    # die höchste betroffene Upload-ID — derselbe Batch ergibt in jedem Lauf
-    # denselben Idempotenz-Key, ein Wiederholungslauf pusht also nicht erneut.
-    failed_ids = sorted(set(unsupported) | set(failed_dups))
-    if failed_ids:
-        _push_failed(token, max(failed_ids))
+    # Unbekannte Formate sind kein Nutzerfehler. Sie bleiben samt Payload im
+    # Review und erzeugen deshalb bewusst keinen „bitte erneut hochladen“-Push.
 
 
 def main():

@@ -119,16 +119,16 @@ def test_screenshot_waits_for_review_instead_of_failing(monkeypatch):
     assert events[-1][0] == "review"
 
 
-def test_dup_of_unsupported_inherits_failed(monkeypatch):
-    # Regression #286: Kopie einer unbrauchbaren Datei muss `failed` sein.
+def test_dup_of_unsupported_inherits_review(monkeypatch):
+    # Regression #286: Auch die Byte-Kopie muss auf die Parser-Erweiterung
+    # warten; weder Original noch Kopie dürfen den Nutzer zum Reupload drängen.
     h = Harness(monkeypatch, {5: (b"same", "unsupported"),
                               6: (b"same", "unsupported")})
     events = []
     w.process_token_batch("AT-TEST", [_row(5, b"same"), _row(6, b"same")], events)
-    assert h.statuses_for(5)[-1] == (w.STATUS_FAILED, True)
-    assert h.statuses_for(6)[-1] == (w.STATUS_FAILED, True)
-    # Datei + Byte-Kopie sind EIN Problem → EIN Fehler-Push, Anker = höchste ID.
-    assert h.pushes == [("failed", "AT-TEST", 6)]
+    assert h.statuses_for(5)[-1] == (w.STATUS_REVIEW, False)
+    assert h.statuses_for(6)[-1] == (w.STATUS_REVIEW, False)
+    assert h.pushes == []
     assert not h.upserts
 
 
@@ -300,15 +300,15 @@ def test_batch_cap_still_runs_a_single_oversized_group(monkeypatch):
     assert seen == [("AT-A", 59)]       # sonst bliebe die Gruppe ewig liegen
 
 
-def test_mixed_batch_imports_good_and_fails_unsupported(monkeypatch):
+def test_mixed_batch_imports_good_and_keeps_unsupported_for_review(monkeypatch):
     h = Harness(monkeypatch, {10: (b"pdf-10", [LEG_A]),
                               11: (b"pdf-11", "unsupported")})
     events = []
     w.process_token_batch("AT-TEST", [_row(10, b"pdf-10"), _row(11, b"pdf-11")], events)
     assert h.statuses_for(10)[-1] == (w.STATUS_COMPLETED, True)
-    assert h.statuses_for(11)[-1] == (w.STATUS_FAILED, True)
+    assert h.statuses_for(11)[-1] == (w.STATUS_REVIEW, False)
     kinds = {p[0] for p in h.pushes}
-    assert kinds == {"completed", "failed"}
+    assert kinds == {"completed"}
 
 
 def test_mixed_batch_imports_good_while_bad_file_waits_for_review(monkeypatch):
@@ -341,17 +341,17 @@ def test_duplicate_of_merge_conflict_inherits_review(monkeypatch):
 
 # ── Fehler-Push („bitte nochmal hochladen") ────────────────────────────────
 
-def test_unsupported_batch_gets_exactly_one_failure_push(monkeypatch):
-    """Drei unlesbare Dateien in einem Schub = EIN Push, Anker = höchste ID."""
+def test_unsupported_batch_waits_for_review_without_failure_push(monkeypatch):
+    """Unbekannte Dateien bleiben serverseitig erhalten; Reupload hilft nicht."""
     h = Harness(monkeypatch, {20: (b"a", "unsupported"),
                               21: (b"b", "unsupported"),
                               22: (b"c", "unsupported")})
     events = []
     w.process_token_batch("AT-TEST", [_row(20, b"a"), _row(21, b"b"),
                                       _row(22, b"c")], events)
-    assert h.pushes == [("failed", "AT-TEST", 22)]
+    assert h.pushes == []
     for rid in (20, 21, 22):
-        assert h.statuses_for(rid)[-1] == (w.STATUS_FAILED, True)
+        assert h.statuses_for(rid)[-1] == (w.STATUS_REVIEW, False)
 
 
 def test_review_never_pushes_upload_again(monkeypatch):
