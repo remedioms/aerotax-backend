@@ -226,6 +226,30 @@ def _download(upload_id):
     return base64.b64decode(rows[0]["data_b64"])
 
 
+def _is_supported_image(filename, blob):
+    """Nur belegte Screenshot-/Bildformate in die manuelle Prüfung geben.
+
+    Die Endung allein ist kein Typbeweis (Upload-Dateinamen sind Nutzereingabe),
+    deshalb müssen Endung UND Magic Bytes passen. Bilder werden absichtlich
+    nicht zu Flügen halluziniert: sie bleiben 14 Tage im privaten Review-Store,
+    bis der Inhalt kontrolliert übernommen wurde.
+    """
+    name = str(filename or '').lower()
+    if name.endswith(('.jpg', '.jpeg')):
+        return blob.startswith(b'\xff\xd8\xff')
+    if name.endswith('.png'):
+        return blob.startswith(b'\x89PNG\r\n\x1a\n')
+    if name.endswith(('.heic', '.heif')):
+        return (len(blob) >= 12 and blob[4:8] == b'ftyp'
+                and any(brand in blob[8:32]
+                        for brand in (b'heic', b'heix', b'hevc', b'hevx',
+                                      b'heif', b'mif1', b'msf1')))
+    if name.endswith('.webp'):
+        return (len(blob) >= 12 and blob[:4] == b'RIFF'
+                and blob[8:12] == b'WEBP')
+    return False
+
+
 # ── Parser-Erkennung ────────────────────────────────────────────────────────
 
 def _try_parsers(path):
@@ -694,6 +718,12 @@ def process_token_batch(token, rows, events, terminal=None):
             parsed_files.append({"id": rid, "dup_of": seen_sha[sha]})
             continue
         seen_sha[sha] = rid
+        if _is_supported_image(row.get("filename"), blob):
+            review.append((
+                rid,
+                "Screenshot/Bild ist angekommen und wartet auf manuelle "
+                "Flugbuch-Prüfung."))
+            continue
         # Format-Routing arbeitet mit Content-Signaturen. Die neutrale Endung
         # verhindert zusätzlich, dass Aufrufer sie versehentlich als Typbeleg
         # missverstehen.

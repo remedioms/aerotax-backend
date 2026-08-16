@@ -110,6 +110,15 @@ def test_upload_rejects_unsupported_extension(monkeypatch):
     assert not sent, 'Mail darf bei abgelehnter Datei nie rausgehen'
 
 
+def test_upload_accepts_duty_plan_screenshot(monkeypatch):
+    A._LOGBOOK_IMPORT_TS.clear()
+    png = b'\x89PNG\r\n\x1a\n' + b'screenshot-data'
+    r, sent = _post(_client(), 'tok_upload_image', 'Dienstplan.png', png,
+                    monkeypatch=monkeypatch)
+    assert r.status_code == 200 and r.get_json()['ok'] is True
+    assert sent['filename'] == 'Dienstplan.png'
+
+
 def test_upload_rejects_oversize(monkeypatch):
     A._LOGBOOK_IMPORT_TS.clear()
     big = b'0' * (A._LOGBOOK_IMPORT_MAX_BYTES + 1)

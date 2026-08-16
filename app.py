@@ -23924,7 +23924,8 @@ def save_logbook_leg(token):
 
 _LOGBOOK_IMPORT_MAX_BYTES = 15 * 1024 * 1024   # Resend-Attachment-Limit 40MB gesamt
 _LOGBOOK_IMPORT_EXTS = ('.csv', '.txt', '.tsv', '.xls', '.xlsx', '.numbers',
-                        '.pdf', '.json', '.zip')
+                        '.pdf', '.json', '.zip', '.jpg', '.jpeg', '.png',
+                        '.heic', '.heif', '.webp')
 _LOGBOOK_IMPORT_TS = {}            # token -> [epoch, ...] (in-memory Throttle)
 _LOGBOOK_IMPORT_TS_LOCK = _req_threading.Lock()
 # Uploads pro Token und 24 h. 5 war für das Nachtragen alter Monate zu knapp:
@@ -24165,8 +24166,8 @@ def upload_logbook_import(token):
         or 'flugbuch-export'
     if not filename.lower().endswith(_LOGBOOK_IMPORT_EXTS):
         return jsonify({'ok': False, 'error': 'unsupported_format',
-                        'message': 'Bitte einen Export als CSV, Excel, PDF '
-                                   'oder ZIP auswählen.'}), 415
+                        'message': 'Bitte einen Export, Dienstplan, ein PDF '
+                                   'oder einen Screenshot auswählen.'}), 415
     # Disk-Kopie best-effort (ephemer, aber hilfreich bis zum nächsten Deploy).
     try:
         import os as _os
@@ -31935,6 +31936,36 @@ def _forum_load_replies(thread_id):
     return []
 
 
+def _forum_reply_participant_tokens(replies, *, current_reply_id=None,
+                                    excluded_tokens=None, limit=50):
+    """Return prior thread participants once, in their first-seen order.
+
+    A forum participant is a reply author, not merely somebody who opened or
+    liked the thread.  The caller excludes the new author and recipients that
+    already get the more specific thread-author/mention/parent notification.
+    Keeping this pure also makes the anti-duplicate/privacy rule testable.
+    """
+    excluded = {
+        str(value).strip() for value in (excluded_tokens or set()) if value
+    }
+    max_recipients = max(0, int(limit))
+    if max_recipients == 0:
+        return []
+    out = []
+    seen = set(excluded)
+    for item in replies or []:
+        if current_reply_id and item.get('id') == current_reply_id:
+            continue
+        participant = str(item.get('author_token') or '').strip()
+        if not participant or participant in seen:
+            continue
+        seen.add(participant)
+        out.append(participant)
+        if len(out) >= max_recipients:
+            break
+    return out
+
+
 def _forum_save_replies(thread_id, replies):
     """SB primary + Disk Read-Cache."""
     capped = (replies or [])[-2000:] if isinstance(replies, list) else replies
@@ -32956,11 +32987,16 @@ def forum_create_reply(token, thread_id):
     response_reply = dict(reply)
     response_reply.pop('author_token', None)
     response_reply['liked_by_me'] = False
-    # Push an Thread-Author (nicht-self) + optional an mentioned-User
+    # Push an Thread-Author (nicht-self) + optional an mentioned-User.
+    # Ausserdem an bisherige Teilnehmer: wer in einem Thema geantwortet hat,
+    # erwartet weitere Antworten dort. Vorher wurden nur Thread-Autor,
+    # erwaehnte Person und der direkte Parent gepusht; normale Mitdiskutierende
+    # (Violas gemeldeter Fall) erhielten trotz aktivierter Forum-Pushes nichts.
     try:
         # Anonym: der Push darf den echten Namen nicht verraten.
         author_name = 'Anonym' if is_anonymous else (reply.get('author_name') or 'Crew')
         thread_author_token = target.get('author_token')
+        notified_tokens = {token}
         if thread_author_token and thread_author_token != token:
             _push_notify_async(thread_author_token,
                                f'{author_name} hat geantwortet',
@@ -32971,6 +33007,7 @@ def forum_create_reply(token, thread_id):
                                idempotency_key=(
                                    f'forum-reply:{reply.get("id")}:{thread_author_token}'),
                                actor_token=token)
+            notified_tokens.add(thread_author_token)
         # Mentioned-User extra benachrichtigen (nicht doppelt wenn = thread-author)
         if mentioned_token and mentioned_token != token and mentioned_token != thread_author_token:
             _push_notify_async(mentioned_token,
@@ -32982,12 +33019,14 @@ def forum_create_reply(token, thread_id):
                                idempotency_key=(
                                    f'forum-mention:{reply.get("id")}:{mentioned_token}'),
                                actor_token=token)
+            notified_tokens.add(mentioned_token)
         # ANTWORT AUF EINEN KOMMENTAR (Florian 2026-07-24: „Auf meinen weiteren
         # Kommentar hast Du nicht geantwortet … [keine] Benachrichtigung"):
         # bisher wurde NUR der Thread-Autor gepusht — der Autor des parent-Reply
         # erfuhr von Antworten auf SEINEN Kommentar nichts. Jetzt zusätzlich den
         # parent-Reply-Autor benachrichtigen (dedupt gegen self/Thread-Autor/
         # Mention, damit niemand doppelt gepusht wird).
+        parent_author = None
         if parent_reply_id:
             parent = _forum_reply_sb_get(parent_reply_id)
             if parent is None:
@@ -33006,6 +33045,31 @@ def forum_create_reply(token, thread_id):
                                    idempotency_key=(
                                        f'forum-reply-parent:{reply.get("id")}:{parent_author}'),
                                    actor_token=token)
+                notified_tokens.add(parent_author)
+
+        # Alle anderen bisherigen Reply-Autoren genau einmal informieren.
+        # Der neue Reply ist in SB/Disk bereits enthalten; seine ID und sein
+        # Autor werden explizit ausgeschlossen. Push-Praeferenzen und Blocks
+        # bleiben zentral in `_push_notify_async` wirksam.
+        participants = _forum_reply_participant_tokens(
+            _forum_load_replies(thread_id),
+            current_reply_id=reply.get('id'),
+            excluded_tokens=notified_tokens,
+        )
+        for participant in participants:
+            _push_notify_async(
+                participant,
+                f'{author_name} hat im Thema geantwortet',
+                (text or '')[:120],
+                data={'type': 'forum_reply', 'thread_id': str(thread_id),
+                      'reply_id': str(reply.get('id') or ''),
+                      'category_id': str(target.get('category_id') or ''),
+                      'title_localization_key': 'push_title_replied',
+                      'localization_args': {'name': author_name}},
+                idempotency_key=(
+                    f'forum-reply-participant:{reply.get("id")}:{participant}'),
+                actor_token=token,
+            )
     except Exception:
         pass
     return jsonify({'ok': True, 'reply': response_reply})

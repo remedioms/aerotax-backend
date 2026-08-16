@@ -104,6 +104,21 @@ def test_happy_path_imports_and_completes(monkeypatch):
     assert h.cache_busts == ["AT-TEST"]
 
 
+def test_screenshot_waits_for_review_instead_of_failing(monkeypatch):
+    png = b'\x89PNG\r\n\x1a\n' + b'duty-plan'
+    # Der Parser-Harness kennt den Inhalt absichtlich nicht: die Bild-Magic
+    # muss ihn vorher in den Review-Pfad lenken.
+    h = Harness(monkeypatch, {9: (png, "unsupported")})
+    events = []
+    row = _row(9, png)
+    row["filename"] = "Dienstplan.png"
+    w.process_token_batch("AT-TEST", [row], events)
+    assert h.statuses_for(9)[-1] == (w.STATUS_REVIEW, False)
+    assert h.pushes == []
+    assert not h.upserts
+    assert events[-1][0] == "review"
+
+
 def test_dup_of_unsupported_inherits_failed(monkeypatch):
     # Regression #286: Kopie einer unbrauchbaren Datei muss `failed` sein.
     h = Harness(monkeypatch, {5: (b"same", "unsupported"),
