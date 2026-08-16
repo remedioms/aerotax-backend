@@ -268,6 +268,50 @@ def test_arrival_mode_rejects_previous_day_as_false_on_time(client, monkeypatch)
     }
 
 
+@pytest.mark.parametrize("account_tz_arrival", [
+    "2026-07-06T16:00:00+02:00",  # FRA / Europe-Berlin
+    "2026-07-06T10:00:00-04:00",  # JFK / America-New_York
+    "2026-07-06T23:00:00+09:00",  # HND / Asia-Tokyo
+    "2026-07-07T02:00:00+12:00",  # AKL / Pacific-Auckland
+])
+def test_arrival_target_is_same_in_multiple_account_timezones(
+        client, monkeypatch, account_tz_arrival):
+    """Gleicher Zeitpunkt mit vier Account-Zonen ergibt dieselbe Verbindung."""
+    _patch(monkeypatch, FAKE_ARR)
+
+    r = client.get("/api/ax/transit", query_string={
+        "from_lat": HOME_LAT, "from_lon": HOME_LON,
+        "to_lat": FRA_LAT, "to_lon": FRA_LON,
+        "arrival": account_tz_arrival,
+    })
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["found"] is True
+    assert d["last_arr"] == "2026-07-06T16:00:00+02:00"
+
+
+@pytest.mark.parametrize(("arrival", "found"), [
+    ("2026-07-06T17:34:00Z", True),   # letzter Treffer 2 h 59 min vorher
+    ("2026-07-06T17:35:00Z", True),   # exakte 3-h-Grenze
+    ("2026-07-06T17:36:00Z", False),  # 3 h 1 min: anderer Fahrtag/zu alt
+])
+def test_arrival_early_limit_boundary(client, monkeypatch, arrival, found):
+    _patch(monkeypatch, FAKE_ARR)
+
+    r = client.get("/api/ax/transit", query_string={
+        "from_lat": HOME_LAT, "from_lon": HOME_LON,
+        "to_lat": FRA_LAT, "to_lon": FRA_LON,
+        "arrival": arrival,
+    })
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["found"] is found
+    if found:
+        assert d["last_arr"] == "2026-07-06T16:35:00+02:00"
+    else:
+        assert d["reason"] == "no_journey_near_arrival_target"
+
+
 # ─────────────────────────────────────────────────────────────────
 # 4) beide Params → arrival gewinnt
 # ─────────────────────────────────────────────────────────────────
