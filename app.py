@@ -48956,6 +48956,16 @@ def ax_transit():
         # schnell wie möglich nach Hause). Randfall (Provider ignoriert
         # depart-after) → die mit der SPÄTESTEN Losgeh-Zeit, also die am wenigsten
         # „zu früh" — nie eine, die noch weiter in der Vergangenheit losgeht.
+        # Ein Arrive-by-Provider darf seine Ergebnisliste nicht still auf den
+        # vorherigen Betriebstag begrenzen. Genau das passierte bei einer Suche
+        # am Sonntagabend für Montagmorgen: die letzte Sonntagsverbindung war
+        # formal "pünktlich" (sie liegt ja vor Montag 08:55) und gewann dadurch
+        # gegen jede ehrliche Antwort. Mehr als drei Stunden Zielzeit-Abstand ist
+        # keine brauchbare Arrive-by-Empfehlung; dann soll die App auf Apple/
+        # Auto zurückfallen, statt eine Übernachtung am Flughafen zu empfehlen.
+        max_arrival_lead = timedelta(hours=3)
+        rejected_too_early = 0
+
         best = None              # späteste pünktliche Ankunft (≤ Zielzeit, max. Ankunft)
         best_arr = None          # deren Ankunfts-datetime (zum Vergleich)
         fallback = None          # früheste Ankunft, falls keine pünktlich ist
@@ -49006,6 +49016,15 @@ def ax_transit():
                                     (best_arr is None or arr_dt < best_arr)):
                     best, best_arr = cand, arr_dt
                 continue
+            # DEFENSE-IN-DEPTH FÜR FOLGETAGE: bei arrival= muss die Ankunft in
+            # einem plausiblen Fenster vor dem Ziel liegen. Ohne Untergrenze ist
+            # jeder beliebig alte Fahrtag mathematisch "rechtzeitig". Dieser
+            # Guard läuft VOR Fallback und Alternativen, damit die alte Fahrt an
+            # keiner Stelle des Response-Contracts wieder auftaucht.
+            if (target_dt is not None and arr_dt is not None
+                    and arr_dt < target_dt - max_arrival_lead):
+                rejected_too_early += 1
+                continue
             # früheste-Ankunft-Fallback unabhängig von Pünktlichkeit
             if arr_dt is not None and (fallback is None or fallback_arr is None
                                        or arr_dt < fallback_arr):
@@ -49025,7 +49044,9 @@ def ax_transit():
             best = fallback
 
         if best is None:
-            out = {'ok': True, 'found': False, 'reason': 'no_nahverkehr'}
+            reason = ('no_journey_near_arrival_target'
+                      if rejected_too_early else 'no_nahverkehr')
+            out = {'ok': True, 'found': False, 'reason': reason}
             if request.args.get('debug') == '1':
                 out['debug'] = dbg
             return jsonify(out)

@@ -243,6 +243,31 @@ def test_arrival_mode_unchanged_latest_on_time_arrival(client, monkeypatch):
     ]
 
 
+def test_arrival_mode_rejects_previous_day_as_false_on_time(client, monkeypatch):
+    """Regression 2026-08-16: Sonntagabend darf nicht Montagmorgen gewinnen.
+
+    Manche HAFAS-Antworten enthalten bei einer Folgetag-Suche nur die letzten
+    Verbindungen des laufenden Tages. Ohne eine untere Arrive-by-Grenze ist
+    jede davon formal pünktlich und die API empfiehlt eine Anreise 15 Stunden
+    zu früh. Ein solcher Provider-Treffer muss als nicht gefunden gelten, damit
+    der Client seine ehrliche MapKit-/Auto-Kaskade benutzt.
+    """
+    _patch(monkeypatch, FAKE_ARR)
+
+    # Provider-Fixture: Montag, 06.07., letzte Ankunft 16:35 lokal.
+    # Gesucht: Dienstag 08:55 lokal (= 06:55Z), also >14 Stunden später.
+    r = client.get("/api/ax/transit?" + _q(
+        from_lat=HOME_LAT, from_lon=HOME_LON, to_lat=FRA_LAT, to_lon=FRA_LON,
+        arrival="2026-07-07T06:55:00Z"))
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d == {
+        "ok": True,
+        "found": False,
+        "reason": "no_journey_near_arrival_target",
+    }
+
+
 # ─────────────────────────────────────────────────────────────────
 # 4) beide Params → arrival gewinnt
 # ─────────────────────────────────────────────────────────────────
