@@ -15097,6 +15097,75 @@ def _destination_lobby_effective_time(sector, planned_key, live_keys):
     return planned
 
 
+def _destination_lobby_roster_allows_stay(days, iata, arrival, departure,
+                                          arrival_day=None,
+                                          departure_day=None):
+    """True, wenn kein voller Zwischentag die Stationsruhe widerlegt.
+
+    Zwei aufeinanderfolgende Flugsektoren sind nicht automatisch dieselbe Tour:
+    bei Pendlern bzw. einer vom operativen Dienstort abweichenden Profil-Homebase
+    kann zwischen Heimkehr und naechstem Umlauf dieselbe Station liegen.  Der alte
+    Code verband solche Sektoren bis zu 14 Tage lang und erzeugte dadurch z.B.
+    waehrend expliziter FREE-/Urlaubstage eine Destination Lobby an der
+    operativen Basis.
+
+    Ein *vorhandener* Frei-/Urlaubs-/Krank- oder anderer Diensttag trennt sicher.
+    Dasselbe gilt fuer einen widersprechenden Layover-Ort. Tatsaechlich fehlende
+    Tage bleiben dagegen erlaubt: etliche valide iCal-/PDF-Importe speichern nur
+    Hin- und Rueckflug und lassen reine Hotel-Tage aus. Diese Parser-Luecken hat
+    die Lobby schon immer unterstuetzt und darf der Fix nicht regressieren.
+    Ein normaler Overnight/Same-Day-Aufenthalt hat keinen inneren Tag und bleibt
+    ebenfalls unveraendert.
+    """
+    if not isinstance(days, dict) or not isinstance(arrival, datetime) \
+            or not isinstance(departure, datetime):
+        return False
+    station = str(iata or '').strip().upper()
+    if len(station) != 3 or not station.isalpha() or departure <= arrival:
+        return False
+
+    try:
+        first_roster_day = datetime.fromisoformat(
+            str(arrival_day or '')[:10]).date()
+    except Exception:
+        first_roster_day = arrival.date()
+    try:
+        last_inner_day = datetime.fromisoformat(
+            str(departure_day or '')[:10]).date()
+    except Exception:
+        last_inner_day = departure.date()
+
+    cursor = first_roster_day + timedelta(days=1)
+    while cursor < last_inner_day:
+        day = days.get(cursor.isoformat())
+        if isinstance(day, dict):
+            facts = day.get('reader_facts') or {}
+            layover = str(facts.get('layover_ort')
+                          or day.get('ical_layover_ort') or '').strip().upper()
+
+            # Ein Flug/Routing auf einem vollen Zwischentag ist positive
+            # Evidenz, dass die Person nicht durchgehend am Kandidaten-Ort war.
+            if day.get('ical_sectors') or day.get('legs') \
+                    or str(day.get('routing') or '').strip():
+                return False
+
+            # Ein sauber erkannter Hotel-/Layover-Tag darf auch als FREI/X
+            # klassifiziert sein (bei einigen PDF-Formaten ist genau das der
+            # Rohcode). Der konkrete Ort ist hier die staerkere Information.
+            if layover:
+                if layover != station:
+                    return False
+                cursor += timedelta(days=1)
+                continue
+
+            # Eindeutig belegte Frei- und Diensttage sind Tourgrenzen. Leere
+            # bzw. schwache Legacy-Layover-Tage bleiben kompatibel erlaubt.
+            if _rc_duty_state(day) in ('off', 'duty'):
+                return False
+        cursor += timedelta(days=1)
+    return True
+
+
 def _destination_lobby_compute(token, now=None):
     """Aktive Lobby oder None. Fehlende/unklare Rosterdaten fallen geschlossen aus."""
     now = now or _destination_lobby_now()
@@ -15119,13 +15188,13 @@ def _destination_lobby_compute(token, now=None):
             dep = _destination_lobby_parse_iso(sector.get('dep_iso'))
             arr = _destination_lobby_parse_iso(sector.get('arr_iso'))
             if dep is not None and arr is not None and arr > dep:
-                sectors.append((dep, arr, sector))
+                sectors.append((dep, arr, datum, sector))
     sectors.sort(key=lambda item: item[0])
     homebase = str(_profile_homebase_cached(token) or '').strip().upper()
     active = []
     for idx in range(len(sectors) - 1):
-        _in_dep, scheduled_arrival, inbound = sectors[idx]
-        scheduled_departure, _out_arr, outbound = sectors[idx + 1]
+        _in_dep, scheduled_arrival, inbound_day, inbound = sectors[idx]
+        scheduled_departure, _out_arr, outbound_day, outbound = sectors[idx + 1]
         iata = str(inbound.get('to') or '').strip().upper()
         if iata != str(outbound.get('from') or '').strip().upper():
             continue
@@ -15140,6 +15209,10 @@ def _destination_lobby_compute(token, now=None):
         ground_seconds = (departure - arrival).total_seconds()
         if not (_DESTINATION_LOBBY_MIN_STAY_SECONDS <= ground_seconds
                 <= _DESTINATION_LOBBY_MAX_STAY_SECONDS):
+            continue
+        if not _destination_lobby_roster_allows_stay(
+                days, iata, arrival, departure,
+                arrival_day=inbound_day, departure_day=outbound_day):
             continue
         if arrival <= now < departure:
             session_epoch = int(scheduled_arrival.timestamp())
@@ -34561,10 +34634,15 @@ def ax_crew_hotels_suggest():
                  or iata not in _condor_roster_hotel_iatas(token))):
         return jsonify({'ok': False, 'error': 'station_not_in_own_roster'}), 403
     base = (body.get('base') or '').strip().upper() or None
+    raw_tmin = body.get('transfer_min')
     try:
-        tmin = max(0, min(600, int(body.get('transfer_min') or 0)))
-    except Exception:
-        tmin = 0
+        # `None` bedeutet unbekannt und bleibt NULL. Zuvor wurde eine nicht
+        # angegebene Zeit als 0 gespeichert; iOS deutete 0 korrekt als
+        # „fußläufig" und erhielt dadurch z.B. für CLJ eine Null-Minuten-Fahrt.
+        tmin = (None if raw_tmin is None or str(raw_tmin).strip() == ''
+                else max(0, min(600, int(raw_tmin))))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'invalid_transfer_min'}), 400
     if not SB_AVAILABLE:
         return jsonify({'ok': False, 'error': 'unavailable'}), 503
     try:

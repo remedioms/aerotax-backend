@@ -62,6 +62,126 @@ def test_homebase_ground_time_is_not_a_destination_lobby():
     assert _compute(homebase='JFK') is None
 
 
+def test_multi_day_layover_with_confirmed_inner_day_opens():
+    days = {
+        '2026-08-04': {
+            'ical_sectors': [_sector(
+                'LH400', 'FRA', 'JFK',
+                '2026-08-04T02:00:00Z', '2026-08-04T12:00:00Z')],
+        },
+        '2026-08-05': {
+            'marker': 'Layover [JFK] (Tag 2/3)',
+            'reader_facts': {'layover_ort': 'JFK',
+                             'overnight_after_day': True},
+        },
+        '2026-08-06': {
+            'ical_sectors': [_sector(
+                'LH401', 'JFK', 'FRA',
+                '2026-08-06T20:00:00Z', '2026-08-07T04:00:00Z')],
+        },
+    }
+    lobby = _compute(
+        days, now=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc))
+    assert lobby is not None
+    assert lobby['iata'] == 'JFK'
+
+
+def test_explicit_free_days_split_same_station_into_two_tours():
+    """Katja 16.08.: FRA ist Dienstanker, Profil-Homebase aber HAM.
+
+    Eine Heimkehr GIG-FRA und der neun Tage spaetere neue FRA-DEL-Umlauf sind
+    trotz identischer Anschlussstation kein durchgehender Aufenthalt. Die
+    expliziten freien/Urlaubstage muessen die Lobby fail-closed unterbrechen.
+    """
+    days = {
+        '2026-08-08': {
+            'ical_sectors': [_sector(
+                'LH501', 'GIG', 'FRA',
+                '2026-08-07T19:21:00Z', '2026-08-08T06:11:00Z')],
+        },
+        '2026-08-09': {
+            'klass': 'FREI',
+            'marker': 'Off Day (FREE)',
+            'reader_facts': {},
+        },
+        '2026-08-17': {
+            'ical_sectors': [_sector(
+                'LH760', 'FRA', 'DEL',
+                '2026-08-17T11:20:00Z', '2026-08-17T19:25:00Z')],
+        },
+    }
+    assert _compute(
+        days,
+        now=datetime(2026, 8, 16, 18, 0, tzinfo=timezone.utc),
+        homebase='HAM',
+    ) is None
+
+
+def test_missing_inner_roster_day_keeps_sparse_import_layover_compatible():
+    days = {
+        '2026-08-04': {
+            'ical_sectors': [_sector(
+                'LH400', 'FRA', 'JFK',
+                '2026-08-04T02:00:00Z', '2026-08-04T12:00:00Z')],
+        },
+        # 05.08. fehlt: viele valide iCal/PDF-Importe speichern nur die Legs.
+        '2026-08-06': {
+            'ical_sectors': [_sector(
+                'LH401', 'JFK', 'FRA',
+                '2026-08-06T20:00:00Z', '2026-08-07T04:00:00Z')],
+        },
+    }
+    lobby = _compute(
+        days, now=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc))
+    assert lobby is not None
+    assert lobby['iata'] == 'JFK'
+
+
+def test_explicit_ground_duty_breaks_same_station_candidate():
+    days = {
+        '2026-08-04': {
+            'ical_sectors': [_sector(
+                'LH400', 'FRA', 'JFK',
+                '2026-08-04T02:00:00Z', '2026-08-04T12:00:00Z')],
+        },
+        '2026-08-05': {
+            'marker': 'Mandatory Training',
+        },
+        '2026-08-06': {
+            'ical_sectors': [_sector(
+                'LH401', 'JFK', 'FRA',
+                '2026-08-06T20:00:00Z', '2026-08-07T04:00:00Z')],
+        },
+    }
+    assert _compute(
+        days, now=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)) is None
+
+
+def test_utc_midnight_departure_day_is_not_an_inner_break():
+    """Der Roster-Key, nicht das UTC-Datum, bestimmt volle Zwischentage."""
+    days = {
+        '2026-08-04': {
+            'ical_sectors': [_sector(
+                'LH400', 'FRA', 'JFK',
+                '2026-08-04T02:00:00Z', '2026-08-04T12:00:00Z')],
+        },
+        '2026-08-05': {
+            'marker': 'Layover JFK',
+            'reader_facts': {'layover_ort': 'JFK'},
+        },
+        '2026-08-06': {
+            'ical_sectors': [_sector(
+                'LH401', 'JFK', 'FRA',
+                # Lokal noch 06.08., in UTC bereits 07.08.
+                '2026-08-07T00:30:00Z', '2026-08-07T08:30:00Z')],
+        },
+    }
+    lobby = _compute(
+        days, now=datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc))
+    assert lobby is not None
+    assert lobby['iata'] == 'JFK'
+
+
 def test_lobby_response_exposes_only_anonymous_member_count():
     lobby = _compute()
     with (

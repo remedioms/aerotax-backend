@@ -160,6 +160,39 @@ def test_suggest_writes_suggested_row(client, monkeypatch):
     assert payload['suggested_by'] and payload['suggested_by'] != 'AT-x'  # gehasht
 
 
+def test_suggest_keeps_missing_transfer_time_null(client, monkeypatch):
+    """Unbekannt ist nicht fußläufig: fehlende Minuten bleiben NULL."""
+    fake = _FakeSB({'crew_hotel_directory': []})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/suggest?token=AT-x',
+                    data=json.dumps({'iata': 'CLJ',
+                                     'hotel': 'Hampton by Hilton Cluj-Napoca'}),
+                    content_type='application/json')
+
+    assert r.status_code == 200
+    _tbl, payload = fake.sink['inserts'][0]
+    assert payload['transfer_min'] is None
+
+
+def test_suggest_rejects_invalid_transfer_time(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': []})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/suggest?token=AT-x',
+                    data=json.dumps({'iata': 'CLJ', 'hotel': 'Hampton Hotel',
+                                     'transfer_min': 'unknown'}),
+                    content_type='application/json')
+
+    assert r.status_code == 400
+    assert r.get_json()['error'] == 'invalid_transfer_min'
+    assert fake.sink['inserts'] == []
+
+
 def test_suggest_rejects_bad_iata(client, monkeypatch):
     monkeypatch.setattr(app, 'SB_AVAILABLE', True)
     _airline(monkeypatch, 'Lufthansa')
