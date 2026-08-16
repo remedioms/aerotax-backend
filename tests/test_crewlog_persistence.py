@@ -164,3 +164,27 @@ def test_invalid_token_rejected(monkeypatch):
     # Flask routet einen Whitespace-Only-Slug normalerweise als 404 —
     # beides (400 oder 404) ist akzeptabel solange kein Blob zurückkommt.
     assert r.status_code in (400, 404)
+
+
+def test_me_crewlog_uses_bearer_identity_not_a_url_credential(monkeypatch):
+    """Android's additive endpoint persists under the validated bearer only."""
+    _patch_sb(monkeypatch)
+    _clean(TOKEN_A)
+    c = _client()
+    saved = c.post('/api/me/crewlog', json={'people': SAMPLE_PEOPLE},
+                   headers={'Authorization': f'Bearer {TOKEN_A}'})
+    assert saved.status_code == 200, saved.get_json()
+    loaded = c.get('/api/me/crewlog',
+                   headers={'Authorization': f'Bearer {TOKEN_A}'})
+    assert loaded.status_code == 200, loaded.get_json()
+    assert loaded.get_json()['people'][0]['id'] == 'nico bauer'
+
+
+def test_me_crewlog_rejects_oversized_private_note(monkeypatch):
+    _patch_sb(monkeypatch)
+    c = _client()
+    bad = [dict(SAMPLE_PEOPLE[0], note='x' * 2001)]
+    response = c.post('/api/me/crewlog', json={'people': bad},
+                      headers={'Authorization': f'Bearer {TOKEN_A}'})
+    assert response.status_code == 400
+    assert response.get_json()['error'] == 'invalid_body'

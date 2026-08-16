@@ -54,6 +54,8 @@ PASSWORD = "Test12345!"  # passes _password_policy_ok: len>=8, has digit + lette
 
 # iOS-Regex aus Auth/AuthStore expects token shape AT-<alnum/-/_>+ (uppercase hex in practice).
 TOKEN_REGEX = re.compile(r"^AT-[A-Za-z0-9_\-]+$")
+PATH_TOKEN_REGEX = re.compile(r"AT-[A-Za-z0-9_\-]+")
+_TOKEN_BINDINGS: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +75,20 @@ def _request(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> requests.Response:
     """Make HTTP request with default timeout. expect_status optional whitelist."""
+    headers = None
+    token_match = PATH_TOKEN_REGEX.search(path)
+    if token_match:
+        access = _TOKEN_BINDINGS.get(token_match.group(0))
+        if access:
+            headers = {"Authorization": f"Bearer {access}"}
     try:
-        resp = requests.request(method, _url(path), json=json_body, timeout=timeout)
+        resp = requests.request(
+            method,
+            _url(path),
+            json=json_body,
+            headers=headers,
+            timeout=timeout,
+        )
     except requests.RequestException as e:
         pytest.fail(f"NETWORK ERROR {method} {path}: {e!r}")
     if expect_status is not None and resp.status_code not in expect_status:
@@ -113,8 +127,13 @@ def _signup(email: str, password: str = PASSWORD) -> dict:
 
 def _login(email: str, password: str = PASSWORD) -> dict:
     """Mirrors APIClient.login(email, password)."""
-    return _json(_request("POST", "/api/auth/login",
+    body = _json(_request("POST", "/api/auth/login",
                           json_body={"email": email, "password": password}))
+    token = body.get("token")
+    access = body.get("access_token")
+    if isinstance(token, str) and isinstance(access, str):
+        _TOKEN_BINDINGS[token] = access
+    return body
 
 
 def _delete_account_email_pw(email: str, password: str = PASSWORD) -> dict:
@@ -140,6 +159,7 @@ class ThrowawayUser:
         self.email = _fresh_email(tag)
         self.password = PASSWORD
         self.token: Optional[str] = None
+        self.access_token: Optional[str] = None
         self._signed_up = False
         self._deleted = False
 
@@ -153,6 +173,13 @@ class ThrowawayUser:
             f"backend signup returned token={token!r}"
         )
         self.token = token
+        access = body.get("access_token")
+        if not isinstance(access, str) or not access:
+            pytest.fail(
+                f"modern signup response has no access_token for {self.email}"
+            )
+        self.access_token = access
+        _TOKEN_BINDINGS[token] = access
         self._signed_up = True
         return token
 
@@ -174,6 +201,8 @@ class ThrowawayUser:
         except Exception as e:
             print(f"[cleanup] non-fatal delete fail for {self.email}: {e!r}")
         self._deleted = True
+        if self.token:
+            _TOKEN_BINDINGS.pop(self.token, None)
 
 
 @pytest.fixture
@@ -293,20 +322,24 @@ def test_journey_1_crew_user_lifecycle(user_a, user_b):
         f"Friend-request accept (iOS acceptFriendRequest) expected ok=true, got {acc_body!r}"
     )
 
-    # ── Step 10: A.getFriends → B is present ─────────────────────────────────
+    # ── Step 10: A.getFriends → B is present behind an opaque peer id ───────
     resp = _request("GET", f"/api/user/friends/{token_a}", expect_status=(200,))
     friends_body = _json(resp)
-    # iOS FriendsResp = { friends: [Friend] }, Friend = { token, short, profile? }
+    # Modern clients receive an AXU peer capability in the historic `token`
+    # field. A friend's account-bearing AT token must never be disclosed.
     assert "friends" in friends_body, (
         f"iOS APIClient.getFriends expects envelope `{{friends: [...]}}`, got keys={list(friends_body.keys())!r}"
     )
     friends_list = friends_body.get("friends") or []
     friend_tokens = [f.get("token") for f in friends_list]
-    assert token_b in friend_tokens, (
-        f"After A→B request + B accept, A's getFriends should contain B. "
-        f"Expected token={token_b!r} in {friend_tokens!r}"
+    assert len(friends_list) == 1, (
+        f"Fresh A account should contain exactly accepted friend B, got {friends_list!r}"
     )
-    # Each Friend entry needs `token` and `short` for iOS Friend struct.
+    assert friend_tokens[0].startswith("AXU-") and token_b not in friend_tokens, (
+        f"Friend list must expose only an opaque AXU peer id, never B's AT token. "
+        f"legacy={token_b!r}, returned={friend_tokens!r}"
+    )
+    # Each Friend entry keeps the deployed `token`/`short` wire keys.
     for f in friends_list:
         assert f.get("token"), f"iOS Friend.token (non-optional) missing in {f!r}"
         assert "short" in f, f"iOS Friend.short (non-optional) missing in {f!r}"

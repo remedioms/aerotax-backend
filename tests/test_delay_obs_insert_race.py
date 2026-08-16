@@ -30,8 +30,6 @@ class _RaceQuery:
                 'duplicate key value violates unique constraint '
                 '"airport_delay_obs_pkey" (SQLSTATE 23505)')
         self.update_calls += 1
-        # Erster UPDATE sieht noch keine Zeile; nach dem konkurrierenden INSERT
-        # muss der Retry dieselbe Beobachtung erfolgreich aktualisieren.
         return SimpleNamespace(data=[] if self.update_calls == 1 else [{'ok': True}])
 
 

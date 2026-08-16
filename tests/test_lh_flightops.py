@@ -712,14 +712,16 @@ def test_refresher_two_parallel_processes_single_lh_call(monkeypatch):
 def test_crewlist_serves_cache_when_grant_dead(monkeypatch):
     """Last-Good-Cache (Owner 2026-07-24): toter Grant → letzte Liste mit
     cached:true statt 401 — die Crew-Fläche ist nie leer."""
+    _pass_auth_gate(monkeypatch)
     monkeypatch.setattr(fo, '_valid_access', lambda tok: None)
     monkeypatch.setattr(fo, '_crew_cache_get', lambda tok, f, d: {
         'flight': 'LH582', 'date': '2026-07-26',
         'crew': [{'name': 'MUSTERMANN, MAX', 'pk': '1', 'category': 'CPT'}],
         'cached_at': 1234.0})
     import app as backend
-    r = backend.app.test_client().post('/api/lh/flightops/crewlist/testtok-fo',
-                                       json={'flight': 'LH582', 'date': '2026-07-26'})
+    r = backend.app.test_client().post('/api/lh/flightops/crewlist/AT-U',
+                                       json={'flight': 'LH582', 'date': '2026-07-26'},
+                                       headers={'Authorization': 'Bearer AT-U'})
     d = r.get_json()
     assert r.status_code == 200 and d['ok'] is True
     assert d['cached'] is True and d['crew'][0]['name'] == 'MUSTERMANN, MAX'

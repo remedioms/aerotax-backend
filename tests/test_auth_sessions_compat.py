@@ -116,6 +116,41 @@ def test_legacy_bearer_can_be_retired_after_rollout(monkeypatch):
         assert response.get_json()['error'] == 'legacy_token_retired'
 
 
+def test_me_crew_alias_derives_owner_only_from_bearer(monkeypatch):
+    """Android's URL has no owner credential; legacy handler keeps ownership."""
+    owner = 'AT-LEGACY123456'
+    valid = A._TokenValidationResult(A._TokenValidationState.VALID,
+                                     'known@example.test')
+    monkeypatch.setattr(A, '_validate_token', lambda token: valid)
+    seen = []
+    monkeypatch.setattr(
+        A, 'get_dm_inbox',
+        lambda token: (seen.append(token), A.jsonify({'ok': True}))[1],
+    )
+
+    response = A.app.test_client().get(
+        '/api/me/crew-chat/inbox',
+        headers={'Authorization': 'Bearer ' + owner},
+    )
+
+    assert response.status_code == 200
+    assert seen == [owner]
+
+
+def test_me_routes_never_put_owner_credential_in_url_templates():
+    rules = {rule.rule for rule in A.app.url_map.iter_rules()}
+    expected = {
+        '/api/me/friends', '/api/me/crew-chat/inbox',
+        '/api/me/hotel-rooms/report', '/api/me/trade/post',
+        '/api/me/forum/threads', '/api/me/roster',
+        '/api/me/friend-roster/<friend_token>',
+        '/api/me/ax/daily-briefing', '/api/me/push/prefs',
+        '/api/me/entitlement', '/api/me/flight-ops',
+    }
+    assert expected <= rules
+    assert not any('<token>' in rule for rule in rules if rule.startswith('/api/me/'))
+
+
 def test_issued_session_persists_hashes_not_raw_tokens(monkeypatch):
     table = _SessionTable()
     monkeypatch.setattr(A, 'SB_AVAILABLE', True)

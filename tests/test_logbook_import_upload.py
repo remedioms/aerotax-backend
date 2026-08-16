@@ -170,6 +170,32 @@ class _StatusQuery:
         return type('Result', (), {'data': [self.row] if self.row else []})()
 
 
+class _StatusListQuery:
+    def __init__(self, rows):
+        self.rows = rows
+        self.filters = []
+        self.ordering = None
+        self.limit_count = None
+
+    def select(self, _fields):
+        return self
+
+    def eq(self, field, value):
+        self.filters.append((field, value))
+        return self
+
+    def order(self, field, desc=False):
+        self.ordering = (field, desc)
+        return self
+
+    def limit(self, count):
+        self.limit_count = count
+        return self
+
+    def execute(self):
+        return type('Result', (), {'data': self.rows})()
+
+
 def test_upload_status_is_owner_scoped_and_returns_durable_fields(monkeypatch):
     row = {'id': 44, 'status': 'completed', 'filename': 'old.csv',
            'created_at': '2026-08-10T10:00:00Z',
@@ -200,6 +226,39 @@ def test_upload_status_hides_foreign_or_missing_job(monkeypatch):
     r = _client().get('/api/user/logbook/tok_upload_status/import-upload/999')
     assert r.status_code == 404
     assert r.get_json()['error'] == 'not_found'
+
+
+def test_upload_status_list_is_owner_scoped_and_never_returns_payload(monkeypatch):
+    rows = [
+        {'id': 45, 'status': 'completed', 'processed': True,
+         'filename': 'feb.pdf', 'created_at': '2026-08-10T10:03:00Z',
+         'completed_at': '2026-08-10T10:05:00Z',
+         'error_code': None, 'error_message': None,
+         'data_b64': 'must-not-leak'},
+        {'id': 44, 'status': None, 'processed': False,
+         'filename': 'jan.pdf', 'created_at': '2026-08-10T10:00:00Z',
+         'completed_at': None, 'error_code': None, 'error_message': None},
+    ]
+    monkeypatch.setattr(A, 'SB_AVAILABLE', True)
+    query = _StatusListQuery(rows)
+    monkeypatch.setattr(A, 'sb', type('SB', (), {
+        'table': staticmethod(lambda _name: query),
+    })())
+    monkeypatch.setattr(A, '_supabase_execute_with_timeout',
+                        lambda _name, fn, timeout_s=8: (fn(), False))
+
+    r = _client().get('/api/user/logbook/tok_upload_status/import-uploads')
+
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body['ok'] is True
+    assert [job['job_id'] for job in body['jobs']] == [45, 44]
+    assert body['jobs'][0]['status'] == 'completed'
+    assert body['jobs'][1]['status'] == 'pending'
+    assert all('data_b64' not in job for job in body['jobs'])
+    assert query.filters == [('token', 'tok_upload_status')]
+    assert query.ordering == ('created_at', True)
+    assert query.limit_count == A._LOGBOOK_IMPORT_MAX_PER_DAY
 
 
 # ── Ankunfts-Push („angekommen — wird verarbeitet") ────────────────────────

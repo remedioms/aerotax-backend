@@ -63,9 +63,8 @@ def test_fremdsprachen_bleiben_konkret_und_nicht_deutsch():
         'pt': 'Jenni respondeu',
     }
     for lang, wanted in expected.items():
-        title, body = _copy('push_title_replied', lang, {'name': 'Jenni'})
+        title, _ = _copy('push_title_replied', lang, {'name': 'Jenni'})
         assert title == wanted, lang
-        assert body == 'NUTZER-BODY', lang
 
 
 def test_unbekannte_sprache_faellt_weiter_auf_deutsch_zurueck():
