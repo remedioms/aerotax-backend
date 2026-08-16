@@ -6,8 +6,8 @@ die vier Eigenschaften, an denen Datenverlust oder Erfindung hinge:
 
   1. Union statt Ersetzen — Bestehendes überlebt jeden Re-Import.
   2. Identischer Schlüssel + identische Blockzeit = Dublette (kein Doppel-Leg).
-  3. Identischer Schlüssel + ABWEICHENDE Blockzeit = Konflikt → ValueError
-     (der Wächter schickt den Batch dann in die manuelle Prüfung).
+  3. Identischer Schlüssel + höchstens 1 Minute Rundungsdifferenz = Dublette;
+     größere Abweichung = Konflikt → ValueError (manuelle Prüfung).
   4. Was der LESER im Backend nicht auseinanderhalten kann, wird vor dem
      Schreiben nummeriert — sonst frisst sein gröberer Schlüssel ein Leg.
 
@@ -59,6 +59,14 @@ def test_duplicate_key_same_block_is_noop():
     merged, added = merge_legs(OLD, [dict(OLD[0])])
     assert added == 0
     assert len(merged) == 2
+
+
+def test_duplicate_key_one_minute_rounding_drift_is_noop():
+    rounded = dict(OLD[0], block_min=OLD[0]["block_min"] - 1)
+    merged, added = merge_legs(OLD, [rounded])
+    assert added == 0
+    assert len(merged) == 2
+    assert merged[0]["block_min"] == OLD[0]["block_min"]
 
 
 def test_duplicate_key_different_block_raises():

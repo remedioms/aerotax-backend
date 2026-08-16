@@ -81,6 +81,11 @@ _USER_HISTORY_DIR = os.path.join(
 RE_LEG_SUFFIX = re.compile(r"\(\d+\)$")
 RE_SOURCE_ELLIPSIS = re.compile(r"^…\s*\(\+(\d+)\)$")
 SOURCE_KEEP = 3               # meta.source wächst sonst mit jedem Import
+# Zwei Exporte desselben physischen Legs können die Blockzeit an einer
+# Sekunden-/Minutengrenze unterschiedlich runden. Bei ansonsten identischem
+# Schlüssel ist genau eine Minute deshalb dieselbe Messung; größere
+# Abweichungen bleiben ein harter Konflikt und gehen weiterhin in `review`.
+MAX_BLOCK_MERGE_DRIFT_MIN = 1
 
 
 def _env(name):
@@ -336,8 +341,8 @@ def _fact_key(leg):
 
 def merge_legs(existing, new):
     """Union über Leg-Schlüssel. Bestehende Zeilen gewinnen unverändert;
-    identische Schlüssel mit ABWEICHENDER Blockzeit sind ein Konflikt →
-    ValueError (Aufrufer schickt den Batch in `review`)."""
+    identische Schlüssel mit mehr als einer Minute Blockzeit-Abweichung sind
+    ein Konflikt → ValueError (Aufrufer schickt den Batch in `review`)."""
     by_key = {}
     facts = defaultdict(list)
     for leg in existing or []:
@@ -347,10 +352,16 @@ def merge_legs(existing, new):
     for leg in new:
         key = _leg_key(leg)
         if key in by_key:
-            if by_key[key].get("block_min") != leg.get("block_min"):
+            old_block = by_key[key].get("block_min")
+            new_block = leg.get("block_min")
+            same_measurement = (
+                isinstance(old_block, int)
+                and isinstance(new_block, int)
+                and abs(old_block - new_block) <= MAX_BLOCK_MERGE_DRIFT_MIN
+            )
+            if old_block != new_block and not same_measurement:
                 raise ValueError(
-                    f"Merge-Konflikt {key}: block {by_key[key].get('block_min')}"
-                    f" != {leg.get('block_min')}")
+                    f"Merge-Konflikt {key}: block {old_block} != {new_block}")
             continue
         # FAA Logbook Pro omits flight number and departure clock. The same
         # user can upload its EASA twin, which carries the same physical facts
