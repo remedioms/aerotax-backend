@@ -326,9 +326,20 @@ def test_endpoint_flipflop_pusht_hoechstens_einmal(tmp_path):
             box[0] = [nxt]
     # 8 Wechsel, aber hoechstens 2 Pushes (der erste je Zielzustand).
     assert push.call_count <= 2, push.call_count
-    # Der Verlauf zeigt weiterhin jede SUBSTANZIELLE Aenderung — die Hysterese
-    # daempft nur den Push, nicht den Eintrag.
-    assert len(json.loads(changes_file.read_text())['pending']) == 8
+    # ── POLICY-WECHSEL 2026-08-16 (Owner-Befund „Dienstplan-Aenderungen") ────
+    # Bis hierher stand hier `== 8`: die Hysterese daempfte nur den PUSH, der
+    # VERLAUF behielt jede Haelfte des Pendelns. Genau das hat der Owner am
+    # 16.08. auf dem Schirm gesehen — vier Eintraege, die sich paarweise
+    # aufheben („Route FRA-ATH → FRA-SFO" ueber „Route FRA-SFO → FRA-ATH",
+    # „Dienst entfernt · FRA-BCN-FRA" ueber „Neuer Dienst · FRA-BCN-FRA").
+    # Gemessen im Prod-Verlauf: 583 ms Abstand, also zwei Quellen EINES Syncs.
+    # Seitdem hebt `_rc_cancel_reversals` einen Rueckkipper binnen fuenf
+    # Minuten gegen seine Gegenhaelfte auf und BEIDE fallen raus — sonst
+    # bliebe die halbe Luege stehen. Dieses Pendeln ist paarweise, also
+    # bleibt am Ende nichts uebrig.
+    # Die Push-Zusicherung oben ist unveraendert: die Hysterese ist der
+    # Push-Schutz und wird von der Verlauf-Regel NICHT angefasst.
+    assert json.loads(changes_file.read_text())['pending'] == []
 
 
 def test_endpoint_owner_3007_kein_push_und_kein_verlauf(tmp_path):

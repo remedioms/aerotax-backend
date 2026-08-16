@@ -25330,6 +25330,172 @@ def _rc_state_sig(day):
         return ''
 
 
+# ── Rückkipper-Regel: zwei Quellen EINES Syncs heben sich gegenseitig auf ────
+# Owner-Befund 2026-08-16 (Screen „Dienstplan-Änderungen"): vier Einträge, die
+# sich paarweise widersprechen — „Route FRA-ATH → FRA-SFO" direkt über „Route
+# FRA-SFO → FRA-ATH", „Dienst entfernt · FRA-BCN-FRA" direkt über „Neuer Dienst
+# · FRA-BCN-FRA". Die fünf bestehenden Gatter greifen dabei ALLE nicht: sie
+# bewerten je EINEN Vergleich (alt gegen neu), und jeder der beiden Vergleiche
+# ist für sich korrekt und trägt echte Dienst-Substanz.
+#
+# GEMESSEN (roster_changes, Owner-Token, echte Zeitstempel):
+#   11:32:13.835160  2026-08-16 added     — · → FRA-BCN-FRA
+#   11:32:13.835164  2026-08-17 modified  — FRA-SFO (LH454) → FRA-ATH
+#   11:32:14.418051  2026-08-16 removed   — FRA-BCN-FRA → ·
+#   11:32:14.418058  2026-08-17 modified  — FRA-ATH → FRA-SFO (LH454)
+# Abstand: 583 Millisekunden. Das ist Fall (a): ZWEI Quellen im SELBEN Sync
+# schreiben nacheinander den Snapshot, jede diffed gegen das Ergebnis der
+# anderen. Dieselbe Signatur an drei weiteren Tagen desselben Tokens
+# (09.08. 03:36:57/03:37:00, 12.08. 06:16:28/06:16:30).
+#
+# FLEET-MESSUNG über 2925 roster_changes-Zeilen (Paare = gleicher Tag, exakt
+# gespiegelte Substanz):
+#   Abstand ≤ 2 s   →  296 Token,  947 Paare
+#   Abstand ≤ 10 s  →  335 Token
+#   Abstand ≤ 60 s  →  405 Token,  521 Paare im Fenster 10–60 s
+#   Abstand 1–5 min →  118 Paare   ← TAL
+#   Abstand 5–60 min→  620 Paare
+#   Abstand 1–24 h  → 3244 Paare / > 24 h → 6276 Paare
+# Die Verteilung ist zweigipflig mit einem klaren Tal bei 1–5 Minuten. Unter
+# fünf Minuten nimmt keine Planung einen Dienst und gibt ihn zurück — das ist
+# Maschinen-Rauschen. Darüber sind Rückkipper plausibel echte Umplanung und
+# bleiben unangetastet. Daher genau hier die Grenze.
+_RC_SYNC_WINDOW_SEC = 300
+
+
+def _rc_change_transition(change):
+    """Ein Änderungs-Eintrag als Zustands-ÜBERGANG `(von_sig, nach_sig)` über
+    dieselbe Signatur, die auch die Push-Hysterese benutzt (`_rc_state_sig`;
+    '∅' = Tag existiert nicht). `(None, None)` wenn nicht bewertbar.
+
+    Bewusst `_rc_state_sig` und keine eigene, lockerere Signatur: die Regel
+    unten LÖSCHT Einträge, also muss sie strikt sein. Zwei Tage gelten nur als
+    derselbe Zustand, wenn Dienstzustand, Leg-Struktur, Abflüge, Routing,
+    Layover-Ort, Melde-, Briefing- UND Pickup-Zeit übereinstimmen. Wirft nie."""
+    try:
+        if not isinstance(change, dict):
+            return (None, None)
+        kind = change.get('kind')
+        if kind == 'added':
+            a, b = '∅', _rc_state_sig(change.get('new'))
+        elif kind == 'removed':
+            a, b = _rc_state_sig(change.get('old')), '∅'
+        elif kind == 'modified':
+            a, b = (_rc_state_sig(change.get('old')),
+                    _rc_state_sig(change.get('new')))
+        else:
+            return (None, None)
+        if not a or not b or a == b:
+            return (None, None)
+        return (a, b)
+    except Exception:
+        return (None, None)
+
+
+def _rc_cancel_reversals(new_changes, buckets, now=None,
+                         window_sec=_RC_SYNC_WINDOW_SEC):
+    """HISTORIEN-REGEL über zwei aufeinanderfolgende Vergleiche.
+
+    Ein neuer Eintrag, der einen bestehenden Eintrag desselben Tages EXAKT
+    aufhebt (gleiche Substanz, umgekehrte Richtung — inklusive 'removed'
+    gefolgt von identischem 'added'), ist kein zweiter Fakt, sondern die
+    zweite Hälfte EINES Quellen-Konflikts. Dann fallen BEIDE raus: der neue
+    Eintrag entsteht gar nicht erst, und der bestehende wird aus
+    pending/history entfernt. Sonst bliebe die halbe Lüge stehen („Dienst
+    entfernt", obwohl er nie weg war).
+
+    Das ist zugleich die WURZEL-Behandlung des gemessenen Falls (a): der
+    bestehende Eintrag trägt in `old` exakt den Vor-Sync-Stand des Tages —
+    ihn gegen den neuen Eintrag aufzuheben ist rechnerisch dasselbe wie den
+    zweiten Schreiber des Syncs gegen die Basis VOR dem Sync zu diffen. Es
+    braucht dafür keine zweite Snapshot-Kopie.
+
+    GEGENPROBE (die Regel darf eine echte Rücknahme NIE verschlucken): es
+    entscheidet der ZEITLICHE ABSTAND, nicht die Ähnlichkeit. Nur ein
+    Rückkipper INNERHALB von `window_sec` (Default 5 min, s.o.) gilt als
+    Quellen-Konflikt. Nimmt die Planung einen Dienst Stunden oder Tage später
+    wirklich zurück, liegen beide Einträge weiter auseinander und bleiben
+    beide stehen.
+
+    `new_changes`: die frisch berechneten Diff-Einträge (ohne `detected_at`).
+    `buckets`: Listen bestehender Einträge (pending, history) — werden
+    IN PLACE gefiltert.
+
+    DIE PUSH-HYSTERESE (`_rc_hysteresis_filter`, `push_state`) BLEIBT DABEI
+    UNANGETASTET — bewusst, teuer gemessen: ein erster Versuch räumte die
+    Push-Vermerke des aufgehobenen Paares mit weg (Gedanke: der Vermerk stammt
+    aus einem Sync-Konflikt, also darf er eine SPÄTER echte Änderung in diesen
+    Zustand nicht 24 h stumm schalten). Das ließ
+    `test_endpoint_flipflop_pusht_hoechstens_einmal` von 2 auf 4 Pushes
+    steigen: die Hysterese verlor genau das Gedächtnis, mit dem sie das
+    A→B→A→B-Pendeln dämpft (Owner-Eskalationen 26./28.07.). Der Gewinn wäre
+    ohnehin null gewesen — die erste Hälfte hat, wenn überhaupt, schon
+    gepusht, bevor die zweite überhaupt existiert. Aufräumen kostet also nur
+    Schutz. Der Verlauf-Eintrag verschwindet, der Push-Vermerk bleibt.
+
+    Gibt die überlebenden neuen Einträge zurück. Wirft nie (fail-open: im
+    Fehlerfall bleibt alles unverändert)."""
+    try:
+        if not new_changes:
+            return list(new_changes or [])
+        now = now or datetime.now()
+        cutoff = now.timestamp() - max(0, window_sec)
+        # Bestehende Einträge nach Datum indizieren, jüngste zuerst.
+        by_day = {}
+        for bucket in buckets:
+            if not isinstance(bucket, list):
+                continue
+            for e in bucket:
+                if not isinstance(e, dict):
+                    continue
+                datum = str(e.get('datum') or '')[:10]
+                if not datum:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(
+                        str(e.get('detected_at') or '')).timestamp()
+                except Exception:
+                    continue          # ohne Zeitstempel nicht bewertbar
+                if ts < cutoff:
+                    continue          # außerhalb des Sync-Fensters → echt
+                by_day.setdefault(datum, []).append((ts, id(e), e))
+        for lst in by_day.values():
+            lst.sort(key=lambda x: x[0], reverse=True)
+
+        cancelled_ids, survivors = set(), []
+        for ch in new_changes:
+            datum = str((ch or {}).get('datum') or '')[:10]
+            a, b = _rc_change_transition(ch)
+            hit = None
+            if datum and a:
+                for ts, oid, e in by_day.get(datum, []):
+                    if oid in cancelled_ids:
+                        continue
+                    ea, eb = _rc_change_transition(e)
+                    if ea and ea == b and eb == a:
+                        hit = (ts, oid, e)
+                        break
+            if hit is None:
+                survivors.append(ch)
+                continue
+            cancelled_ids.add(hit[1])
+            try:
+                app.logger.warning(
+                    f'[roster-changes] reversal_cancelled datum={datum} '
+                    f'gap={now.timestamp() - hit[0]:.3f}s '
+                    f'kinds={hit[2].get("kind")}/{ch.get("kind")}')
+            except Exception:
+                pass
+        if cancelled_ids:
+            for bucket in buckets:
+                if isinstance(bucket, list):
+                    bucket[:] = [e for e in bucket
+                                 if id(e) not in cancelled_ids]
+        return survivors
+    except Exception:
+        return list(new_changes or [])
+
+
 def _rc_day_is_off_duty(day):
     """True NUR bei einem eindeutig dienstfreien Roster-Tag (Frei/Urlaub/Krank).
 
@@ -25770,6 +25936,15 @@ def take_roster_snapshot(token):
         existing = _roster_changes_read(token) or {'pending': [], 'history': []}
         pending = existing.get('pending') or []
         history = existing.get('history') or []
+        # GATTER 6 — RÜCKKIPPER (Owner-Befund 2026-08-16, gemessen 583 ms
+        # Abstand): hebt der frische Diff einen Eintrag der letzten fünf
+        # Minuten EXAKT auf, waren das zwei Quellen EINES Syncs, nicht zwei
+        # Umplanungen. Beide Hälften fallen raus — die bestehende hier aus
+        # pending/history, die neue aus `diff`. Muss VOR dem Anhängen UND vor
+        # den Push-Kandidaten laufen: ein aufgehobener Rückkipper darf weder
+        # in der Liste stehen noch pushen. Details + Fleet-Zahlen stehen an
+        # `_rc_cancel_reversals`. Die Push-Hysterese bleibt unberührt.
+        diff = _rc_cancel_reversals(diff, [pending, history])
         # VERGANGENHEITS-GATE FÜR DIE LISTE (2026-07-29): `modified` an einem
         # Tag VOR heute (Homebase-lokal) darf keinen Badge mehr erzeugen. Der
         # Push kennt diese Regel seit dem 20.07. (`_roster_change_is_past`) —
