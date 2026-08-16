@@ -870,6 +870,14 @@ def flight_checkin(token):
                     'via_name': via})
 
 
+@flight_checkins_bp.route('/api/me/flight/checkin', methods=['POST'])
+def flight_checkin_me():
+    """Header-only Android alias; legacy iOS token route remains unchanged."""
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else flight_checkin(token)
+
+
 @flight_checkins_bp.route('/api/flight/checkout/<token>', methods=['POST'])
 def flight_checkout(token):
     """Auschecken. Der Ausstieg muss IMMER funktionieren — deshalb toleriert
@@ -897,6 +905,13 @@ def flight_checkout(token):
                     type(e).__name__)
         return jsonify({'ok': False, 'error': 'store_failed'}), 503
     return jsonify({'ok': True, 'flight': flight_no})
+
+
+@flight_checkins_bp.route('/api/me/flight/checkout', methods=['POST'])
+def flight_checkout_me():
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else flight_checkout(token)
 
 
 @flight_checkins_bp.route('/api/flight/checkins/<token>', methods=['GET'])
@@ -941,6 +956,13 @@ def flight_checkins_list(token):
          'dep': r.get('dep_iata'), 'arr': r.get('arr_iata'),
          'via_name': r.get('via_name')}
         for r in rows]})
+
+
+@flight_checkins_bp.route('/api/me/flight/checkins', methods=['GET'])
+def flight_checkins_list_me():
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else flight_checkins_list(token)
 
 
 @flight_checkins_bp.route('/api/internal/flight-checkin/sweep',

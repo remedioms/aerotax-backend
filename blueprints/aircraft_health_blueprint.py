@@ -306,6 +306,14 @@ def aircraft_health_post(token):
     return jsonify({'ok': True, 'report_id': report_id})
 
 
+@aircraft_health_bp.route('/api/me/aircraft-health/report', methods=['POST'])
+def aircraft_health_post_me():
+    """Header-only alias for Android; the legacy token-path route stays live."""
+    from app import _header_only_owner
+    token, error = _header_only_owner()
+    return error if error is not None else aircraft_health_post(token)
+
+
 @aircraft_health_bp.route('/api/aircraft-health/<tail_reg>/recent', methods=['GET'])
 def aircraft_health_recent(tail_reg):
     """Liste der Reports fuer diese Tail in den letzten N Tagen.

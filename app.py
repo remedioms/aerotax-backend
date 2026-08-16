@@ -7296,6 +7296,7 @@ _PUBLIC_USER_REF_PATH_PREFIXES = (
     '/api/family-share/',
     '/api/moderation/',
     '/api/push/prefs',
+    '/api/me/push/prefs',
     '/api/ax/punctuality/',
     '/api/trade/',
     '/api/ax/smp/',
@@ -17596,7 +17597,10 @@ def get_friend_roster(token, friend_token):
         tage = (_roster_snapshot_read(friend_token) or {}).get('tage') or []
     _ph_roster_ms = int((_req_time.monotonic() - _ph_t1) * 1000)
     _ph_t2 = _req_time.monotonic()
-    today = _date.today()
+    # Anchor the product window to UTC like every live-flight timestamp. Using
+    # `date.today()` made the roster boundary depend on the host timezone and
+    # also bypassed the module clock used by deterministic midnight tests.
+    today = datetime.now(timezone.utc).date()
     cutoff = today + _td(days=days_limit)
     out = []
     for _i, day in enumerate(tage):
@@ -28525,6 +28529,11 @@ def get_chat_messages(token, channel_id, _access_checked=False):
         # 2026-08-12): eine Legacy-URL darf auch dort kein Token tragen.
         if mm.get('image_url'):
             mm['image_url'] = _wall_img_sanitize_urls(mm['image_url'])
+        # Reactions are stored internally per opaque actor so one member can
+        # toggle independently.  HTTP responses reveal only aggregate counts
+        # and the current authenticated user's own choices.
+        mm['reactions'], mm['my_reactions'] = _chat_reaction_view(mm, token)
+        mm.pop('reaction_actors', None)
         out.append(mm)
     # NACHAUFLÖSUNG für den Bestand: alles, was vor dem Sende-Stempel
     # (2026-08-01) geschrieben wurde, hat kein `author_name`. Ohne diesen
@@ -28779,19 +28788,157 @@ def _soft_delete_chat_message(token, channel_id, message_id):
     return jsonify({'ok': True, 'deleted': message_id})
 
 
+# Chat mutations are deliberately persisted with the message instead of in a
+# device-local side store.  The row adapter keeps unknown keys in metadata, so
+# these fields survive both Supabase and the disk fallback without a schema
+# migration.  Actor identifiers are one-way hashes: a reaction must be
+# attributable to its author for toggling, but no bearer credential or public
+# user reference may ever be stored in (or returned from) the reaction map.
+_CHAT_REACTION_EMOJIS = frozenset(('❤️', '👍', '😂', '😮', '😢', '🙏'))
+_CHAT_MESSAGE_ID_RE = re.compile(r'[A-Za-z0-9_-]{1,96}')
+
+
+def _chat_reaction_actor(token):
+    return _hashlib.sha256(
+        ('chat-reaction-v1:' + str(token or '')).encode('utf-8')).hexdigest()[:32]
+
+
+def _chat_reaction_view(message, token):
+    """Return bounded aggregate counts and the current owner's emojis only."""
+    raw = message.get('reaction_actors')
+    actors = raw if isinstance(raw, dict) else {}
+    counts = {}
+    mine = []
+    own_actor = _chat_reaction_actor(token)
+    for actor, values in actors.items():
+        if not isinstance(actor, str) or not isinstance(values, list):
+            continue
+        allowed = []
+        for emoji in values[:len(_CHAT_REACTION_EMOJIS)]:
+            if emoji in _CHAT_REACTION_EMOJIS and emoji not in allowed:
+                allowed.append(emoji)
+                counts[emoji] = min(999, int(counts.get(emoji) or 0) + 1)
+        if actor == own_actor:
+            mine = allowed
+    return counts, mine
+
+
+def _chat_message_mutation_error(token, channel_id, message_id):
+    if not _chat_path(channel_id):
+        return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
+    if not _CHAT_MESSAGE_ID_RE.fullmatch(str(message_id or '')):
+        return jsonify({'ok': False, 'error': 'invalid_message_id'}), 400
+    gate = _channel_access_error(token, channel_id)
+    if gate is not None:
+        _, status = gate
+        err = ((gate[0].get_json(silent=True) or {}).get('error')
+               if status == 403 else 'invalid_channel')
+        return jsonify({'ok': False, 'error': err or 'not_a_member'}), status
+    return None
+
+
+def _chat_find_message(channel_id, message_id):
+    messages = _dm_load_messages(channel_id) or []
+    return messages, next((m for m in messages if m.get('id') == message_id), None)
+
+
+def _save_chat_message_mutation(channel_id, messages, message):
+    sb_ok = _dm_messages_save_to_supabase(channel_id, [message])
+    if not sb_ok and SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'storage_unavailable'}), 503
+    _dm_save_messages_disk(channel_id, messages[-500:])
+    return None
+
+
+def edit_chat_message(token, channel_id, message_id):
+    """Server-confirmed text edit for an author's plain chat message."""
+    error = _chat_message_mutation_error(token, channel_id, message_id)
+    if error is not None:
+        return error
+    body = request.get_json(silent=True) or {}
+    text = str(body.get('text') or '').strip()
+    if not text:
+        return jsonify({'ok': False, 'error': 'empty_text'}), 400
+    if len(text) > 2000:
+        return jsonify({'ok': False, 'error': 'text_too_long'}), 413
+    # Rich messages encode references/media/location in the established text
+    # protocol. Editing only plain text prevents stripping a hidden attachment
+    # or replacing a structured location with misleading prose.
+    if '[aerox:' in text.casefold() or '\x00' in text:
+        return jsonify({'ok': False, 'error': 'invalid_text'}), 400
+    try:
+        messages, message = _chat_find_message(channel_id, message_id)
+        if message is None or message.get('deleted'):
+            return jsonify({'ok': True, 'already_gone': True})
+        if not _chat_author_matches(message.get('author_token'), token):
+            return jsonify({'ok': False, 'error': 'not_author'}), 403
+        old_text = str(message.get('text') or '')
+        if '[aerox:' in old_text.casefold() or message.get('image_url'):
+            return jsonify({'ok': False, 'error': 'message_not_editable'}), 409
+        message['text'] = text
+        message['edited'] = True
+        message['edited_ts'] = time.time()
+        save_error = _save_chat_message_mutation(channel_id, messages, message)
+        if save_error is not None:
+            return save_error
+        return jsonify({'ok': True, 'message': message})
+    except Exception as e:
+        app.logger.warning('[chat] edit_fail %s', type(e).__name__)
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
+
+
+def toggle_chat_message_reaction(token, channel_id, message_id):
+    """Toggle one approved emoji and return the authoritative aggregate view."""
+    error = _chat_message_mutation_error(token, channel_id, message_id)
+    if error is not None:
+        return error
+    body = request.get_json(silent=True) or {}
+    emoji = body.get('emoji')
+    if emoji not in _CHAT_REACTION_EMOJIS:
+        return jsonify({'ok': False, 'error': 'invalid_reaction'}), 400
+    try:
+        messages, message = _chat_find_message(channel_id, message_id)
+        if message is None or message.get('deleted'):
+            return jsonify({'ok': True, 'already_gone': True,
+                            'reactions': {}, 'my_reactions': []})
+        actors = message.get('reaction_actors')
+        actors = dict(actors) if isinstance(actors, dict) else {}
+        actor = _chat_reaction_actor(token)
+        own = actors.get(actor)
+        own = list(own) if isinstance(own, list) else []
+        own = [value for value in own
+               if value in _CHAT_REACTION_EMOJIS]
+        if emoji in own:
+            own.remove(emoji)
+        elif len(own) < len(_CHAT_REACTION_EMOJIS):
+            own.append(emoji)
+        # Reinsert so an active actor is retained if the bounded metadata map
+        # has to discard the oldest reaction actors.
+        actors.pop(actor, None)
+        if own:
+            actors[actor] = own
+        # Limit metadata growth even for a heavily reacted public group chat.
+        if len(actors) > 1000:
+            actors = dict(list(actors.items())[-1000:])
+        message['reaction_actors'] = actors
+        save_error = _save_chat_message_mutation(channel_id, messages, message)
+        if save_error is not None:
+            return save_error
+        counts, mine = _chat_reaction_view(message, token)
+        return jsonify({'ok': True, 'message_id': message_id,
+                        'reactions': counts, 'my_reactions': mine})
+    except Exception as e:
+        app.logger.warning('[chat] reaction_fail %s', type(e).__name__)
+        return jsonify({'ok': False, 'error': 'internal_error'}), 500
+
+
 @app.route('/api/crew-chat/<token>/channel/<channel_id>/message/<message_id>',
            methods=['DELETE'])
 def delete_chat_message(token, channel_id, message_id):
     """Soft-Delete einer eigenen Message in einem (Group-/DM-)Channel."""
-    if not _chat_path(channel_id):
-        return jsonify({'ok': False, 'error': 'invalid_channel'}), 400
-    _gate = _channel_access_error(token, channel_id)
-    if _gate is not None:
-        _, status = _gate
-        err = ((_gate[0].get_json(silent=True) or {}).get('error')
-               if status == 403 else 'invalid_channel')
-        err = err or 'not_a_member'
-        return jsonify({'ok': False, 'error': err}), status
+    error = _chat_message_mutation_error(token, channel_id, message_id)
+    if error is not None:
+        return error
     return _soft_delete_chat_message(token, channel_id, message_id)
 
 
@@ -32763,11 +32910,22 @@ def forum_create_reply(token, thread_id):
         return jsonify({'ok': False, 'error': 'demo_mode_cannot_post'}), 403
     if _token_rate_limited(token, 'forum_reply', limit=20, window_sec=3600):
         return jsonify({'ok': False, 'error': 'rate_limited'}), 429
-    body = request.get_json(silent=True) or {}
-    raw_text = (body.get('body') or '').strip()
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    raw_body = body.get('body', '')
+    if raw_body is None:
+        raw_body = ''
+    raw_parent = body.get('parent_reply_id')
+    if (not isinstance(raw_body, str) or
+            (raw_parent is not None and not isinstance(raw_parent, str)) or
+            any(body.get(key) is not None and not isinstance(body.get(key), str)
+                for key in ('image_url', 'gif_url', 'mentioned_token'))):
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    raw_text = raw_body.strip()
     image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     gif_url = (body.get('gif_url') or '').strip() or None
-    parent_reply_id = (body.get('parent_reply_id') or '').strip() or None
+    parent_reply_id = (raw_parent or '').strip() or None
     mentioned_token = (body.get('mentioned_token') or '').strip() or None
     # Anonyme Antwort (Owner 2026-07-20, wie add_comment): kein Author-Snapshot,
     # per-Item-gesalzener anon_handle; author_token nur server-seitig (Ownership).
@@ -32777,6 +32935,8 @@ def forum_create_reply(token, thread_id):
         return jsonify({'ok': False, 'error': 'empty_reply'}), 400
     if len(raw_text) > 3000:
         return jsonify({'ok': False, 'error': 'too_long'}), 413
+    if parent_reply_id and not _me_forum_resource_id_is_safe(parent_reply_id):
+        return jsonify({'ok': False, 'error': 'invalid_parent_reply_id'}), 400
     text = _sanitize_user_text(raw_text, max_len=3000)
 
     # WALL-BRÜCKE SCHREIBEN (Owner 2026-07-19): Antworten auf 'wall:<id>'-
@@ -32815,6 +32975,21 @@ def forum_create_reply(token, thread_id):
                        if t.get('id') == thread_id), None)
     if not target:
         return jsonify({'ok': False, 'error': 'thread_not_found'}), 404
+
+    # Forum supports exactly one nested reply level.  A parent must be a root
+    # reply of this same thread; accepting arbitrary IDs previously allowed a
+    # crafted body to make an orphaned/deep reply that no client could render.
+    if parent_reply_id:
+        parent = _forum_reply_sb_get(parent_reply_id)
+        if parent is None:
+            parent = next(
+                (row for row in (_forum_replies_load_from_disk(thread_id) or [])
+                 if row.get('id') == parent_reply_id),
+                None,
+            )
+        if (parent is None or parent.get('thread_id') != thread_id or
+                parent.get('parent_reply_id') is not None):
+            return jsonify({'ok': False, 'error': 'invalid_parent_reply_id'}), 400
 
     import uuid, time
     reply = {
@@ -32967,6 +33142,26 @@ def forum_delete_reply(token, reply_id):
             return jsonify({'ok': False, 'error': 'not_found_or_not_author'}), 404
 
     if parent_thread_id:
+        # Keep direct replies visible after their parent is deleted.  Deleting
+        # somebody's own root comment must not silently erase (or orphan in
+        # the one-level client tree) other crew members' replies.
+        def _reparent_children(replies):
+            changed = False
+            for child in replies:
+                if child.get('parent_reply_id') == reply_id:
+                    child['parent_reply_id'] = None
+                    changed = True
+            return replies if changed else None
+        _forum_disk_replies_mutate(parent_thread_id, _reparent_children)
+        if SB_AVAILABLE:
+            try:
+                sb.table('forum_replies').update({'parent_reply_id': None}).eq(
+                    'thread_id', parent_thread_id,
+                ).eq('parent_reply_id', reply_id).execute()
+            except Exception as e:
+                app.logger.warning(
+                    f'[forum-delete] sb reply child reparent failed: {e}',
+                )
         # reply_count dekrementieren — atomar per-Row; SB-down ⇒ Disk-Bump.
         if _forum_thread_apply_counters(parent_thread_id, reply_delta=-1) is None:
             def _dec(threads):
@@ -36607,7 +36802,7 @@ def register_push_fcm():
     compatibility fallback.
     """
     body = request.get_json(silent=True) or {}
-    user_token = (body.get('token') or '').strip()
+    user_token = _header_only_body_owner(body)
     fcm_token = (body.get('fcm_token') or '').strip()
     if not user_token or not fcm_token:
         return jsonify({'ok': False, 'error': 'missing token or fcm_token'}), 400
@@ -36659,7 +36854,7 @@ def register_push_fcm():
 def unregister_push_fcm():
     """Remove the calling Android installation's FCM endpoint on logout."""
     body = request.get_json(silent=True) or {}
-    user_token = (body.get('token') or '').strip()
+    user_token = _header_only_body_owner(body)
     if not user_token:
         return jsonify({'ok': False, 'error': 'missing token'}), 400
     if not _request_bearer_matches(user_token):
@@ -36788,7 +36983,7 @@ def set_push_prefs():
     auf den Default zurückzusetzen, `null` bzw. `{'level':'all'}` schicken.
     """
     body = request.get_json(silent=True) or {}
-    user_token = (body.get('token') or '').strip()
+    user_token = _header_only_body_owner(body)
     prefs_in = body.get('prefs')
     friend_prefs_in = body.get('friend_prefs')
     has_friend_prefs = isinstance(friend_prefs_in, dict)
@@ -60508,7 +60703,7 @@ def google_play_rtdn():
 def verify_google_play_subscription():
     """Owner-bound server verification for Google Play Billing purchases."""
     body = request.get_json(silent=True) or {}
-    user_token = (body.get('token') or '').strip()
+    user_token = _header_only_body_owner(body)
     purchase_token = (body.get('purchase_token') or '').strip()
     if not user_token or not purchase_token:
         return jsonify(
@@ -79560,3 +79755,1126 @@ def erstelle_pdf(d):
 
     doc.build(S, onFirstPage=on_page, onLaterPages=on_page)
     return buf.getvalue()
+
+
+# ── Header-only owner routes (Flutter Android migration, 2026-08-15) ───────
+#
+# The original iOS contract uses the long-lived AT account credential as a
+# path segment.  It remains available for already released iOS versions, but
+# credentials in URLs are observable by proxies and request logs.  Android
+# uses these additive `/api/me/...` aliases instead.  Every alias obtains the
+# established internal principal from Authorization after the AXA session hook
+# above has resolved it; no identity may be supplied by a path, query or body.
+#
+# Keep these wrappers intentionally thin: the mature legacy handlers remain
+# the one implementation of validation, ownership and persistence semantics.
+def _header_only_owner():
+    """Return the authenticated AT principal or a safe HTTP error response.
+
+    The modern-session normalizer runs before this helper and replaces a valid
+    short-lived AXA bearer with its AT principal.  A legacy AT bearer is also
+    accepted during the staged migration, but a client can never select an
+    owner through the URL.
+    """
+    token = _request_bearer_token()
+    if not token or not isinstance(token, str) or not _BUG004_TOKEN_PATH_RE.fullmatch('/' + token):
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    if token.startswith(('AT-GUEST-', 'AT-FAM-')):
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    validation = _validate_token(token)
+    if validation.state is _TokenValidationState.UNAVAILABLE:
+        return None, _auth_store_unavailable_response()
+    if validation.state is not _TokenValidationState.VALID:
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    return token, None
+
+
+def _header_only_dispatch(handler, *args):
+    token, error = _header_only_owner()
+    return error if error is not None else handler(token, *args)
+
+
+def _header_only_public_dispatch(handler, *args):
+    """Dispatch an old social reader and redact every foreign identity.
+
+    `/api/me` is intentionally outside the historic URL-prefix redactor: it
+    must therefore make its public-reference boundary explicit here.  This
+    helper is for JSON read contracts only; mutations use the regular thin
+    dispatcher and resolve AXU target fields before their legacy handler.
+    """
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    response = app.make_response(handler(token, *args))
+    if not response.is_json:
+        return response
+    payload = response.get_json(silent=True)
+    if payload is None:
+        return jsonify({'ok': False, 'error': 'invalid_response'}), 503
+    return app.make_response((
+        jsonify(_publicize_foreign_user_refs(payload, viewer_token=token)),
+        response.status_code,
+    ))
+
+
+_ME_FORUM_RESOURCE_ID_RE = re.compile(r'^[A-Za-z0-9:_-]{1,120}$')
+
+
+def _me_forum_resource_id_is_safe(value):
+    """Accept only opaque, bounded forum resource IDs in `/api/me` routes."""
+    return isinstance(value, str) and bool(_ME_FORUM_RESOURCE_ID_RE.fullmatch(value))
+
+
+def _me_forum_reply_get(reply_id):
+    """Return one reply from the primary store, with disk-only fallback."""
+    reply = _forum_reply_sb_get(reply_id)
+    if reply is not None:
+        return reply
+    for thread in (_forum_threads_load_from_disk() or []):
+        thread_id = thread.get('id')
+        if not _me_forum_resource_id_is_safe(thread_id):
+            continue
+        for candidate in (_forum_replies_load_from_disk(thread_id) or []):
+            if candidate.get('id') == reply_id:
+                return candidate
+    return None
+
+
+def _me_forum_thread_visible_to(token, thread_id):
+    """Mirror the read visibility gate before a reply mutation.
+
+    This is intentionally narrow and side-effect-free.  The actual like
+    mutation stays in the long-lived handler, while this `/api/me` gate keeps
+    opaque IDs from bypassing airline scope or a local block relationship.
+    """
+    thread = _forum_thread_sb_get(thread_id)
+    if thread is None:
+        thread = next((candidate for candidate in
+                       (_forum_threads_load_from_disk() or [])
+                       if candidate.get('id') == thread_id), None)
+    if not thread or thread.get('author_token') in _blocked_by(token):
+        return False
+    if (thread.get('scope') or 'all') != 'airline':
+        return True
+    try:
+        my_airline = _canonical_airline_key(
+            ((_profile_load(token) or {}).get('profile', {}) or {}).get('airline'))
+    except Exception:
+        my_airline = ''
+    thread_airline = _canonical_airline_key(thread.get('author_airline'))
+    return bool(my_airline and thread_airline and my_airline == thread_airline)
+
+
+def _header_only_body_owner(body):
+    """Use the wrapper-authenticated owner instead of a JSON credential.
+
+    Only `/api/me` wrappers set this request-local value. Legacy endpoints
+    continue to read their documented body token unchanged.
+    """
+    try:
+        from flask import g as _g
+        owner = getattr(_g, 'aerox_header_only_owner', None)
+    except Exception:
+        owner = None
+    if owner:
+        return owner
+    return (body.get('token') or '').strip() if isinstance(body, dict) else ''
+
+
+def _header_only_body_dispatch(handler):
+    """Dispatch a legacy body-token handler with a header-derived owner."""
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    from flask import g as _g
+    _g.aerox_header_only_owner = token
+    try:
+        return handler()
+    finally:
+        _g.pop('aerox_header_only_owner', None)
+
+
+@app.route('/api/me/profile', methods=['GET', 'PUT'])
+def me_profile():
+    return _header_only_dispatch(
+        get_user_profile if request.method == 'GET' else put_user_profile,
+    )
+
+
+@app.route('/api/me/avatar', methods=['POST'])
+def me_avatar():
+    return _header_only_dispatch(upload_user_avatar)
+
+
+@app.route('/api/me/logbook', methods=['GET'])
+def me_logbook():
+    return _header_only_dispatch(get_logbook)
+
+
+@app.route('/api/me/crewlog', methods=['GET', 'POST'])
+def me_crewlog():
+    """Header-authenticated Android Crew History backup.
+
+    The legacy iOS endpoint intentionally remains available, but Flutter never
+    puts a durable account credential in a URL.  `_header_only_owner` derives
+    the identity solely from the validated Authorization bearer.
+    """
+    return _header_only_dispatch(
+        get_crewlog if request.method == 'GET' else save_crewlog,
+    )
+
+
+_ME_FLIGHTOPS_CREW_FLIGHT_RE = re.compile(r'^[A-Z0-9]{2,8}$')
+_ME_FLIGHTOPS_CREW_IATA_RE = re.compile(r'^[A-Z]{3}$')
+
+
+@app.route('/api/me/flightops/crewlist', methods=['POST'])
+def me_flightops_crewlist():
+    """Credential-free projection of the official per-roster-leg crew list.
+
+    This deliberately accepts only the four server-resolved leg facts.  In
+    particular, Android cannot provide FlightOps access codes, a legacy AT
+    token, a cache-force flag, or a second user's identity.  The mature
+    FlightOps handler still performs roster-link authorization and cache/live
+    fallback; this alias owns only the header identity and public projection.
+    """
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or set(body) != {'flight', 'date', 'dep', 'arr'}:
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    flight = body.get('flight')
+    date = body.get('date')
+    dep = body.get('dep')
+    arr = body.get('arr')
+    if (not isinstance(flight, str) or
+            not _ME_FLIGHTOPS_CREW_FLIGHT_RE.fullmatch(flight.strip().upper()) or
+            not isinstance(date, str) or
+            not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date) or
+            not isinstance(dep, str) or
+            not _ME_FLIGHTOPS_CREW_IATA_RE.fullmatch(dep.strip().upper()) or
+            not isinstance(arr, str) or
+            not _ME_FLIGHTOPS_CREW_IATA_RE.fullmatch(arr.strip().upper())):
+        return jsonify({'ok': False, 'error': 'invalid_leg'}), 400
+    try:
+        datetime.strptime(date, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'invalid_leg'}), 400
+    # Canonicalize the mutable JSON cache before handing it to the legacy
+    # handler. It reads this same parsed body, but cannot see any extra fields.
+    body.update({
+        'flight': flight.strip().upper(),
+        'date': date,
+        'dep': dep.strip().upper(),
+        'arr': arr.strip().upper(),
+    })
+    from blueprints.lh_flightops import flightops_crewlist
+    response = app.make_response(flightops_crewlist(token))
+    if not response.is_json:
+        return jsonify({'ok': False, 'error': 'invalid_response'}), 503
+    payload = response.get_json(silent=True)
+    if payload is None:
+        return jsonify({'ok': False, 'error': 'invalid_response'}), 503
+    # A crew list has no client use for either its own or a colleague's
+    # credential. Unlike generic old social projections, transform every AT
+    # occurrence, including the requesting account, into a public AXU ref.
+    return app.make_response((
+        jsonify(_publicize_foreign_user_refs(payload)), response.status_code,
+    ))
+
+
+@app.route('/api/me/logbook/pdf', methods=['GET'])
+def me_logbook_pdf():
+    return _header_only_dispatch(get_logbook_pdf)
+
+
+@app.route('/api/me/calendar-pdf', methods=['GET'])
+def me_calendar_pdf():
+    """Credential-free Android alias for the printable monthly calendar."""
+    return _header_only_dispatch(get_user_calendar_pdf)
+
+
+@app.route('/api/me/logbook/leg', methods=['POST'])
+def me_logbook_leg():
+    return _header_only_dispatch(save_logbook_leg)
+
+
+@app.route('/api/me/logbook/import-upload', methods=['POST'])
+def me_logbook_import_upload():
+    return _header_only_dispatch(upload_logbook_import)
+
+
+@app.route('/api/me/logbook/import-upload/<int:job_id>', methods=['GET'])
+def me_logbook_import_status(job_id):
+    return _header_only_dispatch(get_logbook_import_upload_status, job_id)
+
+
+@app.route('/api/me/calendar-feed/import', methods=['POST'])
+def me_calendar_feed_import():
+    return _header_only_dispatch(import_calendar_feed)
+
+
+@app.route('/api/me/passport-stats', methods=['GET'])
+def me_passport_stats():
+    return _header_only_dispatch(get_passport_stats)
+
+
+@app.route('/api/me/friend-passport', methods=['GET'])
+def me_friend_passport():
+    return _header_only_dispatch(get_friend_passport)
+
+
+@app.route('/api/me/ax/shuttle-options', methods=['GET'])
+def me_ax_shuttle_options():
+    return _header_only_dispatch(ax_shuttle_options)
+
+
+@app.route('/api/me/airport/board', methods=['GET'])
+def me_airport_board():
+    return _header_only_dispatch(airport_board)
+
+
+@app.route('/api/me/layover-recs/upload-image', methods=['POST'])
+def me_layover_image():
+    return _header_only_dispatch(upload_layover_image)
+
+
+@app.route('/api/me/layover-recs/add', methods=['POST'])
+def me_layover_add():
+    return _header_only_dispatch(add_layover_rec)
+
+
+@app.route('/api/me/layover-recs/vote/<rec_id>', methods=['POST'])
+def me_layover_vote(rec_id):
+    return _header_only_dispatch(vote_layover_rec, rec_id)
+
+
+@app.route('/api/me/layover-recs/<rec_id>', methods=['DELETE'])
+def me_layover_delete(rec_id):
+    return _header_only_dispatch(delete_layover_rec, rec_id)
+
+
+@app.route('/api/me/layover-recs/<rec_id>/comments', methods=['GET', 'POST'])
+def me_layover_comments(rec_id):
+    return _header_only_dispatch(
+        layover_rec_get_comments if request.method == 'GET' else layover_rec_add_comment,
+        rec_id,
+    )
+
+
+@app.route('/api/me/layover-recs/<rec_id>/comments/<comment_id>', methods=['DELETE'])
+def me_layover_comment_delete(rec_id, comment_id):
+    return _header_only_dispatch(layover_rec_delete_comment, rec_id, comment_id)
+
+
+@app.route('/api/me/layover-recs/discover', methods=['GET'])
+def me_layover_discover():
+    return _header_only_dispatch(discover_layover_recs)
+
+
+@app.route('/api/me/hangouts', methods=['GET'])
+def me_hangouts():
+    return _header_only_dispatch(list_hangouts)
+
+
+@app.route('/api/me/crew-at-destination', methods=['GET'])
+def me_crew_at_destination():
+    """Header-only Crew Map source.
+
+    The mature handler is already the authority for reciprocal-friend,
+    layover-visibility, roster-share and Hangout-audience gates.  Publish its
+    result through the AXU boundary so Android never puts an AT credential in
+    a URL and never receives a foreign credential as a marker identity.
+    """
+    return _header_only_public_dispatch(get_crew_at_destination)
+
+
+@app.route('/api/me/destination-lobby', methods=['GET'])
+def me_destination_lobby():
+    return _header_only_dispatch(get_destination_lobby)
+
+
+# Social, crew and operational aliases.  They deliberately call the mature
+# iOS handlers, preserving their validation, authorization and ownership
+# rules while replacing the credential-bearing owner path with `/api/me`.
+@app.route('/api/me/friends', methods=['GET'])
+def me_friends():
+    return _header_only_public_dispatch(get_user_friends)
+
+
+@app.route('/api/me/friends/remove', methods=['POST'])
+def me_friends_remove():
+    return _header_only_dispatch(remove_user_friend)
+
+
+@app.route('/api/me/friend-visibility/<friend_ref>', methods=['GET', 'PUT'])
+def me_friend_visibility(friend_ref):
+    """Header-only, public-reference variant of the private sharing controls.
+
+    The legacy route has credentials in both path segments.  Do not proxy it:
+    resolve the AXU peer reference here and retain the established friend gate
+    and profile persistence semantics without ever accepting an AT credential
+    from Android's URL or JSON body.
+    """
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    if not isinstance(friend_ref, str) or len(friend_ref) > 192:
+        return jsonify({'ok': False, 'error': 'invalid_friend_ref'}), 400
+    friend_token = _token_from_public_user_ref(friend_ref)
+    if not friend_token:
+        return jsonify({'ok': False, 'error': 'invalid_friend_ref'}), 400
+    if friend_token not in ((_friends_load(token) or {}).get('friends') or []):
+        return jsonify({'ok': False, 'error': 'not_friends'}), 403
+    full = _profile_load(token, fresh=request.method == 'PUT') or {}
+    profile = dict(full.get('profile') or {})
+    prefs = dict(profile.get('friend_visibility') or {})
+    current = dict(prefs.get(friend_token) or {})
+    fields = ('share_sick_status', 'share_training_status',
+              'share_part_time_status', 'share_vacation_status',
+              'share_standby_status')
+    if request.method == 'GET':
+        return jsonify({'ok': True, **{key: current.get(key) is not False
+                                       for key in fields}})
+    body = request.get_json(silent=True)
+    if (not isinstance(body, dict) or set(body) - set(fields) or
+            not body or any(not isinstance(body.get(key), bool)
+                            for key in body)):
+        return jsonify({'ok': False, 'error': 'invalid_friend_permissions'}), 400
+    for key, value in body.items():
+        if value:
+            current.pop(key, None)
+        else:
+            current[key] = False
+    if current:
+        if friend_token not in prefs and len(prefs) >= _FRIEND_VISIBILITY_MAX:
+            return jsonify({'ok': False, 'error': 'too_many_preferences'}), 400
+        prefs[friend_token] = current
+    else:
+        prefs.pop(friend_token, None)
+    profile['friend_visibility'] = prefs
+    if not _profile_save(token, profile, full_disk_payload={
+        **full, 'token': token, 'profile': profile,
+    }):
+        return jsonify({'ok': False, 'error': 'persist_failed'}), 500
+    _profile_memo_invalidate(token)
+    _invalidate_friend_visibility_memos(token, friend_token)
+    return jsonify({'ok': True, **{key: current.get(key) is not False
+                                   for key in fields}})
+
+
+@app.route('/api/me/friend-requests', methods=['GET'])
+def me_friend_requests():
+    return _header_only_public_dispatch(list_friend_requests)
+
+
+@app.route('/api/me/friend-requests/<action>', methods=['POST'])
+def me_friend_request_action(action):
+    handlers = {
+        'send': send_friend_request,
+        'accept': accept_friend_request,
+        'decline': decline_friend_request,
+        'cancel': cancel_friend_request,
+    }
+    handler = handlers.get(action)
+    if handler is None:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    return _header_only_dispatch(handler)
+
+
+@app.route('/api/me/friend-groups', methods=['GET'])
+def me_friend_groups():
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    return jsonify({'groups': _me_friend_groups_public(token)})
+
+
+# Friend groups predate the public-reference boundary and store the owner's
+# long-lived AT credential plus member credentials in their persistence row.
+# Do not wrap the legacy handlers here: their response shape deliberately
+# contains owner credentials and their loose input contract was only safe on
+# the old, bearer-bound iOS path.  Android receives these bounded operations
+# instead.  AXU references are the only cross-user identifiers on this API.
+_ME_FRIEND_GROUP_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+_ME_FRIEND_GROUP_MAX_GROUPS = 100
+_ME_FRIEND_GROUP_MAX_MEMBERS = 100
+_ME_FRIEND_GROUP_MAX_NAME = 60
+
+
+def _me_friend_group_id(value):
+    return value if isinstance(value, str) and _ME_FRIEND_GROUP_ID_RE.fullmatch(value) else None
+
+
+def _me_friend_group_public(group):
+    """Project one owner group without ever serializing an AT credential."""
+    if not isinstance(group, dict):
+        return None
+    group_id = _me_friend_group_id(group.get('id'))
+    name = group.get('name')
+    if not group_id or not isinstance(name, str):
+        return None
+    refs = []
+    for member in group.get('members') or []:
+        ref = _public_user_ref(member)
+        if ref and ref.startswith(_PUBLIC_USER_REF_PREFIX) and ref not in refs:
+            refs.append(ref)
+        if len(refs) >= _ME_FRIEND_GROUP_MAX_MEMBERS:
+            break
+    return {
+        'id': group_id,
+        'name': name.strip()[:_ME_FRIEND_GROUP_MAX_NAME],
+        'members': refs,
+        'member_count': len(refs),
+    }
+
+
+def _me_friend_groups_public(token):
+    groups = []
+    for group in (_friends_load(token).get('groups') or []):
+        public = _me_friend_group_public(group)
+        if public is not None:
+            groups.append(public)
+        if len(groups) >= _ME_FRIEND_GROUP_MAX_GROUPS:
+            break
+    return groups
+
+
+def _me_friend_group_body(*, allowed, required=()):
+    """Read one deliberately small JSON object; credentials have no slot."""
+    if request.args:
+        return None, (jsonify({'ok': False, 'error': 'query_not_allowed'}), 400)
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or set(body) - set(allowed):
+        return None, (jsonify({'ok': False, 'error': 'invalid_body'}), 400)
+    if any(key not in body for key in required):
+        return None, (jsonify({'ok': False, 'error': 'invalid_body'}), 400)
+    return body, None
+
+
+def _me_friend_group_member_refs(value, *, allow_empty=True):
+    if not isinstance(value, list) or len(value) > _ME_FRIEND_GROUP_MAX_MEMBERS:
+        return None
+    members = []
+    for ref in value:
+        if (not isinstance(ref, str) or len(ref) > 192 or
+                not re.fullmatch(r'AXU-[A-Za-z0-9_-]{16,188}', ref)):
+            return None
+        internal = _token_from_public_user_ref(ref)
+        if not internal or internal in members:
+            continue
+        members.append(internal)
+    return members if allow_empty or members else None
+
+
+def _me_friend_group_owned(data, group_id):
+    for group in data.get('groups') or []:
+        if isinstance(group, dict) and group.get('id') == group_id:
+            return group
+    return None
+
+
+def _me_friend_group_members_are_friends(token, members):
+    friends = set((_friends_load(token).get('friends') or []))
+    return all(member in friends and member != token for member in members)
+
+
+def _me_friend_group_save(token, data, group):
+    if not _friends_save(token, data):
+        return jsonify({'ok': False, 'error': 'save_failed'}), 503
+    public = _me_friend_group_public(group)
+    if public is None:  # defensive: a persisted corrupt row must not escape.
+        return jsonify({'ok': False, 'error': 'invalid_group'}), 500
+    return jsonify({'ok': True, 'group': public})
+
+
+@app.route('/api/me/friend-groups', methods=['POST'])
+def me_friend_groups_create():
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    body, error = _me_friend_group_body(
+        allowed=('name', 'member_refs'), required=('name', 'member_refs'))
+    if error is not None:
+        return error
+    name = body.get('name')
+    if not isinstance(name, str):
+        return jsonify({'ok': False, 'error': 'invalid_name'}), 400
+    name = name.strip()
+    if not name or len(name) > _ME_FRIEND_GROUP_MAX_NAME:
+        return jsonify({'ok': False, 'error': 'invalid_name'}), 400
+    members = _me_friend_group_member_refs(body.get('member_refs'))
+    if members is None or not _me_friend_group_members_are_friends(token, members):
+        return jsonify({'ok': False, 'error': 'invalid_members'}), 400
+    data = _friends_load(token)
+    groups = data.setdefault('groups', [])
+    if not isinstance(groups, list) or len(groups) >= _ME_FRIEND_GROUP_MAX_GROUPS:
+        return jsonify({'ok': False, 'error': 'group_limit_reached'}), 400
+    import uuid as _uuid
+    group = {
+        'id': str(_uuid.uuid4())[:8],
+        'name': name,
+        'members': members,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+    }
+    groups.append(group)
+    return _me_friend_group_save(token, data, group)
+
+
+@app.route('/api/me/friend-groups/<group_id>', methods=['PATCH'])
+def me_friend_groups_update(group_id):
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    group_id = _me_friend_group_id(group_id)
+    if not group_id:
+        return jsonify({'ok': False, 'error': 'invalid_group_id'}), 400
+    body, error = _me_friend_group_body(allowed=('name', 'member_refs'))
+    if error is not None:
+        return error
+    if not body:
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    data = _friends_load(token)
+    group = _me_friend_group_owned(data, group_id)
+    if group is None:
+        return jsonify({'ok': False, 'error': 'group_not_found'}), 404
+    if 'name' in body:
+        name = body.get('name')
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > _ME_FRIEND_GROUP_MAX_NAME:
+            return jsonify({'ok': False, 'error': 'invalid_name'}), 400
+        group['name'] = name.strip()
+    if 'member_refs' in body:
+        members = _me_friend_group_member_refs(body.get('member_refs'))
+        if members is None or not _me_friend_group_members_are_friends(token, members):
+            return jsonify({'ok': False, 'error': 'invalid_members'}), 400
+        group['members'] = members
+    group['updated_at'] = datetime.now(timezone.utc).isoformat()
+    return _me_friend_group_save(token, data, group)
+
+
+@app.route('/api/me/friend-groups/<group_id>/members', methods=['POST'])
+def me_friend_groups_add_member(group_id):
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    group_id = _me_friend_group_id(group_id)
+    if not group_id:
+        return jsonify({'ok': False, 'error': 'invalid_group_id'}), 400
+    body, error = _me_friend_group_body(allowed=('member_ref',), required=('member_ref',))
+    if error is not None:
+        return error
+    members = _me_friend_group_member_refs([body.get('member_ref')], allow_empty=False)
+    if members is None or not _me_friend_group_members_are_friends(token, members):
+        return jsonify({'ok': False, 'error': 'invalid_member'}), 400
+    data = _friends_load(token)
+    group = _me_friend_group_owned(data, group_id)
+    if group is None:
+        return jsonify({'ok': False, 'error': 'group_not_found'}), 404
+    existing = [member for member in group.get('members') or [] if isinstance(member, str)]
+    if members[0] not in existing:
+        if len(existing) >= _ME_FRIEND_GROUP_MAX_MEMBERS:
+            return jsonify({'ok': False, 'error': 'member_limit_reached'}), 400
+        group['members'] = existing + members
+        group['updated_at'] = datetime.now(timezone.utc).isoformat()
+        return _me_friend_group_save(token, data, group)
+    public = _me_friend_group_public(group)
+    return jsonify({'ok': True, 'group': public, 'already_member': True})
+
+
+@app.route('/api/me/friend-groups/<group_id>/members', methods=['DELETE'])
+def me_friend_groups_remove_member(group_id):
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    group_id = _me_friend_group_id(group_id)
+    if not group_id:
+        return jsonify({'ok': False, 'error': 'invalid_group_id'}), 400
+    body, error = _me_friend_group_body(allowed=('member_ref',), required=('member_ref',))
+    if error is not None:
+        return error
+    members = _me_friend_group_member_refs([body.get('member_ref')], allow_empty=False)
+    if members is None:
+        return jsonify({'ok': False, 'error': 'invalid_member'}), 400
+    data = _friends_load(token)
+    group = _me_friend_group_owned(data, group_id)
+    if group is None:
+        return jsonify({'ok': False, 'error': 'group_not_found'}), 404
+    existing = [member for member in group.get('members') or [] if isinstance(member, str)]
+    if members[0] not in existing:
+        return jsonify({'ok': False, 'error': 'member_not_found'}), 404
+    group['members'] = [member for member in existing if member != members[0]]
+    group['updated_at'] = datetime.now(timezone.utc).isoformat()
+    return _me_friend_group_save(token, data, group)
+
+
+@app.route('/api/me/friend-groups/<group_id>', methods=['DELETE'])
+def me_friend_groups_delete(group_id):
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    group_id = _me_friend_group_id(group_id)
+    if not group_id or request.args or request.get_json(silent=True) is not None:
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    data = _friends_load(token)
+    groups = data.get('groups') or []
+    retained = [group for group in groups if not isinstance(group, dict) or group.get('id') != group_id]
+    if len(retained) == len(groups):
+        return jsonify({'ok': False, 'error': 'group_not_found'}), 404
+    data['groups'] = retained
+    if not _friends_save(token, data):
+        return jsonify({'ok': False, 'error': 'save_failed'}), 503
+    return jsonify({'ok': True, 'deleted_group_id': group_id})
+
+
+@app.route('/api/me/moderation/<action>', methods=['POST'])
+def me_moderation(action):
+    handlers = {'block': moderation_block, 'mute': moderation_mute}
+    handler = handlers.get(action)
+    if handler is None:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    return _header_only_dispatch(handler)
+
+
+def _me_moderation_users(token, *, muted=False):
+    """Return a display-safe moderation list for header-only clients.
+
+    The historical moderation endpoints store an internal AT credential as the
+    set member.  It must never cross the Android HTTP boundary: a public AXU
+    reference is the only identifier returned and is also the only identifier
+    accepted by the corresponding remove action.  Malformed/legacy values are
+    intentionally omitted instead of being exposed merely to make an old entry
+    removable.
+    """
+    source = _muted_by(token) if muted else _blocked_by(token)
+    users = []
+    # A corrupt persistence file can contain an arbitrarily large list.  The
+    # UI has no use for more than a bounded number of entries and should not
+    # turn a moderation-management request into an amplification primitive.
+    for raw in list(source)[:200]:
+        ref = _public_user_ref(raw)
+        if not ref or not ref.startswith(_PUBLIC_USER_REF_PREFIX):
+            continue
+        item = {'ref': ref}
+        try:
+            profile = ((_profile_load(raw) or {}).get('profile') or {})
+            if isinstance(profile, dict):
+                # Keep this deliberately narrower than a public crew profile.
+                # A moderation list needs identity context, not contact data.
+                for key, max_len in (
+                    ('name', 120), ('airline', 80), ('homebase', 16),
+                ):
+                    value = profile.get(key)
+                    if isinstance(value, str):
+                        value = value.strip()
+                        if value:
+                            item[key] = value[:max_len]
+        except Exception:
+            pass
+        users.append(item)
+    users.sort(key=lambda value: (str(value.get('name') or '').casefold(),
+                                  value['ref']))
+    return users
+
+
+def _me_moderation_remove(token, *, muted=False):
+    """Remove one server-confirmed AXU moderation entry; never accept a token."""
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or set(body) - {'target_ref'}:
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    ref = body.get('target_ref')
+    if (not isinstance(ref, str) or len(ref) > 192 or
+            not re.fullmatch(r'AXU-[A-Za-z0-9_-]{16,188}', ref)):
+        return jsonify({'ok': False, 'error': 'invalid_target_ref'}), 400
+    target = _token_from_public_user_ref(ref)
+    if not target:
+        return jsonify({'ok': False, 'error': 'invalid_target_ref'}), 400
+    entries = _muted_by(token) if muted else _blocked_by(token)
+    # An AXU can be valid but not be in this account's collection.  A 404 is
+    # explicit and avoids pretending that a stale client mutation succeeded.
+    if target not in entries:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    entries.discard(target)
+    _save_set_file(_mutes_path(token) if muted else _blocks_path(token), entries)
+    return jsonify({'ok': True, 'count': len(entries)})
+
+
+@app.route('/api/me/moderation/blocks', methods=['GET'])
+def me_moderation_blocks():
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    users = _me_moderation_users(token)
+    return jsonify({'blocks': users, 'count': len(users)})
+
+
+@app.route('/api/me/moderation/mutes', methods=['GET'])
+def me_moderation_mutes():
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    users = _me_moderation_users(token, muted=True)
+    return jsonify({'mutes': users, 'count': len(users)})
+
+
+@app.route('/api/me/moderation/unblock', methods=['POST'])
+def me_moderation_unblock():
+    token, error = _header_only_owner()
+    return error if error is not None else _me_moderation_remove(token)
+
+
+@app.route('/api/me/moderation/unmute', methods=['POST'])
+def me_moderation_unmute():
+    token, error = _header_only_owner()
+    return error if error is not None else _me_moderation_remove(token, muted=True)
+
+
+@app.route('/api/me/friends-today', methods=['GET'])
+def me_friends_today():
+    return _header_only_dispatch(get_friends_today)
+
+
+@app.route('/api/me/ax/punctuality', methods=['GET'])
+def me_ax_punctuality():
+    return _header_only_dispatch(ax_crew_punctuality)
+
+
+@app.route('/api/me/roster', methods=['GET'])
+def me_roster():
+    return _header_only_dispatch(session_recall)
+
+
+@app.route('/api/me/friend-roster/<friend_token>', methods=['GET'])
+def me_friend_roster(friend_token):
+    return _header_only_dispatch(get_friend_roster, friend_token)
+
+
+@app.route('/api/me/roster-changes', methods=['GET'])
+def me_roster_changes():
+    return _header_only_dispatch(get_roster_changes)
+
+
+@app.route('/api/me/roster-changes/decide', methods=['POST'])
+def me_roster_changes_decide():
+    return _header_only_dispatch(decide_roster_change)
+
+
+@app.route('/api/me/crew-chat/inbox', methods=['GET'])
+def me_chat_inbox():
+    return _header_only_dispatch(get_dm_inbox)
+
+
+def _me_crew_dm_request_target(ref):
+    """Resolve exactly one opaque foreign-user reference for a DM request.
+
+    Request endpoints never accept a raw AT credential as a target: Android
+    receives AXU references from the authenticated inbox/directory and sends
+    that opaque value back.  This keeps the legacy handlers as the authority
+    for existence, block, pair and rate-limit checks without reopening the
+    credential-in-URL contract.
+    """
+    if not isinstance(ref, str) or not ref.startswith(_PUBLIC_USER_REF_PREFIX):
+        return None
+    return _token_from_public_user_ref(ref)
+
+
+def _me_crew_dm_request_dispatch(handler, target_ref):
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    target = _me_crew_dm_request_target(target_ref)
+    if not target:
+        return jsonify({'ok': False, 'error': 'invalid_target_ref'}), 400
+    response = app.make_response(handler(token, target))
+    if not response.is_json:
+        return response
+    payload = response.get_json(silent=True)
+    if payload is None:
+        return jsonify({'ok': False, 'error': 'invalid_response'}), 503
+    return app.make_response((
+        jsonify(_publicize_foreign_user_refs(payload, viewer_token=token)),
+        response.status_code,
+    ))
+
+
+@app.route('/api/me/crew-chat/requests', methods=['GET'])
+def me_crew_dm_requests():
+    return _header_only_public_dispatch(crew_dm_requests_inbox)
+
+
+@app.route('/api/me/crew-chat/requests/<target_ref>/status', methods=['GET'])
+def me_crew_dm_request_status(target_ref):
+    return _me_crew_dm_request_dispatch(crew_dm_request_status, target_ref)
+
+
+@app.route('/api/me/crew-chat/requests/<target_ref>', methods=['POST'])
+def me_crew_dm_request_send(target_ref):
+    return _me_crew_dm_request_dispatch(send_crew_dm_request, target_ref)
+
+
+@app.route('/api/me/crew-chat/requests/<sender_ref>/decision', methods=['POST'])
+def me_crew_dm_request_decision(sender_ref):
+    return _me_crew_dm_request_dispatch(decide_crew_dm_request, sender_ref)
+
+
+@app.route('/api/me/crew-chat/inbox/mark-read', methods=['POST'])
+def me_chat_mark_read():
+    return _header_only_dispatch(dm_mark_read)
+
+
+@app.route('/api/me/crew-chat/dm/<friend_token>', methods=['GET'])
+def me_chat_dm(friend_token):
+    return _header_only_dispatch(get_dm, friend_token)
+
+
+@app.route('/api/me/crew-chat/dm/<friend_token>/send', methods=['POST'])
+def me_chat_dm_send(friend_token):
+    return _header_only_dispatch(send_dm, friend_token)
+
+
+@app.route('/api/me/crew-chat/channel/<channel_id>', methods=['GET'])
+def me_chat_channel(channel_id):
+    return _header_only_dispatch(get_chat_messages, channel_id)
+
+
+@app.route('/api/me/crew-chat/channel/<channel_id>/send', methods=['POST'])
+def me_chat_channel_send(channel_id):
+    return _header_only_dispatch(send_chat_message, channel_id)
+
+
+@app.route('/api/me/crew-chat/channel/<channel_id>/message/<message_id>',
+           methods=['PATCH', 'DELETE'])
+def me_chat_channel_message(channel_id, message_id):
+    return _header_only_dispatch(
+        edit_chat_message if request.method == 'PATCH' else delete_chat_message,
+        channel_id, message_id,
+    )
+
+
+@app.route('/api/me/crew-chat/channel/<channel_id>/message/<message_id>/reaction',
+           methods=['POST'])
+def me_chat_channel_message_reaction(channel_id, message_id):
+    return _header_only_dispatch(
+        toggle_chat_message_reaction, channel_id, message_id,
+    )
+
+
+@app.route('/api/me/wall/upload-image', methods=['POST'])
+def me_wall_upload_image():
+    """Authenticated social-media upload without a credential-bearing URL."""
+    return _header_only_dispatch(upload_wall_image)
+
+
+@app.route('/api/me/forum/threads', methods=['GET', 'POST'])
+def me_forum_threads():
+    return _header_only_dispatch(
+        forum_list_threads if request.method == 'GET' else forum_create_thread,
+    )
+
+
+@app.route('/api/me/forum/threads/<thread_id>/like', methods=['POST'])
+def me_forum_like(thread_id):
+    if not _me_forum_resource_id_is_safe(thread_id):
+        return jsonify({'ok': False, 'error': 'invalid_thread_id'}), 400
+    return _header_only_dispatch(forum_toggle_thread_like, thread_id)
+
+
+@app.route('/api/me/forum/threads/<thread_id>/replies', methods=['GET'])
+def me_forum_replies(thread_id):
+    if not _me_forum_resource_id_is_safe(thread_id):
+        return jsonify({'ok': False, 'error': 'invalid_thread_id'}), 400
+    return _header_only_dispatch(forum_list_replies, thread_id)
+
+
+@app.route('/api/me/forum/threads/<thread_id>/reply', methods=['POST'])
+def me_forum_reply(thread_id):
+    if not _me_forum_resource_id_is_safe(thread_id):
+        return jsonify({'ok': False, 'error': 'invalid_thread_id'}), 400
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    # `wall:` remains a compatibility bridge to the wall handler, which owns
+    # its own audience gate.  Native forum rows use the same visibility rule as
+    # the reader before accepting a reply.
+    if (not thread_id.startswith('wall:') and
+            not _me_forum_thread_visible_to(token, thread_id)):
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    return forum_create_reply(token, thread_id)
+
+
+@app.route('/api/me/forum/threads/<thread_id>', methods=['DELETE'])
+def me_forum_delete_thread(thread_id):
+    """Delete only the caller's own forum thread without an owner in the URL."""
+    if not _me_forum_resource_id_is_safe(thread_id):
+        return jsonify({'ok': False, 'error': 'invalid_thread_id'}), 400
+    return _header_only_dispatch(forum_delete_thread, thread_id)
+
+
+@app.route('/api/me/forum/replies/<reply_id>', methods=['DELETE'])
+def me_forum_delete_reply(reply_id):
+    """Delete only the caller's own reply; legacy handler enforces ownership."""
+    if not _me_forum_resource_id_is_safe(reply_id):
+        return jsonify({'ok': False, 'error': 'invalid_reply_id'}), 400
+    return _header_only_dispatch(forum_delete_reply, reply_id)
+
+
+@app.route('/api/me/forum/replies/<reply_id>/like', methods=['POST'])
+def me_forum_toggle_reply_like(reply_id):
+    """Toggle a reply like after proving the caller can see its parent thread.
+
+    The historical token-in-path endpoint predates airline-scoped forums.  The
+    Android contract is stricter: opaque reply IDs cannot be used to interact
+    with an airline-only or blocked author's discussion that the caller cannot
+    read in the first place.  We deliberately return the same not-found shape
+    for hidden and absent rows, so this check cannot become a discovery API.
+    """
+    if not _me_forum_resource_id_is_safe(reply_id):
+        return jsonify({'ok': False, 'error': 'invalid_reply_id'}), 400
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    reply = _me_forum_reply_get(reply_id)
+    if reply is None:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    thread_id = reply.get('thread_id')
+    if (not _me_forum_resource_id_is_safe(thread_id) or
+            not _me_forum_thread_visible_to(token, thread_id) or
+            reply.get('author_token') in _blocked_by(token)):
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    return forum_toggle_reply_like(token, reply_id)
+
+
+@app.route('/api/me/trip-memos', methods=['GET', 'PUT'])
+def me_trip_memos():
+    return _header_only_dispatch(
+        list_trip_memos if request.method == 'GET' else put_trip_memo,
+    )
+
+
+@app.route('/api/me/trip-memos/<path_kind>/<path_anchor>/<path_scope>', methods=['PUT'])
+def me_trip_memo_put(path_kind, path_anchor, path_scope):
+    return _header_only_dispatch(put_trip_memo, path_kind, path_anchor, path_scope)
+
+
+@app.route('/api/me/entitlement', methods=['GET'])
+def me_entitlement():
+    return _header_only_dispatch(user_entitlement)
+
+
+@app.route('/api/me/flight-ops', methods=['GET'])
+def me_flight_ops():
+    return _header_only_dispatch(get_flight_ops)
+
+
+@app.route('/api/me/flight-ops/<datum>', methods=['PUT', 'DELETE'])
+def me_flight_ops_datum(datum):
+    return _header_only_dispatch(
+        put_flight_ops if request.method == 'PUT' else delete_flight_ops,
+        datum,
+    )
+
+
+@app.route('/api/me/push/register-fcm', methods=['POST'])
+def me_push_register_fcm():
+    return _header_only_body_dispatch(register_push_fcm)
+
+
+@app.route('/api/me/push/unregister-fcm', methods=['POST'])
+def me_push_unregister_fcm():
+    return _header_only_body_dispatch(unregister_push_fcm)
+
+
+@app.route('/api/me/push/prefs', methods=['GET', 'POST'])
+def me_push_prefs():
+    if request.method == 'GET':
+        return _header_only_dispatch(get_push_prefs)
+    return _header_only_body_dispatch(set_push_prefs)
+
+
+@app.route('/api/me/play/subscription/verify', methods=['POST'])
+def me_play_subscription_verify():
+    return _header_only_body_dispatch(verify_google_play_subscription)
+
+
+@app.route('/api/me/hotel-rooms/report', methods=['POST'])
+def me_hotel_rooms_report():
+    from blueprints.hotel_rooms_blueprint import hotel_rooms_post
+    return _header_only_dispatch(hotel_rooms_post)
+
+
+@app.route('/api/me/hotel-rooms/upvote/<report_id>', methods=['POST'])
+def me_hotel_rooms_upvote(report_id):
+    from blueprints.hotel_rooms_blueprint import hotel_rooms_upvote
+    return _header_only_dispatch(hotel_rooms_upvote, report_id)
+
+
+@app.route('/api/me/hotel-rooms/<report_id>', methods=['DELETE'])
+def me_hotel_rooms_delete(report_id):
+    from blueprints.hotel_rooms_blueprint import hotel_rooms_delete
+    return _header_only_dispatch(hotel_rooms_delete, report_id)
+
+
+@app.route('/api/me/trade/post', methods=['POST'])
+def me_trade_post():
+    from blueprints.trip_trade_blueprint import create_trade_post
+    return _header_only_dispatch(create_trade_post)
+
+
+@app.route('/api/me/trade/my-offers', methods=['GET'])
+def me_trade_my_offers():
+    from blueprints.trip_trade_blueprint import my_posts
+    return _header_only_dispatch(my_posts)
+
+
+@app.route('/api/me/trade/express-interest/<post_id>', methods=['POST'])
+def me_trade_express_interest(post_id):
+    from blueprints.trip_trade_blueprint import express_interest
+    return _header_only_dispatch(express_interest, post_id)
+
+
+@app.route('/api/me/trade/post/<post_id>/close', methods=['POST'])
+def me_trade_close(post_id):
+    from blueprints.trip_trade_blueprint import close_trade_post
+    return _header_only_dispatch(close_trade_post, post_id)
+
+
+@app.route('/api/me/trade/post/<post_id>', methods=['DELETE'])
+def me_trade_delete(post_id):
+    from blueprints.trip_trade_blueprint import delete_trade_post
+    return _header_only_dispatch(delete_trade_post, post_id)
+
+
+@app.route('/api/me/ax/daily-briefing', methods=['GET'])
+def me_daily_briefing():
+    from blueprints.daily_briefing import ax_daily_briefing
+    return _header_only_dispatch(ax_daily_briefing)
+
+
+@app.route('/api/me/family-request/pending', methods=['GET'])
+def me_family_request_pending():
+    from blueprints.family_watch import family_request_pending
+    return _header_only_dispatch(family_request_pending)
+
+
+@app.route('/api/me/family-request/<action>', methods=['POST'])
+def me_family_request_action(action):
+    from blueprints.family_watch import family_request_approve, family_request_reject
+    handlers = {'approve': family_request_approve, 'reject': family_request_reject}
+    handler = handlers.get(action)
+    if handler is None:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    return _header_only_dispatch(handler)

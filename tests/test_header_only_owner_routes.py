@@ -1,0 +1,174 @@
+"""Regression contracts for the additive, credential-free Android URLs."""
+
+import sys
+
+import app as A
+from blueprints import layover_group_blueprint as groups
+
+
+TOKEN = 'AT-1234567890abcdef'
+
+
+def _valid(_token):
+    return A._TokenValidationResult(
+        A._TokenValidationState.VALID, 'owner@example.test')
+
+
+def test_me_route_uses_only_the_validated_bearer_as_owner(monkeypatch):
+    seen = []
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A, 'get_logbook', lambda token: seen.append(token) or A.jsonify({'ok': True}),
+    )
+    with A.app.test_request_context(
+            '/api/me/logbook', headers={'Authorization': f'Bearer {TOKEN}'}):
+        response = A.me_logbook()
+    assert response.status_code == 200
+    assert seen == [TOKEN]
+
+
+def test_calendar_pdf_me_route_uses_only_the_validated_bearer(monkeypatch):
+    seen = []
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A,
+        'get_user_calendar_pdf',
+        lambda token: seen.append(token) or A.app.response_class(
+            b'%PDF-test', mimetype='application/pdf'),
+    )
+    with A.app.test_request_context(
+            '/api/me/calendar-pdf?month=2026-08',
+            headers={'Authorization': f'Bearer {TOKEN}'}):
+        response = A.me_calendar_pdf()
+    assert response.status_code == 200
+    assert response.mimetype == 'application/pdf'
+    assert seen == [TOKEN]
+
+
+def test_me_route_rejects_missing_or_non_account_bearer(monkeypatch):
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    with A.app.test_request_context('/api/me/logbook'):
+        response, status = A.me_logbook()
+    assert status == 401
+    assert response.get_json()['error'] == 'unauthorized'
+
+
+def test_crew_map_me_route_uses_bearer_and_redacts_foreign_credentials(monkeypatch):
+    """The Android map gets only the legacy handler's gated result and AXU refs."""
+    seen = []
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A,
+        'get_crew_at_destination',
+        lambda token: seen.append(token) or A.jsonify({
+            'ok': True,
+            'layover_matches': [{
+                'iata': 'FRA', 'lat': 50.0379, 'lng': 8.5622,
+                'friends': [{'token': 'AT-abcdef0123456789', 'name': 'Ada'}],
+            }],
+            'manual_pins': [{
+                'id': 'meetup', 'lat': 50.0, 'lng': 8.0,
+                'owner_token': 'AT-abcdef0123456789',
+            }],
+        }),
+    )
+    with A.app.test_request_context(
+            '/api/me/crew-at-destination',
+            headers={'Authorization': f'Bearer {TOKEN}'}):
+        response = A.me_crew_at_destination()
+    assert response.status_code == 200
+    assert seen == [TOKEN]
+    body = response.get_json()
+    assert body['layover_matches'][0]['friends'][0]['token'].startswith('AXU-')
+    assert body['manual_pins'][0]['owner_token'].startswith('AXU-')
+    assert 'AT-abcdef0123456789' not in str(body)
+
+
+def test_flightops_crewlist_me_is_header_only_bounded_and_public(monkeypatch):
+    """The Android crew sheet cannot select an owner or receive AT secrets."""
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    from blueprints import lh_flightops as fo
+
+    seen = []
+    def legacy_handler(token):
+        seen.append((token, A.request.get_json()))
+        return A.jsonify({
+            'ok': True,
+            'crew': [{
+                'name': 'A. Crew', 'position': 'FO', 'duty': 'OD',
+                'aerox': {'token': TOKEN, 'name': 'A. Crew'},
+            }],
+            'flight_date': '2026-08-15',
+        })
+    monkeypatch.setattr(fo, 'flightops_crewlist', legacy_handler)
+    with A.app.test_request_context(
+            '/api/me/flightops/crewlist', method='POST',
+            headers={'Authorization': f'Bearer {TOKEN}'},
+            json={'flight': 'LH402', 'date': '2026-08-15',
+                  'dep': 'fra', 'arr': 'ewr'}):
+        response = A.me_flightops_crewlist()
+    assert response.status_code == 200
+    assert seen == [(TOKEN, {'flight': 'LH402', 'date': '2026-08-15',
+                             'dep': 'FRA', 'arr': 'EWR'})]
+    body = response.get_json()
+    assert body['crew'][0]['aerox']['token'].startswith('AXU-')
+    assert TOKEN not in str(body)
+
+
+def test_flightops_crewlist_me_rejects_legacy_access_and_bad_leg(monkeypatch):
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    headers = {'Authorization': f'Bearer {TOKEN}'}
+    with A.app.test_request_context(
+            '/api/me/flightops/crewlist', method='POST', headers=headers,
+            json={'flight': 'LH402', 'date': '2026-08-15', 'dep': 'FRA',
+                  'arr': 'EWR', 'force': True}):
+        response, status = A.me_flightops_crewlist()
+    assert status == 400
+    assert response.get_json()['error'] == 'invalid_body'
+    with A.app.test_request_context(
+            '/api/me/flightops/crewlist', method='POST', headers=headers,
+            json={'flight': 'LH402', 'date': '2026-02-30', 'dep': 'FRA',
+                  'arr': 'EWR'}):
+        response, status = A.me_flightops_crewlist()
+    assert status == 400
+    assert response.get_json()['error'] == 'invalid_leg'
+
+    with A.app.test_request_context(
+            '/api/me/logbook', headers={'Authorization': 'Bearer AXU-public-ref'}):
+        response, status = A.me_logbook()
+    assert status == 401
+    assert response.get_json()['error'] == 'unauthorized'
+
+
+def test_layover_group_legacy_path_needs_a_real_matching_account(monkeypatch):
+    # test_calculation.py deliberately re-imports app during the full suite;
+    # this blueprint resolves app lazily, so pin it to the collected instance.
+    monkeypatch.setitem(sys.modules, 'app', A)
+    monkeypatch.setattr(
+        A, '_validate_token',
+        lambda token: _valid(token) if token == TOKEN else A._TokenValidationResult(
+            A._TokenValidationState.INVALID
+        ),
+    )
+    with A.app.test_request_context(
+            '/api/layover-group/AT-invented/meta/fra',
+            headers={'Authorization': 'Bearer AT-invented'}):
+        response = groups.get_layover_group_meta('AT-invented', 'fra')
+    status = response[1] if isinstance(response, tuple) else response.status_code
+    assert status == 401
+
+    with A.app.test_request_context(
+            f'/api/layover-group/{TOKEN}/meta/fra',
+            headers={'Authorization': f'Bearer {TOKEN}'}):
+        response = groups.get_layover_group_meta(TOKEN, 'fra')
+    assert response.status_code == 200
+
+
+def test_layover_group_me_url_does_not_accept_a_path_credential(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'app', A)
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    with A.app.test_request_context(
+            '/api/me/layover-group/meta/fra',
+            headers={'Authorization': f'Bearer {TOKEN}'}):
+        response = groups.get_layover_group_meta_me('fra')
+    assert response.status_code == 200
