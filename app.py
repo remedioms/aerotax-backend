@@ -12970,33 +12970,72 @@ _PUSH_USER_CONTENT_TYPES = frozenset((
 ))
 _PUSH_SYSTEM_COPY = {
     # ── Titel-Templates der User-Content-Pushes (L10n-Welle 15.08.) ────────
-    # NUR 'de' eingetragen — Nicht-de-Sprachen fallen bis zur Übersetzung
-    # (Codex) auf 'de' zurück, das Verhalten ist damit byte-identisch zu
-    # vorher. Body ist None: bei User-Content bleibt der Nutzer-Text, bei den
-    # Inbound-Pushes der (noch deutsche) zusammengesetzte Body.
+    # Deutsch bleibt byte-identisch zum bisherigen Titel. Body ist überall
+    # None: bei User-Content bleibt der Nutzer-Text, bei den Inbound-Pushes der
+    # konkret zusammengesetzte Body — keine generische Push-Regression.
     'push_title_commented': {
         'de': ('{name} hat kommentiert', None),
+        'en': ('{name} commented', None),
+        'it': ('{name} ha commentato', None),
+        'es': ('{name} ha comentado', None),
+        'fr': ('{name} a commenté', None),
+        'pt': ('{name} comentou', None),
     },
     'push_title_replied': {
         'de': ('{name} hat geantwortet', None),
+        'en': ('{name} replied', None),
+        'it': ('{name} ha risposto', None),
+        'es': ('{name} ha respondido', None),
+        'fr': ('{name} a répondu', None),
+        'pt': ('{name} respondeu', None),
     },
     'push_title_replied_to_comment': {
         'de': ('{name} hat auf deinen Kommentar geantwortet', None),
+        'en': ('{name} replied to your comment', None),
+        'it': ('{name} ha risposto al tuo commento', None),
+        'es': ('{name} ha respondido a tu comentario', None),
+        'fr': ('{name} a répondu à votre commentaire', None),
+        'pt': ('{name} respondeu ao seu comentário', None),
     },
     'push_title_replied_to_you': {
         'de': ('{name} hat dir geantwortet', None),
+        'en': ('{name} replied to you', None),
+        'it': ('{name} ti ha risposto', None),
+        'es': ('{name} te ha respondido', None),
+        'fr': ('{name} vous a répondu', None),
+        'pt': ('{name} respondeu-lhe', None),
     },
     'push_title_mentioned': {
         'de': ('{name} hat dich erwähnt', None),
+        'en': ('{name} mentioned you', None),
+        'it': ('{name} ti ha menzionato', None),
+        'es': ('{name} te ha mencionado', None),
+        'fr': ('{name} vous a mentionné', None),
+        'pt': ('{name} mencionou-te', None),
     },
     'push_title_inbound_departed': {
         'de': ('Dein Flieger ist gestartet · {flight}', None),
+        'en': ('Your aircraft has departed · {flight}', None),
+        'it': ('Il tuo aereo è decollato · {flight}', None),
+        'es': ('Tu avión ha despegado · {flight}', None),
+        'fr': ('Votre avion a décollé · {flight}', None),
+        'pt': ('O seu avião descolou · {flight}', None),
     },
     'push_title_inbound_delay': {
         'de': ('Dein Flieger verspätet sich · {flight}', None),
+        'en': ('Your aircraft is delayed · {flight}', None),
+        'it': ('Il tuo aereo è in ritardo · {flight}', None),
+        'es': ('Tu avión está retrasado · {flight}', None),
+        'fr': ('Votre avion est retardé · {flight}', None),
+        'pt': ('O seu avião está atrasado · {flight}', None),
     },
     'push_title_inbound_arrived': {
         'de': ('Dein Flieger ist gelandet · {flight}', None),
+        'en': ('Your aircraft has landed · {flight}', None),
+        'it': ('Il tuo aereo è atterrato · {flight}', None),
+        'es': ('Tu avión ha aterrizado · {flight}', None),
+        'fr': ('Votre avion a atterri · {flight}', None),
+        'pt': ('O seu avião aterrou · {flight}', None),
     },
     'logbook_import_received': {
         'de': ('Flugbuch-Import angekommen', 'Wird verarbeitet.'),
@@ -50192,7 +50231,23 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
                    .eq('date', date_str).eq('airport', payload['airport'])
                    .eq('flight', fn).eq('sched', hhmm).execute())
             if not (upd.data or []):
-                sb.table('airport_delay_obs').insert(payload).execute()
+                try:
+                    sb.table('airport_delay_obs').insert(payload).execute()
+                except Exception as insert_error:
+                    # Zwei Instanzen können gleichzeitig UPDATE→leer sehen.
+                    # Gewinnt die andere das INSERT, ist 23505 kein verlorener
+                    # Write: dieselben Felder noch einmal atomar aktualisieren.
+                    # Andere Fehler gehen unverändert in den bisherigen Schema-
+                    # Fallback bzw. Pending-Puffer.
+                    duplicate = str(insert_error).lower()
+                    if ('23505' not in duplicate
+                            and 'duplicate key value violates unique constraint'
+                            not in duplicate):
+                        raise
+                    (sb.table('airport_delay_obs')
+                     .update(upd_fields)
+                     .eq('date', date_str).eq('airport', payload['airport'])
+                     .eq('flight', fn).eq('sched', hhmm).execute())
         except Exception as inner:
             # SCHEMA-SAFE FALLBACK: läuft die reg/type_code-Migration (20260623)
             # noch nicht, kennt PostgREST diese Spalten nicht (Fehler enthält
@@ -50218,7 +50273,18 @@ def _delay_obs_write_through(date_str, fn, hhmm, max_delay, cancelled, airport,
                        .eq('date', date_str).eq('airport', payload['airport'])
                        .eq('flight', fn).eq('sched', hhmm).execute())
                 if not (upd.data or []):
-                    sb.table('airport_delay_obs').insert(slim_payload).execute()
+                    try:
+                        sb.table('airport_delay_obs').insert(slim_payload).execute()
+                    except Exception as insert_error:
+                        duplicate = str(insert_error).lower()
+                        if ('23505' not in duplicate
+                                and 'duplicate key value violates unique constraint'
+                                not in duplicate):
+                            raise
+                        (sb.table('airport_delay_obs')
+                         .update(slim_upd)
+                         .eq('date', date_str).eq('airport', payload['airport'])
+                         .eq('flight', fn).eq('sched', hhmm).execute())
             else:
                 raise
         _delay_obs_write_ok_count += 1

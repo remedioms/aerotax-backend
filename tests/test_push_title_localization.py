@@ -4,7 +4,7 @@ Drei Zusicherungen, die die Push-Regressions-Klassen von früher ausschließen:
 1. Deutsch bleibt BYTE-IDENTISCH zum bisherigen f-String-Titel.
 2. Der Body wird NIE ersetzt (User-Text bzw. komponierter Inbound-Body) —
    das war der Florian/FO-Vorfall vom 11.08. mit der generischen Vorlage.
-3. Unbekannte/fehlende Sprache fällt auf Deutsch zurück (kein Push-Verlust).
+3. Alle App-Sprachen haben konkrete Titel; unbekannte Sprache fällt auf Deutsch.
 """
 import app as m
 
@@ -25,9 +25,11 @@ def test_alle_neuen_templates_registriert():
                 'push_title_mentioned', 'push_title_inbound_departed',
                 'push_title_inbound_delay', 'push_title_inbound_arrived'):
         assert key in m._PUSH_SYSTEM_COPY, key
-        assert 'de' in m._PUSH_SYSTEM_COPY[key], key
-        # Body-Slot MUSS None sein: User-Text/komponierter Body bleibt.
-        assert m._PUSH_SYSTEM_COPY[key]['de'][1] is None, key
+        assert set(m._PUSH_SYSTEM_COPY[key]) == set(m._PUSH_LANGUAGES), key
+        # Body-Slot MUSS in JEDER Sprache None sein: User-Text/komponierter
+        # Inbound-Body bleibt exakt erhalten.
+        assert all(value[1] is None
+                   for value in m._PUSH_SYSTEM_COPY[key].values()), key
 
 
 def test_deutsch_bleibt_byteidentisch_zum_fstring():
@@ -52,10 +54,22 @@ def test_body_wird_nie_ersetzt():
         assert body == 'ORIGINAL', key
 
 
-def test_fremdsprache_faellt_auf_deutsch_zurueck_bis_uebersetzt():
-    # Solange Codex die Sprachen nicht geliefert hat, existiert nur 'de' —
-    # jede andere Sprache bekommt den deutschen Titel, nie einen Fehler.
-    for lang in ('en', 'it', 'es', 'fr', 'pt', 'xx', ''):
+def test_fremdsprachen_bleiben_konkret_und_nicht_deutsch():
+    expected = {
+        'en': 'Jenni replied',
+        'it': 'Jenni ha risposto',
+        'es': 'Jenni ha respondido',
+        'fr': 'Jenni a répondu',
+        'pt': 'Jenni respondeu',
+    }
+    for lang, wanted in expected.items():
+        title, body = _copy('push_title_replied', lang, {'name': 'Jenni'})
+        assert title == wanted, lang
+        assert body == 'NUTZER-BODY', lang
+
+
+def test_unbekannte_sprache_faellt_weiter_auf_deutsch_zurueck():
+    for lang in ('xx', ''):
         title, _ = _copy('push_title_replied', lang, {'name': 'Jenni'})
         assert title == 'Jenni hat geantwortet', lang
 
