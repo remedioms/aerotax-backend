@@ -7522,8 +7522,37 @@ def _resolve_user_reference(value):
     return raw
 
 
-def _publicize_foreign_user_refs(value, viewer_token=None):
-    """Ersetzt fremde AT-Credentials rekursiv, lässt das eigene Credential stehen."""
+def _publicize_composite_user_refs(text, viewer_token=None):
+    """Projiziert AT-Credentials, die in einem ZUSAMMENGESETZTEN String stecken.
+
+    `_publicize_foreign_user_refs` prüft mit `fullmatch` — ein Wert wie die
+    DM-Channel-ID `dm__<AT-a>__<AT-b>` rutschte deshalb ungeschwärzt durch,
+    obwohl er zwei vollständige Bearer-Credentials enthält (Befund 17.08.).
+    Diese Variante schwärzt jedes eingebettete Vorkommen; das eigene Credential
+    bleibt wie überall byteidentisch stehen (friend_token-Muster).
+
+    Bewusst NICHT global: der historische URL-Prefix-Redactor bleibt auf
+    `fullmatch`, sonst würden Legacy-Routen (Bild-URLs, Chat-Text, Alt-Clients)
+    ihre Wire-Form verlieren. Nur der `/api/me`-Antwortpfad nutzt das hier.
+    """
+    def _swap(match):
+        found = match.group(0)
+        if viewer_token and hmac.compare_digest(found, viewer_token):
+            return found
+        # Fail-closed: `_public_user_ref` gibt bei Krypto-Fehlern '' zurück —
+        # dann verschwindet das Credential, statt als Fallback zu leaken.
+        return _public_user_ref(found)
+
+    return _INTERNAL_USER_TOKEN_RE.sub(_swap, text)
+
+
+def _publicize_foreign_user_refs(value, viewer_token=None, composites=False):
+    """Ersetzt fremde AT-Credentials rekursiv, lässt das eigene Credential stehen.
+
+    `composites=True` schwärzt zusätzlich Credentials INNERHALB zusammengesetzter
+    Strings (DM-Channel-IDs). Default bleibt aus, damit die Legacy-Routen exakt
+    ihr bisheriges Verhalten behalten.
+    """
     if isinstance(value, dict):
         safe = {}
         for key, nested in value.items():
@@ -7533,17 +7562,23 @@ def _publicize_foreign_user_refs(value, viewer_token=None):
                     and not (viewer_token
                              and hmac.compare_digest(key, viewer_token))):
                 public_key = _public_user_ref(key)
+            elif composites and isinstance(key, str):
+                public_key = _publicize_composite_user_refs(key, viewer_token)
             safe[public_key] = _publicize_foreign_user_refs(
-                nested, viewer_token)
+                nested, viewer_token, composites)
         return safe
     if isinstance(value, list):
-        return [_publicize_foreign_user_refs(v, viewer_token) for v in value]
+        return [_publicize_foreign_user_refs(v, viewer_token, composites)
+                for v in value]
     if isinstance(value, tuple):
-        return [_publicize_foreign_user_refs(v, viewer_token) for v in value]
+        return [_publicize_foreign_user_refs(v, viewer_token, composites)
+                for v in value]
     if isinstance(value, str) and _INTERNAL_USER_TOKEN_RE.fullmatch(value):
         if viewer_token and hmac.compare_digest(value, viewer_token):
             return value
         return _public_user_ref(value)
+    if composites and isinstance(value, str):
+        return _publicize_composite_user_refs(value, viewer_token)
     return value
 
 
@@ -80507,6 +80542,12 @@ def _header_only_public_dispatch(handler, *args):
     must therefore make its public-reference boundary explicit here.  This
     helper is for JSON read contracts only; mutations use the regular thin
     dispatcher and resolve AXU target fields before their legacy handler.
+
+    `composites=True`: `/api/me` JSON also carries COMPOSITE identifiers such as
+    the DM channel `dm__<AT-a>__<AT-b>`.  Those never matched the whole-value
+    regex, so the projection used to hand out two raw bearer credentials per
+    inbox row.  The composite pass closes that; `/api/me` request handlers
+    resolve the public channel handle back through `_me_chat_channel_internal`.
     """
     token, error = _header_only_owner()
     if error is not None:
@@ -80518,7 +80559,8 @@ def _header_only_public_dispatch(handler, *args):
     if payload is None:
         return jsonify({'ok': False, 'error': 'invalid_response'}), 503
     return app.make_response((
-        jsonify(_publicize_foreign_user_refs(payload, viewer_token=token)),
+        jsonify(_publicize_foreign_user_refs(
+            payload, viewer_token=token, composites=True)),
         response.status_code,
     ))
 
@@ -81286,10 +81328,76 @@ def me_roster_changes_decide():
 @app.route('/api/me/crew-chat/inbox', methods=['GET'])
 def me_chat_inbox():
     # SEC (Review 16.08.): Inbox-Zeilen tragen `friend_token` (volles AT) roh.
-    # HINWEIS: `channel_id` (dm__AT__AT) bleibt Vorbestand — die Channel-Routen
-    # nehmen ihn roh zurueck; sauber nur mit koordiniertem AXU-Channel-Umbau
-    # loesbar (separates Ticket), nicht hier.
+    # SEC (Review 17.08.): `channel_id` (dm__AT__AT) trug das Freund-Credential
+    # als TEILSTRING — der fullmatch-Redactor griff dort nicht. Der Composite-
+    # Pass in `_header_only_public_dispatch` projiziert die Channel-ID jetzt zu
+    # `dm__<eigenes AT>__<AXU-Ref>`; die Channel-Routen loesen sie ueber
+    # `_me_chat_channel_internal` wieder auf. Wire-Break ist hier erlaubt: die
+    # Android-App, einziger `/api/me`-Client, ist noch nicht released.
     return _header_only_public_dispatch(get_dm_inbox)
+
+
+def _me_chat_channel_internal(token, channel_id):
+    """Public `/api/me`-Channel-Handle -> interner Channel. Fail-closed.
+
+    Die Inbox liefert DM-Kanaele als `dm__<eigenes AT>__<AXU-Ref>` aus. Hier
+    laeuft der Weg zurueck: die AXU-Referenz wird entschluesselt und NUR
+    akzeptiert, wenn der Aufrufer selbst Teil des Kanals ist UND die
+    Freund-/Crew-Beziehung zum Gegenueber belegt ist (`_crew_dm_pair_authorized`
+    — dieselbe Autoritaet wie `_channel_access_error`). Jeder andere Fall gibt
+    None zurueck, der Aufrufer antwortet mit 400 statt zu raten.
+
+    Gruppen-/Lobby-Kanaele (`group__…`) tragen keine Identitaet und bleiben
+    unveraendert. Rohe `dm__AT__AT`-Handles bleiben ebenfalls durchlaessig:
+    ihr Gate sitzt unveraendert in `_channel_access_error`, sonst wuerde diese
+    Aufloesung die Legacy-Fehlercodes der Bestandsroute veraendern.
+    """
+    raw = str(channel_id or '')
+    if not raw.startswith('dm__') or _PUBLIC_USER_REF_PREFIX not in raw:
+        return raw
+    parts = raw[len('dm__'):].split('__')
+    if len(parts) != 2:
+        return None
+    resolved = []
+    for part in parts:
+        if part.startswith(_PUBLIC_USER_REF_PREFIX):
+            internal = _token_from_public_user_ref(part)
+            if not internal:
+                return None
+            resolved.append(internal)
+        else:
+            resolved.append(part)
+    own = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    if not own or own not in resolved:
+        return None
+    peer = resolved[1] if resolved[0] == own else resolved[0]
+    try:
+        if not _crew_dm_pair_authorized(token, peer):
+            return None
+    except Exception:
+        return None
+    return _dm_channel(token, peer)
+
+
+def _me_chat_channel_dispatch(handler, channel_id, *args, public=False):
+    """Thin `/api/me`-Dispatch mit vorgeschalteter Channel-Handle-Aufloesung."""
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    internal = _me_chat_channel_internal(token, channel_id)
+    if not internal:
+        return jsonify({'ok': False, 'error': 'invalid_channel_ref'}), 400
+    response = app.make_response(handler(token, internal, *args))
+    if not public or not response.is_json:
+        return response
+    payload = response.get_json(silent=True)
+    if payload is None:
+        return jsonify({'ok': False, 'error': 'invalid_response'}), 503
+    return app.make_response((
+        jsonify(_publicize_foreign_user_refs(
+            payload, viewer_token=token, composites=True)),
+        response.status_code,
+    ))
 
 
 def _me_crew_dm_request_target(ref):
@@ -81322,7 +81430,8 @@ def _me_crew_dm_request_dispatch(handler, target_ref):
     if payload is None:
         return jsonify({'ok': False, 'error': 'invalid_response'}), 503
     return app.make_response((
-        jsonify(_publicize_foreign_user_refs(payload, viewer_token=token)),
+        jsonify(_publicize_foreign_user_refs(
+            payload, viewer_token=token, composites=True)),
         response.status_code,
     ))
 
@@ -81349,7 +81458,19 @@ def me_crew_dm_request_decision(sender_ref):
 
 @app.route('/api/me/crew-chat/inbox/mark-read', methods=['POST'])
 def me_chat_mark_read():
-    return _header_only_dispatch(dm_mark_read)
+    # Der Channel steht hier im BODY, nicht im Pfad. `get_json` cached das
+    # Dict — die In-place-Aufloesung ist fuer den Legacy-Handler sichtbar
+    # (dasselbe Muster wie `_resolve_public_user_refs_at_boundary`).
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    body = request.get_json(silent=True)
+    if isinstance(body, dict) and body.get('channel_id'):
+        internal = _me_chat_channel_internal(token, body.get('channel_id'))
+        if not internal:
+            return jsonify({'ok': False, 'error': 'invalid_channel_ref'}), 400
+        body['channel_id'] = internal
+    return dm_mark_read(token)
 
 
 @app.route('/api/me/crew-chat/dm/<friend_token>', methods=['GET'])
@@ -81364,18 +81485,20 @@ def me_chat_dm_send(friend_token):
 
 @app.route('/api/me/crew-chat/channel/<channel_id>', methods=['GET'])
 def me_chat_channel(channel_id):
-    return _header_only_dispatch(get_chat_messages, channel_id)
+    # Der Verlauf echot `channel` zurueck — ohne die Projektion stuenden die
+    # rohen ATs erneut in der Antwort.
+    return _me_chat_channel_dispatch(get_chat_messages, channel_id, public=True)
 
 
 @app.route('/api/me/crew-chat/channel/<channel_id>/send', methods=['POST'])
 def me_chat_channel_send(channel_id):
-    return _header_only_dispatch(send_chat_message, channel_id)
+    return _me_chat_channel_dispatch(send_chat_message, channel_id)
 
 
 @app.route('/api/me/crew-chat/channel/<channel_id>/message/<message_id>',
            methods=['PATCH', 'DELETE'])
 def me_chat_channel_message(channel_id, message_id):
-    return _header_only_dispatch(
+    return _me_chat_channel_dispatch(
         edit_chat_message if request.method == 'PATCH' else delete_chat_message,
         channel_id, message_id,
     )
@@ -81384,7 +81507,7 @@ def me_chat_channel_message(channel_id, message_id):
 @app.route('/api/me/crew-chat/channel/<channel_id>/message/<message_id>/reaction',
            methods=['POST'])
 def me_chat_channel_message_reaction(channel_id, message_id):
-    return _header_only_dispatch(
+    return _me_chat_channel_dispatch(
         toggle_chat_message_reaction, channel_id, message_id,
     )
 

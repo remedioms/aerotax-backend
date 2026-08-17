@@ -26,7 +26,7 @@ def _prepare(monkeypatch):
     monkeypatch.setattr(A, '_token_from_public_user_ref',
                         lambda value: PEER if value == REF else None)
     monkeypatch.setattr(A, '_publicize_foreign_user_refs',
-                        lambda value, viewer_token=None: value)
+                        lambda value, viewer_token=None, composites=False: value)
 
 
 def test_dm_request_aliases_require_header_owner(monkeypatch):
@@ -72,7 +72,7 @@ def test_dm_request_send_and_decision_use_header_owner_and_public_response(monke
     )
     monkeypatch.setattr(
         A, '_publicize_foreign_user_refs',
-        lambda value, viewer_token=None: {
+        lambda value, viewer_token=None, composites=False: {
             **value,
             'viewer': viewer_token,
             'publicized': True,
