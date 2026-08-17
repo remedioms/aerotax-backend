@@ -33575,6 +33575,9 @@ def forum_create_reply(token, thread_id):
     # Forum supports exactly one nested reply level.  A parent must be a root
     # reply of this same thread; accepting arbitrary IDs previously allowed a
     # crafted body to make an orphaned/deep reply that no client could render.
+    # `addressed_author` haelt den Autor der ANGESPROCHENEN Reply fest, auch
+    # wenn die Antwort danach auf die Wurzel umgehaengt wird (siehe unten).
+    addressed_author = None
     if parent_reply_id:
         parent = _forum_reply_sb_get(parent_reply_id)
         if parent is None:
@@ -33603,6 +33606,12 @@ def forum_create_reply(token, thread_id):
                 )
             if (root is not None and root.get('thread_id') == thread_id
                     and root.get('parent_reply_id') is None):
+                # Wer WIRKLICH angesprochen wurde, ist der Autor der Reply, auf
+                # die der User getippt hat — nicht der Wurzel-Autor, an dem die
+                # Antwort technisch haengt. Ohne diesen Merker bekaeme nach dem
+                # Re-Rooting der Falsche „hat auf deinen Kommentar geantwortet"
+                # und der wirklich Gemeinte nur den generischen Thread-Push.
+                addressed_author = parent.get('author_token') or None
                 parent_reply_id = root_id
                 parent = root
         if (parent is None or parent.get('thread_id') != thread_id or
@@ -33698,11 +33707,21 @@ def forum_create_reply(token, thread_id):
         # Mention, damit niemand doppelt gepusht wird).
         parent_author = None
         if parent_reply_id:
-            parent = _forum_reply_sb_get(parent_reply_id)
-            if parent is None:
-                parent = next((r for r in (_forum_replies_load_from_disk(thread_id) or [])
-                               if r.get('id') == parent_reply_id), None)
-            parent_author = (parent or {}).get('author_token')
+            # NACH DEM RE-ROOTING (Befund 17.08.): `parent_reply_id` zeigt hier
+            # ggf. auf die WURZEL, nicht mehr auf die Reply, die der User
+            # angetippt hat. Ein erneutes Nachladen ueber diese ID pushte
+            # deshalb dem Wurzel-Autor „hat auf deinen Kommentar geantwortet",
+            # waehrend der wirklich Angesprochene nur den generischen
+            # Thread-Push bekam — genau die Luecke, die der Fix von 2026-07-24
+            # schliessen sollte. `addressed_author` wurde VOR dem Umhaengen
+            # gemerkt und gewinnt.
+            parent_author = addressed_author
+            if not parent_author:
+                parent = _forum_reply_sb_get(parent_reply_id)
+                if parent is None:
+                    parent = next((r for r in (_forum_replies_load_from_disk(thread_id) or [])
+                                   if r.get('id') == parent_reply_id), None)
+                parent_author = (parent or {}).get('author_token')
             if (parent_author and parent_author != token
                     and parent_author != thread_author_token
                     and parent_author != mentioned_token):
