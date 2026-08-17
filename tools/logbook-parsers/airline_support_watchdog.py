@@ -4,17 +4,16 @@
 The first import already happens synchronously in the onboarding endpoint.
 This small cron worker is the durable 24-hour fallback: it retries temporary
 feed/AI failures from the service-key-only Supabase queue, alerts the owner on
-the first unresolved attempt and promotes a carrier only after the normal
-calendar pipeline persisted real events. It never invents parser output and it
-never exposes or logs a calendar URL/PDF payload.
+the first unresolved attempt (and again when it gives up) and promotes a
+carrier only after the normal calendar pipeline persisted real events — that
+promotion also sends the owner a short "it works" mail. It never invents parser
+output and it never exposes or logs a calendar URL/PDF payload.
 """
 
 import base64
 import io
-import json
 import os
 import sys
-import urllib.request
 from datetime import datetime, timedelta, timezone
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -160,13 +159,22 @@ def _mark_supported(backend, row, events_count):
     }).eq('id', row['id']).eq('status', STATUS_PROCESSING).execute())
     backend._airline_catalog_promote(
         row['airline_name'], row['normalized_name'], row['source_kind'])
+    _notify_supported(backend, row, events_count)
+
+
+def _notify_supported(backend, row, events_count):
+    """„Hat geklappt": die Airline ist jetzt für alle in der Liste."""
+    try:
+        backend._airline_request_success_mail(
+            row['airline_name'], row.get('homebase'), row['source_kind'],
+            events_count, request_id=row['id'],
+            attempts=int(row.get('attempt_count') or 0) + 1)
+    except Exception as exc:
+        _log(f'owner-success failed id={row["id"]} error={type(exc).__name__}')
 
 
 def _alert_owner(row, error):
-    key = os.environ.get('RESEND_API_KEY', '').strip()
-    if not key:
-        _log(f'owner-alert skipped no-key id={row["id"]}')
-        return
+    """Erste und letzte Fehl-Meldung an den Owner — sonst nichts."""
     body = (
         'Eine neue Airline braucht Parser-Aufmerksamkeit.\n\n'
         f'Airline: {row["airline_name"]}\n'
@@ -176,20 +184,9 @@ def _alert_owner(row, error):
         f'Fehlercode: {error}\n\n'
         'Die Quelle liegt privat in Supabase. Keine Zugangsdaten oder PDF-'
         'Inhalte werden in dieser Mail mitgesendet.')
-    request = urllib.request.Request(
-        'https://api.resend.com/emails', method='POST',
-        data=json.dumps({
-            'from': os.environ.get(
-                'MAIL_FROM', 'AeroX <noreply@aerosteuer.de>'),
-            'to': ['aerox@aerosteuer.de'],
-            'subject': f'[AeroX] Neue Airline: {row["airline_name"]}',
-            'text': body,
-        }).encode(),
-        headers={'Authorization': f'Bearer {key}',
-                 'Content-Type': 'application/json',
-                 'User-Agent': 'curl/8.0'})
     try:
-        urllib.request.urlopen(request, timeout=30).read()
+        _backend()._airline_request_owner_mail(
+            f'[AeroX] Neue Airline: {row["airline_name"]}', body)
     except Exception as exc:
         _log(f'owner-alert failed id={row["id"]} error={type(exc).__name__}')
 

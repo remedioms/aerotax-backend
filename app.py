@@ -60801,6 +60801,16 @@ def _roster_pdf_upload_finish(job_ids, status, error_code=None,
 # (the encrypted calendar feed or the private roster-PDF inbox).
 _AIRLINE_REQUEST_SOURCE_KINDS = frozenset(('ical_url', 'pdf'))
 
+# Die Airlines, die die App im Onboarding fest anbietet (iOS-Spiegel:
+# OnboardingView.builtInAirlines). Tippt jemand unter „Andere" einen Namen,
+# den es längst gibt („LH", „lufthansa cargo", „SWISS"), gehört er NICHT in
+# die Warteschlange: er bekommt die bestehende Airline zurück und läuft in den
+# normalen, geprüften Dienstplan-Pfad (Owner 2026-08-17).
+_AIRLINE_REQUEST_BUILTIN = (
+    'Lufthansa', 'Lufthansa Cargo', 'Lufthansa City', 'Eurowings', 'Discover',
+    'Condor', 'Edelweiss', 'Austrian', 'Swiss', 'Brussels', 'TUIfly',
+    'Aerologic', 'AeroWest', 'ITA Airways')
+
 
 def _airline_request_clean_name(value):
     name = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(value or ''))
@@ -60906,6 +60916,84 @@ def _airline_catalog_load():
         return None
 
 
+def _airline_request_existing_name(airline_name, normalized_name):
+    """Anzeige-Name einer BEREITS unterstützten Airline — '' wenn wirklich neu.
+
+    Drei Netze in dieser Reihenfolge: (1) normalisierter Namensvergleich gegen
+    die eingebaute Liste, (2) der kanonische Airline-Schlüssel (fängt „LH",
+    „DLH", „LX", „AZ", „CFG", „3V" und Schreibvarianten, weil er dieselbe
+    Kanonisierung nutzt wie Crewhotels/Forum), (3) der Katalog der bereits
+    freigeschalteten freien Airlines. Ein Treffer bedeutet: KEINE neue
+    Warteschlangen-Zeile und keine Owner-Mail — der Nutzer bekommt die
+    bestehende Airline und damit deren geprüften Dienstplan-Pfad."""
+    for name in _AIRLINE_REQUEST_BUILTIN:
+        if _airline_request_normalized_name(name) == normalized_name:
+            return name
+    key = _canonical_airline_key(airline_name)
+    if key:
+        for name in _AIRLINE_REQUEST_BUILTIN:
+            if _canonical_airline_key(name) == key:
+                return name
+    for row in (_airline_catalog_load() or []):
+        display = str(row.get('display_name') or '')
+        if display and _airline_request_normalized_name(display) == normalized_name:
+            return display
+    return ''
+
+
+def _airline_request_owner_mail(subject, text):
+    """Owner-Mail zur Freie-Airline-Warteschlange (Resend; Fehler nur geloggt).
+
+    Enthält NIE Kalender-Link, PDF-Inhalt oder Token — nur Name, Homebase,
+    Quellenart, Anfrage-ID und Fehlercode. Der Watchdog nutzt denselben
+    Sender (`backend._airline_request_owner_mail`), damit es EINEN Weg gibt."""
+    key = os.environ.get('RESEND_API_KEY', '').strip()
+    if not key:
+        app.logger.info('[airline-request] owner-mail skipped (no key)')
+        return False
+    to_email = os.environ.get(
+        'SUPPORT_NOTIFY_EMAIL', 'aerox@aerosteuer.de').strip()
+    safe_subject = str(subject or '').replace('\r', ' ').replace('\n', ' ')[:200]
+    payload = json.dumps({
+        'from': os.environ.get('MAIL_FROM', 'AeroX <noreply@aerosteuer.de>'),
+        'to': [to_email], 'subject': safe_subject, 'text': str(text or ''),
+    }).encode()
+    try:
+        import urllib.request
+        request_ = urllib.request.Request(
+            'https://api.resend.com/emails', method='POST', data=payload,
+            headers={'Authorization': f'Bearer {key}',
+                     'Content-Type': 'application/json',
+                     # Resend blockt die Python-Default-UA (Vorfall 06.08.).
+                     'User-Agent': 'curl/8.0'})
+        urllib.request.urlopen(request_, timeout=20).read()
+        return True
+    except Exception as exc:
+        app.logger.warning('[airline-request] owner-mail failed err=%s',
+                           type(exc).__name__)
+        return False
+
+
+def _airline_request_success_mail(airline_name, homebase, source_kind,
+                                  events_count, request_id=None, attempts=None):
+    """„Hat geklappt"-Mail: eine neue Airline ist live im Katalog."""
+    lines = [
+        'Eine neue Airline funktioniert und ist ab sofort für alle in der '
+        'Airline-Liste.', '',
+        f'Airline: {airline_name}',
+        f'Homebase: {homebase or "—"}',
+        f'Quelle: {source_kind}',
+        f'Dienstplan-Einträge: {events_count}',
+    ]
+    if request_id is not None:
+        lines.append(f'Anfrage-ID: {request_id}')
+    if attempts is not None:
+        lines.append(f'Versuche: {attempts}')
+    lines += ['', 'Es ist nichts zu tun. Die Quelle liegt privat in Supabase.']
+    return _airline_request_owner_mail(
+        f'[AeroX] Airline live: {airline_name}', '\n'.join(lines))
+
+
 @app.route('/api/user/airlines/<token>', methods=['GET'])
 def get_supported_airlines(token):
     rows = _airline_catalog_load()
@@ -60924,6 +61012,15 @@ def submit_airline_support_request(token):
         return jsonify({'ok': False, 'error': 'invalid_airline_name'}), 400
     if source_kind not in _AIRLINE_REQUEST_SOURCE_KINDS:
         return jsonify({'ok': False, 'error': 'invalid_source_kind'}), 400
+    # Frei getippt, aber längst vorhanden („LH", „lufthansa cargo", „SWISS"
+    # oder eine bereits freigeschaltete freie Airline): keine Warteschlangen-
+    # Zeile, keine Owner-Mail. Die App übernimmt den zurückgegebenen Namen und
+    # der Nutzer landet im geprüften Pfad dieser Airline.
+    existing_airline = _airline_request_existing_name(
+        airline_name, normalized_name)
+    if existing_airline:
+        return jsonify({'ok': True, 'status': 'known', 'eta_hours': 0,
+                        'known_airline': existing_airline})
     homebase = _airline_request_homebase(body.get('homebase'))
     feed = _airline_request_profile_feed(token)
     stored_events = feed.get('events') if isinstance(feed.get('events'), list) else []
@@ -60964,6 +61061,11 @@ def submit_airline_support_request(token):
         return jsonify({'ok': False, 'error': 'request_store_failed'}), 503
     if source_verified:
         _airline_catalog_promote(airline_name, normalized_name, source_kind)
+        # „Hat geklappt" auf Anhieb — der Watchdog sieht diese Zeile nie,
+        # also meldet der Endpoint selbst (Owner 2026-08-17).
+        _airline_request_success_mail(
+            airline_name, homebase, source_kind, len(stored_events),
+            request_id=stored.get('id'), attempts=0)
     return jsonify({'ok': True, 'request_id': stored.get('id'), 'status': status,
                     'eta_hours': 0 if status == 'supported' else 24})
 
