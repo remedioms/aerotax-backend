@@ -18,3 +18,9 @@ fi
 
 docker exec -w /app/tools/logbook-parsers aerotax-backend \
   python3 logbook_watchdog.py >> "$LOG" 2>&1
+
+# Freie Airlines aus dem Onboarding: derselbe Cron-Lock, damit auch die
+# KI-/Feed-Retries höchstens einmal parallel laufen. Ein Fehler hier darf den
+# nächsten regulären Flugbuch-Lauf nicht verhindern.
+docker exec -w /app/tools/logbook-parsers aerotax-backend \
+  python3 airline_support_watchdog.py >> "$LOG" 2>&1

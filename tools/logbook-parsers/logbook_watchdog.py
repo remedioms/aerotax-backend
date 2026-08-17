@@ -60,6 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from legkeys import dedupe_keys  # noqa: E402
 
 ROSTER_MARKER = "AEROX_ROSTER_PDF_V1"
+ROSTER_AI_LEARN_MARKER = "AEROX_ROSTER_AI_LEARN_V1"
 ALERT_TO = "aerox@aerosteuer.de"
 ALERT_FROM = "noreply@aerosteuer.de"
 MAX_BATCH_FILES = 40          # Schutz vor Amok-Uploads in einem Lauf
@@ -170,9 +171,12 @@ def _recover_stale_processing():
 
 
 def _pending_rows():
-    # `neq` würde NULL-notes verwerfen — deshalb explizites or=(is.null,neq).
+    # `neq` würde NULL-notes verwerfen. Roster-Quellen UND die erfolgreichen
+    # KI-Lernbeispiele gehören nicht in die Flugbuch-Pipeline: das eine ist
+    # die Airline-Retry-Queue, das andere bewusst dauerhaftes Lernmaterial.
     q = ("ax_logbook_upload?processed=is.false&status=eq.pending"
-         f"&or=(note.is.null,note.neq.{ROSTER_MARKER})"
+         f"&or=(note.is.null,and(note.neq.{ROSTER_MARKER},"
+         f"note.neq.{ROSTER_AI_LEARN_MARKER}))"
          "&select=id,token,name,airline,filename,sha256,size_bytes,created_at"
          "&order=id&limit=200")
     return _rest("GET", q) or []
