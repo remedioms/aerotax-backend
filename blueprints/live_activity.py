@@ -665,8 +665,135 @@ def _row_digest(row):
 # APNs-Vollersatz deshalb löschen würde. Phasen-abhängige Beschriftungen
 # (mainLabel, phaseLabel, footTrailing, mainTimeIsToday, mainTimeDayLabel,
 # progress) stehen bewusst NICHT hier — sie gehören zur Phase des Absenders.
-_MERGE_PRESERVED_FIELDS = ('chain', 'displayTZIdentifier', 'fromCity',
-                           'toCity', 'rosterFrozen', 'rosterFrozenNote')
+_MERGE_PRESERVED_FIELDS = ('displayTZIdentifier', 'rosterFrozen',
+                           'rosterFrozenNote')
+
+# Diese Angaben gehoeren zur konkreten Flug-Instanz. Ein MQTT-Ereignis kennt
+# regelmaessig nur EINEN davon (zum Beispiel nur `estArr`). Da APNs den
+# ContentState komplett ersetzt, muessen die uebrigen bekannten Werte aus dem
+# letzten erfolgreichen Stand mitgenommen werden. Das passiert nur bei sicher
+# derselben Flug-Instanz; ein Turnaround darf nichts vom vorherigen Leg erben.
+_FLIGHT_CACHE_FIELDS = (
+    'flightNo', 'fromIATA', 'toIATA', 'route', 'chain',
+    'fromCity', 'toCity', 'footLeading',
+    'fromTZIdentifier', 'toTZIdentifier',
+    'schedDep', 'estDep', 'schedArr', 'estArr',
+    'deltaMin', 'depConfirmed', 'arrConfirmed', 'cancelled',
+)
+
+_DISPLAY_CACHE_FIELDS = (
+    'countdownTarget', 'mainLabel', 'phaseLabel', 'footTrailing',
+    'mainTimeIsToday', 'mainTimeDayLabel',
+)
+
+
+def _same_state_flight(a, b):
+    """True nur bei derselben ausreichend belegten Flug-Instanz.
+
+    Flugnummer + Strecke sind der primaere Schluessel. Die Plan-Abflugzeit
+    darf bis zu sechs Stunden abweichen, weil `dep_iso` nach dem Abflug die
+    beobachtete Zeit tragen kann; die taegliche Nachbar-Instanz (~24 h) bleibt
+    damit sicher getrennt. Fehlen starke Belege, wird konservativ NICHT
+    gemergt.
+    """
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    matches = 0
+    for key in ('flightNo', 'fromIATA', 'toIATA'):
+        av = str(a.get(key) or '').strip().upper()
+        bv = str(b.get(key) or '').strip().upper()
+        if key == 'flightNo':
+            av = ''.join(av.split())
+            bv = ''.join(bv.split())
+        if av and bv:
+            if av != bv:
+                return False
+            matches += 1
+    ad = _stored_date_to_unix(a.get('schedDep'))
+    bd = _stored_date_to_unix(b.get('schedDep'))
+    if ad is not None and bd is not None:
+        if abs(float(ad) - float(bd)) > 6 * 3600:
+            return False
+        matches += 2
+    return matches >= 2
+
+
+def _same_display_moment(a, b):
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if a.get('phase') != b.get('phase') or a.get('kicker') != b.get('kicker'):
+        return False
+    at = _stored_date_to_unix(a.get('mainTime'))
+    bt = _stored_date_to_unix(b.get('mainTime'))
+    return at is not None and bt is not None and abs(at - bt) < 1
+
+
+def _merge_cached_state(state, previous, cleared=()):
+    """Vollstaendiger APNs-Zustand aus frischem Teilstand + letztem Cache.
+
+    Ein explizites JSON-null bleibt ein Grabstein. Fehlende Keys dagegen sind
+    bei Teil-Absendern kein Widerruf. Phasen-Texte werden nur erhalten, wenn
+    Phase, Kicker UND Hauptzeit gleich geblieben sind.
+    """
+    if not isinstance(previous, dict):
+        return state
+    cleared = set(cleared or ())
+    fresh_keys = set(state)
+    for key in _MERGE_PRESERVED_FIELDS:
+        if key not in cleared and key not in state and previous.get(key) is not None:
+            state[key] = previous[key]
+    same_flight = _same_state_flight(state, previous)
+    if same_flight:
+        for key in _FLIGHT_CACHE_FIELDS:
+            if key not in cleared and key not in state and previous.get(key) is not None:
+                state[key] = previous[key]
+    if same_flight:
+        state = _preserve_prepickup_phase(state, previous)
+    # Der Zielzeitpunkt muss denselben Cache benutzen wie die sichtbare
+    # Zeitzeile. Sonst bleibt `estArr` zwar im Payload erhalten, Countdown und
+    # Lichtbogen springen beim naechsten Teil-Event trotzdem auf `schedArr`.
+    if same_flight and state.get('phase') in ('inFlight', 'turnaround') \
+            and 'estArr' not in fresh_keys and 'estArr' not in cleared \
+            and state.get('estArr') is not None:
+        state['mainTime'] = state['estArr']
+        state['countdownTarget'] = state['estArr']
+    elif same_flight and state.get('phase') == 'briefing' \
+            and 'estDep' not in fresh_keys and 'estDep' not in cleared \
+            and state.get('estDep') is not None:
+        state['mainTime'] = state['estDep']
+        state['countdownTarget'] = state['estDep']
+    if _same_display_moment(state, previous):
+        for key in _DISPLAY_CACHE_FIELDS:
+            if key not in cleared and key not in state and previous.get(key) is not None:
+                state[key] = previous[key]
+    return state
+
+
+def _preserve_prepickup_phase(state, previous):
+    """Ein ETA-Event ist kein Dienstbeginn.
+
+    `est_dep` kommt oft Stunden vor dem Abflug und der MQTT-Absender nennt den
+    groben Zielzustand `briefing`. Wenn der vollstaendige iPhone-State noch
+    `preDuty`/Pickup ist und weder Abflug noch Streichung belegt sind, bleiben
+    Phase, Kicker und naechste Marke vom Client erhalten. Sonst springt die
+    Karte per Push auf ABFLUG und beim App-Oeffnen wieder auf AUS DEM HAUS.
+    """
+    if not isinstance(previous, dict):
+        return state
+    if previous.get('phase') not in ('preDuty', 'layover'):
+        return state
+    if state.get('phase') != 'briefing':
+        return state
+    if state.get('depConfirmed') is True or state.get('cancelled') is True:
+        return state
+    for key in ('phase', 'kicker', 'mainTime', 'countdownTarget',
+                'mainLabel', 'phaseLabel', 'mainTimeIsToday',
+                'mainTimeDayLabel'):
+        if key in previous:
+            state[key] = previous[key]
+        else:
+            state.pop(key, None)
+    return state
 
 
 def _stored_state(rows):
@@ -1031,11 +1158,7 @@ def push_live_activity(user_token, content_state, event='update',
     if event != 'end':
         preserved = _stored_state(rows)
         if preserved:
-            for key in _MERGE_PRESERVED_FIELDS:
-                if key in cleared:
-                    continue
-                if key not in state and preserved.get(key) is not None:
-                    state[key] = preserved[key]
+            state = _merge_cached_state(state, preserved, cleared)
     used_event = event if event in ('update', 'end') else 'update'
     attrs = None
     if not rows and used_event != 'end' and attributes:
@@ -1056,9 +1179,20 @@ def push_live_activity(user_token, content_state, event='update',
                 return {'ok': True, 'sent': 0, 'skipped': 'start_cooldown',
                         'event': 'start', 'targets': len(start_rows)}
             start_rows = open_rows
+        # Ein vorhandener Client-Snapshot ist die autoritative Startuhr. Er
+        # ersetzt das alte pauschale dep-4h-Fenster; Legacy-Zeilen ohne State
+        # duerfen vorerst den bisherigen Fallback benutzen. Der Cooldown steht
+        # davor: eine eben per Push erzeugte Karte darf unter keinen Umstaenden
+        # als `no_target` durchfallen und beim Folgeruf dupliziert werden.
+        start_rows = [r for r in start_rows
+                      if not isinstance(r.get('last_content_state'), dict)
+                      or _stored_state_wants_start(r.get('last_content_state'))]
         if start_rows:
             rows = start_rows
             used_event = 'start'
+            previous = _stored_state(start_rows)
+            if previous:
+                state = _merge_cached_state(state, previous, cleared)
     if not rows:
         return {'ok': True, 'sent': 0, 'skipped': 'no_target',
                 'event': used_event}
@@ -1519,8 +1653,15 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             continue
         frm = (sector.get('from') or '').strip().upper() or None
         to = (sector.get('to') or '').strip().upper() or None
-        est_dep = facts.get('est_dep') or sector.get('dep_iso')
-        est_arr = facts.get('est_arr') or sector.get('arr_iso')
+        # `dep_iso`/`arr_iso` sind der Roster-Fallback, NICHT automatisch eine
+        # neue Beobachtung. Bis hier wurden sie trotzdem als estDep/estArr
+        # verschickt und ueberschrieben damit eine bereits gecachte echte ETA
+        # wieder mit der Planzeit. Fuer die sichtbare Zielzeit bleiben sie der
+        # ehrliche Fallback; in den `est*`-Feldern steht nur ein echtes Faktum.
+        observed_dep = facts.get('est_dep')
+        observed_arr = facts.get('est_arr')
+        est_dep = observed_dep or sector.get('dep_iso')
+        est_arr = observed_arr or sector.get('arr_iso')
         delta = facts.get('dep_delay_min')
         state = {
             'stateVersion': 2,
@@ -1560,9 +1701,9 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             'fromTZIdentifier': _airport_tz(frm),
             'toTZIdentifier': _airport_tz(to),
             'schedDep': facts.get('sched_dep') or sector.get('dep_iso'),
-            'estDep': est_dep,
+            'estDep': observed_dep,
             'schedArr': facts.get('sched_arr') or sector.get('arr_iso'),
-            'estArr': est_arr,
+            'estArr': observed_arr,
             'cancelled': True if kind == 'cancelled' else None,
             'footLeading': flight_disp or None,
             # BESTÄTIGT GEGEN GEPLANT (Nachzug 2026-08-02). Die Felder gab es
@@ -1578,6 +1719,11 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
         if state['mainTime'] is None:
             # Ohne Ziel-Zeitpunkt gibt es keine ehrliche Karte.
             continue
+        # Dieser Fanout ist ein TEIL-Absender. `None` bedeutet hier "weiss ich
+        # nicht" und darf nicht als explizites JSON-null den Server-Cache
+        # loeschen. Echte Grabsteine bleiben dem vollstaendigen API-Absender
+        # vorbehalten (`push_live_activity` unterstuetzt sie weiterhin).
+        state = {key: value for key, value in state.items() if value is not None}
         # PUNKT-FORTSCHRITT (Tibor 01.08., „Punkt hinkt der Uhr hinterher"):
         # nur wenn der Abflug BELEGT ist (shows_arrival trägt genau diese
         # Gate-Semantik) und beide Instants da sind — dann bekommt jeder
@@ -1679,6 +1825,8 @@ _LA_SWEEP_HARD_MAX_AGE_H = 14       # Reißleine ohne Roster-Beleg
 _LA_SWEEP_MIN_GAP_S = 300           # höchstens alle 5 min (pro Prozess)
 _LA_SWEEP_MAX_ROWS = 500
 _LA_SWEEP_TOKEN_CHUNK = 60
+_LA_STORED_START_LEAD_S = 60 * 60   # identisch zu iOS pickupLead
+_LA_STORED_START_KEEP_S = 3 * 3600  # identisch zu iOS keepAhead
 
 _SWEEP_SELECT = _ROW_SELECT + ',updated_at'
 
@@ -1705,6 +1853,171 @@ def _active_update_rows_all(limit=_LA_SWEEP_MAX_ROWS):
         log.warning('[live-activity] sweep rows read failed: %s',
                     type(exc).__name__)
         return []
+
+
+def _active_start_rows_all(limit=_LA_SWEEP_MAX_ROWS):
+    """Push-to-Start-Zeilen samt letztem iPhone-Snapshot.
+
+    Seit Build 347 laedt der Client den fertigen ContentState auch am
+    geraeteweiten Start-Token hoch. Damit entscheidet der Server nicht mehr
+    pauschal mit „Abflug minus vier Stunden", sondern mit exakt derselben
+    Aus-dem-Haus-/Pickup-Marke wie die App.
+    """
+    client = _sb()
+    if client is None:
+        return []
+    try:
+        rows = (client.table('live_activities')
+                .select(_SWEEP_SELECT)
+                .eq('kind', 'start').eq('active', True)
+                .limit(limit).execute().data or [])
+        return [r for r in rows
+                if (r or {}).get('la_token')
+                and isinstance((r or {}).get('last_content_state'), dict)]
+    except Exception as exc:
+        log.warning('[live-activity] start rows read failed: %s',
+                    type(exc).__name__)
+        return []
+
+
+def _stored_date_to_unix(value):
+    """Datum aus `last_content_state` -> Unix.
+
+    Die DB speichert bereits APNs-normalisierte Zahlen seit Apples Epoche.
+    `_to_unix` ist fuer ROHE Senderwerte und wuerde diese Zahl ein zweites Mal
+    umrechnen. Strings/Datetimes bleiben fuer schema-aeltere Zeilen tolerant.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) + _APPLE_EPOCH_OFFSET
+    return _to_unix(value)
+
+
+def _state_chain_times(state):
+    """Belegte Kettenzeiten als Unix-Sekunden, sortiert und dedupliziert."""
+    out = []
+    for step in (state or {}).get('chain') or []:
+        if not isinstance(step, dict):
+            continue
+        ts = _stored_date_to_unix(step.get('time'))
+        if ts is not None:
+            out.append(float(ts))
+    return sorted(set(out))
+
+
+def _stored_pickup_mark(state):
+    """Dieselbe Lebenszyklus-Marke wie iOS `pickupMark`, ohne Schaetzung."""
+    state = state or {}
+    chain = state.get('chain') or []
+    for step in chain:
+        if not isinstance(step, dict):
+            continue
+        label = str(step.get('label') or '').strip().lower()
+        if label in ('aus dem haus', 'leave home'):
+            mark = _stored_date_to_unix(step.get('time'))
+            if mark is not None:
+                return float(mark)
+    mark = _stored_date_to_unix(
+        state.get('countdownTarget') or state.get('mainTime'))
+    return None if mark is None else float(mark)
+
+
+def _stored_state_wants_start(state, now_ts=None):
+    """Darf der gespeicherte iPhone-State JETZT per Push entstehen?
+
+    Pure und absichtlich eng: freie/Feierabend-/Standby-Zustaende starten nie;
+    Layover nur mit echter PICKUP-Marke; preDuty ab exakt einer Stunde vor der
+    vom Client gelieferten Marke. Ein alter State ist nach drei Stunden hinter
+    seiner Marke kein Startgrund mehr.
+    """
+    if not isinstance(state, dict):
+        return False
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    phase = str(state.get('phase') or '')
+    kicker = str(state.get('kicker') or '').strip().upper()
+    duty_end = _stored_date_to_unix(state.get('dutyEnd'))
+    if duty_end is not None and now_ts > float(duty_end) + 60 * 60:
+        return False
+    if phase == 'layover':
+        if kicker != 'PICKUP':
+            return False
+    elif phase in ('briefing', 'turnaround', 'inFlight'):
+        generated = _stored_date_to_unix(state.get('generatedAt'))
+        return generated is None or now_ts - float(generated) <= 20 * 3600
+    elif phase != 'preDuty':
+        return False
+    mark = _stored_pickup_mark(state)
+    if mark is None:
+        return False
+    return (mark - _LA_STORED_START_LEAD_S
+            <= now_ts <= mark + _LA_STORED_START_KEEP_S)
+
+
+def _stored_start_attributes(state, now_utc):
+    """ActivityKit-Attributes aus demselben gespeicherten State."""
+    return {
+        'flightNo': (state or {}).get('flightNo'),
+        'from': (state or {}).get('fromIATA'),
+        'to': (state or {}).get('toIATA'),
+        'startedAt': now_utc,
+    }
+
+
+def _state_milestones(state):
+    """Alle Instants, an denen die archivierte View neu rendern muss."""
+    out = _state_chain_times(state)
+    for key in ('countdownTarget', 'mainTime', 'schedDep', 'estDep',
+                'schedArr', 'estArr', 'dutyEnd'):
+        ts = _stored_date_to_unix((state or {}).get(key))
+        if ts is not None:
+            out.append(float(ts))
+    # `Text(style: .relative)` und `Text(timerInterval:)` schreiben ihren Wert
+    # selbst fort. Die WAHL zwischen beiden trifft SwiftUI aber nur beim
+    # Rendern. Genau eine Stunde vor dem Ziel muss daher ein neuer State kommen,
+    # sonst bleibt die wortreiche Relativanzeige bis zur Marke stehen.
+    target = _stored_date_to_unix(
+        (state or {}).get('countdownTarget') or (state or {}).get('mainTime'))
+    if target is not None:
+        out.append(float(target) - 60 * 60)
+    return sorted(set(out))
+
+
+def _milestone_due(state, last_timestamp, now_ts):
+    """Neu passierter Meilenstein oder None. Pure, verhindert Push-Polling."""
+    generated = _stored_date_to_unix((state or {}).get('generatedAt')) or 0
+    try:
+        after = max(float(last_timestamp or 0), float(generated))
+    except (TypeError, ValueError):
+        after = float(generated)
+    passed = [ts for ts in _state_milestones(state)
+              if after < ts <= float(now_ts)]
+    return max(passed) if passed else None
+
+
+def _next_milestone_after(state, now_ts):
+    future = [ts for ts in _state_milestones(state) if ts > float(now_ts)]
+    return min(future) if future else None
+
+
+def _refresh_row_at_milestone(row, now_utc):
+    """Rendert eine laufende Karte genau einmal pro passierter Marke neu."""
+    state = (row or {}).get('last_content_state')
+    if not isinstance(state, dict):
+        return False
+    now_ts = now_utc.timestamp()
+    if _milestone_due(state, row.get('last_timestamp'), now_ts) is None:
+        return False
+    fresh = dict(state)
+    fresh['generatedAt'] = now_ts - _APPLE_EPOCH_OFFSET
+    nxt = _next_milestone_after(fresh, now_ts)
+    stale_after = max(5 * 60, int(nxt - now_ts)) if nxt is not None else None
+    result = _push_row(row, fresh, event='update',
+                       stale_after_s=stale_after, force=True)
+    if result.get('status') != 'sent':
+        return False
+    _store_last_state([row.get('id')], fresh)
+    return True
 
 
 def _roster_sectors_by_token(tokens, now_utc):
@@ -2105,7 +2418,40 @@ def sweep_stale_live_activities(now_utc=None):
         return counts
     now_utc = now_utc or datetime.now(timezone.utc)
     rows = _active_update_rows_all()
+    start_rows = _active_start_rows_all()
     counts['checked'] = len(rows)
+    # PUSH-TO-START AUS DER ECHTEN CLIENT-MARKE. Eine aktive Update-Zeile
+    # gewinnt immer; ohne sie darf genau der gespeicherte iPhone-Snapshot die
+    # Karte im gleichen 60-Minuten-Fenster wie der lokale Controller starten.
+    active_users = {r.get('user_token') for r in rows if r.get('user_token')}
+    for row in start_rows:
+        user_token = row.get('user_token')
+        state = row.get('last_content_state')
+        if not user_token or user_token in active_users:
+            continue
+        if not _stored_state_wants_start(state, now_utc.timestamp()):
+            continue
+        if _start_cooldown_active(row, now_utc.timestamp()):
+            continue
+        fresh = dict(state)
+        fresh['generatedAt'] = now_utc.timestamp() - _APPLE_EPOCH_OFFSET
+        attrs, attr_problems = _normalize_attributes(
+            _stored_start_attributes(fresh, now_utc))
+        if _fatal_problems(attr_problems):
+            continue
+        nxt = _next_milestone_after(fresh, now_utc.timestamp())
+        stale_after = (max(5 * 60, int(nxt - now_utc.timestamp()))
+                       if nxt is not None else None)
+        try:
+            result = _push_row(row, fresh, event='start',
+                               attributes=attrs, stale_after_s=stale_after)
+        except Exception as exc:                       # pragma: no cover
+            log.warning('[live-activity] scheduled start failed user_ref=%s: %s',
+                        _token_ref(user_token), type(exc).__name__)
+            continue
+        if result.get('status') == 'sent':
+            counts['started'] = counts.get('started', 0) + 1
+            _store_last_state([row.get('id')], fresh)
     if not rows:
         return counts
     by_token = _roster_sectors_by_token({r.get('user_token') for r in rows},
@@ -2139,6 +2485,9 @@ def sweep_stale_live_activities(now_utc=None):
                         counts['landed'] += 1
                     continue
                 if _duty_still_plausible(sectors, now_utc):
+                    if _refresh_row_at_milestone(row, now_utc):
+                        counts['milestone_updates'] = \
+                            counts.get('milestone_updates', 0) + 1
                     counts['kept'] += 1
                     continue
                 if _end_row(row, _last_known_arrival(sectors) or
@@ -2155,6 +2504,9 @@ def sweep_stale_live_activities(now_utc=None):
                     counts['ended'] += 1
                     counts['hard_age'] += 1
             else:
+                if _refresh_row_at_milestone(row, now_utc):
+                    counts['milestone_updates'] = \
+                        counts.get('milestone_updates', 0) + 1
                 counts['kept'] += 1
         except Exception as exc:                        # pragma: no cover
             log.warning('[live-activity] sweep row failed: %s',

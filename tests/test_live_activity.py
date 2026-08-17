@@ -2069,6 +2069,8 @@ def test_teilabsender_loescht_die_kette_nicht_mehr(sb, auth, apns):
             'generatedAt': '2026-08-12T00:30:00Z',
             'mainTime': '2026-08-12T09:50:00+09:00',
             'countdownTarget': '2026-08-12T12:20:00+09:00',
+            'flightNo': 'LH713', 'fromIATA': 'ICN', 'toIATA': 'FRA',
+            'schedDep': '2026-08-12T12:20:00+09:00',
             'displayTZIdentifier': 'Asia/Seoul',
             'fromCity': 'Seoul', 'toCity': 'Frankfurt',
             'chain': [{'label': 'Pickup',
@@ -2082,6 +2084,8 @@ def test_teilabsender_loescht_die_kette_nicht_mehr(sb, auth, apns):
             'generatedAt': '2026-08-12T03:00:00Z',
             'mainTime': '2026-08-12T12:35:00+09:00',
             'countdownTarget': '2026-08-12T12:35:00+09:00',
+            'flightNo': 'LH713', 'fromIATA': 'ICN', 'toIATA': 'FRA',
+            'schedDep': '2026-08-12T12:20:00+09:00',
             'estDep': '2026-08-12T12:35:00+09:00'}
     r2 = LA.push_live_activity(TOKEN, teil)
     assert r2['sent'] == 1
@@ -2106,6 +2110,77 @@ def test_teilabsender_ueberschreibt_erhaltene_felder_wenn_er_sie_setzt(sb, auth,
                                       displayTZIdentifier='Europe/Berlin'))
     cs = apns['client'].sent[-1]['payload']['aps']['content-state']
     assert cs['displayTZIdentifier'] == 'Europe/Berlin'
+
+
+def test_mqtt_teilabsender_behaelt_gecachte_ankunftszeit(sb, auth, apns):
+    """Eine spaetere Abflugmeldung ohne ETA darf die zuvor empfangene neue
+    Ankunft nicht wieder auf die Roster-Planzeit setzen."""
+    _seed_row(sb)
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2026-08-17T06:25:00Z',
+              'arr_iso': '2026-08-17T17:40:00Z'}
+    first_facts = {'est_dep': '2026-08-17T06:31:00Z',
+                   'sched_arr': '2026-08-17T17:40:00Z',
+                   'est_arr': '2026-08-17T18:02:00Z',
+                   'dep_status': 'Flight Departed'}
+    assert LA.push_for_affected([(TOKEN, sector)], 'est_arr', 'LH454',
+                                '2026-08-17', facts=first_facts) == 1
+    cached_eta = apns['client'].sent[-1]['payload']['aps'][
+        'content-state']['estArr']
+
+    # Das naechste Ereignis weiss nur etwas ueber den Abflug. `arr_iso` ist
+    # weiterhin die Planzeit und darf nicht als neue ETA missverstanden werden.
+    assert LA.push_for_affected([(TOKEN, sector)], 'departed', 'LH454',
+                                '2026-08-17',
+                                facts={'est_dep': '2026-08-17T06:33:00Z'}) == 1
+    cs = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert cs['estArr'] == cached_eta
+    assert cs['schedArr'] != cs['estArr']
+    assert cs['countdownTarget'] == cached_eta
+
+
+def test_neue_eta_gewinnt_gegen_gecachte_eta(sb, auth, apns):
+    _seed_row(sb)
+    sector = {'flight': 'LH454', 'from': 'FRA', 'to': 'SFO',
+              'dep_iso': '2026-08-17T06:25:00Z',
+              'arr_iso': '2026-08-17T17:40:00Z'}
+    for eta in ('2026-08-17T18:02:00Z', '2026-08-17T18:14:00Z'):
+        LA.push_for_affected([(TOKEN, sector)], 'est_arr', 'LH454',
+                             '2026-08-17',
+                             facts={'est_arr': eta,
+                                    'dep_status': 'Flight Departed'})
+    cs = apns['client'].sent[-1]['payload']['aps']['content-state']
+    assert cs['estArr'] == LA._to_apple_date('2026-08-17T18:14:00Z')
+    assert cs['countdownTarget'] == cs['estArr']
+
+
+def test_flug_cache_wandert_nicht_in_naechstes_leg():
+    old = _state(flightNo='LH454', fromIATA='FRA', toIATA='SFO',
+                 schedDep=_stored_date('2026-08-17T06:25:00Z'),
+                 estArr=_stored_date('2026-08-17T18:02:00Z'))
+    new = _state(flightNo='LH455', fromIATA='SFO', toIATA='FRA',
+                 schedDep=_stored_date('2026-08-18T10:00:00Z'))
+    merged = LA._merge_cached_state(new, old)
+    assert 'estArr' not in merged
+
+
+def test_flug_cache_erkennt_flugnummer_mit_oder_ohne_leerzeichen():
+    old = _state(flightNo='LH 454', fromIATA='FRA', toIATA='SFO',
+                 schedDep=_stored_date('2026-08-17T06:25:00Z'),
+                 estArr=_stored_date('2026-08-17T18:02:00Z'))
+    new = _state(flightNo='LH454', fromIATA='FRA', toIATA='SFO',
+                 schedDep=_stored_date('2026-08-17T06:25:00Z'))
+    assert LA._merge_cached_state(new, old)['estArr'] == old['estArr']
+
+
+def test_explizites_null_darf_auch_eta_loeschen():
+    old = _state(flightNo='LH454', fromIATA='FRA', toIATA='SFO',
+                 schedDep=_stored_date('2026-08-17T06:25:00Z'),
+                 estArr=_stored_date('2026-08-17T18:02:00Z'))
+    incoming = _state(flightNo='LH454', fromIATA='FRA', toIATA='SFO',
+                      schedDep=_stored_date('2026-08-17T06:25:00Z'))
+    merged = LA._merge_cached_state(incoming, old, cleared={'estArr'})
+    assert 'estArr' not in merged
 
 
 def test_end_event_erhaelt_nichts(sb, auth, apns):
@@ -2173,7 +2248,9 @@ def test_register_nimmt_content_state_als_erhaltungs_grundlage(client, sb,
     body = {'token': TOKEN, 'la_token': LA_TOKEN_A, 'kind': 'update',
             'bundle_id': BUNDLE, 'apns_env': 'prod', 'platform': 'ios',
             'activity_id': ACT_ID,
-            'content_state': _state(chain=kette,
+            'content_state': _state(chain=kette, flightNo='LH713',
+                                    fromIATA='ICN', toIATA='FRA',
+                                    schedDep='2026-08-12T03:20:00Z',
                                     displayTZIdentifier='Asia/Seoul')}
     r = client.post('/api/push/register-live-activity', json=body,
                     headers=_auth_hdr())
@@ -2186,7 +2263,9 @@ def test_register_nimmt_content_state_als_erhaltungs_grundlage(client, sb,
         '2026-08-12T09:50:00+09:00')
 
     # Der Fanout schickt sein handgebautes Teil-Dict — die Kette überlebt.
-    res = LA.push_live_activity(TOKEN, _state(kicker='ABFLUG'))
+    res = LA.push_live_activity(
+        TOKEN, _state(kicker='ABFLUG', flightNo='LH713', fromIATA='ICN',
+                      toIATA='FRA', schedDep='2026-08-12T03:20:00Z'))
     assert res['sent'] == 1
     cs = apns['client'].sent[-1]['payload']['aps']['content-state']
     assert [s['label'] for s in cs['chain']] == ['Pickup']
@@ -2263,3 +2342,126 @@ def test_echter_store_ausfall_bleibt_ein_ausfall(sb, auth, apns, monkeypatch):
     assert res == {'ok': True, 'sent': 0, 'skipped': 'no_target',
                    'event': 'update'}
     assert apns['client'].sent == []
+
+
+# ── Build 347: Start/Refresh ohne App-Oeffnen ───────────────────────────────
+
+def _stored_date(iso):
+    """So liegt ein Date in `last_content_state` (Apple-Referenzsekunden)."""
+    return LA._to_apple_date(iso)
+
+
+def test_gespeicherter_pickup_startet_im_selben_fenster_wie_ios():
+    state = _state(
+        phase='preDuty', kicker='AUS DEM HAUS',
+        mainTime=_stored_date('2026-08-17T05:07:00Z'),
+        generatedAt=_stored_date('2026-08-16T18:00:00Z'),
+        chain=[{'label': 'Aus dem Haus',
+                'time': _stored_date('2026-08-17T05:07:00Z'),
+                'state': 'current'}])
+    before = datetime.fromisoformat('2026-08-17T04:06:59+00:00').timestamp()
+    inside = datetime.fromisoformat('2026-08-17T04:07:00+00:00').timestamp()
+    assert LA._stored_state_wants_start(state, before) is False
+    assert LA._stored_state_wants_start(state, inside) is True
+
+
+def test_gespeicherte_apple_dates_werden_nicht_doppelt_umgerechnet():
+    iso = '2026-08-17T05:07:00Z'
+    stored = _stored_date(iso)
+    expected = datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+    assert LA._stored_date_to_unix(stored) == expected
+
+
+def test_meilenstein_refresh_feuert_einmal_pro_passierter_marke():
+    state = _state(
+        generatedAt=_stored_date('2026-08-17T04:00:00Z'),
+        mainTime=_stored_date('2026-08-17T08:25:00Z'),
+        chain=[
+            {'label': 'Aus dem Haus',
+             'time': _stored_date('2026-08-17T05:07:00Z'),
+             'state': 'current'},
+            {'label': 'Briefing',
+             'time': _stored_date('2026-08-17T06:35:00Z'),
+             'state': 'upcoming'},
+        ])
+    now = datetime.fromisoformat('2026-08-17T05:08:00+00:00').timestamp()
+    first = LA._milestone_due(state, 0, now)
+    assert first == datetime.fromisoformat(
+        '2026-08-17T05:07:00+00:00').timestamp()
+    # Ein erfolgreicher Push setzt `last_timestamp` hinter die Marke.
+    assert LA._milestone_due(state, int(now), now + 60) is None
+
+
+def test_countdown_stufenwechsel_ist_ein_server_meilenstein():
+    target_iso = '2026-08-17T08:35:00Z'
+    state = _state(
+        generatedAt=_stored_date('2026-08-17T04:00:00Z'),
+        mainTime=_stored_date(target_iso),
+        countdownTarget=_stored_date(target_iso))
+    boundary = datetime.fromisoformat('2026-08-17T07:35:00+00:00').timestamp()
+    assert boundary in LA._state_milestones(state)
+    assert LA._milestone_due(state, boundary - 1, boundary) == boundary
+
+
+def test_eta_push_darf_prepickup_nicht_auf_abflug_umschalten():
+    previous = _state(
+        phase='preDuty', kicker='AUS DEM HAUS',
+        mainTime=_stored_date('2026-08-17T05:07:00Z'),
+        countdownTarget=_stored_date('2026-08-17T05:07:00Z'))
+    incoming = _state(
+        phase='briefing', kicker='ABFLUG',
+        mainTime=_stored_date('2026-08-17T08:25:00Z'),
+        estDep=_stored_date('2026-08-17T08:25:00Z'))
+    merged = LA._preserve_prepickup_phase(incoming, previous)
+    assert merged['phase'] == 'preDuty'
+    assert merged['kicker'] == 'AUS DEM HAUS'
+    assert merged['mainTime'] == previous['mainTime']
+    assert merged['estDep'] == incoming['estDep']
+
+
+def test_sweep_startet_gespeicherten_pickup_wirklich_per_apns(
+        client, sb, auth, apns, frozen):
+    _register(client, kind='start', activity_id=None)
+    row = sb.row(kind='start', activity_id=None)
+    mark = FROZEN_UTC + timedelta(minutes=30)
+    row['last_content_state'] = _state(
+        phase='preDuty', kicker='AUS DEM HAUS',
+        mainTime=_stored_date(mark.isoformat()),
+        countdownTarget=_stored_date(mark.isoformat()),
+        generatedAt=_stored_date(
+            (FROZEN_UTC - timedelta(hours=1)).isoformat()),
+        chain=[{'label': 'Aus dem Haus',
+                'time': _stored_date(mark.isoformat()),
+                'state': 'current'}])
+
+    counts = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+
+    assert counts['started'] == 1
+    aps = apns['client'].sent[-1]['payload']['aps']
+    assert aps['event'] == 'start'
+    assert aps['content-state']['phase'] == 'preDuty'
+
+
+def test_sweep_refreshes_laufende_activity_am_meilenstein_nur_einmal(
+        client, sb, auth, apns, frozen):
+    _register(client)
+    row = sb.row()
+    mark = FROZEN_UTC - timedelta(minutes=1)
+    row['last_timestamp'] = int(
+        (FROZEN_UTC - timedelta(hours=2)).timestamp())
+    row['last_content_state'] = _state(
+        phase='preDuty', kicker='AUS DEM HAUS',
+        generatedAt=_stored_date(
+            (FROZEN_UTC - timedelta(hours=2)).isoformat()),
+        chain=[{'label': 'Aus dem Haus',
+                'time': _stored_date(mark.isoformat()),
+                'state': 'current'}])
+
+    first = LA.sweep_stale_live_activities(now_utc=FROZEN_UTC)
+    sent = len(apns['client'].sent)
+    second = LA.sweep_stale_live_activities(
+        now_utc=FROZEN_UTC + timedelta(seconds=30))
+
+    assert first['milestone_updates'] == 1
+    assert second.get('milestone_updates', 0) == 0
+    assert len(apns['client'].sent) == sent

@@ -4022,8 +4022,11 @@ def _marks_cache_state(ts, marks, now, departure_epoch=None):
 
 def _boarding_cache_get(key, now=None, departure_epoch=None):
     """(hit, marks). Bei später Nachabfrage bleibt die Teilantwort sichtbar:
-    `(False, marks)` bedeutet stale-while-refresh; ein echter Miss/TTL-Ablauf
-    bleibt `(False, {})`. Ein leerer Negativ-Treffer zählt innerhalb TTL als hit."""
+    `(False, marks)` bedeutet stale-while-refresh. Auch nach TTL bleibt ein
+    zuvor BELEGTER Wert sichtbar, waehrend er neu geladen wird: das exakte Leg
+    steckt im Cache-Key, daher kann die bekannte Boarding-Zeit nicht ploetzlich
+    zu einem anderen Flug gehoeren. Nur ein echter/negativer Miss bleibt leer.
+    Ein leerer Negativ-Treffer zählt innerhalb TTL als hit."""
     now = now if now is not None else time.time()
     with _BOARDING_LOCK:
         e = _BOARDING_CACHE.get(key)
@@ -4033,16 +4036,24 @@ def _boarding_cache_get(key, now=None, departure_epoch=None):
     marks = _boarding_marks_normalize(payload)
     state = _marks_cache_state(ts, marks, now, departure_epoch)
     if state == 'expired':
-        return False, {}
+        return False, marks
     if state == 'refresh':
         return False, marks
     return True, marks
 
 
-def _boarding_cache_put(key, marks, now=None):
+def _boarding_cache_put(key, marks, now=None, preserve_known=False):
     now = now if now is not None else time.time()
+    normalized = _boarding_marks_normalize(marks)
     with _BOARDING_LOCK:
-        _BOARDING_CACHE[key] = (now, _boarding_marks_normalize(marks))
+        if preserve_known:
+            old = _boarding_marks_normalize(
+                (_BOARDING_CACHE.get(key) or (None, {}))[1])
+            # Exakter Flug-Key: neue belegte Werte gewinnen, eine leere oder
+            # partielle Refresh-Antwort widerruft bekannte Marken nicht.
+            old.update(normalized)
+            normalized = old
+        _BOARDING_CACHE[key] = (now, normalized)
         if len(_BOARDING_CACHE) > _BOARDING_CACHE_MAX:
             for k in sorted(_BOARDING_CACHE,
                             key=lambda k: _BOARDING_CACHE[k][0])[:100]:
@@ -4182,12 +4193,12 @@ def _boarding_fetch(user_token, flight, date, dep, arr, departure_epoch=None):
         # Eigenschaft DIESES Users, keine des Fluges — es darf den Kollegen
         # nicht als Negativ-Treffer im Weg stehen.
         if kind != 'no_access':
-            _marks_shared_put(skey, marks)
+            _marks_shared_put(skey, marks, preserve_known=True)
     except Exception as e:
         log.warning('[lh_flightops] boarding_fetch: %s', type(e).__name__)
     finally:
         if not blocked:
-            _boarding_cache_put(key, marks)
+            _boarding_cache_put(key, marks, preserve_known=True)
         with _BOARDING_LOCK:
             _BOARDING_INFLIGHT.discard(key)
     return marks
@@ -4261,12 +4272,18 @@ def _marks_shared_get(key, now=None, departure_epoch=None):
     return True, marks
 
 
-def _marks_shared_put(key, marks, now=None):
+def _marks_shared_put(key, marks, now=None, preserve_known=False):
     if not key:
         return
     now = now if now is not None else time.time()
+    normalized = _boarding_marks_normalize(marks)
     with _BOARDING_LOCK:
-        _MARKS_SHARED[key] = (now, _boarding_marks_normalize(marks))
+        if preserve_known:
+            old = _boarding_marks_normalize(
+                (_MARKS_SHARED.get(key) or (None, {}))[1])
+            old.update(normalized)
+            normalized = old
+        _MARKS_SHARED[key] = (now, normalized)
         if len(_MARKS_SHARED) > _MARKS_SHARED_MAX:
             for k in sorted(_MARKS_SHARED,
                             key=lambda k: _MARKS_SHARED[k][0])[:200]:

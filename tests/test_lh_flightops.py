@@ -1269,6 +1269,54 @@ def test_late_refresh_keeps_partial_marks_visible(monkeypatch):
     assert 'boarding_iso' not in sec
 
 
+def test_expired_boarding_bleibt_waehrend_refresh_sichtbar(monkeypatch):
+    """Ein TTL-Refresh darf eine bereits bekannte Boarding-Zeit nicht loeschen."""
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    warmed = []
+    monkeypatch.setattr(fo, '_boarding_warm_async',
+                        lambda *a: warmed.append(a) or True)
+    now = 1785000000.0
+    sec = _due_sector(now)
+    key = fo._boarding_key('AT-U', 'LH123', sec['dep_iso'][:10], 'MUC')
+    marks = fo.duty_marks_from_times(CHECKIN_MUC)
+    fo._boarding_cache_put(
+        key, marks, now=now - fo._BOARDING_HIT_TTL_S - 1)
+
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is True
+    assert len(warmed) == 1
+    assert sec['boarding_iso'] == marks['boarding_iso']
+
+
+def test_leere_refresh_antwort_loescht_bekannte_boarding_zeit_nicht():
+    _reset_boarding_cache()
+    key = ('AT-U', 'LH123', '2026-08-17', 'MUC')
+    known = fo.duty_marks_from_times(CHECKIN_MUC)
+    fo._boarding_cache_put(key, known, now=100)
+
+    fo._boarding_cache_put(key, {}, now=200, preserve_known=True)
+    hit, marks = fo._boarding_cache_get(key, now=201)
+
+    assert hit is True
+    assert marks['boarding_iso'] == known['boarding_iso']
+
+
+def test_partielle_refresh_antwort_aktualisiert_ohne_andere_marken_zu_loeschen():
+    _reset_boarding_cache()
+    key = ('AT-U', 'LH123', '2026-08-17', 'MUC')
+    old = {'boarding_iso': '2026-08-17T09:40:00Z',
+           'security_iso': '2026-08-17T08:57:00Z'}
+    fo._boarding_cache_put(key, old, now=100)
+    fo._boarding_cache_put(
+        key, {'boarding_iso': '2026-08-17T09:45:00Z'},
+        now=200, preserve_known=True)
+
+    hit, marks = fo._boarding_cache_get(key, now=201)
+    assert hit is True
+    assert marks == {'boarding_iso': '2026-08-17T09:45:00Z',
+                     'security_iso': '2026-08-17T08:57:00Z'}
+
+
 def test_shared_partial_marks_use_same_single_late_refresh():
     """Der Flug-Cache darf die gezielte Nachabfrage nicht wieder verhindern."""
     fo._MARKS_SHARED.clear()
