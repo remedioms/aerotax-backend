@@ -15226,6 +15226,14 @@ def _destination_lobby_compute(token, now=None):
                 sectors.append((dep, arr, datum, sector))
     sectors.sort(key=lambda item: item[0])
     homebase = str(_profile_homebase_cached(token) or '').strip().upper()
+    # Fail-closed, wie der Docstring oben es zusagt: ohne belastbare Homebase
+    # gibt es KEINEN Auto-Join. Vorher blieb `homebase` in diesem Fall '' und
+    # der Ausschluss `iata == homebase` lief ins Leere — die EIGENE Basis wurde
+    # damit zur automatischen Destination Lobby (Katja-Regel: die eigene
+    # Homebase ist nie eine Lobby). Ein leeres/kaputtes Profilfeld ist
+    # „unklare Rosterdaten", kein Freibrief.
+    if not re.fullmatch(r'[A-Z]{3}', homebase):
+        return None
     active = []
     for idx in range(len(sectors) - 1):
         _in_dep, scheduled_arrival, inbound_day, inbound = sectors[idx]

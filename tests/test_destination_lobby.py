@@ -421,3 +421,22 @@ def test_send_accepts_current_lobby_session():
     ):
         response = A.send_chat_message(TOKEN, channel)
     assert response.get_json()['ok'] is True
+
+
+# ── Fail-closed ohne belastbare Homebase (Review 17.08.) ────────────────────
+# Der Docstring von `_destination_lobby_compute` sagt „Fehlende/unklare
+# Rosterdaten fallen geschlossen aus" — fuer die Homebase galt das NICHT: bei
+# leerem Profilfeld verglich `iata == homebase` gegen '' und die eigene Basis
+# wurde zur Auto-Lobby (Katja-Regel: die eigene Homebase ist nie eine Lobby).
+
+def test_missing_homebase_never_auto_joins_a_lobby():
+    for homebase in (None, '', '   ', 'FRANKFURT', 'FR', '123'):
+        assert _compute(homebase=homebase) is None, homebase
+
+
+def test_missing_homebase_blocks_the_lobby_at_the_own_base():
+    # Genau der gefaehrliche Fall: der Aufenthalt LIEGT an der eigenen Basis.
+    # Mit Homebase greift der Ausschluss, ohne Homebase darf nicht ersatzweise
+    # gejoint werden.
+    assert _compute(homebase='JFK') is None
+    assert _compute(homebase=None) is None
