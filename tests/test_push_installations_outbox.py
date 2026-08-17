@@ -505,3 +505,50 @@ def test_native_registration_returns_rotating_logout_capability():
     assert body['installation_id'].startswith('11111111')
     assert body['unregister_token'] == captured['secret']
     assert len(captured['secret']) >= 32
+
+
+# ── Sprachwahl bei der Registrierung (Review 17.08.) ────────────────────────
+# Der APNs-Pfad verglich den GANZEN Client-String gegen die Sprachliste. iOS
+# schickt aber die BCP-47-Form seines Systems (`en-US`, `pt-BR`, teils `de_AT`):
+# jeder Sprecher MIT Region fiel damit auf Deutsch zurueck, obwohl seine Sprache
+# unterstuetzt ist. Der FCM-Pfad macht es seit jeher richtig.
+
+def _register_apns_language(sent_language):
+    client = A.app.test_client()
+    saved = {}
+
+    def save(_token, merged):
+        saved.update(merged)
+        return True
+
+    with patch.object(A, '_push_load', return_value={}), \
+            patch.object(A, '_push_save', side_effect=save), \
+            patch.object(A, 'SB_AVAILABLE', False), \
+            patch.object(A, '_push_installation_register', return_value=None):
+        response = client.post(
+            '/api/push/register-apns',
+            json={'token': USER, 'apns_token': 'abc',
+                  'language': sent_language},
+            headers={'Authorization': f'Bearer {USER}'})
+    assert response.status_code == 200
+    return saved['language']
+
+
+def test_apns_registration_strips_the_bcp47_region():
+    assert _register_apns_language('en-US') == 'en'
+    assert _register_apns_language('pt-BR') == 'pt'
+    assert _register_apns_language('de_AT') == 'de'
+    assert _register_apns_language('FR-ca') == 'fr'
+
+
+def test_apns_registration_keeps_plain_and_unsupported_languages():
+    assert _register_apns_language('it') == 'it'
+    assert _register_apns_language('ja-JP') == 'de'   # nicht unterstuetzt
+    assert _register_apns_language('') == 'de'
+
+
+def test_push_language_helper_accepts_both_locale_separators():
+    assert A._push_language('en-US') == 'en'
+    assert A._push_language('en_US') == 'en'
+    assert A._push_language('es-419') == 'es'
+    assert A._push_language(None) == 'de'

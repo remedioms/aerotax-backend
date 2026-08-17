@@ -13226,7 +13226,12 @@ _PUSH_SYSTEM_COPY = {
 
 
 def _push_language(value):
-    language = str(value or '').strip().lower().split('-', 1)[0]
+    """BCP-47/POSIX-Locale auf die unterstützte Sprache reduzieren.
+
+    Apple liefert je nach API `en-US` ODER `de_AT` — beide Trenner müssen weg,
+    sonst landet ein unterstützter Sprecher auf dem 'de'-Default.
+    """
+    language = re.split(r'[-_]', str(value or '').strip().lower(), 1)[0]
     return language if language in _PUSH_LANGUAGES else 'de'
 
 
@@ -37397,9 +37402,12 @@ def register_push_apns():
     if not _request_bearer_matches(user_token):
         return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     existing = _push_load(user_token) or {}
-    language = (body.get('language') or existing.get('language') or 'de').strip().lower()
-    if language not in ('de', 'en', 'it', 'es', 'fr', 'pt'):
-        language = 'de'
+    # `_push_language` statt einer eigenen Liste: der iOS-Client schickt die
+    # BCP-47-Form seines Systems (`en-US`, `pt-BR`, `de_AT`). Der frühere
+    # Inline-Check verglich den GANZEN String gegen die Sprachliste — jeder
+    # Client mit Region fiel damit auf Deutsch zurück, obwohl die Sprache
+    # unterstützt ist. Der FCM-Pfad macht es seit jeher richtig.
+    language = _push_language(body.get('language') or existing.get('language'))
     merged = {
         'token': user_token,
         'push_token': existing.get('push_token') or '',  # Expo nicht überschreiben
