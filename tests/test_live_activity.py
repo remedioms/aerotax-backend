@@ -2112,6 +2112,62 @@ def test_teilabsender_ueberschreibt_erhaltene_felder_wenn_er_sie_setzt(sb, auth,
     assert cs['displayTZIdentifier'] == 'Europe/Berlin'
 
 
+def test_partielle_kette_behaelt_security_crewbus_und_boarding():
+    old = _state(
+        phase='briefing', kicker='SECURITY', flightNo='LH400',
+        fromIATA='FRA', toIATA='JFK',
+        schedDep=_stored_date('2026-08-17T09:25:00Z'),
+        chain=[
+            {'label': 'Aus dem Haus',
+             'time': _stored_date('2026-08-17T06:25:00Z'),
+             'state': 'done'},
+            {'label': 'Briefing', 'time': _stored_date('2026-08-17T07:05:00Z'),
+             'state': 'done'},
+            {'label': 'Security', 'time': _stored_date('2026-08-17T07:25:00Z'),
+             'state': 'current'},
+            {'label': 'Crewbus', 'time': _stored_date('2026-08-17T07:55:00Z'),
+             'state': 'upcoming'},
+            {'label': 'Boarding', 'time': _stored_date('2026-08-17T08:45:00Z'),
+             'state': 'upcoming'},
+            {'label': 'Abflug', 'time': _stored_date('2026-08-17T09:25:00Z'),
+             'state': 'upcoming'},
+        ])
+    partial = _state(
+        phase='briefing', kicker='ABFLUG', flightNo='LH400',
+        fromIATA='FRA', toIATA='JFK',
+        schedDep=_stored_date('2026-08-17T09:25:00Z'),
+        chain=[
+            {'label': 'Abflug', 'time': _stored_date('2026-08-17T09:25:00Z'),
+             'state': 'current'},
+        ])
+
+    merged = LA._merge_cached_state(partial, old)
+
+    assert [step['label'] for step in merged['chain']] == [
+        'Aus dem Haus', 'Briefing', 'Security', 'Crewbus', 'Boarding', 'Abflug']
+
+
+def test_partielle_kette_wird_nicht_in_naechstes_leg_uebertragen():
+    old = _state(
+        phase='briefing', kicker='BOARDING', flightNo='LH400',
+        fromIATA='FRA', toIATA='JFK',
+        schedDep=_stored_date('2026-08-17T09:25:00Z'),
+        chain=[{'label': 'Boarding',
+                'time': _stored_date('2026-08-17T08:45:00Z'),
+                'state': 'current'}])
+    next_leg = _state(
+        phase='briefing', kicker='ABFLUG', flightNo='LH401',
+        fromIATA='JFK', toIATA='FRA',
+        schedDep=_stored_date('2026-08-18T19:40:00Z'),
+        chain=[{'label': 'Abflug',
+                'time': _stored_date('2026-08-18T19:40:00Z'),
+                'state': 'current'}])
+
+    merged = LA._merge_cached_state(next_leg, old)
+
+    assert [step['label'] for step in merged['chain']] == ['Abflug']
+
+
 def test_mqtt_teilabsender_behaelt_gecachte_ankunftszeit(sb, auth, apns):
     """Eine spaetere Abflugmeldung ohne ETA darf die zuvor empfangene neue
     Ankunft nicht wieder auf die Roster-Planzeit setzen."""

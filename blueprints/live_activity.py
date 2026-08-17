@@ -728,6 +728,31 @@ def _same_display_moment(a, b):
     return at is not None and bt is not None and abs(at - bt) < 1
 
 
+def _merge_chain_facts(fresh, previous):
+    """Vervollstaendigt eine partielle Vorflug-Kette mit bekannten Fakten.
+
+    `chain` ist als Ganzes ein ContentState-Feld, inhaltlich aber eine Liste
+    unabhaengiger belegter Marken. Ein Absender, der nur Briefing + Abflug
+    kennt, widerruft damit keine zuvor gelieferte Security-/Crewbus-/Boarding-
+    Zeit. Ein explizites JSON-null wird schon vor diesem Aufruf als `cleared`
+    behandelt und erreicht die Funktion nicht.
+    """
+    if not isinstance(fresh, list) or not isinstance(previous, list):
+        return fresh
+    merged = [dict(step) for step in fresh if isinstance(step, dict)]
+    labels = {str(step.get('label') or '').strip().upper() for step in merged}
+    for step in previous:
+        if not isinstance(step, dict):
+            continue
+        label = str(step.get('label') or '').strip().upper()
+        if not label or label in labels:
+            continue
+        merged.append(dict(step))
+        labels.add(label)
+    merged.sort(key=lambda step: float(step.get('time') or 0))
+    return merged
+
+
 def _merge_cached_state(state, previous, cleared=()):
     """Vollstaendiger APNs-Zustand aus frischem Teilstand + letztem Cache.
 
@@ -747,6 +772,14 @@ def _merge_cached_state(state, previous, cleared=()):
         for key in _FLIGHT_CACHE_FIELDS:
             if key not in cleared and key not in state and previous.get(key) is not None:
                 state[key] = previous[key]
+        # Ein vorhandener, aber VERKUERZTER Array darf die anderen bekannten
+        # Marken nicht loeschen. Fehlendes `chain` wurde oben bereits komplett
+        # erhalten; explizites null bleibt wegen `cleared` ein Grabstein.
+        if state.get('phase') in ('preDuty', 'briefing', 'turnaround', 'layover') \
+                and 'chain' not in cleared \
+                and isinstance(state.get('chain'), list) \
+                and isinstance(previous.get('chain'), list):
+            state['chain'] = _merge_chain_facts(state['chain'], previous['chain'])
     if same_flight:
         state = _preserve_prepickup_phase(state, previous)
     # Der Zielzeitpunkt muss denselben Cache benutzen wie die sichtbare
