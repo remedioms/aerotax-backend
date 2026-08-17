@@ -12,6 +12,21 @@ import app
 import pytest
 
 
+# Prod-DDL (geprueft 17.08.2026, information_schema): `transfer_min` ist
+# `integer NOT NULL DEFAULT 0`. Ein explizites `None` im Insert ist damit KEIN
+# NULL-Wert, sondern ein 23502-Fehler — genau der Unterschied, den ein
+# Fake ohne Constraint verschluckt (Blocker: 500 bei jeder Hotel-Meldung ohne
+# Transferzeit). Der Fake bildet das jetzt nach.
+_NOT_NULL_COLUMNS = {
+    'crew_hotel_directory': ('airline', 'iata', 'hotel', 'transfer_min',
+                             'status', 'votes', 'active'),
+}
+
+
+class _NotNullViolation(Exception):
+    """PostgREST-Aequivalent: {'code': '23502', ...}."""
+
+
 class _FakeQuery:
     def __init__(self, sink, table):
         self._sink = sink
@@ -24,6 +39,12 @@ class _FakeQuery:
     def insert(self, payload):
         self._op = 'insert'
         self._payload = payload
+        for row in (payload if isinstance(payload, list) else [payload]):
+            for column in _NOT_NULL_COLUMNS.get(self._table, ()):
+                if column in row and row[column] is None:
+                    raise _NotNullViolation(
+                        f'23502 null value in column "{column}" of relation '
+                        f'"{self._table}" violates not-null constraint')
         self._sink['inserts'].append((self._table, payload))
         return self
 
@@ -46,6 +67,9 @@ class _FakeQuery:
         return self
 
     def neq(self, *_a, **_k):
+        return self
+
+    def ilike(self, *_a, **_k):
         return self
 
     def is_(self, *_a, **_k):
@@ -160,8 +184,14 @@ def test_suggest_writes_suggested_row(client, monkeypatch):
     assert payload['suggested_by'] and payload['suggested_by'] != 'AT-x'  # gehasht
 
 
-def test_suggest_keeps_missing_transfer_time_null(client, monkeypatch):
-    """Unbekannt ist nicht fußläufig: fehlende Minuten bleiben NULL."""
+def test_suggest_without_transfer_time_reaches_the_database(client, monkeypatch):
+    """Ohne Transferzeit darf die Meldung NICHT an der Spalte scheitern.
+
+    Regression 17.08.: der Insert schickte `transfer_min: None` gegen
+    `int NOT NULL DEFAULT 0` — jede Hotel-Meldung ohne Transferzeit endete als
+    500 `db` und der Vorschlag war weg. Der Key fehlt jetzt, der Spalten-Default
+    greift.
+    """
     fake = _FakeSB({'crew_hotel_directory': []})
     monkeypatch.setattr(app, 'sb', fake)
     monkeypatch.setattr(app, 'SB_AVAILABLE', True)
@@ -173,8 +203,54 @@ def test_suggest_keeps_missing_transfer_time_null(client, monkeypatch):
                     content_type='application/json')
 
     assert r.status_code == 200
+    assert r.get_json()['status'] == 'approved_new'
     _tbl, payload = fake.sink['inserts'][0]
-    assert payload['transfer_min'] is None
+    assert 'transfer_min' not in payload
+    assert payload['iata'] == 'CLJ'
+
+
+def test_both_insert_paths_share_one_row_builder():
+    """Der `suggested`-Pfad (belegte Station) hatte denselben Fehler.
+
+    Er ist mit dem No-op-Filter dieses Fakes nicht separat ansteuerbar (beide
+    Selects sehen dieselben Zeilen), deshalb wird hier die eigentliche Garantie
+    gepinnt: es gibt genau EINEN Row-Builder und beide Inserts benutzen ihn —
+    ein neu eingefuegtes Literal-Dict faellt auf.
+    """
+    import inspect
+    source = inspect.getsource(app.ax_crew_hotels_suggest)
+    assert source.count('_hotel_row(') == 3          # def + 2 Aufrufstellen
+    assert '.insert(\n            _hotel_row(' in source \
+        or '.insert(_hotel_row(' in source
+    assert "'transfer_min': tmin" not in source
+
+
+def test_explicit_none_would_violate_the_real_column(client, monkeypatch):
+    """Beweist, dass die Constraint-Simulation echt ist (sonst waere der Test
+    oben ein Papiertiger, der auch den kaputten Stand gruen faerbt)."""
+    fake = _FakeSB({'crew_hotel_directory': []})
+    with pytest.raises(_NotNullViolation):
+        fake.table('crew_hotel_directory').insert(
+            {'airline': 'LUFTHANSA', 'iata': 'CLJ', 'hotel': 'X',
+             'transfer_min': None, 'status': 'approved', 'votes': 1,
+             'active': True}).execute()
+
+
+def test_known_transfer_time_is_still_written(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': []})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/suggest?token=AT-x',
+                    data=json.dumps({'iata': 'CLJ', 'hotel': 'Hampton Hotel',
+                                     'transfer_min': 0}),
+                    content_type='application/json')
+
+    assert r.status_code == 200
+    _tbl, payload = fake.sink['inserts'][0]
+    # Explizite 0 heisst „fußläufig" und bleibt eine echte Angabe.
+    assert payload['transfer_min'] == 0
 
 
 def test_suggest_rejects_invalid_transfer_time(client, monkeypatch):

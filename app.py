@@ -34688,6 +34688,23 @@ def ax_crew_hotels_suggest():
         return jsonify({'ok': False, 'error': 'invalid_transfer_min'}), 400
     if not SB_AVAILABLE:
         return jsonify({'ok': False, 'error': 'unavailable'}), 503
+
+    def _hotel_row(status, suggested_by):
+        """Unbekannte Transferzeit heisst KEY WEGLASSEN — nie explizit `None`.
+
+        `crew_hotel_directory.transfer_min` ist `int NOT NULL DEFAULT 0`
+        (Prod-DDL geprueft 17.08.). Ein Insert mit explizitem `None` ist damit
+        eine not-null-Verletzung (23502): JEDE Hotel-Meldung ohne Transferzeit
+        endete im `except` unten als 500 `db` — der Vorschlag ging verloren.
+        Ohne den Key greift der Spalten-Default und die Meldung kommt an.
+        """
+        row = {'airline': airline, 'iata': iata, 'base': base, 'hotel': hotel,
+               'status': status, 'suggested_by': suggested_by, 'votes': 1,
+               'active': True}
+        if tmin is not None:
+            row['transfer_min'] = tmin
+        return row
+
     try:
         my_hash = _crew_hotel_token_hash(token)
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -34699,11 +34716,8 @@ def ax_crew_hotels_suggest():
             'airline', airline).eq('iata', iata).eq('status', 'approved').eq(
             'active', True).limit(20).execute().data) or []
         if not active_rows:
-            sb.table(_CREW_HOTEL_DIR_TABLE).insert({
-                'airline': airline, 'iata': iata, 'base': base, 'hotel': hotel,
-                'transfer_min': tmin, 'status': 'approved',
-                'suggested_by': my_hash, 'votes': 1, 'active': True,
-            }).execute()
+            sb.table(_CREW_HOTEL_DIR_TABLE).insert(
+                _hotel_row('approved', my_hash)).execute()
             return jsonify({'ok': True, 'status': 'approved_new'})
         # ÄNDERUNG an belegter Station: gleicher Vorschlag einer ZWEITEN Crew
         # (case-insensitiv) promotet automatisch auf approved und deaktiviert
@@ -34732,11 +34746,8 @@ def ax_crew_hotels_suggest():
                 {'votes': votes, 'updated_at': now_iso}
             ).eq('id', row['id']).execute()
             return jsonify({'ok': True, 'status': 'voted'})
-        sb.table(_CREW_HOTEL_DIR_TABLE).insert({
-            'airline': airline, 'iata': iata, 'base': base, 'hotel': hotel,
-            'transfer_min': tmin, 'status': 'suggested',
-            'suggested_by': my_hash, 'votes': 1, 'active': True,
-        }).execute()
+        sb.table(_CREW_HOTEL_DIR_TABLE).insert(
+            _hotel_row('suggested', my_hash)).execute()
         return jsonify({'ok': True, 'status': 'suggested'})
     except Exception as e:
         print(f"[crew-hotel] suggest fail: {e}")
