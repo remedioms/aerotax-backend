@@ -82,19 +82,32 @@ def test_merge_sorts_by_date_then_dep():
     assert [l["flight"] for l in merged] == ["LH050", "LH100", "LH101"]
 
 
-def test_legs_without_dep_iso_fall_back_to_block_key():
-    # Alt-Importe (z.B. Condor-Historie) können Legs ohne dep_iso tragen —
-    # der Schlüssel weicht dann auf die Blockzeit aus, statt zu kollidieren.
-    # ABER: der Leser im Backend kennt nur `date|flight|from|to`. Beide Legs
-    # trügen dort denselben Schlüssel, das erste verschwände samt Landungen.
-    # Deshalb bekommt die zweite Belegung vor dem Schreiben ihr „(2)".
+def test_legs_without_dep_iso_do_not_duplicate_on_block_drift():
+    # Alt-Importe (z.B. Condor-Historie, FAA-Layouts) tragen Legs ohne dep_iso.
+    # Die Blockzeit stand früher im Schlüssel — eine Minute Rundungsdifferenz
+    # war damit eine neue Identität und erzeugte STILL ein zweites Leg mit
+    # doppelten Landungen. Blockzeit ist eine Messung, keine Identität: die
+    # Toleranz in merge_legs greift, der Bestand gewinnt.
+    a = {"date": "2024-01-01", "flight": "DE123", "from": "FRA", "to": "PMI",
+         "block_min": 500}
+    b = dict(a, block_min=501)
+    merged, added = merge_legs([a], [b])
+    assert added == 0
+    assert len(merged) == 1
+    assert merged[0]["block_min"] == 500      # Bestand gewinnt
+    assert merged[0]["flight"] == "DE123"     # keine „(2)"-Belegung
+    # Andere Richtung (kleinerer Wert kommt neu) genauso.
+    merged, added = merge_legs([dict(a, block_min=501)], [dict(a, block_min=500)])
+    assert added == 0 and len(merged) == 1 and merged[0]["block_min"] == 501
+
+
+def test_legs_without_dep_iso_still_conflict_on_a_real_difference():
+    # Kein stilles Zusammenlegen echter Unterschiede: das bleibt ein Konflikt
+    # und schickt den Batch in `review`.
     a = {"date": "2024-01-01", "flight": "DE123", "from": "FRA", "to": "PMI",
          "block_min": 130}
-    b = dict(a, block_min=131)  # gleiche Strecke, anderer Block ⇒ eigener Key
-    merged, added = merge_legs([a], [b])
-    assert added == 1 and len(merged) == 2
-    assert len(dedupe_for_reader(merged)) == 1
-    assert [l["flight"] for l in merged] == ["DE123", "DE123(2)"]
+    with pytest.raises(ValueError, match="Merge-Konflikt"):
+        merge_legs([a], [dict(a, block_min=190)])
 
 
 def test_dedupe_is_stable_across_reruns_and_numbers_a_third_leg():

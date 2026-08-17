@@ -401,8 +401,19 @@ def _base_flight(flight):
 
 
 def _leg_key(leg):
+    """Identität eines Legs: Datum + Flugnummer + Strecke (+ Abflugzeit).
+
+    Für Legs OHNE `dep_iso` (Alt-Importe, FAA-Layouts, Condor-Historie) stand
+    hier früher die BLOCKZEIT im Schlüssel. Damit war jede Minute Rundungs-
+    differenz eine neue Identität: derselbe Flug mit 500 statt 501 Minuten kam
+    beim nächsten Upload als ZWEITES Leg dazu — still, ohne Konflikt, mit
+    doppelten Landungen im Flugbuch. Die Blockzeit ist eine MESSUNG, keine
+    Identität. Sie gehört deshalb in die Toleranzprüfung von `merge_legs`
+    (MAX_BLOCK_MERGE_DRIFT_MIN), nicht in den Schlüssel: kleine Drift heißt
+    „dasselbe Leg, Bestand gewinnt", große Drift heißt Konflikt → `review`.
+    """
     return (leg.get("date"), _base_flight(leg.get("flight")), leg.get("from"),
-            leg.get("to"), leg.get("dep_iso") or f"block:{leg.get('block_min')}")
+            leg.get("to"), leg.get("dep_iso") or "")
 
 
 def _sim_key(sim):
