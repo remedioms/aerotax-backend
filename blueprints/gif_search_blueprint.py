@@ -322,6 +322,12 @@ def gif_search(token):
     return jsonify(out)
 
 
+@gif_search_bp.route('/api/me/gif-search', methods=['GET'])
+def me_gif_search():
+    """Bearer-only alias; the mature handler already authenticates the header."""
+    return gif_search('')
+
+
 def _allowed_media_url(u):
     """Nur https auf die Medien-Domains des Anbieters. Alles andere ⇒ None.
 
@@ -420,3 +426,9 @@ def gif_import(token):
     if store_err is not None:
         return jsonify(store_err[0]), store_err[1]
     return jsonify({'ok': True, 'url': url, 'attribution': _ATTRIBUTION})
+
+
+@gif_search_bp.route('/api/me/gif-search/import', methods=['POST'])
+def me_gif_import():
+    """Bearer-only import alias; `gif_import` authenticates the header."""
+    return gif_import('')

@@ -2175,6 +2175,35 @@ def _authenticated_family_owner_token():
         return None
 
 
+def family_bearer_capability():
+    """Return the verified Family credential from ``Authorization``.
+
+    A Family caller can hold either its normal ``AT-…`` account credential or
+    a least-privilege ``AT-FAM-…`` pairing capability.  Header-only routes
+    must require possession of that exact credential, never just any active
+    app session.
+    """
+    bearer_fn = _app_attr('_request_bearer_token')
+    token = bearer_fn() if callable(bearer_fn) else None
+    if not _safe_token(token):
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    if token.startswith('AT-FAM-'):
+        if _scoped_token_crew(token):
+            return token, None
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    validate = _app_attr('_validate_token')
+    state_type = _app_attr('_TokenValidationState')
+    unavailable = _app_attr('_auth_store_unavailable_response')
+    result = validate(token) if callable(validate) else None
+    if result is not None and state_type is not None:
+        if result.state is state_type.UNAVAILABLE:
+            return None, (unavailable() if callable(unavailable) else
+                          (jsonify({'ok': False, 'error': 'auth_store_unavailable'}), 503))
+        if result.state is state_type.VALID:
+            return token, None
+    return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+
+
 def _normalize_code(raw):
     """Uppercase, Whitespace/Bindestriche weg, dann tolerant gegen die typischen
     Tipp-Verwechsler mappen (0→O, 1→I, I→? ...). Da das Generator-Alphabet
@@ -2244,6 +2273,64 @@ def family_watch_feed(token):
             'allowed_fields': fields_clean,
         })
     return jsonify({'watched': out, 'count': len(out)})
+
+
+@family_watch_bp.route('/api/me/family-watch/feed', methods=['GET'])
+def me_family_watch_feed():
+    """Header-only equivalent of the Family Watch feed."""
+    token, error = family_bearer_capability()
+    return error if error is not None else family_watch_feed(token)
+
+
+@family_watch_bp.route(
+    '/api/me/family-watch/connection/<opaque_crew_id>', methods=['DELETE'])
+def me_family_watch_revoke_connection(opaque_crew_id):
+    """Remove exactly one Family-owned connection selected by its public ID."""
+    family_token, error = family_bearer_capability()
+    if error is not None:
+        return error
+    if not re.fullmatch(r'[a-f0-9]{16}', opaque_crew_id or ''):
+        return jsonify({'ok': False, 'error': 'invalid_connection'}), 400
+    crew_token = _resolve_crew_for_family(
+        family_token, opaque_id=opaque_crew_id)
+    if not crew_token:
+        return jsonify({'ok': False, 'error': 'connection_not_found'}), 404
+
+    changed = False
+    shares = _shares_load()
+    retained = [
+        share for share in shares
+        if not (
+            share.get('family_token') == family_token
+            and share.get('crew_token') == crew_token
+        )
+    ]
+    if len(retained) != len(shares):
+        if not _shares_save(retained):
+            return jsonify({'ok': False, 'error': 'persist_failed'}), 503
+        changed = True
+        sb_avail, sb = _get_sb()
+        if sb_avail and sb is not None:
+            try:
+                (sb.table('family_shares').update({'deleted': True})
+                 .eq('crew_token', crew_token)
+                 .eq('family_token', family_token).execute())
+            except Exception as exc:
+                _log().warning(
+                    f'[family-watch] family_revoke_sb_skip {type(exc).__name__}')
+
+    if family_token.startswith('AT-FAM-'):
+        scoped = _scoped_tokens_load() or {}
+        record = scoped.get(family_token)
+        if isinstance(record, dict) and record.get('crew_token') == crew_token:
+            scoped.pop(family_token, None)
+            if not _scoped_tokens_save(scoped):
+                return jsonify({'ok': False, 'error': 'persist_failed'}), 503
+            changed = True
+
+    if not changed:
+        return jsonify({'ok': False, 'error': 'connection_not_found'}), 404
+    return jsonify({'ok': True, 'revoked': True})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2396,6 +2483,13 @@ def family_request_create(family_token):
     })
     _requests_save(reqs)
     return jsonify({'ok': True})
+
+
+@family_watch_bp.route('/api/me/family-request', methods=['POST'])
+def me_family_request_create():
+    """Header-only equivalent of a Family connection request."""
+    token, error = family_bearer_capability()
+    return error if error is not None else family_request_create(token)
 
 
 @family_watch_bp.route('/api/family-request/<crew_token>/pending', methods=['GET'])
@@ -2720,6 +2814,13 @@ def family_roster(family_token):
         # nur Initialen (User: „Name UND Foto vom Crew-Member fehlt").
         'crew_avatar_url': _crew_avatar(crew_token),
     })
+
+
+@family_watch_bp.route('/api/me/family-roster', methods=['GET'])
+def me_family_roster():
+    """Header-only equivalent of the Family calendar reader."""
+    token, error = family_bearer_capability()
+    return error if error is not None else family_roster(token)
 
 
 @family_watch_bp.route('/api/family/pair-code/<token>/create', methods=['POST'])

@@ -45,6 +45,44 @@ def test_calendar_pdf_me_route_uses_only_the_validated_bearer(monkeypatch):
     assert seen == [TOKEN]
 
 
+def test_calendar_events_me_route_uses_only_the_validated_bearer(monkeypatch):
+    seen = []
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A,
+        'upload_calendar_events',
+        lambda token: seen.append(token) or A.jsonify({'ok': True}),
+    )
+    with A.app.test_request_context(
+            '/api/me/calendar-events/upload', method='POST',
+            json={'events': []},
+            headers={'Authorization': f'Bearer {TOKEN}'}):
+        response = A.me_calendar_events_upload()
+    assert response.status_code == 200
+    assert response.get_json() == {'ok': True}
+    assert seen == [TOKEN]
+
+
+def test_destination_leaderboard_me_route_binds_the_bearer_not_a_url_token(monkeypatch):
+    seen = []
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A,
+        'get_destination_leaderboard',
+        lambda iata, token: seen.append((iata, token)) or A.jsonify({
+            'ok': True, 'iata': iata, 'ranking': [], 'total_crew': 0,
+            'my_rank': None, 'my_count': 0,
+        }),
+    )
+    with A.app.test_request_context(
+            '/api/me/destination-leaderboard/FRA',
+            headers={'Authorization': f'Bearer {TOKEN}'}):
+        response = A.me_destination_leaderboard('FRA')
+    assert response.status_code == 200
+    assert response.get_json()['iata'] == 'FRA'
+    assert seen == [('FRA', TOKEN)]
+
+
 def test_me_route_rejects_missing_or_non_account_bearer(monkeypatch):
     monkeypatch.setattr(A, '_validate_token', _valid)
     with A.app.test_request_context('/api/me/logbook'):

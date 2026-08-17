@@ -5659,6 +5659,38 @@ def flightops_sim_crewlist(token):
                     'session': simulator_session_info(resp)})
 
 
+@lh_flightops_bp.route('/api/me/lh/flightops/sim-crewlist', methods=['POST'])
+def me_flightops_sim_crewlist():
+    """Credential-free simulator-crew alias for Android.
+
+    Keep the mature FlightOps handler as the sole authority for grant state,
+    roster ownership and LH response parsing.  The wrapper merely derives the
+    owner from the normalized Authorization bearer and makes the response safe
+    for the `/api/me` public-reference boundary.
+    """
+    try:
+        import app as _app
+        token, error = _app._header_only_owner()
+    except Exception:
+        return jsonify({'ok': False, 'error': 'auth_unavailable'}), 503
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or set(body) != {'date'}:
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    response = _app.app.make_response(flightops_sim_crewlist(token))
+    if not response.is_json:
+        return response
+    payload = response.get_json(silent=True)
+    if payload is None:
+        return jsonify({'ok': False, 'error': 'invalid_response'}), 503
+    return _app.app.make_response((
+        jsonify(_app._publicize_foreign_user_refs(payload)), response.status_code,
+    ))
+
+
 @lh_flightops_bp.route('/api/lh/flightops/crewlist/<token>', methods=['POST'])
 def flightops_crewlist(token):
     """„Wer fliegt mit" für ein Leg (COMMON_CREWLIST → normalisiert). Body

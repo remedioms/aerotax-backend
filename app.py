@@ -24100,7 +24100,8 @@ _LOGBOOK_IMPORT_TS_LOCK = _req_threading.Lock()
 _LOGBOOK_IMPORT_MAX_PER_DAY = 30
 
 
-def _logbook_upload_store(token, filename, blob, note):
+def _logbook_upload_store(token, filename, blob, note,
+                          airline_hint=None, homebase_hint=None):
     """Upload durabel in SB `ax_logbook_upload` ablegen (data_b64 als Text —
     PostgREST-bytea-Encoding vermeiden). Primärer Transportweg seit 07-24:
     der Owner zieht die Datei direkt aus der Tabelle statt aus dem
@@ -24119,8 +24120,10 @@ def _logbook_upload_store(token, filename, blob, note):
         row = {
             'token': token,
             'name': (prof.get('name') or None),
-            'airline': (prof.get('airline') or None),
-            'homebase': (prof.get('homebase') or None),
+            'airline': ((airline_hint or '').strip()
+                        or prof.get('airline') or None),
+            'homebase': ((homebase_hint or '').strip().upper()
+                         or prof.get('homebase') or None),
             'filename': filename,
             'sha256': _hl.sha256(blob).hexdigest(),
             'size_bytes': len(blob),
@@ -30226,6 +30229,12 @@ def get_dm_inbox(token):
         except Exception:
             continue
         friends.append(peer)
+    # The native Crew list shows the peer name, not a generic "Direct
+    # message" label. Resolve all display profiles in one bounded query; never
+    # derive a label from the credential itself. The `/api/me` wrapper still
+    # replaces `friend_token` with an AXU reference before the response leaves
+    # the backend.
+    friend_profiles = _profiles_load_bulk(friends)
     last_seen = _dm_lastseen_load(token) or {}
     # send_chat_message speichert author_token PII-truncated als
     # `token[:16] + "…"`. Beim Vergleich hier muessen wir gegen dieselbe
@@ -30288,6 +30297,11 @@ def get_dm_inbox(token):
                 (last_msg or {}).get('author_token'), token),
             'unread_count': unread,
         }
+        friend_profile = friend_profiles.get(friend_token) or {}
+        friend_name = str(friend_profile.get('name')
+                          or friend_profile.get('short') or '').strip()
+        if friend_name:
+            entry['friend_name'] = friend_name[:160]
         # Additiv (iOS-Codable-sicher, alte Clients ignorieren die Felder):
         # aktive „guten Flug"-Wuensche < 24h fuer die Feed-Glas-Karten.
         if gf_in is not None:
@@ -39807,6 +39821,82 @@ def auth_revoke_session():
 _APPLE_JWKS_CACHE = {'keys': None, 'expires': 0.0}
 APPLE_BUNDLE_ID = os.environ.get('APPLE_BUNDLE_ID', 'aerotax.AeroTax')
 
+
+def _apple_allowed_audiences():
+    """Return every explicitly owned Apple client identifier.
+
+    Native iOS identity tokens use the bundle identifier as ``aud``. Apple's
+    Android/web authorization flow instead uses the registered Service ID.
+    Accepting only ``APPLE_BUNDLE_ID`` therefore made a correctly signed
+    Android token fail after the browser returned to AeroX.
+    """
+    values = [APPLE_BUNDLE_ID]
+    values.extend((os.environ.get('APPLE_SERVICE_ID') or '').split(','))
+    values.extend((os.environ.get('APPLE_ALLOWED_AUDIENCES') or '').split(','))
+    return frozenset(value.strip() for value in values if value.strip())
+
+
+def _apple_audience_allowed(raw_audience):
+    allowed = _apple_allowed_audiences()
+    if isinstance(raw_audience, str):
+        return raw_audience in allowed
+    if isinstance(raw_audience, (list, tuple)):
+        return any(isinstance(value, str) and value in allowed
+                   for value in raw_audience)
+    return False
+
+
+_APPLE_ANDROID_CALLBACK_FIELDS = (
+    'code', 'id_token', 'state', 'user', 'error', 'error_description')
+_APPLE_ANDROID_PACKAGE_ID = 'de.aerosteuer.aerox'
+
+
+@app.route('/callbacks/sign_in_with_apple', methods=['POST'])
+def apple_android_callback():
+    """Return Apple's ``form_post`` response to the Android plugin.
+
+    This endpoint never creates a session and never trusts the forwarded JWT.
+    The Flutter client sends the identity token to ``/api/auth/apple``, where
+    its signature, issuer, audience and expiry are independently verified.
+    """
+    if request.content_length is not None and request.content_length > 32_768:
+        return jsonify({'ok': False, 'error': 'callback_too_large'}), 413
+    if request.mimetype != 'application/x-www-form-urlencoded':
+        return jsonify({'ok': False, 'error': 'invalid_content_type'}), 415
+
+    forwarded = {}
+    for key in _APPLE_ANDROID_CALLBACK_FIELDS:
+        values = request.form.getlist(key)
+        if len(values) > 1:
+            return jsonify({'ok': False, 'error': 'duplicate_callback_field'}), 400
+        if not values:
+            continue
+        value = values[0]
+        limit = 16_384 if key == 'id_token' else 8_192 if key == 'user' else 2_048
+        if not isinstance(value, str) or len(value) > limit:
+            return jsonify({'ok': False, 'error': 'invalid_callback_field'}), 400
+        if value:
+            forwarded[key] = value
+
+    state = forwarded.get('state', '')
+    if len(state) < 16 or len(state) > 256:
+        return jsonify({'ok': False, 'error': 'invalid_state'}), 400
+    if 'error' not in forwarded and (
+            not forwarded.get('code') or not forwarded.get('id_token')):
+        return jsonify({'ok': False, 'error': 'incomplete_callback'}), 400
+
+    import urllib.parse as _apple_urlparse
+    query = _apple_urlparse.urlencode(forwarded)
+    location = (
+        f'intent://callback?{query}'
+        f'#Intent;package={_APPLE_ANDROID_PACKAGE_ID};'
+        'scheme=signinwithapple;end')
+    response = make_response('', 303)
+    response.headers['Location'] = location
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
+
 def _fetch_apple_jwks():
     now = time.time()
     if _APPLE_JWKS_CACHE['keys'] and _APPLE_JWKS_CACHE['expires'] > now:
@@ -39840,7 +39930,7 @@ def _verify_apple_identity_token(token, expected_sub=None):
         # Claims-Check
         if payload.get('iss') != 'https://appleid.apple.com':
             return (False, None, None)
-        if payload.get('aud') != APPLE_BUNDLE_ID:
+        if not _apple_audience_allowed(payload.get('aud')):
             return (False, None, None)
         now = int(time.time())
         if int(payload.get('exp') or 0) < now:
@@ -60620,7 +60710,8 @@ def _roster_ai_fallback_ics(text, token, det_error):
 _ROSTER_PDF_QUEUE_NOTE = 'AEROX_ROSTER_PDF_V1'
 
 
-def _roster_pdf_upload_store(token, filename, blob):
+def _roster_pdf_upload_store(token, filename, blob, airline_hint=None,
+                             homebase_hint=None):
     """Keep every valid roster PDF until the import watcher verified it.
 
     Reuses the private, service-key-only import inbox that already carries
@@ -60657,8 +60748,13 @@ def _roster_pdf_upload_store(token, filename, blob):
     except Exception:
         # Monitoring durability wins over dedupe when the read path degrades.
         pass
+    profile_hints = {}
+    if (airline_hint or '').strip():
+        profile_hints['airline_hint'] = airline_hint
+    if (homebase_hint or '').strip():
+        profile_hints['homebase_hint'] = homebase_hint
     stored = _logbook_upload_store(
-        token, safe_name, blob, _ROSTER_PDF_QUEUE_NOTE)
+        token, safe_name, blob, _ROSTER_PDF_QUEUE_NOTE, **profile_hints)
     level = app.logger.info if stored else app.logger.warning
     level(f'[roster-pdf] queue-store-{"ok" if stored else "fail"} '
           f'tok={token[:8]} sha={sha} bytes={len(blob)}')
@@ -60700,6 +60796,178 @@ def _roster_pdf_upload_finish(job_ids, status, error_code=None,
         return False
 
 
+# ── Offenes Airline-Onboarding ─────────────────────────────────────────────
+# The durable support queue only accepts a source which is already owner-bound
+# (the encrypted calendar feed or the private roster-PDF inbox).
+_AIRLINE_REQUEST_SOURCE_KINDS = frozenset(('ical_url', 'pdf'))
+
+
+def _airline_request_clean_name(value):
+    name = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(value or ''))
+    name = re.sub(r'\s+', ' ', name).strip()[:80]
+    return name if len(name) >= 2 and any(ch.isalpha() for ch in name) else ''
+
+
+def _airline_request_normalized_name(value):
+    import unicodedata
+    name = _airline_request_clean_name(value)
+    folded = unicodedata.normalize('NFKD', name).encode(
+        'ascii', 'ignore').decode('ascii').lower()
+    return re.sub(r'[^a-z0-9]+', '-', folded).strip('-')[:96]
+
+
+def _airline_request_homebase(value):
+    homebase = str(value or '').strip().upper()
+    return homebase if re.fullmatch(r'[A-Z]{3}', homebase) else None
+
+
+def _airline_request_pdf_source(token, sha256):
+    digest = str(sha256 or '').strip().lower()
+    if not re.fullmatch(r'[0-9a-f]{64}', digest) or not SB_AVAILABLE:
+        return None
+    try:
+        def _load():
+            return (sb.table('ax_logbook_upload')
+                    .select('id,status,filename,sha256')
+                    .eq('token', token).eq('sha256', digest)
+                    .eq('note', _ROSTER_PDF_QUEUE_NOTE)
+                    .order('id', desc=True).limit(1).execute())
+        result, failed = _supabase_execute_with_timeout(
+            'airline_request_pdf_source', _load, timeout_s=8)
+        rows = getattr(result, 'data', None) or []
+        return None if failed or not rows else rows[0]
+    except Exception as exc:
+        app.logger.warning('[airline-request] source-lookup-fail tok=%s err=%s',
+                           token[:8], type(exc).__name__)
+        return None
+
+
+def _airline_request_profile_feed(token):
+    try:
+        full = _profile_load(token) or {}
+        for source in ((full.get('profile') or {}), full):
+            feed = source.get('calendar_feed')
+            if isinstance(feed, dict):
+                return feed
+    except Exception:
+        pass
+    return {}
+
+
+def _airline_request_store(row):
+    if not SB_AVAILABLE:
+        return None
+    try:
+        def _insert():
+            return sb.table('airline_support_requests').insert(row).execute()
+        result, failed = _supabase_execute_with_timeout(
+            'airline_request_store', _insert, timeout_s=8)
+        rows = getattr(result, 'data', None) or []
+        return None if failed or not rows else rows[0]
+    except Exception as exc:
+        app.logger.warning('[airline-request] store-fail tok=%s err=%s',
+                           str(row.get('token') or '')[:8], type(exc).__name__)
+        return None
+
+
+def _airline_catalog_promote(display_name, normalized_name, source_kind):
+    if not SB_AVAILABLE:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        def _upsert():
+            return sb.table('airline_catalog').upsert({
+                'normalized_name': normalized_name,
+                'display_name': display_name, 'status': 'supported',
+                'source_kind': source_kind, 'last_verified_at': now,
+                'updated_at': now,
+            }, on_conflict='normalized_name').execute()
+        _, failed = _supabase_execute_with_timeout(
+            'airline_catalog_promote', _upsert, timeout_s=8)
+        return not failed
+    except Exception as exc:
+        app.logger.warning('[airline-request] catalog-fail name=%s err=%s',
+                           normalized_name, type(exc).__name__)
+        return False
+
+
+def _airline_catalog_load():
+    if not SB_AVAILABLE:
+        return None
+    try:
+        def _load():
+            return (sb.table('airline_catalog')
+                    .select('display_name,source_kind,last_verified_at')
+                    .eq('status', 'supported').order('display_name').execute())
+        result, failed = _supabase_execute_with_timeout(
+            'airline_catalog_load', _load, timeout_s=8)
+        return None if failed else (getattr(result, 'data', None) or [])
+    except Exception:
+        return None
+
+
+@app.route('/api/user/airlines/<token>', methods=['GET'])
+def get_supported_airlines(token):
+    rows = _airline_catalog_load()
+    if rows is None:
+        return jsonify({'ok': False, 'error': 'catalog_unavailable'}), 503
+    return jsonify({'ok': True, 'airlines': rows})
+
+
+@app.route('/api/user/airline-request/<token>', methods=['POST'])
+def submit_airline_support_request(token):
+    body = request.get_json(silent=True) or {}
+    airline_name = _airline_request_clean_name(body.get('airline_name'))
+    normalized_name = _airline_request_normalized_name(airline_name)
+    source_kind = str(body.get('source_kind') or '').strip().lower()
+    if not airline_name or not normalized_name:
+        return jsonify({'ok': False, 'error': 'invalid_airline_name'}), 400
+    if source_kind not in _AIRLINE_REQUEST_SOURCE_KINDS:
+        return jsonify({'ok': False, 'error': 'invalid_source_kind'}), 400
+    homebase = _airline_request_homebase(body.get('homebase'))
+    feed = _airline_request_profile_feed(token)
+    stored_events = feed.get('events') if isinstance(feed.get('events'), list) else []
+    source_upload_id = source_filename = source_url_enc = None
+    if source_kind == 'ical_url':
+        source_url = _normalize_feed_scheme(_sanitize_feed_url(body.get('source_url') or ''))
+        if not source_url.startswith('https://'):
+            return jsonify({'ok': False, 'error': 'invalid_source_url'}), 400
+        source_fingerprint = _hashlib.sha256(source_url.encode()).hexdigest()
+        try:
+            source_url_enc = _calendar_feed_encrypt_value(source_url, 'url')
+        except Exception:
+            source_url_enc = ''
+        if not source_url_enc:
+            return jsonify({'ok': False, 'error': 'source_encryption_failed'}), 503
+        stored_url = _normalize_feed_scheme(_sanitize_feed_url(feed.get('url') or ''))
+        source_verified = bool(stored_events and stored_url == source_url)
+    else:
+        source = _airline_request_pdf_source(token, body.get('source_sha256'))
+        if source is None:
+            return jsonify({'ok': False, 'error': 'pdf_source_not_found'}), 400
+        source_upload_id, source_filename = source.get('id'), str(source.get('filename') or '')[:120] or None
+        source_fingerprint = source.get('sha256')
+        source_verified = bool(stored_events and source.get('status') == 'completed')
+    status = 'supported' if source_verified else 'pending'
+    now = datetime.now(timezone.utc).isoformat()
+    stored = _airline_request_store({
+        'token': token, 'airline_name': airline_name,
+        'normalized_name': normalized_name, 'homebase': homebase,
+        'source_kind': source_kind, 'source_upload_id': source_upload_id,
+        'source_filename': source_filename, 'source_url_enc': source_url_enc,
+        'source_fingerprint': source_fingerprint, 'status': status,
+        'import_source': str(body.get('import_source') or '')[:40] or None,
+        'events_count': len(stored_events) if source_verified else None,
+        'updated_at': now, 'completed_at': now if source_verified else None,
+    })
+    if stored is None:
+        return jsonify({'ok': False, 'error': 'request_store_failed'}), 503
+    if source_verified:
+        _airline_catalog_promote(airline_name, normalized_name, source_kind)
+    return jsonify({'ok': True, 'request_id': stored.get('id'), 'status': status,
+                    'eta_hours': 0 if status == 'supported' else 24})
+
+
 def _pdf_informational_only_kind(text):
     """Recognize valid PDFs that cannot truthfully create calendar events."""
     source = text or ''
@@ -60732,7 +61000,9 @@ def import_roster_pdf(token):
         return jsonify({'ok': False, 'error': 'too_many_pdfs_20'}), 413
 
     import hashlib as _hl
-    carrier = _crewaccess_carrier_for(request.form.get('airline'), token)
+    airline_hint = request.form.get('airline')
+    homebase_hint = request.form.get('homebase')
+    carrier = _crewaccess_carrier_for(airline_hint, token)
     queued = []
     upload_shas = []
     standard_calendars = []
@@ -60751,8 +61021,13 @@ def import_roster_pdf(token):
         upload_shas.append(upload_sha)
         # Durable private inbox before parsing: even a parser/extractor failure
         # can be reproduced after this request has ended.
+        upload_hints = {}
+        if (airline_hint or '').strip():
+            upload_hints['airline_hint'] = airline_hint
+        if (homebase_hint or '').strip():
+            upload_hints['homebase_hint'] = homebase_hint
         queued.append(_roster_pdf_upload_store(
-            token, upload.filename or 'roster.pdf', data))
+            token, upload.filename or 'roster.pdf', data, **upload_hints))
         try:
             import io
             import pdfplumber
@@ -80815,6 +81090,93 @@ def me_calendar_feed_import():
     return _header_only_dispatch(import_calendar_feed)
 
 
+@app.route('/api/me/calendar-events/upload', methods=['POST'])
+def me_calendar_events_upload():
+    """Credential-free Android alias for the selected device-calendar import."""
+    return _header_only_dispatch(upload_calendar_events)
+
+
+@app.route('/api/me/roster-pdf/import', methods=['POST'])
+def me_roster_pdf_import():
+    """Header-authenticated multipart roster-PDF import."""
+    return _header_only_dispatch(import_roster_pdf)
+
+
+@app.route('/api/me/airlines', methods=['GET'])
+def me_supported_airlines():
+    """Bearer-authenticated dynamic airline catalog."""
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    return _header_only_dispatch(get_supported_airlines)
+
+
+@app.route('/api/me/airline-request', methods=['POST'])
+def me_airline_support_request():
+    """Bearer-authenticated, owner-bound unknown-airline support request."""
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    body = request.get_json(silent=True)
+    if isinstance(body, dict) and any(
+            key in body for key in ('token', 'account_token', 'owner_token')):
+        return jsonify({'ok': False, 'error': 'owner_in_body_not_allowed'}), 400
+    return _header_only_dispatch(submit_airline_support_request)
+
+
+@app.route('/api/me/briefing', methods=['GET'])
+def me_briefing():
+    return _header_only_dispatch(get_briefings)
+
+
+@app.route('/api/me/briefing/<datum>', methods=['PUT'])
+def me_briefing_datum(datum):
+    # Deliberately no GET alias: the historic API has no GET-day contract.
+    return _header_only_dispatch(put_briefing, datum)
+
+
+@app.route('/api/me/flight-notes', methods=['GET'])
+def me_flight_notes():
+    return _header_only_dispatch(list_flight_notes)
+
+
+@app.route('/api/me/flight-notes/<datum>', methods=['GET', 'PUT'])
+def me_flight_note(datum):
+    return _header_only_dispatch(
+        get_flight_note if request.method == 'GET' else put_flight_note, datum)
+
+
+@app.route('/api/me/voice-note', methods=['GET'])
+def me_voice_notes():
+    return _header_only_dispatch(list_voice_notes)
+
+
+@app.route('/api/me/voice-note/<datum>', methods=['GET', 'POST', 'DELETE'])
+def me_voice_note(datum):
+    # Do not public-project this route: GET returns an audio/mp4 response.
+    handlers = {
+        'GET': get_voice_note,
+        'POST': upload_voice_note,
+        'DELETE': delete_voice_note,
+    }
+    return _header_only_dispatch(handlers[request.method], datum)
+
+
+@app.route('/api/me/destination-notes', methods=['GET'])
+def me_destination_notes():
+    return _header_only_dispatch(list_destination_notes)
+
+
+@app.route('/api/me/destination-notes/<iata>', methods=['GET', 'PUT'])
+def me_destination_note(iata):
+    return _header_only_dispatch(
+        get_destination_note if request.method == 'GET' else put_destination_note,
+        iata)
+
+
+@app.route('/api/me/trip-stats', methods=['GET'])
+def me_trip_stats():
+    return _header_only_dispatch(get_trip_stats)
+
+
 @app.route('/api/me/passport-stats', methods=['GET'])
 def me_passport_stats():
     return _header_only_dispatch(get_passport_stats)
@@ -80833,6 +81195,15 @@ def me_ax_shuttle_options():
 @app.route('/api/me/airport/board', methods=['GET'])
 def me_airport_board():
     return _header_only_dispatch(airport_board)
+
+
+@app.route('/api/me/destination-leaderboard/<iata>', methods=['GET'])
+def me_destination_leaderboard(iata):
+    """Credential-free destination leaderboard for the signed-in crew member."""
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    token, error = _header_only_owner()
+    return error if error is not None else get_destination_leaderboard(iata, token)
 
 
 @app.route('/api/me/layover-recs/upload-image', methods=['POST'])
@@ -80878,6 +81249,28 @@ def me_layover_discover():
 def me_hangouts():
     # SEC (Review 16.08.): Freundes-Pins tragen `owner_token` (fremdes AT) roh.
     return _header_only_public_dispatch(list_hangouts)
+
+
+@app.route('/api/me/hangouts/<pin_id>', methods=['GET'])
+def me_hangout_detail(pin_id):
+    return _header_only_public_dispatch(get_hangout_detail, pin_id)
+
+
+@app.route('/api/me/hangouts/<pin_id>/join', methods=['POST'])
+def me_hangout_join(pin_id):
+    return _header_only_dispatch(join_hangout, pin_id)
+
+
+@app.route('/api/me/manual-pins', methods=['GET', 'POST'])
+def me_manual_pins():
+    if request.method == 'GET':
+        return _header_only_public_dispatch(list_manual_pins)
+    return _header_only_dispatch(create_manual_pin)
+
+
+@app.route('/api/me/manual-pins/<pin_id>/delete', methods=['POST'])
+def me_manual_pin_delete(pin_id):
+    return _header_only_dispatch(delete_manual_pin, pin_id)
 
 
 @app.route('/api/me/crew-at-destination', methods=['GET'])
@@ -80985,6 +81378,22 @@ def me_friend_request_action(action):
     if handler is None:
         return jsonify({'ok': False, 'error': 'not_found'}), 404
     return _header_only_dispatch(handler)
+
+
+@app.route('/api/me/friend-requests/invite', methods=['POST'])
+def me_friend_request_invite():
+    """Header-authenticated minting endpoint for the short-lived Crew QR.
+
+    The legacy route deliberately keeps its owner token in the URL for older
+    iOS builds. Android must never re-introduce that credential-bearing URL.
+    """
+    return _header_only_dispatch(mint_friend_invite)
+
+
+@app.route('/api/me/friend-requests/redeem-invite', methods=['POST'])
+def me_friend_request_redeem_invite():
+    """Redeem a Crew QR invite using the current bearer-bound account only."""
+    return _header_only_dispatch(redeem_friend_invite)
 
 
 @app.route('/api/me/friend-groups', methods=['GET'])
@@ -81235,7 +81644,11 @@ def me_friend_groups_delete(group_id):
 
 @app.route('/api/me/moderation/<action>', methods=['POST'])
 def me_moderation(action):
-    handlers = {'block': moderation_block, 'mute': moderation_mute}
+    handlers = {
+        'block': moderation_block,
+        'mute': moderation_mute,
+        'report': moderation_report,
+    }
     handler = handlers.get(action)
     if handler is None:
         return jsonify({'ok': False, 'error': 'not_found'}), 404
@@ -81351,9 +81764,210 @@ def me_ax_punctuality():
     return _header_only_dispatch(ax_crew_punctuality)
 
 
+@app.route('/api/me/airport/punctuality', methods=['GET'])
+def me_airport_punctuality():
+    return _header_only_dispatch(airport_punctuality)
+
+
+def _me_roster_routing(day):
+    """Build the evidenced IATA chain used by the iOS briefing synthesis."""
+    sectors = day.get('ical_sectors') if isinstance(day, dict) else None
+    chain = []
+    for sector in sectors if isinstance(sectors, list) else []:
+        if not isinstance(sector, dict):
+            continue
+        origin = str(sector.get('from') or '').strip().upper()
+        destination = str(sector.get('to') or '').strip().upper()
+        if not (re.fullmatch(r'[A-Z]{3}', origin)
+                and re.fullmatch(r'[A-Z]{3}', destination)):
+            continue
+        if not chain:
+            chain.append(origin)
+        elif chain[-1] != origin:
+            chain.append(origin)
+        if chain[-1] != destination:
+            chain.append(destination)
+    if len(chain) >= 2:
+        return '-'.join(chain)
+    location = str((day or {}).get('ical_location') or '').upper()
+    codes = re.findall(r'\b[A-Z]{3}\b', location)
+    deduplicated = []
+    for code in codes:
+        if not deduplicated or deduplicated[-1] != code:
+            deduplicated.append(code)
+    return '-'.join(deduplicated) if len(deduplicated) >= 2 else None
+
+
+def _me_roster_briefing_klass(summary, has_flight=False, has_time=False):
+    """Return only classification hints supported by explicit roster text.
+
+    This mirrors the iOS rule that a merged Off-Day marker must never hide a
+    flight or a timed ground duty. Unknown markers deliberately stay ``None``
+    and are rendered verbatim by the client instead of being guessed.
+    """
+    upper = str(summary or '').strip().upper()
+    if not upper or has_flight or _summary_has_ground_duty(upper):
+        return None
+    if 'ABSENCE' in upper and re.search(r'\((?:K|KH|KK|KO|T)\)', upper):
+        return 'Krank'
+    if any(value in upper for value in ('KRANK', 'SICKNESS', 'SICK')) \
+            or re.search(r'\bILL\b', upper):
+        return 'Krank'
+    if any(value in upper for value in ('URLAUB', 'VACATION', 'VAC')):
+        return 'Urlaub'
+    if 'ABSENCE' in upper:
+        return None if has_time else 'Urlaub'
+    if any(value in upper for value in ('RESERVE', 'RISERVA')) \
+            or upper in ('RES', 'RB'):
+        return 'RES'
+    if 'STANDBY' in upper or 'STBY' in upper:
+        return 'STBY'
+    if any(value in upper for value in ('OFFICE', 'BÜRO', 'BUERO', 'GROUND')):
+        return 'OFFICE'
+    if (any(value in upper for value in (
+            'OFF DAY', 'DAY OFF', 'FREE DAY', 'REST DAY', 'RECOVERY',
+            'ORTSTAG')) or upper in ('FREI', 'OFF', 'OF', 'X', 'FR',
+                                     'FREE', 'ORT', '-')):
+        return 'FREI'
+    return None
+
+
+def _me_roster_days_from_briefings(token, briefings):
+    """Project the same persisted iCal facts iOS merges into effectiveDays."""
+    if not isinstance(briefings, dict):
+        return []
+    try:
+        homebase = (_profile_homebase_cached(token) or 'FRA').strip().upper()
+    except Exception:
+        homebase = 'FRA'
+    shaped = []
+    for datum in sorted(briefings):
+        row = briefings.get(datum)
+        if not (isinstance(row, dict)
+                and re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(datum))):
+            continue
+        try:
+            datetime.strptime(str(datum), '%Y-%m-%d')
+        except ValueError:
+            continue
+        summary = str(row.get('ical_summary') or '').strip()
+        location = str(row.get('ical_location') or '').strip()
+        start_iso = str(row.get('ical_start_iso')
+                        or row.get('ical_start') or '').strip()
+        end_iso = str(row.get('ical_end_iso')
+                      or row.get('ical_end') or '').strip()
+        sectors = row.get('ical_sectors')
+        sectors = sectors if isinstance(sectors, list) else []
+        if not (summary or location or start_iso or sectors):
+            continue
+        marker = summary or location
+        routing = _me_roster_routing(row)
+        has_flight = bool(routing or any(
+            isinstance(sector, dict)
+            and (sector.get('flight') or (sector.get('from') and sector.get('to')))
+            for sector in sectors))
+        day = {
+            'datum': str(datum),
+            'klass': _me_roster_briefing_klass(
+                marker, has_flight=has_flight, has_time=bool(start_iso)),
+            'marker': marker,
+            'routing': routing,
+            'ical_sectors': sectors,
+            'ical_start_iso': start_iso or None,
+        }
+        single_station = location.upper()
+        if (not routing and re.fullmatch(r'[A-Z]{3}', single_station)):
+            day['ical_station'] = single_station
+        raw_layover = str(row.get('ical_layover_ort') or '').strip().upper()
+        layover = raw_layover if re.fullmatch(r'[A-Z]{3}', raw_layover) else None
+        if layover is None and sectors:
+            probe = dict(day)
+            probe['reader_facts'] = {'layover_ort': None}
+            try:
+                layover = _feed_nightstop_ort(probe, homebase=homebase)
+            except Exception:
+                layover = None
+        day['reader_facts'] = {
+            'layover_ort': layover,
+            'start_time': _rc_local_hhmm(start_iso, homebase) or None,
+            'end_time': _rc_local_hhmm(end_iso, homebase) or None,
+            'overnight_after_day': True if layover else None,
+            'marker_raw': summary or marker,
+        }
+        shaped.append(day)
+    return shaped
+
+
+def _me_roster_merge_days(evaluated, live):
+    """Merge iOS-style live roster facts over tax-only day information."""
+    by_date = {}
+    for day in evaluated if isinstance(evaluated, list) else []:
+        if isinstance(day, dict) and re.fullmatch(
+                r'\d{4}-\d{2}-\d{2}', str(day.get('datum') or '')):
+            by_date[day['datum']] = dict(day)
+    live_fields = ('klass', 'marker', 'routing', 'reader_facts',
+                   'ical_sectors', 'ical_start_iso', 'ical_station')
+    for day in live if isinstance(live, list) else []:
+        if not (isinstance(day, dict) and re.fullmatch(
+                r'\d{4}-\d{2}-\d{2}', str(day.get('datum') or ''))):
+            continue
+        datum = day['datum']
+        merged = dict(by_date.get(datum) or {'datum': datum})
+        for field in live_fields:
+            value = day.get(field)
+            if value is not None and value != [] and value != '':
+                merged[field] = value
+        by_date[datum] = merged
+    return [by_date[key] for key in sorted(by_date)]
+
+
 @app.route('/api/me/roster', methods=['GET'])
 def me_roster():
-    return _header_only_dispatch(session_recall)
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    if request.get_data(cache=True):
+        return jsonify({'ok': False, 'error': 'body_not_allowed'}), 400
+
+    session, session_timed_out = _load_session_safe(token)
+    result_data = dict((session or {}).get('result_data') or {})
+    days = result_data.get('_tage_detail')
+    days = days if isinstance(days, list) else []
+    source = 'session' if days else None
+
+    try:
+        snapshot_days = (_roster_snapshot_read(token) or {}).get('tage') or []
+    except Exception:
+        snapshot_days = []
+    if snapshot_days:
+        days = _me_roster_merge_days(days, snapshot_days)
+        source = 'session+snapshot' if source else 'snapshot'
+
+    briefing_error = False
+    try:
+        briefing_response = app.make_response(get_briefings(token))
+        briefing_payload = briefing_response.get_json(silent=True) \
+            if briefing_response.is_json else None
+        if briefing_response.status_code == 200 and isinstance(briefing_payload, dict):
+            briefing_days = _me_roster_days_from_briefings(
+                token, briefing_payload.get('briefings'))
+            if briefing_days:
+                days = _me_roster_merge_days(days, briefing_days)
+                source = f'{source}+briefings' if source else 'briefings'
+        else:
+            briefing_error = True
+    except Exception:
+        briefing_error = True
+
+    if not days and session_timed_out and briefing_error:
+        return jsonify(_fetch_error_response()), 503
+    result_data['_tage_detail'] = days
+    return jsonify({
+        'result_data': result_data,
+        'roster_source': source or 'empty',
+    })
 
 
 @app.route('/api/me/friend-roster/<friend_token>', methods=['GET'])
@@ -81566,6 +82180,36 @@ def me_chat_channel_message_reaction(channel_id, message_id):
 def me_wall_upload_image():
     """Authenticated social-media upload without a credential-bearing URL."""
     return _header_only_dispatch(upload_wall_image)
+
+
+@app.route('/api/me/wall/feed', methods=['GET'])
+def me_wall_feed():
+    return _header_only_public_dispatch(get_wall_feed)
+
+
+@app.route('/api/me/wall/post', methods=['POST'])
+def me_wall_post():
+    return _header_only_dispatch(create_wall_post)
+
+
+@app.route('/api/me/wall/like/<post_id>', methods=['POST'])
+def me_wall_like(post_id):
+    return _header_only_dispatch(toggle_like, post_id)
+
+
+@app.route('/api/me/wall/post/<post_id>/comment', methods=['POST'])
+def me_wall_comment(post_id):
+    return _header_only_dispatch(add_comment, post_id)
+
+
+@app.route('/api/me/wall/post/<post_id>/comments', methods=['GET'])
+def me_wall_comments(post_id):
+    return _header_only_public_dispatch(get_comments, post_id)
+
+
+@app.route('/api/me/wall/post/<post_id>', methods=['DELETE'])
+def me_wall_delete_post(post_id):
+    return _header_only_dispatch(delete_wall_post, post_id)
 
 
 @app.route('/api/me/forum/threads', methods=['GET', 'POST'])

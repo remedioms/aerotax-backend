@@ -349,6 +349,27 @@ def post_family_status(family_token):
     return jsonify({'ok': True, 'status': _public_view(rec)})
 
 
+def _family_bearer_capability():
+    fw = _fw()
+    helper = getattr(fw, 'family_bearer_capability', None) if fw else None
+    if not callable(helper):
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    return helper()
+
+
+def _crew_bearer_owner():
+    helper = _app_attr('_header_only_owner')
+    if not callable(helper):
+        return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
+    return helper()
+
+
+@feed_status_bp.route('/api/me/feed-status/family', methods=['POST'])
+def me_post_family_status():
+    token, error = _family_bearer_capability()
+    return error if error is not None else post_family_status(token)
+
+
 @feed_status_bp.route('/api/feed-status/family/<family_token>', methods=['GET'])
 def get_family_status(family_token):
     """Family sieht die eigene aktive Nachricht (zum Bearbeiten/Entfernen)."""
@@ -364,12 +385,24 @@ def get_family_status(family_token):
     return jsonify({'ok': True, 'status': None})
 
 
+@feed_status_bp.route('/api/me/feed-status/family', methods=['GET'])
+def me_get_family_status():
+    token, error = _family_bearer_capability()
+    return error if error is not None else get_family_status(token)
+
+
 @feed_status_bp.route('/api/feed-status/family/<family_token>', methods=['DELETE'])
 def delete_family_status(family_token):
     if not _safe_token(family_token):
         return jsonify({'ok': False, 'error': 'invalid_token'}), 400
     _status_delete(family_token)
     return jsonify({'ok': True})
+
+
+@feed_status_bp.route('/api/me/feed-status/family', methods=['DELETE'])
+def me_delete_family_status():
+    token, error = _family_bearer_capability()
+    return error if error is not None else delete_family_status(token)
 
 
 @feed_status_bp.route('/api/feed-status/family/<family_token>/bind-push',
@@ -424,6 +457,12 @@ def incoming_statuses(crew_token):
     out = [_public_view(r) for r in rows]
     out.sort(key=lambda v: v.get('created_at') or '', reverse=True)
     return jsonify({'ok': True, 'statuses': out, 'count': len(out)})
+
+
+@feed_status_bp.route('/api/me/feed-status/incoming', methods=['GET'])
+def me_incoming_statuses():
+    token, error = _crew_bearer_owner()
+    return error if error is not None else incoming_statuses(token)
 
 
 def _notify_crew_of_family_message(crew_token, rec):
@@ -647,6 +686,12 @@ def reply_to_status(crew_token):
     })
 
 
+@feed_status_bp.route('/api/me/feed-status/reply', methods=['POST'])
+def me_reply_to_status():
+    token, error = _crew_bearer_owner()
+    return error if error is not None else reply_to_status(token)
+
+
 @feed_status_bp.route('/api/feed-status/<crew_token>/react', methods=['POST'])
 def react_to_status(crew_token):
     """Crew schickt eine Reaktion (z. B. ❤️) auf eine Family-Nachricht zurück.
@@ -704,3 +749,9 @@ def react_to_status(crew_token):
     except Exception:
         pass
     return jsonify({'ok': True, 'reaction': emoji})
+
+
+@feed_status_bp.route('/api/me/feed-status/react', methods=['POST'])
+def me_react_to_status():
+    token, error = _crew_bearer_owner()
+    return error if error is not None else react_to_status(token)

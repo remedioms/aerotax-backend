@@ -132,8 +132,12 @@ def test_dm_wrapper_does_not_repeat_the_pair_gate():
 
 
 def test_inbox_uses_edge_only_read_and_trusts_accepted_request_row():
-    rows = {'user_friends': [{
-        'owner_token': ME, 'friend_token': PEER, 'status': 'accepted'}]}
+    rows = {
+        'user_friends': [{
+            'owner_token': ME, 'friend_token': PEER, 'status': 'accepted'}],
+        'user_profiles': [{
+            'token': PEER, 'name': 'Alex Crew', 'metadata': {}}],
+    }
     with (
         _fast_sb(rows) as fake,
         A.app.test_request_context(method='GET'),
@@ -144,5 +148,7 @@ def test_inbox_uses_edge_only_read_and_trusts_accepted_request_row():
         patch.object(A, '_dm_load_recent', return_value=[]),
     ):
         response = A.get_dm_inbox(ME)
-    assert response.get_json()['count'] == 1
-    assert fake.calls == ['user_friends']
+    payload = response.get_json()
+    assert payload['count'] == 1
+    assert payload['inbox'][0]['friend_name'] == 'Alex Crew'
+    assert fake.calls == ['user_friends', 'user_profiles']

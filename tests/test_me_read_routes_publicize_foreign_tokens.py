@@ -97,3 +97,29 @@ def test_me_profile_put_stays_on_thin_dispatch(monkeypatch):
         resp = A.me_profile()
     assert seen == [OWNER]
     assert A.app.make_response(resp).get_json()['ok'] is True
+
+
+def test_me_friend_invite_aliases_keep_owner_in_bearer_only(monkeypatch):
+    seen = []
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    monkeypatch.setattr(
+        A, 'mint_friend_invite',
+        lambda token: seen.append(('mint', token)) or A.jsonify({'ok': True}),
+    )
+    monkeypatch.setattr(
+        A, 'redeem_friend_invite',
+        lambda token: seen.append(('redeem', token)) or A.jsonify({'ok': True}),
+    )
+    headers = {'Authorization': f'Bearer {OWNER}'}
+    with A.app.test_request_context(
+        '/api/me/friend-requests/invite', method='POST', headers=headers,
+    ):
+        assert A.app.make_response(A.me_friend_request_invite()).get_json()['ok']
+    with A.app.test_request_context(
+        '/api/me/friend-requests/redeem-invite', method='POST',
+        json={'invite': 'opaque'}, headers=headers,
+    ):
+        assert A.app.make_response(
+            A.me_friend_request_redeem_invite(),
+        ).get_json()['ok']
+    assert seen == [('mint', OWNER), ('redeem', OWNER)]
