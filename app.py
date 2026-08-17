@@ -81521,7 +81521,11 @@ def me_chat_mark_read():
 
 @app.route('/api/me/crew-chat/dm/<friend_token>', methods=['GET'])
 def me_chat_dm(friend_token):
-    return _header_only_dispatch(get_dm, friend_token)
+    # SEC: `get_dm` delegiert an `get_chat_messages` und echot dessen
+    # `channel` — also `dm__<AT-a>__<AT-b>` mit dem ROHEN Freund-Credential.
+    # Derselbe Composite-Leak wie in der Inbox, nur ueber den DM-Wrapper.
+    # `friend_token` ist als view_arg bereits AXU-aufgeloest (before_request).
+    return _header_only_public_dispatch(get_dm, friend_token)
 
 
 @app.route('/api/me/crew-chat/dm/<friend_token>/send', methods=['POST'])

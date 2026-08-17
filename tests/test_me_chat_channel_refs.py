@@ -182,3 +182,21 @@ def test_mark_read_resolves_the_public_channel_handle(monkeypatch):
         response = _resp(A.me_chat_mark_read())
     assert response.get_json()['ok'] is True
     assert seen == [(OWNER, A._dm_channel(OWNER, FRIEND))]
+
+
+def test_dm_wrapper_response_also_hides_the_composite_channel(monkeypatch):
+    # `get_dm` delegiert an `get_chat_messages` und echot dessen `channel` —
+    # derselbe Composite-Leak wie in der Inbox, nur ueber den DM-Wrapper.
+    monkeypatch.setattr(A, '_validate_token', _valid)
+    internal = A._dm_channel(OWNER, FRIEND)
+    monkeypatch.setattr(
+        A, 'get_dm',
+        lambda token, friend: A.jsonify({'channel': internal, 'messages': []}))
+    with A.app.test_request_context(
+            f'/api/me/crew-chat/dm/{A._public_user_ref(FRIEND)}',
+            headers={'Authorization': f'Bearer {OWNER}'}):
+        payload = _resp(A.me_chat_dm(FRIEND)).get_json()
+    found = {match for text in _all_strings(payload)
+             for match in RAW_AT_RE.findall(text)}
+    assert found <= {OWNER}, f'fremdes AT-Credential in der Antwort: {found}'
+    assert payload['channel'] == f'dm__{OWNER}__{A._public_user_ref(FRIEND)}'
