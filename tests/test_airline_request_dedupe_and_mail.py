@@ -30,10 +30,30 @@ def test_builtin_name_variants_resolve_to_the_existing_airline(monkeypatch):
             ('LX', 'Swiss'),
             ('ita airways', 'ITA Airways'),
             ('AZ', 'ITA Airways'),
-            ('3V', 'Aerologic'),
-            ('eurowings', 'Eurowings')):
+            ('3V', 'Aerologic')):
         normalized = A._airline_request_normalized_name(typed)
         assert A._airline_request_existing_name(typed, normalized) == expected, typed
+
+
+def test_removed_chips_run_through_the_request_pipeline(monkeypatch):
+    """Eurowings und Austrian sind keine eingebauten Airlines mehr (Owner
+    2026-08-18): ihre Links funktionierten fast nie. Wer sie eingibt, muss den
+    Probier-Prozess durchlaufen — NICHT als „known" abgefangen werden."""
+    _no_catalog(monkeypatch)
+    for typed in ('Eurowings', 'eurowings', 'EW', 'Austrian', 'OS', 'AUA'):
+        normalized = A._airline_request_normalized_name(typed)
+        assert A._airline_request_existing_name(typed, normalized) == '', typed
+
+
+def test_removed_chip_counts_as_existing_once_relearned(monkeypatch):
+    """Klappt eine Eurowings-Quelle später, steht sie im Katalog — ab dann
+    greift die Doppel-Erkennung wieder."""
+    monkeypatch.setattr(
+        A, '_airline_catalog_load',
+        lambda: [{'display_name': 'Eurowings'}])
+    normalized = A._airline_request_normalized_name('eurowings')
+    assert A._airline_request_existing_name(
+        'eurowings', normalized) == 'Eurowings'
 
 
 def test_catalog_airline_counts_as_existing(monkeypatch):

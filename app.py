@@ -27360,13 +27360,28 @@ _MK_ALERT_SENT_TS = []       # unix ts der zuletzt versendeten Mails
 _MK_ALERT_LOCK = _req_threading.Lock()   # `threading` ist modulweit nur als Alias da
 
 
-def _mk_signature(kind, build, top_frames):
+def _mk_signature(kind, build, top_frames, termination_reason=None):
     """Stabile Kurz-Signatur eines Reports: kind + build + die obersten
     Frame-BINÄRNAMEN (ohne Offsets — die wandern mit jedem Compile).
+
+    WATCHDOG-SONDERFALL (18.08.2026, 65 „NEU"-Mails für EINEN Bug): bei
+    0x8BADF00D-Kills steht der Haupt-Thread irgendwo MITTEN in der
+    SwiftUI-Maschinerie — der oberste Frame ist Zufall, jede Mail sah wie
+    eine neue Signatur aus. Watchdog-Kills eines Builds sind aber in der
+    Praxis EIN Befund (über Builds pivotieren, nicht über Stacks) — sie
+    bekommen deshalb EINE Signatur pro (Build, Watchdog-Art). Die vollen
+    Stacks bleiben in der payload; nur die Mail-Dedupe wird gebündelt.
 
     Leerer Stack ⇒ None. Ein Report ohne Stack bekommt bewusst KEINE Signatur,
     weil er auch nichts zu unterscheiden hätte — er wird nie gemailt.
     """
+    term = str(termination_reason or '')
+    if '8BADF00D' in term.upper():
+        art = ('scene-update' if 'scene-update' in term
+               else 'terminate' if 'terminate' in term.lower()
+               else 'watchdog')
+        raw = f'{kind}|{build}|watchdog|{art}'
+        return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
     if not top_frames:
         return None
     names = [str(f).split(' +')[0] for f in top_frames[:6]]
@@ -27655,7 +27670,8 @@ def post_telemetry_diagnostics():
     # überlebt das „kenne ich schon" jeden Deploy/Neustart (siehe Kommentar am
     # _MK_SEEN_SIGS-Block). `body` ist dasselbe Objekt wie row['payload'].
     top_frames = _mk_top_frames(body.get('call_stack'))
-    mk_sig = _mk_signature(kind, row['build'], top_frames)
+    mk_sig = _mk_signature(kind, row['build'], top_frames,
+                           termination_reason=body.get('termination_reason'))
     if mk_sig:
         body['_mk_sig'] = mk_sig
 
@@ -61785,9 +61801,15 @@ _AIRLINE_REQUEST_SOURCE_KINDS = frozenset(('ical_url', 'pdf'))
 # den es längst gibt („LH", „lufthansa cargo", „SWISS"), gehört er NICHT in
 # die Warteschlange: er bekommt die bestehende Airline zurück und läuft in den
 # normalen, geprüften Dienstplan-Pfad (Owner 2026-08-17).
+# Eurowings und Austrian sind hier bewusst NICHT drin (Owner 2026-08-18):
+# ihre Portal-Links liefern von außen nichts (flybase = 0 Bytes), nur 22 %/25 %
+# der User bekamen je einen Dienstplan. Wer sie eingibt, läuft durch den
+# Probier-Prozess — klappt eine Quelle, holt `_airline_catalog_promote` die
+# Airline als gelernten Chip für alle zurück. Bestehende Profile bleiben
+# unangetastet.
 _AIRLINE_REQUEST_BUILTIN = (
-    'Lufthansa', 'Lufthansa Cargo', 'Lufthansa City', 'Eurowings', 'Discover',
-    'Condor', 'Edelweiss', 'Austrian', 'Swiss', 'Brussels', 'TUIfly',
+    'Lufthansa', 'Lufthansa Cargo', 'Lufthansa City', 'Discover',
+    'Condor', 'Edelweiss', 'Swiss', 'Brussels', 'TUIfly',
     'Aerologic', 'AeroWest', 'ITA Airways')
 
 
