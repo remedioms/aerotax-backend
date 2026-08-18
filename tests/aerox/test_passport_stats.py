@@ -176,6 +176,48 @@ def test_compute_includes_logbook_import(synth_days, monkeypatch):
     assert p["minutes_flown"] == 510 + 430 + 645 + 500 + 115 + 690
 
 
+def test_compute_all_carryover_from_import_meta(synth_days, monkeypatch):
+    """Christoph 2026-08: er sah bei sich 16.545 h (Client addierte den
+    FCL.050-Übertrag aus get_logbook), Freunde sahen 6.020 h. Der Server
+    liefert den Übertrag jetzt selbst — ADDITIV, minutes_flown bleibt die
+    reine Leg-Summe (alte Clients addieren selbst, sonst Doppelzählung)."""
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {"meta": {
+        "carryover_min": 631500, "carryover_ldg_day": 900,
+        "carryover_ldg_night": 100}})
+    p = A._passport_stats_compute(TOKEN, "all")
+    assert p["carryover_min"] == 631500
+    assert p["carryover_landings"] == 1000
+    # NICHT eingerechnet — der Übertrag ist ein eigenes Feld.
+    assert p["minutes_flown"] == 510 + 430 + 645 + 500 + 115
+
+
+def test_compute_all_carryover_zero_without_import(synth_days):
+    # Kein Import → Felder vorhanden, aber 0 (stabiler Client-Vertrag).
+    p = A._passport_stats_compute(TOKEN, "all")
+    assert p["carryover_min"] == 0
+    assert p["carryover_landings"] == 0
+
+
+def test_compute_carryover_nur_bei_range_all(synth_days, monkeypatch):
+    """Jahres-/Monats-Payloads bleiben byte-identisch — der Übertrag ist eine
+    Karriere-Summe und gehört zu keinem einzelnen Jahr."""
+    monkeypatch.setattr(A, "_logbook_import_load",
+                        lambda t: {"meta": {"carryover_min": 631500}})
+    y = A._passport_stats_compute(TOKEN, "2026")
+    assert "carryover_min" not in y and "carryover_landings" not in y
+
+
+def test_compute_carryover_deckel_wie_get_logbook(synth_days, monkeypatch):
+    # Nur 0 < c < 3.600.000 zählt (get_logbook-Deckel) — Müll wird 0.
+    monkeypatch.setattr(A, "_logbook_import_load", lambda t: {"meta": {
+        "carryover_min": 60000 * 60,          # == Deckel → raus
+        "carryover_ldg_day": -5,               # negativ → raus
+        "carryover_ldg_night": 100000}})       # == Deckel → raus
+    p = A._passport_stats_compute(TOKEN, "all")
+    assert p["carryover_min"] == 0
+    assert p["carryover_landings"] == 0
+
+
 def test_compute_ohne_import_unveraendert(synth_days):
     """Ohne Flugbuch-Import ändert der geteilte Merge NICHTS am Roster-Bild."""
     p_leer = A._passport_stats_compute(TOKEN, "all")
@@ -415,6 +457,20 @@ def test_friend_route_ok_returns_friend_stats(client, friend_setup):
     # Range-Filter greift auch für Freunde.
     r2 = _friend_get(client, rng="2025")
     assert r2.get_json()["flights"] == 0
+
+
+def test_friend_route_carries_carryover(client, friend_setup, monkeypatch):
+    """Genau das Ziel des Server-Felds: die Freundes-Sicht bekommt den
+    FCL.050-Übertrag des FREUNDES mit (Christoph: 16.545 h vs. 6.020 h) —
+    automatisch, weil owner- und friend-Route denselben Compute teilen."""
+    monkeypatch.setattr(
+        A, "_logbook_import_load",
+        lambda t: {"meta": {"carryover_min": 631500}} if t == FRIEND else {})
+    r = _friend_get(client, rng="all")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["carryover_min"] == 631500
+    assert body["carryover_landings"] == 0
 
 
 def test_friend_route_resolves_shortened_token(client, friend_setup):

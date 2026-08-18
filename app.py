@@ -36503,7 +36503,34 @@ def _passport_stats_compute(token, rng):
             routes_out.append(row)
             covered.add(row['from']); covered.add(row['to'])
 
-    return {
+    # ÜBERTRAG aus dem Vor-Logbuch (Christoph, 2026-08: er sah bei sich
+    # 16.545 h — die App rechnete den FCL.050-Übertrag clientseitig aus
+    # get_logbook dazu —, Freunde sahen nur 6.020 h, weil der Friend-Passport
+    # denselben Compute OHNE Logbuch-Kontext nutzt). Deshalb liefert der
+    # Server den Übertrag jetzt selbst als ADDITIVE Felder; da owner- und
+    # friend-Route denselben Compute teilen, stimmt die Freundes-Sicht
+    # automatisch mit. `minutes_flown` bleibt UNANGETASTET (alte Clients
+    # addieren selbst — eine Mutation hätte doppelt gezählt). Nur bei
+    # range=all: der Übertrag ist Karriere-Summe, kein Jahres-/Monatswert.
+    carryover_min = 0
+    carryover_landings = 0
+    if rng == 'all':
+        try:
+            _imp_meta = (_logbook_import_load(token) or {}).get('meta') or {}
+            _c = _imp_meta.get('carryover_min')
+            # Deckel wie get_logbook: nur 0 < c < 3.600.000 (60.000 h).
+            if isinstance(_c, int) and 0 < _c < 60000 * 60:
+                carryover_min = _c
+            _d = _imp_meta.get('carryover_ldg_day')
+            _n = _imp_meta.get('carryover_ldg_night')
+            if isinstance(_d, int) and 0 <= _d < 100000:
+                carryover_landings += _d
+            if isinstance(_n, int) and 0 <= _n < 100000:
+                carryover_landings += _n
+        except Exception:
+            pass   # Passport darf nie am Flugbuch-Store scheitern
+
+    out = {
         'ok': True,
         'has_data': flights > 0,
         'range': rng,
@@ -36524,6 +36551,11 @@ def _passport_stats_compute(token, rng):
         'last_date': last_date,
         'years': sorted(years, reverse=True),
     }
+    if rng == 'all':
+        # Nur bei all — Jahres-/Monats-Payloads bleiben byte-identisch.
+        out['carryover_min'] = carryover_min
+        out['carryover_landings'] = carryover_landings
+    return out
 
 
 @app.route('/api/user/passport-stats/<token>', methods=['GET'])
