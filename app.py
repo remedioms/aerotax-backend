@@ -58605,6 +58605,40 @@ _CONDOR_CREW_MAX_MEMBERS = 30
 # nur die Zeile darf vom Nachbartag stammen, und die Antwort SAGT das dann
 # ueber `flight_date`.
 _CONDOR_CREW_DATE_SLACK = (0, -1, 1)
+# AUFBEWAHRUNG: aelter als das haelt niemand mehr fuer „mit wem war ich
+# unterwegs". Der Condor-Feed selbst reicht nicht so weit zurueck, und der
+# lokale Geraete-Stand kappt bei 240 Eintraegen. Geraeumt wird beim Schreiben
+# (ein DELETE je Import, hoechstens alle 30 min pro User) — kein Cron noetig,
+# und die Tabelle waechst nicht unbegrenzt mit jedem geflogenen Leg.
+_CONDOR_CREW_RETENTION_DAYS = 400
+# TABELLE FEHLT (bis die Migration angewendet ist): dann scheitert JEDER
+# Schreib-/Lesezugriff und wuerde pro Import eine Warnung schreiben. Muster wie
+# `_links_tbl_state` (flightops_links_cache): nach dem ersten Fehlschlag fuenf
+# Minuten Ruhe, danach wieder probieren. [naechster_versuch_ts, tabelle_da?]
+_CONDOR_CREW_TBL_QUIET_S = 300
+_condor_crew_tbl_state = [0.0, True]
+
+
+def _condor_crew_table_ready():
+    """False, solange die Tabelle als fehlend gilt (kurze Ruhe). Wirft nie."""
+    if _condor_crew_tbl_state[1]:
+        return True
+    return time.time() >= _condor_crew_tbl_state[0]
+
+
+def _condor_crew_table_note_failure(exc):
+    """Fehlende Tabelle → Backoff. Andere Fehler bleiben laute Einzelfaelle."""
+    text = str(exc or '').lower()
+    if 'does not exist' in text or 'could not find' in text or '42p01' in text:
+        _condor_crew_tbl_state[0] = time.time() + _CONDOR_CREW_TBL_QUIET_S
+        _condor_crew_tbl_state[1] = False
+        return True
+    return False
+
+
+def _condor_crew_table_note_success():
+    _condor_crew_tbl_state[0] = 0.0
+    _condor_crew_tbl_state[1] = True
 
 # `CP 402644F HAEBEL, KAI (FRA)` — Rolle, Personalnummer, Name, Basis.
 _CONDOR_CREW_LINE_RE = re.compile(
@@ -58797,6 +58831,8 @@ def _condor_crew_store_upsert(token, rows, source):
     """
     if not token or not rows or not SB_AVAILABLE:
         return 0
+    if not _condor_crew_table_ready():
+        return 0
     now_iso = datetime.now(timezone.utc).isoformat()
     # DEDUPE VOR DEM UPSERT: derselbe (Tag, Flug) darf in EINEM Statement nur
     # einmal vorkommen — Postgres bricht ein `ON CONFLICT DO UPDATE` sonst mit
@@ -58819,37 +58855,80 @@ def _condor_crew_store_upsert(token, rows, source):
     try:
         sb.table(_CONDOR_CREW_TABLE).upsert(
             payload, on_conflict='token,flight_date,flight').execute()
-        return len(payload)
+        _condor_crew_table_note_success()
     except Exception as e:
-        app.logger.warning('[condor_crew] upsert_fail %s: %s',
-                           type(e).__name__, str(e)[:160])
+        if not _condor_crew_table_note_failure(e):
+            app.logger.warning('[condor_crew] upsert_fail %s: %s',
+                               type(e).__name__, str(e)[:160])
         return 0
+    _condor_crew_prune(token)
+    return len(payload)
 
 
-def _condor_crew_store_fetch(token, date, flight):
-    """Gespeicherte Zeile lesen — angefragter Tag zuerst, dann die Nachbartage
-    (`_CONDOR_CREW_DATE_SLACK`). Gibt (row|None) zurueck, wirft nie."""
-    if not token or not SB_AVAILABLE:
-        return None
-    f = _condor_normalize_flight(flight)
+def _condor_crew_prune(token):
+    """Eigene Zeilen aelter als `_CONDOR_CREW_RETENTION_DAYS` loeschen.
+
+    Laeuft nach einem erfolgreichen Upsert, also hoechstens im Import-Takt
+    (30 min pro User) — ein DELETE, kein Cron, keine neue Infrastruktur.
+    Best-effort: schlaegt es fehl, bleiben die alten Zeilen einfach liegen.
+    """
+    try:
+        cutoff = (datetime.now(timezone.utc).date()
+                  - timedelta(days=_CONDOR_CREW_RETENTION_DAYS)).isoformat()
+        (sb.table(_CONDOR_CREW_TABLE).delete()
+         .eq('token', token).lt('flight_date', cutoff).execute())
+    except Exception as e:
+        app.logger.warning('[condor_crew] prune_fail %s', type(e).__name__)
+
+
+def _condor_crew_slack_days(date):
+    """Angefragter Tag + Nachbartage in Lese-Reihenfolge (`_CONDOR_CREW_DATE_SLACK`).
+
+    Warum ueberhaupt Nachbartage: bei Red-Eyes faellt das Roster-Datum (Ortszeit
+    des Abflugs) und das DTSTART-Datum (Z) auseinander — dieselbe Toleranz wie
+    beim LH-Crew-Cache. Die Liste ist NUR ein Lese-Vorschlag; welcher dieser
+    Tage tatsaechlich gelesen werden darf, entscheidet allein das Roster-Gate.
+    Pure, wirft nie.
+    """
     base = str(date or '')[:10]
-    if not f or not re.match(r'^\d{4}-\d{2}-\d{2}$', base):
-        return None
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', base):
+        return []
     try:
         base_date = datetime.fromisoformat(base).date()
     except Exception:
+        return []
+    return [(base_date + timedelta(days=o)).isoformat()
+            for o in _CONDOR_CREW_DATE_SLACK]
+
+
+def _condor_crew_store_fetch(token, days, flight):
+    """Gespeicherte Zeile lesen — NUR aus den uebergebenen, bereits vom Gate
+    freigegebenen Tagen (in dieser Reihenfolge). Gibt (row|None), wirft nie.
+
+    ⚠️ Diese Funktion prueft KEINE Berechtigung. Sie bekommt ausschliesslich
+    Tage, fuer die `_condor_roster_has_leg` bereits True gesagt hat — deshalb
+    darf hier kein eigener Datums-Spielraum mehr entstehen (sonst waere die
+    Toleranz ein Loch im Gate statt einer Lesehilfe).
+    """
+    if not token or not SB_AVAILABLE or not _condor_crew_table_ready():
         return None
-    for offset in _CONDOR_CREW_DATE_SLACK:
-        day = (base_date + timedelta(days=offset)).isoformat()
+    f = _condor_normalize_flight(flight)
+    if not f:
+        return None
+    for day in (days or []):
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', str(day or '')):
+            continue
         try:
             r = (sb.table(_CONDOR_CREW_TABLE)
                  .select('flight_date,flight,crew,dep,arr,source,updated_at')
                  .eq('token', token).eq('flight_date', day).eq('flight', f)
                  .limit(1).execute())
             rows = r.data or []
+            _condor_crew_table_note_success()
         except Exception as e:
-            app.logger.warning('[condor_crew] fetch_fail %s: %s',
-                               type(e).__name__, str(e)[:160])
+            if not _condor_crew_table_note_failure(e):
+                app.logger.warning('[condor_crew] fetch_fail %s: %s',
+                                   type(e).__name__, str(e)[:160])
             return None
         if rows and rows[0].get('crew'):
             return rows[0]
@@ -59019,19 +59098,31 @@ def ax_condor_crew():
 
     Query: `?date=YYYY-MM-DD&flight=DE2360`.
 
-    FAIL-CLOSED: geliefert wird nur, wenn der anfragende Token diesen Flug an
-    diesem Tag im EIGENEN, echt importierten Roster stehen hat
-    (`_condor_roster_has_leg`). Ein fremder Condor-Token ohne das Leg bekommt
-    403 — nicht etwa eine leere Liste, die wie „keine Crew" aussaehe.
+    FAIL-CLOSED: geliefert wird nur, was der anfragende Token an einem Tag im
+    EIGENEN, echt importierten Roster stehen hat (`_condor_roster_has_leg`).
+    Ein fremder Condor-Token ohne das Leg bekommt 403 — nicht etwa eine leere
+    Liste, die wie „keine Crew" aussaehe.
+
+    RED-EYE (Nachzug 18.08.): geprueft wird der angefragte Tag UND seine
+    Nachbartage, aber JEDER davon einzeln und mit derselben Strenge. Gelesen
+    werden nur die Tage, die das Gate freigegeben hat. Vorher lief die
+    Datums-Toleranz allein im Store, das Gate dagegen strikt auf dem
+    angefragten Tag: bei einem Uebernacht-Leg (Roster-Datum = Ortszeit
+    Abflug, DTSTART = Z) fiel beides auseinander und die Kapsel blieb leer,
+    obwohl die Liste dalag. Das Gate wird dadurch NICHT lockerer — eine
+    gelieferte Zeile gehoert jetzt garantiert zu einem Tag, an dem der Flug
+    wirklich im eigenen Roster steht.
     """
     token = _request_token()
     date = (request.args.get('date') or '').strip()[:10]
     flight = _condor_normalize_flight(request.args.get('flight'))
     if not token or not flight or not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
         return jsonify({'ok': False, 'error': 'invalid_request'}), 400
-    if not _condor_roster_has_leg(token, date, flight):
+    allowed_days = [d for d in _condor_crew_slack_days(date)
+                    if _condor_roster_has_leg(token, d, flight)]
+    if not allowed_days:
         return jsonify({'ok': False, 'error': 'leg_not_in_own_roster'}), 403
-    row = _condor_crew_store_fetch(token, date, flight)
+    row = _condor_crew_store_fetch(token, allowed_days, flight)
     if not row:
         return jsonify({'ok': True, 'crew': [], 'flight_date': date})
     return jsonify({'ok': True,

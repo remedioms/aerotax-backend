@@ -61,9 +61,13 @@ create table if not exists public.condor_crew_roster (
 );
 
 -- Der Serve-Pfad liest immer (token, flight_date, flight) — das ist der PK.
--- Zusaetzlich ein Datums-Index fuer Aufraeum-/Retention-Laeufe.
-create index if not exists condor_crew_roster_date_idx
-    on public.condor_crew_roster (flight_date);
+-- AUFBEWAHRUNG: der Code raeumt selbst. Nach jedem erfolgreichen Upsert
+-- loescht `_condor_crew_prune` die EIGENEN Zeilen aelter als
+-- `_CONDOR_CREW_RETENTION_DAYS` (400) — ein DELETE im Import-Takt (hoechstens
+-- alle 30 min pro User), kein Cron, keine neue Infrastruktur. Dieser Index
+-- bedient genau dieses `where token = … and flight_date < …`.
+create index if not exists condor_crew_roster_prune_idx
+    on public.condor_crew_roster (token, flight_date);
 
 alter table public.condor_crew_roster enable row level security;
 

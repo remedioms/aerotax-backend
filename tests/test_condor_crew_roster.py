@@ -262,6 +262,133 @@ def test_get_never_leaks_a_foreign_at_credential(client, monkeypatch):
     assert app_module._PUBLIC_USER_REF_PREFIX in raw
 
 
+def test_red_eye_serves_the_neighbour_day_but_only_if_the_gate_allows_it(
+        client, monkeypatch):
+    """RED-EYE: Roster-Datum (Ortszeit Abflug) und DTSTART (Z) fallen um einen
+    Tag auseinander. Gelesen werden darf der Nachbartag NUR, wenn der Flug auch
+    DORT im eigenen Roster steht — die Toleranz ist eine Lesehilfe, kein Loch."""
+    read_days = {}
+    # Der User hat DE1234 am 31.08. (nicht am 01.09.) im eigenen Roster.
+    monkeypatch.setattr(app_module, '_viewer_airline_and_calendar',
+                        lambda t: ('CONDOR', True))
+    monkeypatch.setattr(app_module, '_ical_briefings_load', lambda t: {
+        '2026-08-31': {'ical_imported_at': 'x',
+                       'ical_sectors': [{'flight': 'DE1234'}]}})
+
+    def _fetch(token, days, flight):
+        read_days['days'] = list(days)
+        return {'flight_date': '2026-08-31', 'flight': 'DE1234',
+                'source': 'server_ics', 'updated_at': None,
+                'crew': [{'role': 'CP', 'name': 'Anna Muster'}]}
+
+    monkeypatch.setattr(app_module, '_condor_crew_store_fetch', _fetch)
+    monkeypatch.setattr(app_module, '_condor_crew_aerox_matches',
+                        lambda members: {})
+
+    resp = client.get('/api/ax/condor/crew?date=2026-09-01&flight=DE1234',
+                      headers={'Authorization': 'Bearer AT-anna'})
+
+    assert resp.status_code == 200
+    # NUR der freigegebene Nachbartag darf gelesen werden — nicht der
+    # angefragte 01.09. und nicht der 02.09.
+    assert read_days['days'] == ['2026-08-31']
+    # Und die Antwort SAGT, zu welchem Tag die Liste gehoert.
+    assert resp.get_json()['flight_date'] == '2026-08-31'
+
+
+def test_no_neighbour_day_in_the_roster_still_means_403(client, monkeypatch):
+    """Gegenprobe: liegt der Flug an KEINEM der drei Tage im eigenen Roster,
+    bleibt es bei 403 — und der Store wird gar nicht erst gelesen."""
+    _condor_viewer(monkeypatch, briefings={
+        '2026-09-05': {'ical_imported_at': 'x',
+                       'ical_sectors': [{'flight': 'DE1234'}]}})
+    monkeypatch.setattr(app_module, '_condor_crew_store_fetch',
+                        lambda *a: pytest.fail('Store darf nie gelesen werden'))
+
+    resp = client.get('/api/ax/condor/crew?date=2026-09-01&flight=DE1234',
+                      headers={'Authorization': 'Bearer AT-fremd'})
+
+    assert resp.status_code == 403
+
+
+def test_slack_days_are_the_requested_day_first_then_the_neighbours():
+    assert app_module._condor_crew_slack_days('2026-09-01') == [
+        '2026-09-01', '2026-08-31', '2026-09-02']
+    assert app_module._condor_crew_slack_days('kaputt') == []
+
+
+def test_missing_table_goes_quiet_instead_of_warning_on_every_import(
+        monkeypatch):
+    """Solange die Migration NICHT angewendet ist, scheitert jeder Zugriff.
+    Ohne Backoff schriebe das pro Import eine Warnung. Muster wie
+    `_links_tbl_state` (flightops_links_cache): kurz Ruhe, dann neu probieren."""
+    warnings = []
+    monkeypatch.setattr(app_module, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(app_module.app.logger, 'warning',
+                        lambda *a, **k: warnings.append(a))
+    monkeypatch.setattr(app_module, '_condor_crew_tbl_state', [0.0, True])
+
+    class _MissingTable:
+        def table(self, name):
+            raise RuntimeError(
+                'relation "condor_crew_roster" does not exist')
+
+    monkeypatch.setattr(app_module, 'sb', _MissingTable(), raising=False)
+
+    rows = [{'date': '2026-09-01', 'flight': 'DE1234',
+             'crew': [{'role': 'CP', 'name': 'Anna Muster'}]}]
+    assert app_module._condor_crew_store_upsert('AT-a', rows, 'server_ics') == 0
+    assert app_module._condor_crew_tbl_state[1] is False
+    # Zweiter Versuch faellt in die Ruhephase: kein weiterer Zugriff, kein Log.
+    assert app_module._condor_crew_store_upsert('AT-a', rows, 'server_ics') == 0
+    assert app_module._condor_crew_store_fetch('AT-a', ['2026-09-01'],
+                                               'DE1234') is None
+    assert warnings == [], 'fehlende Tabelle darf das Log nicht fluten'
+
+
+def test_successful_write_prunes_the_users_old_rows(monkeypatch):
+    """Aufbewahrung: nach jedem erfolgreichen Upsert fliegen die eigenen Zeilen
+    aelter als `_CONDOR_CREW_RETENTION_DAYS` raus — ein DELETE, kein Cron."""
+    deleted = {}
+
+    class _Table:
+        def upsert(self, payload, on_conflict=None):
+            return self
+
+        def delete(self):
+            deleted['delete'] = True
+            return self
+
+        def eq(self, col, val):
+            deleted[col] = val
+            return self
+
+        def lt(self, col, val):
+            deleted['lt'] = (col, val)
+            return self
+
+        def execute(self):
+            return type('R', (), {'data': []})()
+
+    monkeypatch.setattr(app_module, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(app_module, '_condor_crew_tbl_state', [0.0, True])
+    monkeypatch.setattr(app_module, 'sb',
+                        type('SB', (), {'table': lambda self, n: _Table()})())
+
+    rows = [{'date': '2026-09-01', 'flight': 'DE1234',
+             'crew': [{'role': 'CP', 'name': 'Anna Muster'}]}]
+    assert app_module._condor_crew_store_upsert('AT-a', rows, 'server_ics') == 1
+
+    assert deleted['delete'] is True
+    assert deleted['token'] == 'AT-a'          # nur die EIGENEN Zeilen
+    col, cutoff = deleted['lt']
+    assert col == 'flight_date'
+    expected = (app_module.datetime.now(app_module.timezone.utc).date()
+                - app_module.timedelta(
+                    days=app_module._CONDOR_CREW_RETENTION_DAYS)).isoformat()
+    assert cutoff == expected
+
+
 def test_upload_stores_only_legs_from_the_own_roster(client, monkeypatch):
     stored = []
     _condor_viewer(monkeypatch, briefings=_OWN_ROSTER)
