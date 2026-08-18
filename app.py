@@ -22702,8 +22702,60 @@ def _corrected_briefing_start_iso(date_str, summary, current_start_iso,
 # Request serviert noch den alten Stand, der nächste liest frisch.
 _FEED_REFRESH_MIN_AGE_S = 6 * 3600       # Feed älter als 6 h → neu ziehen
 _FEED_REFRESH_RETRY_GAP_S = 45 * 60      # Prozess-Drossel zwischen Versuchen
+# BEREITSCHAFTS-FENSTER (Ivan D./LX 18.08.2026): nach einer SBY-Aktivierung
+# erschien der neue Flug erst ~1 h später — Apple-Kalender (direktes
+# iCal-Abo) und FollowMe hatten ihn sofort. Die 6-h-Ruhe schützt die
+# myTime-Shares, ist aber genau an Bereitschaftstagen falsch: DANN ändert
+# sich der Plan kurzfristig. Steht im ±1-Tage-Fenster ein Standby-/
+# Reserve-Tag, gilt eine engere Frische (15 min) und Drossel (10 min).
+_FEED_REFRESH_SB_MIN_AGE_S = 15 * 60
+_FEED_REFRESH_SB_GAP_S = 10 * 60
+_FEED_REFRESH_SB_MEMO_S = 30 * 60        # Standby-Erkennung selbst memoisiert
 _feed_refresh_last_attempt = {}
+_feed_refresh_sb_memo = {}               # token → (ts, bool)
 _feed_refresh_lock = _req_threading.Lock()
+
+
+def _feed_refresh_wanted(age_s, standby_window):
+    """Frische-Entscheid, pur für Tests: None-Alter (unparsebar/leer) → immer
+    ziehen; sonst 6-h-Regel, im Bereitschafts-Fenster 15 min."""
+    if age_s is None:
+        return True
+    if age_s >= _FEED_REFRESH_MIN_AGE_S:
+        return True
+    return bool(standby_window) and age_s >= _FEED_REFRESH_SB_MIN_AGE_S
+
+
+def _feed_summary_is_standby(text):
+    """Bereitschafts-Signal im iCal-Summary — gleiche Wortliste wie
+    `_friend_day_is_standby` (dort auf tage_detail-Tagen)."""
+    up = str(text or '').upper()
+    tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', up))
+    return ('STANDBY' in up or 'BEREITSCHAFT' in up or 'RESERVE' in up
+            or bool(tokens & {'SBY', 'RSV'}))
+
+
+def _calendar_refresh_standby_window(token):
+    """True, wenn im ±1-Tage-Fenster um heute (UTC, deckt die TZ-Naht) ein
+    Bereitschafts-Tag im gespeicherten Feed steht. Memoisiert (30 min),
+    damit der heiße Roster-Read-Pfad höchstens alle 30 min einen SB-Read
+    zahlt. Wirft nie."""
+    now_ts = time.time()
+    memo = _feed_refresh_sb_memo.get(token)
+    if memo and now_ts - memo[0] < _FEED_REFRESH_SB_MEMO_S:
+        return memo[1]
+    hit = False
+    try:
+        base = datetime.now(timezone.utc).date()
+        days = [(base + timedelta(days=off)).isoformat() for off in (-1, 0, 1)]
+        r = (sb.table('user_ical_briefings').select('ical_summary')
+             .eq('token', token).in_('datum', days).execute())
+        hit = any(_feed_summary_is_standby(row.get('ical_summary'))
+                  for row in (getattr(r, 'data', None) or []))
+    except Exception:
+        hit = False
+    _feed_refresh_sb_memo[token] = (now_ts, hit)
+    return hit
 
 
 def _server_ical_refresh_enabled():
@@ -22746,7 +22798,17 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
             return
         now_ts = time.time()
         with _feed_refresh_lock:
-            if now_ts - _feed_refresh_last_attempt.get(token, 0) < _FEED_REFRESH_RETRY_GAP_S:
+            _since = now_ts - _feed_refresh_last_attempt.get(token, 0)
+            if _since < _FEED_REFRESH_SB_GAP_S:
+                return
+        # Zwischen 10 und 45 min seit dem letzten Versuch zieht NUR das
+        # Bereitschafts-Fenster erneut (Ivan D. 18.08.). Der SB-Read dafür
+        # läuft AUSSERHALB des Locks und ist per 30-min-Memo gedeckelt.
+        if _since < _FEED_REFRESH_RETRY_GAP_S \
+                and not _calendar_refresh_standby_window(token):
+            return
+        with _feed_refresh_lock:
+            if now_ts - _feed_refresh_last_attempt.get(token, 0) < _FEED_REFRESH_SB_GAP_S:
                 return
             _feed_refresh_last_attempt[token] = now_ts
         # _profile_load liefert einen WRAPPER {'token':…, 'profile': {…}} —
@@ -22774,7 +22836,8 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
         if imported_at:
             try:
                 age = (datetime.now() - datetime.fromisoformat(imported_at)).total_seconds()
-                if age < _FEED_REFRESH_MIN_AGE_S:
+                if not _feed_refresh_wanted(
+                        age, _calendar_refresh_standby_window(token)):
                     return
             except Exception:
                 pass  # unparsebares Datum → lieber refreshen
