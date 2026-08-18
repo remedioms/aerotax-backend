@@ -60939,11 +60939,13 @@ def _roster_pdf_review_owner_mail(ids, error_code, error_message):
         return
     try:
         rows = (sb.table('ax_logbook_upload')
-                .select('id,token,filename,size_bytes')
+                .select('id,token,filename,size_bytes,data_b64')
                 .in_('id', list(ids)).execute().data) or []
     except Exception:
         rows = []
     zeilen = []
+    anhaenge = []
+    anhang_bytes = 0
     for r in rows:
         tok = str(r.get('token') or '')
         prof = {}
@@ -60955,17 +60957,35 @@ def _roster_pdf_review_owner_mail(ids, error_code, error_message):
             f"upload {r.get('id')} · {prof.get('name') or '—'} · "
             f"{prof.get('airline') or '—'}/{prof.get('homebase') or '—'} · "
             f"{r.get('filename') or '—'} · {r.get('size_bytes') or 0} B")
+        # PDF direkt anhaengen (Owner 18.08.: „zusammen angucken"): der Blob
+        # liegt schon base64-fertig in der Zeile. Deckel 15 MB gesamt —
+        # groessere Dateien bleiben nur in der Tabelle (steht in der Mail).
+        blob64 = r.get('data_b64')
+        size = int(r.get('size_bytes') or 0)
+        if blob64 and size and anhang_bytes + size <= 15 * 1024 * 1024:
+            anhaenge.append({
+                'filename': (r.get('filename')
+                             or f"upload-{r.get('id')}.pdf"),
+                'content': blob64,
+            })
+            anhang_bytes += size
     body = ("Roster-Upload im Review-Status (Quelle liegt in "
-            "ax_logbook_upload, 14 Tage):\n\n"
+            "ax_logbook_upload, 14 Tage"
+            + (", PDF haengt an" if anhaenge else
+               "; PDF zu gross fuer die Mail — aus der Tabelle ziehen")
+            + "):\n\n"
             f"Fehler: {error_code or '—'}\n"
             f"Meldung: {str(error_message or '—')[:300]}\n\n"
             + "\n".join(zeilen or [f"ids={sorted(ids)} (Zeilen nicht lesbar)"]))
-    payload = json.dumps({
+    mail = {
         'from': 'AeroX <noreply@aerosteuer.de>',
         'to': [to_email],
         'subject': f"[AeroX Roster-Import KAPUTT] {error_code or 'review'}",
         'text': body,
-    }).encode()
+    }
+    if anhaenge:
+        mail['attachments'] = anhaenge
+    payload = json.dumps(mail).encode()
     import urllib.request as _rq
     req = _rq.Request('https://api.resend.com/emails', data=payload,
                       headers={'Authorization': f'Bearer {api_key}',
