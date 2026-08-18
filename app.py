@@ -33538,8 +33538,16 @@ def forum_create_reply(token, thread_id):
     if (not isinstance(raw_body, str) or
             (raw_parent is not None and not isinstance(raw_parent, str)) or
             any(body.get(key) is not None and not isinstance(body.get(key), str)
-                for key in ('image_url', 'gif_url', 'mentioned_token'))):
+                for key in ('image_url', 'gif_url', 'mentioned_token',
+                            'client_id'))):
         return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    # IDEMPOTENZ-SCHLÜSSEL (Owner 18.08.): iOS schickt künftig pro Sende-
+    # Versuch eine stabile UUID mit — Retries nach Timeout/Netzwechsel
+    # erzeugten vorher DOPPELTE Replies samt doppelter Push-Welle. Optional
+    # (alte Clients schicken nichts → Verhalten unverändert), max 64 Zeichen.
+    client_id = (body.get('client_id') or '').strip() or None
+    if client_id and len(client_id) > 64:
+        return jsonify({'ok': False, 'error': 'invalid_client_id'}), 400
     raw_text = raw_body.strip()
     image_url = _own_image_url_only((body.get('image_url') or '').strip() or None)
     gif_url = (body.get('gif_url') or '').strip() or None
@@ -33593,6 +33601,26 @@ def forum_create_reply(token, thread_id):
                        if t.get('id') == thread_id), None)
     if not target:
         return jsonify({'ok': False, 'error': 'thread_not_found'}), 404
+
+    # IDEMPOTENZ-CHECK vor dem Insert: existiert für (author_token, thread_id,
+    # client_id) schon eine Reply, wird die BESTEHENDE zurückgegeben — kein
+    # zweiter Insert, keine zweite Push-Welle. Die client_id liegt in der
+    # metadata-jsonb-Spalte; `_forum_load_replies` merged metadata-Keys beim
+    # Laden zurück ins Reply-Dict (SB-Pfad) bzw. Disk hält das volle Dict —
+    # der Vergleich funktioniert damit auf beiden Pfaden.
+    if client_id:
+        try:
+            existing = next(
+                (r for r in (_forum_load_replies(thread_id) or [])
+                 if r.get('author_token') == token
+                 and r.get('client_id') == client_id), None)
+        except Exception:
+            existing = None   # Dedupe ist Komfort — nie den Post blockieren
+        if existing:
+            dup = dict(existing)
+            dup.pop('author_token', None)
+            dup['liked_by_me'] = False
+            return jsonify({'ok': True, 'reply': dup, 'deduped': True})
 
     # Forum supports exactly one nested reply level.  A parent must be a root
     # reply of this same thread; accepting arbitrary IDs previously allowed a
@@ -33656,6 +33684,12 @@ def forum_create_reply(token, thread_id):
         'like_count': 0,
         'is_anonymous': is_anonymous,
     }
+    # client_id wandert als normales Dict-Feld mit: der SB-Save sortiert
+    # unbekannte Keys automatisch in die metadata-jsonb-Spalte (MERGE über das
+    # volle Reply-Dict — metadata wird nie separat/partiell überschrieben,
+    # Avatar/Roster-Clobber-Lektion), der Disk-Append hält das volle Dict.
+    if client_id:
+        reply['client_id'] = client_id
     if is_anonymous:
         # Pseudonymer Handle statt Profil-Snapshot (per-Reply-Salt, wie Wall).
         reply['anon_handle'] = _anon_handle_for(token, salt=reply['id'])
