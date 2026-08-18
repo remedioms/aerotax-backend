@@ -3514,8 +3514,89 @@ def _links_path(user_token):
 # Links. (Full-Review 2026-08-01)
 _links_lock = threading.Lock()
 
+# ── Durabler Link-Cache (Owner 18.08.) ──────────────────────────────────────
+# `folinks_<token>.json` liegt auf der UNGEMOUNTETEN Container-Disk
+# (`Mounts: []`) und ist nach JEDEM Deploy leer — die Folge waren
+# 404-`no_access_code`-Wellen, bis jeder User sein Tages-Fenster einmal live
+# nachgeladen hatte (Log 28.07. 06:00:35: der Nachlade-Call fiel zusätzlich
+# unterm Hintergrund-Key-Deckel aus). Deshalb wird der Link-Cache jetzt
+# zusätzlich in einer Supabase-Tabelle gespiegelt (Muster
+# `flightops_crew_cache`): EINE jsonb-Zeile pro Token, Disk bleibt der heiße
+# Lesepfad, SB füllt die Disk nach einem Deploy einmalig wieder auf.
+# Fehlt die Tabelle (Migration supabase_migrations/
+# 20260818_flightops_links_cache.sql noch nicht angewandt) oder ist SB weg,
+# degradiert alles aufs alte Disk-Verhalten — fail-open, kein Crash; nach
+# einem Fehler 5 min Ruhe, damit ein PostgREST-404 nicht jeden Request kostet.
+_LINKS_TABLE = 'flightops_links_cache'
+_links_tbl_state = [0.0, True]   # (letzter Fehlversuch, Tabelle nutzbar?)
+_LINKS_TBL_RETRY_S = 300.0
+# RAM-Memo VOR Disk und SB: _links_load läuft im Crewlist-/Rotation-Hot-Path
+# teils mehrfach pro Request. Kurz gehalten (Cross-Worker-Merges sollen wie
+# bisher zeitnah sichtbar werden); gekeyt auf den Datei-PFAD, nicht den Token
+# (Tests/Container mit anderem _flow_dir teilen sich sonst Einträge).
+_LINKS_MEMO_TTL_S = 10.0
+_links_memo = {}                 # links_path → (expires_at, links)
 
-def _links_save(user_token, links):
+
+def _links_tbl_ok():
+    """True wenn die Link-Tabelle gerade als nutzbar gilt (wie _crew_tbl_ok)."""
+    try:
+        import app as _app
+        if not getattr(_app, 'SB_AVAILABLE', False):
+            return False
+    except Exception:
+        return False
+    if (not _links_tbl_state[1]
+            and (time.time() - _links_tbl_state[0]) < _LINKS_TBL_RETRY_S):
+        return False
+    return True
+
+
+def _links_tbl_fail(exc):
+    _links_tbl_state[0], _links_tbl_state[1] = time.time(), False
+    log.warning('[lh_flightops] links_cache-Tabelle nicht nutzbar (%s) — '
+                'Disk-only bis zur Migration', type(exc).__name__)
+
+
+def _links_sb_get(user_token):
+    """Links-Liste aus der Tabelle — None bei Miss/leer/nicht verfügbar."""
+    if not (user_token and _links_tbl_ok()):
+        return None
+    try:
+        import app as _app
+        r = (_app.sb.table(_LINKS_TABLE).select('links')
+             .eq('token', user_token).limit(1).execute())
+        _links_tbl_state[1] = True
+        rows = getattr(r, 'data', None) or []
+    except Exception as e:
+        _links_tbl_fail(e)
+        return None
+    if rows and isinstance(rows[0].get('links'), list) and rows[0]['links']:
+        return rows[0]['links']
+    return None
+
+
+def _links_sb_put(user_token, links):
+    """Best-effort-Spiegel nach SB. Leere Listen werden nicht geschrieben —
+    ein frischer Container ohne Disk-Bestand darf den durablen Stand nicht
+    mit [] überschreiben (gleiche Füllen-nie-überschreiben-Regel wie bei
+    Toleranz-Fenstern)."""
+    if not (user_token and isinstance(links, list) and links
+            and _links_tbl_ok()):
+        return False
+    try:
+        import app as _app
+        (_app.sb.table(_LINKS_TABLE).upsert(
+            {'token': user_token, 'links': links, 'ts': time.time()},
+            on_conflict='token').execute())
+        _links_tbl_state[1] = True
+        return True
+    except Exception as e:
+        _links_tbl_fail(e)
+        return False
+
+
+def _links_disk_write(p, links):
     """Atomar schreiben: erst in eine Temp-Datei neben dem Ziel, dann
     `os.replace`. Das alte `open(p, 'w')` kürzte die Datei SOFORT auf 0 Bytes —
     ein Absturz oder ein Neustart des Containers mitten im Dump hinterließ eine
@@ -3523,9 +3604,6 @@ def _links_save(user_token, links):
     Rotation ohne zusätzliche LH-Calls) war für diesen User verloren."""
     tmp = None
     try:
-        p = _links_path(user_token)
-        if not p or not isinstance(links, list):
-            return
         tmp = f'{p}.tmp{os.getpid()}'
         with open(tmp, 'w') as f:
             json.dump({'ts': time.time(), 'links': links}, f)
@@ -3541,16 +3619,49 @@ def _links_save(user_token, links):
             pass
 
 
+def _links_memo_put(p, links):
+    if len(_links_memo) > 2000:
+        _links_memo.clear()      # grober Deckel reicht — Memo ist 10-s-Ware
+    _links_memo[p] = (time.time() + _LINKS_MEMO_TTL_S, links)
+
+
+def _links_save(user_token, links):
+    """Disk (atomar) + RAM-Memo + SB-Spiegel (best-effort)."""
+    p = _links_path(user_token)
+    if not p or not isinstance(links, list):
+        return
+    _links_disk_write(p, links)
+    _links_memo_put(p, links)
+    _links_sb_put(user_token, links)
+
+
 def _links_load(user_token):
+    """RAM-Memo → Disk → SB. Der SB-Treffer rehydriert die Disk, damit der
+    Hot-Path nach einem Deploy sofort wieder lokal liest."""
+    p = _links_path(user_token)
+    if not p:
+        return []
+    now = time.time()
+    hit = _links_memo.get(p)
+    if hit and hit[0] > now:
+        return hit[1]
+    links = None
     try:
-        p = _links_path(user_token)
-        if p and os.path.exists(p):
+        if os.path.exists(p):
             with open(p) as f:
                 d = json.load(f)
-            return d.get('links') or []
+            links = d.get('links') or []
     except Exception:
-        pass
-    return []
+        links = None
+    if not links:
+        sb_links = _links_sb_get(user_token)
+        if sb_links:
+            links = sb_links
+            _links_disk_write(p, links)
+    if not isinstance(links, list):
+        links = []
+    _links_memo_put(p, links)
+    return links
 
 
 def _links_find(links, service, flight, date, dep=None, arr=None):
