@@ -63,7 +63,14 @@ def test_deploy_wipe_rehydriert_aus_sb(monkeypatch):
 
 def test_tabelle_fehlt_fail_open_und_backoff(monkeypatch):
     """PostgREST-404/fehlende Tabelle: kein Crash, altes Disk-Verhalten,
-    und 5 min Ruhe statt SB-Fehler auf jedem Request."""
+    und 5 min Ruhe statt SB-Fehler auf jedem Request.
+
+    Der Tabellen-State wird hier durch eine FRISCHE Liste ersetzt: der echte
+    `_links_tbl_state` ist ein Modul-Singleton, den im Voll-Suite-Lauf
+    Hintergrund-Threads früherer Tests (Queue-Worker/Import-Pfade rufen
+    _links_save) konkurrierend beschreiben — der Test flakte darüber am
+    18.08. (True statt False). Einzeln lief er immer grün; die Isolation
+    macht ihn auch im Suite-Lauf deterministisch."""
     calls = []
 
     class _FailingSb:
@@ -73,12 +80,14 @@ def test_tabelle_fehlt_fail_open_und_backoff(monkeypatch):
 
     monkeypatch.setattr(A, 'SB_AVAILABLE', True)
     monkeypatch.setattr(A, 'sb', _FailingSb(), raising=False)
+    monkeypatch.setattr(fo, '_links_tbl_state', [0.0, True])
     assert fo._links_load(TOKEN) == []                # fail-open
     assert fo._links_tbl_state[1] is False
-    assert len(calls) == 1
+    n = len(calls)
+    assert n >= 1
     fo._links_memo.clear()
     assert fo._links_load(TOKEN) == []                # Backoff: kein 2. Call
-    assert len(calls) == 1
+    assert len(calls) == n
 
 
 def test_leere_liste_ueberschreibt_sb_nicht(monkeypatch):
