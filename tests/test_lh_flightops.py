@@ -4628,7 +4628,11 @@ def test_w0_sektor_felder_aus_xprops():
 
 def test_w0_sektor_ohne_xprops_byte_identisch():
     """Alt-Verhalten: ein Feed OHNE X-Props erzeugt exakt dieselben Sektor-
-    Dicts wie vor Welle 0 — keine neuen Keys, kein None-Ballast."""
+    Dicts wie vor Welle 0 — keine neuen Keys, kein None-Ballast. AUSNAHME
+    seit dem DH-Summary-Fix (Christopher Magin, 18.08.): das Rück-Leg heißt
+    „DH LH501" — der Deadhead-Marker im Summary reicht jetzt auch OHNE
+    X-AEROX-DH für `dh: True` (genau der myTime-Fall, in dem der Marker
+    vorher verloren ging)."""
     import app as backend
     ics = fo.duty_events_to_ics(DUTY_W0)          # enrich, aber ohne Rotation
     ics_plain = fo.duty_events_to_ics(DUTY_W0, enrich=False)
@@ -4638,7 +4642,8 @@ def test_w0_sektor_ohne_xprops_byte_identisch():
         'dep_iso': '2026-09-10T20:00:00Z', 'arr_iso': '2026-09-11T06:00:00Z'}]
     assert secs['2026-09-12'] == [{
         'flight': 'LH501', 'from': 'GRU', 'to': 'FRA',
-        'dep_iso': '2026-09-12T22:00:00Z', 'arr_iso': '2026-09-13T08:00:00Z'}]
+        'dep_iso': '2026-09-12T22:00:00Z', 'arr_iso': '2026-09-13T08:00:00Z',
+        'dh': True}]
     # Der DH-Marker der Duty-Events allein reicht für das Sektor-Flag.
     s_dh = backend._build_ical_sectors(backend._parse_ics_to_events(ics))
     assert s_dh['2026-09-12'][0]['dh'] is True
