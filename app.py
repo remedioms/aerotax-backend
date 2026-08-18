@@ -60926,6 +60926,56 @@ def _roster_pdf_upload_store(token, filename, blob, airline_hint=None,
     return int(stored) if stored is not None else None
 
 
+def _roster_pdf_review_owner_mail(ids, error_code, error_message):
+    """[AeroX Roster-Import KAPUTT]-Mail an SUPPORT_NOTIFY_EMAIL.
+
+    Profil-Kontext kommt aus der Upload-Zeile selbst (token dort gespeichert),
+    damit der Melder ohne zusaetzliche Parameter an ALLEN Review-Pfaden greift.
+    """
+    api_key = os.environ.get('RESEND_API_KEY', '').strip()
+    to_email = os.environ.get('SUPPORT_NOTIFY_EMAIL',
+                              'aerox@aerosteuer.de').strip()
+    if not api_key or not ids:
+        return
+    try:
+        rows = (sb.table('ax_logbook_upload')
+                .select('id,token,filename,size_bytes')
+                .in_('id', list(ids)).execute().data) or []
+    except Exception:
+        rows = []
+    zeilen = []
+    for r in rows:
+        tok = str(r.get('token') or '')
+        prof = {}
+        try:
+            prof = ((_profile_load(tok) or {}).get('profile') or {})
+        except Exception:
+            pass
+        zeilen.append(
+            f"upload {r.get('id')} · {prof.get('name') or '—'} · "
+            f"{prof.get('airline') or '—'}/{prof.get('homebase') or '—'} · "
+            f"{r.get('filename') or '—'} · {r.get('size_bytes') or 0} B")
+    body = ("Roster-Upload im Review-Status (Quelle liegt in "
+            "ax_logbook_upload, 14 Tage):\n\n"
+            f"Fehler: {error_code or '—'}\n"
+            f"Meldung: {str(error_message or '—')[:300]}\n\n"
+            + "\n".join(zeilen or [f"ids={sorted(ids)} (Zeilen nicht lesbar)"]))
+    payload = json.dumps({
+        'from': 'AeroX <noreply@aerosteuer.de>',
+        'to': [to_email],
+        'subject': f"[AeroX Roster-Import KAPUTT] {error_code or 'review'}",
+        'text': body,
+    }).encode()
+    import urllib.request as _rq
+    req = _rq.Request('https://api.resend.com/emails', data=payload,
+                      headers={'Authorization': f'Bearer {api_key}',
+                               'Content-Type': 'application/json'},
+                      method='POST')
+    # curl-artiger UA: Resend blockt den Python-Default-UA.
+    req.add_header('User-Agent', 'curl/8.4.0')
+    _rq.urlopen(req, timeout=10)
+
+
 def _roster_pdf_upload_finish(job_ids, status, error_code=None,
                               error_message=None):
     """Close roster verification rows and enforce source-file retention."""
@@ -60947,6 +60997,17 @@ def _roster_pdf_upload_finish(job_ids, status, error_code=None,
     elif status == 'review':
         values['purge_after'] = (
             datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+        # OWNER-MELDER (Christoph S./LHX 18.08.): ein fehlgeschlagener
+        # Roster-Upload einer UNTERSTUETZTEN Airline landete bisher STILL im
+        # Review-Status — der Owner erfuhr davon nur, wenn der Nutzer selbst
+        # mailte. Kompakte Mail (keine Datei-Kopie: die Quelle liegt durabel
+        # in der Upload-Zeile), best effort und niemals blockierend.
+        try:
+            _roster_pdf_review_owner_mail(ids, error_code, error_message)
+        except Exception as mail_exc:
+            app.logger.warning(
+                f'[roster-pdf] review-mail-fail ids={ids} '
+                f'err={type(mail_exc).__name__}: {str(mail_exc)[:120]}')
     try:
         def _finish():
             return (sb.table('ax_logbook_upload').update(values)
