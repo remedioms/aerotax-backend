@@ -7300,6 +7300,12 @@ _PUBLIC_USER_REF_PATH_PREFIXES = (
     '/api/ax/punctuality/',
     '/api/trade/',
     '/api/ax/smp/',
+    # Condor-Crewliste (Owner 2026-08-18): liefert je Mitglied dasselbe
+    # `aerox`-Public-Profil wie die LH-Crewliste — also auch den `token` eines
+    # FREMDEN Users. Ein AT ist das Bearer-Credential; ohne diesen Eintrag
+    # verliesse es roh den Server. Deckt GET /api/ax/condor/crew und den
+    # Upload-Pfad darunter ab.
+    '/api/ax/condor/crew',
 )
 _PUBLIC_USER_REF_BODY_KEYS = frozenset((
     'friend_token', 'target_token', 'sender_token', 'recipient_token',
@@ -58546,6 +58552,532 @@ def _condor_ics_privacy_sanitize(raw):
     return '\r\n'.join(out) + '\r\n'
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  CONDOR-CREWLISTE — SERVERSEITIG (Owner-Entscheidung 2026-08-18)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Owner woertlich: „warum lokal.. dann ist es nicht wie bei LH sollte der
+# ausfallen haben wir es im backend und koennen so ihr den immer laden.. auch
+# bei app loeschung und neue installation und so.. angeben wer bei aero x als
+# crew ist etc etc hotel auch mit bewertungen und alles alles sicher
+# gespeichert wie bei LH im backend".
+#
+# Damit ist die bis 17.08. geltende Regel „Crew bleibt strikt lokal" ersetzt.
+# Was sich AENDERT:
+#   * Die aus dem Condor-DESCRIPTION gelesene Crew wird STRUKTURIERT
+#     persistiert ([{role, name, staff_no, base}]) — pro (token, datum, flug).
+#   * Personalnummern DUERFEN gespeichert werden. Sie sind bei Condor exakt
+#     das, was `lh_pk_number` bei Lufthansa ist: das einzige belastbare
+#     Match-Kriterium fuer „wer davon ist auf AeroX" (Memory-Regel
+#     „Crew-Match nur pk" — kein Namens-Raten, s. Marco-C.-Vorfall 30.07.).
+#
+# Was UNVERAENDERT bleibt (nicht verhandelbar):
+#   * Der ROHE DESCRIPTION-Text wird NIRGENDS persistiert.
+#     `_condor_ics_privacy_sanitize` laeuft weiterhin vor JEDEM Parser-/
+#     Persistenzpfad des Kalenders; hier wird nur VORHER strukturiert gelesen.
+#   * Hotel-ADRESSE und Telefonnummer aus dem Freitext gehen weiter NICHT zum
+#     Server (der Hotel-NAME reist getrennt und gegatet ueber
+#     `/api/ax/crew-hotels/suggest`, Owner-Entscheidung 08.08.).
+#   * Ausgeliefert wird fail-closed: nur an einen Token, der GENAU DIESEN Flug
+#     an DIESEM Tag im EIGENEN, echt importierten Roster stehen hat.
+#     Family-/Fremd-Roster kommen hier nie durch (sie haben keine eigenen
+#     `ical_imported_at`-Sektoren dieses Legs).
+#
+# ZWEI INGEST-WEGE — beide muenden in `_condor_crew_store_upsert`:
+#   (A) SERVER-FETCH (`?url=`-Import, Auto-Refresh, alte App-Builds):
+#       der Rohtext liegt hier vor. `_condor_crew_parse_ics` liest ihn
+#       DIREKT VOR `_condor_ics_privacy_sanitize`; danach wird sanitisiert
+#       wie bisher. Der Rohtext selbst verlaesst diese Funktion nicht.
+#   (B) GERAETE-POST: die App strippt DESCRIPTION schon auf dem iPhone
+#       (`CondorRosterPrivacy.prepareForUpload`) — der Server SIEHT den Text
+#       dort also gar nicht, und das soll auch so bleiben (kein Rueckbau des
+#       Geraete-Datenschutzes). Deshalb laedt iOS nach einem erfolgreichen
+#       Import die LOKAL geparste, STRUKTURIERTE Crew ueber
+#       `POST /api/ax/condor/crew/upload` nach (idempotent per
+#       (token, datum, flug)).
+
+_CONDOR_CREW_TABLE = 'condor_crew_roster'
+_CONDOR_CREW_MAX_ITEMS_PER_CALL = 400
+_CONDOR_CREW_MAX_MEMBERS = 30
+# Roster-Datum (LT) und DTSTART-Datum (Z) koennen bei Red-Eyes um einen Tag
+# auseinanderfallen — dieselbe Toleranz wie beim LH-Crew-Cache. Das GATE bleibt
+# davon unberuehrt (es prueft immer den ANGEFRAGTEN Tag im eigenen Roster);
+# nur die Zeile darf vom Nachbartag stammen, und die Antwort SAGT das dann
+# ueber `flight_date`.
+_CONDOR_CREW_DATE_SLACK = (0, -1, 1)
+
+# `CP 402644F HAEBEL, KAI (FRA)` — Rolle, Personalnummer, Name, Basis.
+_CONDOR_CREW_LINE_RE = re.compile(
+    r'^(CP|FO|PU|ST)\s+([A-Z0-9-]{4,})\s+(.+?)\s+\(([A-Z]{3})\)\s*$',
+    re.IGNORECASE | re.MULTILINE)
+_CONDOR_FLIGHT_RE = re.compile(r'\b(?:DE|CFG)\s?\d{1,4}[A-Z]?\b', re.IGNORECASE)
+_CONDOR_ROUTE_RE = re.compile(r'\b([A-Z]{3})\s*(?:-|–|—|→|>)\s*([A-Z]{3})\b',
+                              re.IGNORECASE)
+
+
+def _condor_ics_unescape(value):
+    """iCal-Escapes aufloesen (pure). Spiegelt `CondorRosterPrivacy.unescape`."""
+    out = str(value or '').replace('\\N', '\n').replace('\\n', '\n')
+    return (out.replace('\\,', ',').replace('\\;', ';')
+            .replace('\\\\', '\\'))
+
+
+def _condor_crew_display_name(raw):
+    """`HAEBEL, KAI` → `Kai Haebel`. Pure.
+
+    Spiegelt `CondorRosterPrivacy.displayName` (iOS: `lowercased()` +
+    `localizedCapitalized`), damit Server- und Geraete-Pfad fuer dieselbe Person
+    denselben String schreiben. ICU bricht auch am Bindestrich
+    („MEYER-SCHMIDT" → „Meyer-Schmidt"), NICHT am Apostroph — `str.title()`
+    wuerde hier auseinanderlaufen, deshalb die eigene Zerlegung.
+    """
+    clean = str(raw or '').strip()
+    if not clean:
+        return ''
+    if ',' in clean:
+        last, first = clean.split(',', 1)
+        clean = f'{first.strip()} {last.strip()}'.strip()
+    return ' '.join(
+        '-'.join(seg.capitalize() for seg in word.split('-'))
+        for word in clean.lower().split())
+
+
+def _condor_normalize_flight(raw):
+    return re.sub(r'[^0-9A-Z]', '', str(raw or '').upper())
+
+
+def _condor_crew_parse_ics(raw):
+    """ROH-ICS → [{date, flight, dep, arr, crew:[{role,name,staff_no,base}]}].
+
+    Pure + testbar, wirft nie. Liest ausschliesslich das, was strukturiert
+    gespeichert werden darf — Hotelname/-adresse/Telefon bleiben hier
+    ABSICHTLICH ungelesen (Hotels laufen ueber das eigene, gegatete
+    Verzeichnis). Ein Event ohne verwertbare Crew faellt raus (Regel
+    „lieber keine Zeile als ein synthetisierter Wert").
+    """
+    if not isinstance(raw, str) or 'BEGIN:VEVENT' not in raw.upper():
+        return []
+    physical = raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    logical = []
+    for line in physical:
+        if line[:1] in (' ', '\t') and logical:
+            logical[-1] += line[1:]
+        elif line:
+            logical.append(line)
+
+    out = []
+    cur = None
+    for line in logical:
+        upper = line.upper()
+        if upper == 'BEGIN:VEVENT':
+            cur = {'SUMMARY': '', 'LOCATION': '', 'DESCRIPTION': '',
+                   'DTSTART': ''}
+            continue
+        if upper == 'END:VEVENT':
+            if cur is not None:
+                row = _condor_crew_event_row(cur)
+                if row:
+                    out.append(row)
+            cur = None
+            continue
+        if cur is None or ':' not in line:
+            continue
+        lhs, value = line.split(':', 1)
+        name = lhs.split(';', 1)[0].upper()
+        if name in cur:
+            cur[name] = value
+    return out
+
+
+def _condor_crew_event_row(event):
+    """Ein VEVENT-Dict → gespeicherte Zeile oder None. Pure."""
+    description = _condor_ics_unescape(event.get('DESCRIPTION'))
+    crew = []
+    seen = set()
+    for m in _CONDOR_CREW_LINE_RE.finditer(description):
+        role = m.group(1).upper()
+        staff_no = m.group(2).strip().upper()
+        name = _condor_crew_display_name(m.group(3))
+        base = m.group(4).upper()
+        if not name:
+            continue
+        key = f'{role}|{name}|{staff_no}'
+        if key in seen:
+            continue
+        seen.add(key)
+        member = {'role': role, 'name': name}
+        # Personalnummer ist seit 18.08. das Match-Kriterium (Condor-Pendant
+        # zur lh_pk_number) — aber nur, wenn sie wirklich dasteht.
+        if staff_no:
+            member['staff_no'] = staff_no
+        if base:
+            member['base'] = base
+        crew.append(member)
+        if len(crew) >= _CONDOR_CREW_MAX_MEMBERS:
+            break
+    if not crew:
+        return None
+
+    summary = _condor_ics_unescape(event.get('SUMMARY')).strip()
+    location = _condor_ics_unescape(event.get('LOCATION'))
+    digits = re.sub(r'\D', '', str(event.get('DTSTART') or ''))[:8]
+    if len(digits) != 8:
+        return None
+    date = f'{digits[0:4]}-{digits[4:6]}-{digits[6:8]}'
+    fm = _CONDOR_FLIGHT_RE.search(summary)
+    flight = _condor_normalize_flight(fm.group(0)) if fm else ''
+    if not flight:
+        return None
+    rm = _CONDOR_ROUTE_RE.search(f'{summary} {location}')
+    row = {'date': date, 'flight': flight, 'crew': crew}
+    if rm:
+        row['dep'] = rm.group(1).upper()
+        row['arr'] = rm.group(2).upper()
+    return row
+
+
+def _condor_crew_sanitize_items(items):
+    """Fremd-Eingabe (Geraete-POST) → dieselbe Zeilenform wie der Parser.
+
+    Streng: unbekannte Felder fallen weg, Laengen sind gekappt, ein Eintrag
+    ohne Namen existiert nicht. Pure, wirft nie.
+    """
+    out = []
+    if not isinstance(items, list):
+        return out
+    for raw in items[:_CONDOR_CREW_MAX_ITEMS_PER_CALL]:
+        if not isinstance(raw, dict):
+            continue
+        date = str(raw.get('date') or '')[:10]
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+            continue
+        flight = _condor_normalize_flight(raw.get('flight'))
+        if not (3 <= len(flight) <= 8):
+            continue
+        crew = []
+        seen = set()
+        for m in (raw.get('crew') or [])[:_CONDOR_CREW_MAX_MEMBERS]:
+            if not isinstance(m, dict):
+                continue
+            role = re.sub(r'[^A-Z]', '', str(m.get('role') or '').upper())[:4]
+            name = _condor_crew_display_name(m.get('name'))[:80]
+            staff_no = re.sub(r'[^0-9A-Z-]', '',
+                              str(m.get('staff_no') or '').upper())[:16]
+            base = re.sub(r'[^A-Z]', '', str(m.get('base') or '').upper())[:3]
+            if not name or not role:
+                continue
+            key = f'{role}|{name}|{staff_no}'
+            if key in seen:
+                continue
+            seen.add(key)
+            member = {'role': role, 'name': name}
+            if staff_no:
+                member['staff_no'] = staff_no
+            if len(base) == 3:
+                member['base'] = base
+            crew.append(member)
+        if not crew:
+            continue
+        row = {'date': date, 'flight': flight, 'crew': crew}
+        for key in ('dep', 'arr'):
+            code = re.sub(r'[^A-Z]', '', str(raw.get(key) or '').upper())[:3]
+            if len(code) == 3:
+                row[key] = code
+        out.append(row)
+    return out
+
+
+def _condor_crew_store_upsert(token, rows, source):
+    """Strukturierte Crew pro (token, datum, flug) ablegen. Idempotent.
+
+    `source` ist Pflicht und wandert mit in die Zeile — es gibt keinen
+    Crew-Eintrag ohne Quelle (Owner-Regel „keine Fake-Werte"). Wirft nie;
+    ohne Supabase passiert schlicht nichts (die App faellt dann auf ihren
+    lokalen Stand zurueck).
+    """
+    if not token or not rows or not SB_AVAILABLE:
+        return 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # DEDUPE VOR DEM UPSERT: derselbe (Tag, Flug) darf in EINEM Statement nur
+    # einmal vorkommen — Postgres bricht ein `ON CONFLICT DO UPDATE` sonst mit
+    # „cannot affect row a second time" ab, und ein Rotationsplan kann dieselbe
+    # Flugnummer am selben Tag durchaus zweimal nennen. Der letzte Eintrag
+    # gewinnt (das ist die Reihenfolge, in der auch die App speichert).
+    by_key = {}
+    for row in rows[:_CONDOR_CREW_MAX_ITEMS_PER_CALL]:
+        by_key[(row['date'], row['flight'])] = {
+            'token': token,
+            'flight_date': row['date'],
+            'flight': row['flight'],
+            'crew': row['crew'],
+            'dep': row.get('dep'),
+            'arr': row.get('arr'),
+            'source': source,
+            'updated_at': now_iso,
+        }
+    payload = list(by_key.values())
+    try:
+        sb.table(_CONDOR_CREW_TABLE).upsert(
+            payload, on_conflict='token,flight_date,flight').execute()
+        return len(payload)
+    except Exception as e:
+        app.logger.warning('[condor_crew] upsert_fail %s: %s',
+                           type(e).__name__, str(e)[:160])
+        return 0
+
+
+def _condor_crew_store_fetch(token, date, flight):
+    """Gespeicherte Zeile lesen — angefragter Tag zuerst, dann die Nachbartage
+    (`_CONDOR_CREW_DATE_SLACK`). Gibt (row|None) zurueck, wirft nie."""
+    if not token or not SB_AVAILABLE:
+        return None
+    f = _condor_normalize_flight(flight)
+    base = str(date or '')[:10]
+    if not f or not re.match(r'^\d{4}-\d{2}-\d{2}$', base):
+        return None
+    try:
+        base_date = datetime.fromisoformat(base).date()
+    except Exception:
+        return None
+    for offset in _CONDOR_CREW_DATE_SLACK:
+        day = (base_date + timedelta(days=offset)).isoformat()
+        try:
+            r = (sb.table(_CONDOR_CREW_TABLE)
+                 .select('flight_date,flight,crew,dep,arr,source,updated_at')
+                 .eq('token', token).eq('flight_date', day).eq('flight', f)
+                 .limit(1).execute())
+            rows = r.data or []
+        except Exception as e:
+            app.logger.warning('[condor_crew] fetch_fail %s: %s',
+                               type(e).__name__, str(e)[:160])
+            return None
+        if rows and rows[0].get('crew'):
+            return rows[0]
+    return None
+
+
+def _condor_roster_has_leg(token, date, flight):
+    """Steht DIESER Flug an DIESEM Tag im EIGENEN, echt importierten Roster?
+
+    Das ist das Auslieferungs-Gate der Crewliste — dasselbe Muster wie beim
+    Crew-Hotel-Verzeichnis (`_condor_roster_hotel_iatas`): eine Aussage ueber
+    sich selbst, kein Rueckschluss auf fremde Daten. FAIL-CLOSED: jede
+    Unklarheit (kein Profil, keine Condor-Airline, kein `ical_imported_at`,
+    Exception) heisst False.
+    """
+    if not token:
+        return False
+    f = _condor_normalize_flight(flight)
+    day = str(date or '')[:10]
+    if not f or not re.match(r'^\d{4}-\d{2}-\d{2}$', day):
+        return False
+    try:
+        airline, has_cal = _viewer_airline_and_calendar(token)
+        if _canonical_airline_key(airline) != 'CONDOR' or not has_cal:
+            return False
+        briefings = _ical_briefings_load(token) or {}
+        entry = briefings.get(day)
+        if not isinstance(entry, dict) or not entry.get('ical_imported_at'):
+            return False
+        for sector in (entry.get('ical_sectors') or []):
+            if not isinstance(sector, dict):
+                continue
+            if _condor_normalize_flight(sector.get('flight')) == f:
+                return True
+        # Kurzstrecken-Tage ohne aufgeloeste Sektoren tragen die Flugnummer
+        # nur in der Zusammenfassung. Wortgrenzen-Match, damit `DE23` nicht
+        # `DE2360` oeffnet.
+        summary = _condor_normalize_flight(entry.get('ical_summary'))
+        return bool(re.search(rf'(?<![0-9A-Z]){re.escape(f)}(?![0-9])',
+                              summary))
+    except Exception:
+        return False
+
+
+def _condor_learn_own_staff_no(token, rows):
+    """Eigene Condor-Personalnummer aus der eigenen Crewliste lernen.
+
+    Der User steht in seiner eigenen Besatzung — der Name im Profil trifft dort
+    genau einen Eintrag. Das ist das Condor-Pendant zu `_store_own_pk`
+    (lh_pk_number) und macht den `aerox`-Match spaeter exakt statt geraten.
+    Additiv (`metadata.condor_staff_no`), idempotent, wirft nie.
+
+    STRENG: Nur ein EINDEUTIGER Treffer zaehlt. Tauchen unter dem eigenen Namen
+    zwei verschiedene Nummern auf, wird NICHTS gespeichert — eine falsche
+    Personalnummer wuerde spaeter ein fremdes Profil als „auf AeroX" ausweisen.
+    """
+    if not token or not rows:
+        return None
+    try:
+        payload = _profile_load(token) or {}
+        profile = payload.get('profile') or {}
+        own = ' '.join(str(profile.get('name') or '').lower().split())
+        if len(own) < 4:
+            return None
+        found = set()
+        for row in rows:
+            for member in (row.get('crew') or []):
+                staff_no = str(member.get('staff_no') or '').strip().upper()
+                if not staff_no:
+                    continue
+                name = ' '.join(str(member.get('name') or '').lower().split())
+                if name and name == own:
+                    found.add(staff_no)
+        if len(found) != 1:
+            return None
+        staff_no = found.pop()
+        if str(profile.get('condor_staff_no') or '') == staff_no:
+            return staff_no
+        profile['condor_staff_no'] = staff_no
+        _profile_save(token, profile)
+        return staff_no
+    except Exception as e:
+        app.logger.warning('[condor_crew] learn_staff_no %s', type(e).__name__)
+        return None
+
+
+def _condor_crew_ingest(token, raw_ics, source):
+    """Ingest-Sammelpunkt fuer BEIDE Wege (Server-Fetch-Rohtext).
+
+    Wird im Import AUSSCHLIESSLICH vor `_condor_ics_privacy_sanitize`
+    aufgerufen; der Rohtext wird hier gelesen und NICHT weitergereicht.
+    """
+    try:
+        rows = _condor_crew_parse_ics(raw_ics)
+    except Exception as e:
+        app.logger.warning('[condor_crew] parse_fail %s', type(e).__name__)
+        return 0
+    if not rows:
+        return 0
+    _condor_learn_own_staff_no(token, rows)
+    return _condor_crew_store_upsert(token, rows, source)
+
+
+def _condor_crew_aerox_matches(members):
+    """staff_no → AeroX-PUBLIC-Profil. Spiegelt `_match_aerox_profiles` (LH).
+
+    NUR ueber die Personalnummer — kein Namens-Match (Marco-C.-Vorfall
+    30.07.: aus einem Namen laesst sich keine Identitaet ableiten). Ohne
+    Treffer bleibt das Mitglied ohne `aerox`-Feld, und die App zeigt es ohne
+    Badge und ohne Profil-Tap. Wirft nie.
+    """
+    try:
+        if not SB_AVAILABLE or not members:
+            return {}
+        numbers = sorted({str(m.get('staff_no') or '').strip().upper()
+                          for m in members if m.get('staff_no')})
+        if not numbers:
+            return {}
+        r = (sb.table('user_profiles')
+             .select('token,name,airline,homebase,position,metadata')
+             .in_('metadata->>condor_staff_no', numbers[:60])
+             .limit(60).execute())
+        out = {}
+        for row in (r.data or []):
+            md = row.get('metadata') or {}
+            if str(md.get('account_type') or '').strip().lower() == 'family':
+                continue
+            if not row.get('token'):
+                continue
+            if _canonical_airline_key(row.get('airline')) != 'CONDOR':
+                continue
+            key = str(md.get('condor_staff_no') or '').strip().upper()
+            if not key:
+                continue
+            out[key] = {'token': row.get('token'), 'name': row.get('name'),
+                        'airline': row.get('airline'),
+                        'homebase': row.get('homebase'),
+                        'position': row.get('position'),
+                        'avatar_url': md.get('avatar_url')}
+        return out
+    except Exception as e:
+        app.logger.warning('[condor_crew] aerox_match %s', type(e).__name__)
+        return {}
+
+
+def _condor_crew_public_members(members):
+    """Auslieferungs-Form je Mitglied — exakt die LH-Crewlisten-Form:
+    Rolle/Name + optionales `aerox`-Public-Profil. Die Personalnummer bleibt
+    INTERN (sie ist Match-Kriterium, kein Anzeigewert)."""
+    matches = _condor_crew_aerox_matches(members)
+    out = []
+    for m in members or []:
+        if not isinstance(m, dict) or not m.get('name'):
+            continue
+        item = {'role': str(m.get('role') or '').upper(),
+                'name': m.get('name')}
+        profile = matches.get(str(m.get('staff_no') or '').strip().upper())
+        if profile:
+            item['aerox'] = profile
+        out.append(item)
+    return out
+
+
+@app.route('/api/ax/condor/crew', methods=['GET'])
+def ax_condor_crew():
+    """Condor-Crewliste EINES Legs — serverseitig gefuehrt (Owner 18.08.).
+
+    Query: `?date=YYYY-MM-DD&flight=DE2360`.
+
+    FAIL-CLOSED: geliefert wird nur, wenn der anfragende Token diesen Flug an
+    diesem Tag im EIGENEN, echt importierten Roster stehen hat
+    (`_condor_roster_has_leg`). Ein fremder Condor-Token ohne das Leg bekommt
+    403 — nicht etwa eine leere Liste, die wie „keine Crew" aussaehe.
+    """
+    token = _request_token()
+    date = (request.args.get('date') or '').strip()[:10]
+    flight = _condor_normalize_flight(request.args.get('flight'))
+    if not token or not flight or not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
+        return jsonify({'ok': False, 'error': 'invalid_request'}), 400
+    if not _condor_roster_has_leg(token, date, flight):
+        return jsonify({'ok': False, 'error': 'leg_not_in_own_roster'}), 403
+    row = _condor_crew_store_fetch(token, date, flight)
+    if not row:
+        return jsonify({'ok': True, 'crew': [], 'flight_date': date})
+    return jsonify({'ok': True,
+                    'crew': _condor_crew_public_members(row.get('crew') or []),
+                    'flight_date': str(row.get('flight_date') or date)[:10],
+                    'source': row.get('source'),
+                    'updated_at': row.get('updated_at')})
+
+
+@app.route('/api/ax/condor/crew/upload', methods=['POST'])
+def ax_condor_crew_upload():
+    """GERAETE-Weg (B): die App laedt ihre LOKAL geparste, strukturierte Crew
+    hoch. Body `{items:[{date, flight, dep?, arr?, crew:[{role,name,staff_no?,
+    base?}]}]}`. Idempotent per (token, datum, flug).
+
+    Warum nicht einfach der Rohtext? Weil der Geraete-Import DESCRIPTION
+    absichtlich schon auf dem iPhone entfernt — der rohe Freitext soll den
+    Server nie erreichen. Strukturiert hochgeladen wird genau das, was auch
+    gespeichert werden darf.
+
+    Gate: Condor-Profil MIT gueltigem Kalender. Zusaetzlich muss jede
+    hochgeladene Zeile im eigenen Roster stehen — sonst koennte ein Konto
+    fremde Legs mit erfundenen Besatzungen belegen.
+    """
+    token = _request_token()
+    if not token:
+        return jsonify({'ok': False, 'error': 'no_token'}), 400
+    airline, has_cal = _viewer_airline_and_calendar(token)
+    if _canonical_airline_key(airline) != 'CONDOR' or not has_cal:
+        return jsonify({'ok': False, 'error': 'not_condor_crew'}), 403
+    body = request.get_json(silent=True) or {}
+    rows = _condor_crew_sanitize_items(body.get('items'))
+    if not rows:
+        return jsonify({'ok': False, 'error': 'no_items'}), 400
+    accepted = [r for r in rows
+                if _condor_roster_has_leg(token, r['date'], r['flight'])]
+    if not accepted:
+        return jsonify({'ok': False, 'error': 'leg_not_in_own_roster',
+                        'stored': 0, 'rejected': len(rows)}), 403
+    staff_no = _condor_learn_own_staff_no(token, accepted)
+    stored = _condor_crew_store_upsert(token, accepted, 'device_structured')
+    return jsonify({'ok': True, 'stored': stored,
+                    'rejected': len(rows) - len(accepted),
+                    'own_staff_no_known': bool(staff_no)})
+
+
 _CALENDAR_FEED_MAX_BYTES = 1024 * 1024
 _CALENDAR_FEED_MAX_REDIRECTS = 3
 
@@ -58780,6 +59312,14 @@ def import_calendar_feed(token):
         err_1 = 'fetch_failed'
     if text is not None:
         if _condor_private_ics:
+            # CREWLISTE (Owner 18.08.): STRUKTURIERT lesen, solange der
+            # Rohtext noch da ist — und zwar unmittelbar VOR dem Sanitize.
+            # Neue App-Builds haben DESCRIPTION schon auf dem Geraet entfernt;
+            # dann findet der Parser nichts und die Zeile kommt ueber
+            # `/api/ax/condor/crew/upload` nach. Der Rohtext selbst wird
+            # weiterhin NIRGENDS persistiert.
+            _condor_crew_ingest(token, text,
+                                'device_ics' if ics_text_direct else 'server_ics')
             text = _condor_ics_privacy_sanitize(text)
         _shadow_text_1 = text
         # RFC-5545-konformer ICS-Parser via module-level pure functions —
@@ -58803,6 +59343,7 @@ def import_calendar_feed(token):
     if ics_text_2_direct:
         # Geräte-Abruf: der zweite Feed kommt schon als Text mit (kein Fetch).
         if _condor_private_ics:
+            _condor_crew_ingest(token, ics_text_2_direct, 'device_ics')
             ics_text_2_direct = _condor_ics_privacy_sanitize(ics_text_2_direct)
         _shadow_text_2 = ics_text_2_direct
         try:
@@ -58823,6 +59364,7 @@ def import_calendar_feed(token):
                                                     slot='calendar_feed_2')
         else:
             if _condor_private_ics:
+                _condor_crew_ingest(token, text2, 'server_ics')
                 text2 = _condor_ics_privacy_sanitize(text2)
                 _shadow_text_2 = text2
             try:
