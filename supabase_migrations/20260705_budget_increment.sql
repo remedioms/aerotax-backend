@@ -39,3 +39,11 @@ as $$
             updated_at = now()
     returning n;
 $$;
+
+-- The RPC is called only by the backend's service-role client.  A public
+-- SECURITY DEFINER function otherwise receives EXECUTE through PUBLIC by
+-- default and could let an API caller exhaust or distort paid-call budgets.
+revoke all on function public.ax_budget_increment(text, integer)
+    from public, anon, authenticated;
+grant execute on function public.ax_budget_increment(text, integer)
+    to service_role;

@@ -59,7 +59,6 @@ CREATE TABLE IF NOT EXISTS pdfs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_pdfs_expires ON pdfs (expires_at);
-ALTER TABLE pdfs DISABLE ROW LEVEL SECURITY;
 
 -- ─── HOCHGELADENE DATEIEN (überlebt Render-Restarts während Bezahlung) ───
 CREATE TABLE IF NOT EXISTS uploaded_files (
@@ -74,7 +73,6 @@ CREATE TABLE IF NOT EXISTS uploaded_files (
 );
 CREATE INDEX IF NOT EXISTS idx_uploaded_files_ref ON uploaded_files (ref);
 CREATE INDEX IF NOT EXISTS idx_uploaded_files_expires ON uploaded_files (expires_at);
-ALTER TABLE uploaded_files DISABLE ROW LEVEL SECURITY;
 
 -- ─── AUDIT LOG (optional Compliance) ───
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -86,13 +84,25 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_job ON audit_logs (job_id, created_at);
 
--- ─── RLS DISABLEN (wir nutzen service_role key, kein Public-Auth) ───
-ALTER TABLE questions DISABLE ROW LEVEL SECURITY;
-ALTER TABLE answers DISABLE ROW LEVEL SECURITY;
-ALTER TABLE upvotes DISABLE ROW LEVEL SECURITY;
-ALTER TABLE sessions DISABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs DISABLE ROW LEVEL SECURITY;
-ALTER TABLE pdfs DISABLE ROW LEVEL SECURITY;
+-- ─── Backend-only Data API surface ────────────────────────────────────────
+-- All actual application access goes through the server's service-role client;
+-- browser/mobile code has no direct Supabase client. Keep both Data API
+-- privileges and rows closed even if a future policy is added by mistake.
+ALTER TABLE public.questions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.answers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.upvotes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.pdfs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.uploaded_files ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON TABLE public.questions FROM public, anon, authenticated;
+REVOKE ALL ON TABLE public.answers FROM public, anon, authenticated;
+REVOKE ALL ON TABLE public.upvotes FROM public, anon, authenticated;
+REVOKE ALL ON TABLE public.sessions FROM public, anon, authenticated;
+REVOKE ALL ON TABLE public.audit_logs FROM public, anon, authenticated;
+REVOKE ALL ON TABLE public.pdfs FROM public, anon, authenticated;
+REVOKE ALL ON TABLE public.uploaded_files FROM public, anon, authenticated;
 
 -- ─── Cleanup-Funktion: alte Sessions löschen ───
 CREATE OR REPLACE FUNCTION cleanup_expired_sessions()
@@ -105,4 +115,4 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Fertig. Tabellen + Indices + RLS-Disable sind drin.
+-- Fertig. Tabellen + Indices + server-only RLS/Grants sind gesetzt.

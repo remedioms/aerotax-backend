@@ -6722,37 +6722,16 @@ def ax_unified_flight(query):
         lat=lat, lon=lon, allow_paid=allow_paid))
 
 
-@aerox_data_bp.route('/api/ax/tail-history', methods=['GET'])
-def ax_tail_history():
-    """„Zuletzt geflogen" EINER Maschine: die letzten ~10 Legs by Tail/Reg aus
-    dem Flight-Warehouse (`flights`, board-verifiziert). Für die Kennzeichen-
-    Detailseite, wenn die Maschine gerade NICHT sendet — statt leerer Seite.
+def _tail_history_warehouse(reg=None, hexid=None, limit=10):
+    """Return verified recent legs without invoking a paid data source.
 
-    Query: reg=D-AIZB (bevorzugt, hyphen-tolerant) ODER hex=<icao24>.
-    Response: {ok, reg, count, legs:[{flight_no,src,dst,day,sched_dep,status}]}
-    KEIN Tail-Raten: nur exakte Tail-/Hex-Matches aus dem Warehouse; leer wenn
-    die Maschine dort nie beobachtet wurde.
-
-    own=1/watch=1 (wie ax_callsign): NUR dann darf der bezahlte FR24-Fallback
-    feuern — der anonyme Tap auf eine fremde Maschine bleibt Warehouse-only
-    (kein Paid-per-Tap). iOS sendet own=1 für die eigene Maschine."""
-    from flask import request
-    # Per-IP-Limit (Kosten-Review 2026-07-09: Endpoint war ungedeckelt und
-    # konnte pro Miss einen Paid-Call ziehen).
-    if _ax_rate_limited('tail_history', limit=30, window_sec=60):
-        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
-    reg = (request.args.get('reg') or '').strip().upper()
-    hexid = (request.args.get('hex') or '').strip().lower()
-    if not reg and not hexid:
-        return jsonify({'ok': False, 'error': 'reg_or_hex_required'}), 400
-    _own = (request.args.get('own') or request.args.get('watch')
-            or request.args.get('mine') or '').strip().lower()
-    # Bearer-Pflicht fürs Paid-Gate (Sweep 2026-07-10, Klasse A) — Muster wie
-    # ax_unified_flight: anonym darf nie Credits schalten, own=1 allein reicht
-    # nicht mehr. Warehouse-Teil bleibt für alle (auch Alt-Builds) unverändert.
-    _authed = (request.headers.get('Authorization') or '').strip().lower() \
-        .startswith('bearer ')
-    allow_paid = _authed and _own in ('1', 'true', 'yes', 'y')
+    The registration-search aggregate and the legacy tail-history URL share
+    this read-only warehouse projection.  Keeping the paid fallback in the
+    route below prevents a normal public search tap from ever spending FR24
+    credits or writing crowd-sourced observations.
+    """
+    reg = (reg or '').strip().upper()
+    hexid = (hexid or '').strip().lower()
     sb = _sb()
     legs = []
     if sb is not None:
@@ -6803,10 +6782,45 @@ def ax_tail_history():
                              'sched_arr': _sa,
                              'duration_min': _dur,
                              'status': f.get('status')})
-                if len(legs) >= 10:
+                if len(legs) >= limit:
                     break
         except Exception:
             pass
+    return legs
+
+
+@aerox_data_bp.route('/api/ax/tail-history', methods=['GET'])
+def ax_tail_history():
+    """„Zuletzt geflogen" EINER Maschine: die letzten ~10 Legs by Tail/Reg aus
+    dem Flight-Warehouse (`flights`, board-verifiziert). Für die Kennzeichen-
+    Detailseite, wenn die Maschine gerade NICHT sendet — statt leerer Seite.
+
+    Query: reg=D-AIZB (bevorzugt, hyphen-tolerant) ODER hex=<icao24>.
+    Response: {ok, reg, count, legs:[{flight_no,src,dst,day,sched_dep,status}]}
+    KEIN Tail-Raten: nur exakte Tail-/Hex-Matches aus dem Warehouse; leer wenn
+    die Maschine dort nie beobachtet wurde.
+
+    own=1/watch=1 (wie ax_callsign): NUR dann darf der bezahlte FR24-Fallback
+    feuern — der anonyme Tap auf eine fremde Maschine bleibt Warehouse-only
+    (kein Paid-per-Tap). iOS sendet own=1 für die eigene Maschine."""
+    from flask import request
+    # Per-IP-Limit (Kosten-Review 2026-07-09: Endpoint war ungedeckelt und
+    # konnte pro Miss einen Paid-Call ziehen).
+    if _ax_rate_limited('tail_history', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+    reg = (request.args.get('reg') or '').strip().upper()
+    hexid = (request.args.get('hex') or '').strip().lower()
+    if not reg and not hexid:
+        return jsonify({'ok': False, 'error': 'reg_or_hex_required'}), 400
+    _own = (request.args.get('own') or request.args.get('watch')
+            or request.args.get('mine') or '').strip().lower()
+    # Bearer-Pflicht fürs Paid-Gate (Sweep 2026-07-10, Klasse A) — Muster wie
+    # ax_unified_flight: anonym darf nie Credits schalten, own=1 allein reicht
+    # nicht mehr. Warehouse-Teil bleibt für alle (auch Alt-Builds) unverändert.
+    _authed = (request.headers.get('Authorization') or '').strip().lower() \
+        .startswith('bearer ')
+    allow_paid = _authed and _own in ('1', 'true', 'yes', 'y')
+    legs = _tail_history_warehouse(reg=reg, hexid=hexid)
     source = 'warehouse'
     # ── LETZTER Fallback (bezahlt, budget-gated, hart gecacht): kennt das
     #    Warehouse die Maschine NICHT (z.B. D-AIXS nie getafelt), die FR24-API
@@ -6844,6 +6858,113 @@ def ax_tail_history():
                         pass
     return jsonify({'ok': True, 'reg': reg or None, 'hex': hexid or None,
                     'count': len(legs), 'legs': legs, 'source': source})
+
+
+def _registration_reference(reg):
+    """Resolve a registration from the immutable reference database only."""
+    raw = reg.replace('-', '')
+    variants = [reg]
+    if raw and raw not in variants:
+        variants.append(raw)
+    # The reference feed is not entirely consistent about D-AIZB vs DAIZB.
+    # Probe its two established hyphen variants without a table-wide REPLACE()
+    # scan; the exact search value remains the response identity.
+    for cut in (1, 2):
+        if len(raw) > cut:
+            candidate = raw[:cut] + '-' + raw[cut:]
+            if candidate not in variants:
+                variants.append(candidate)
+    placeholders = ','.join('?' for _ in variants)
+    return _q1(
+        f'SELECT * FROM aircraft WHERE reg IN ({placeholders}) LIMIT 1',
+        tuple(variants),
+    )
+
+
+@aerox_data_bp.route('/api/ax/registration/<reg>', methods=['GET'])
+def ax_registration(reg):
+    """One read-only contract for Flutter's registration result screen.
+
+    This is intentionally an aggregate of the already authoritative local
+    sources: the immutable aircraft reference, verified warehouse legs and a
+    current live snapshot.  It deliberately does *not* call the paid FR24
+    fallback or any cache/write-back source for an anonymous search tap.
+    """
+    normalized = re.sub(r'\s+', '', (reg or '').strip().upper())
+    if not re.fullmatch(r'[A-Z0-9][A-Z0-9-]{2,11}', normalized):
+        return jsonify({'ok': False, 'error': 'invalid_registration'}), 400
+    if _ax_rate_limited('registration', limit=30, window_sec=60):
+        return jsonify({'ok': False, 'error': 'rate_limited'}), 429
+
+    row = _registration_reference(normalized)
+    canonical_reg = ((row or {}).get('reg') or normalized).strip().upper()
+    hexid = ((row or {}).get('hex') or '').strip().lower() or None
+    aircraft = None
+    if row:
+        aircraft = {
+            key: row.get(key)
+            for key in ('typecode', 'manufacturer', 'model', 'operator',
+                        'owner', 'built', 'built_date', 'category')
+            if row.get(key) is not None
+        }
+        typecode = row.get('typecode')
+        if typecode:
+            type_row = _q1(
+                'SELECT name, manufacturer, model FROM aircraft_types '
+                'WHERE typecode=? LIMIT 1',
+                (str(typecode).upper(),),
+            )
+            if type_row:
+                if type_row.get('name') is not None:
+                    aircraft['type_name'] = type_row['name']
+                for key in ('manufacturer', 'model'):
+                    if type_row.get(key) is not None:
+                        aircraft[key] = type_row[key]
+
+    legs = _tail_history_warehouse(reg=canonical_reg, hexid=hexid)
+    live, live_state = None, 'unknown'
+    try:
+        position, _route, _live_reg, live_type = _aircraft_live_pos(
+            reg=canonical_reg,
+        )
+    except Exception:
+        position, live_type = None, None
+    if position:
+        live = position
+        live_state = 'on_ground' if position.get('on_ground') else 'in_flight'
+        if aircraft is None and live_type:
+            aircraft = {'typecode': live_type}
+
+    # The existing photo endpoints write a shared cache on misses.  This
+    # aggregate must remain read-only, so it exposes an already cached photo
+    # only; otherwise Flutter renders its honest no-photo state.
+    photo = None
+    for photo_key in (hexid, canonical_reg, normalized):
+        if not photo_key:
+            continue
+        try:
+            photo = _cache_get('ax_photo_cache', 'hex', photo_key)
+        except Exception:
+            photo = None
+        if photo:
+            break
+
+    return jsonify({
+        'ok': True,
+        # The Flutter repository verifies exact normalized identity.  Do not
+        # replace a user-entered DAIZB with a reference-feed D-AIZB spelling.
+        'reg': normalized,
+        'hex': hexid,
+        'aircraft': aircraft,
+        'photo': photo,
+        'tail_history': {
+            'count': len(legs),
+            'legs': legs,
+            'source': 'warehouse',
+        },
+        'live': live,
+        'live_state': live_state,
+    })
 
 
 def _iso_to_epoch(s):
@@ -10332,6 +10453,31 @@ def _build_inbound_chain(flight_no, date, dep_iata, reg_hint=None,
     return chain, forecast, my
 
 
+def inbound_chain_payload(*, flight_no, date, dep_iata, reg_hint=None,
+                          arr_iata=None, dep_iso=None):
+    """Build the existing inbound-chain response from already validated input.
+
+    This deliberately has no Flask request or credential dependency so the
+    header-authenticated `/api/me` route can reuse the exact same factual
+    chain as the legacy iOS URL without placing an account credential in a
+    URL.  The caller owns HTTP/query validation; the existing builder remains
+    the sole source for board, warehouse and live facts.
+    """
+    mkey = ('chain', flight_no, date or '', dep_iata, reg_hint or '',
+            arr_iata or '', dep_iso)
+    memo = _memo_get(mkey)
+    if memo is not None:
+        return memo
+    chain, forecast, _my = _build_inbound_chain(
+        flight_no, date, dep_iata, reg_hint,
+        arr_iata=arr_iata, my_dep_utc=dep_iso)
+    payload = {
+        'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
+        **chain, 'dep_delay_forecast': forecast,
+    }
+    return _memo_put(mkey, payload)
+
+
 @aerox_data_bp.route('/api/ax/flight-inbound-chain/<token>', methods=['GET'])
 def ax_flight_inbound_chain(token):
     """#1 Tail-Verkettung + #2 Abflug-Delay-Prognose in EINEM Payload.
@@ -10361,19 +10507,15 @@ def ax_flight_inbound_chain(token):
             my_dep_utc = None
     if len(flight_no) < 3 or not dep_iata:
         return jsonify({'ok': False, 'error': 'need_flight_no_and_dep_iata'}), 400
-    mkey = ('chain', flight_no, date or '', dep_iata, reg_hint or '',
-            arr_iata or '', dep_iso)
-    memo = _memo_get(mkey)
-    if memo is not None:
-        return jsonify(memo)
-    chain, forecast, _my = _build_inbound_chain(
-        flight_no, date, dep_iata, reg_hint,
-        arr_iata=arr_iata, my_dep_utc=my_dep_utc)
-    payload = {
-        'ok': True, 'flight': flight_no, 'date': date, 'dep_iata': dep_iata,
-        **chain, 'dep_delay_forecast': forecast,
-    }
-    return jsonify(_memo_put(mkey, payload))
+    payload = inbound_chain_payload(
+        flight_no=flight_no,
+        date=date,
+        dep_iata=dep_iata,
+        reg_hint=reg_hint,
+        arr_iata=arr_iata,
+        dep_iso=my_dep_utc,
+    )
+    return jsonify(payload)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10780,8 +10922,8 @@ def _live_arrival_facts(flight_no, date, dep, dest, merged):
     return _live_arrival_fields(merged, facts)
 
 
-@aerox_data_bp.route('/api/ax/flight-live/<token>', methods=['GET'])
-def ax_flight_live(token):
+def flight_live_payload(*, flight_no, date=None, reg=None, dep_iata=None,
+                        arr_iata=None):
     """#3 Live-Track der EIGENEN Maschine für die In-Flight-Karte. Query:
     flight_no, date, reg (optional, echter Roster-Tail — Owner-Algorithmus
     „Plan sagt D-ABYO → Reg→Hex→ADS-B findet ihn, wo auch immer er ist"),
@@ -10795,22 +10937,16 @@ def ax_flight_live(token):
     /api/ax/uflight (`_live_arrival_facts`, gecacht + `lh_cached_only` ⇒ kein
     zusätzlicher LH-Call pro Poll). Rangfolge: echtes est_arr > sched_arr >
     nichts — es wird NIE eine Ankunft geschätzt oder abgeleitet."""
-    from flask import request
-    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
-    date = (request.args.get('date') or '').strip()[:10] or None
-    reg = (request.args.get('reg') or '').strip().upper() or None
     # Optionale Leg-Airports vom Client (Roster kennt sie) — damit kann der
     # Dual-Side-Merge die richtigen Boards/Store-Keys scannen. Ohne sie sah
     # `_flight_obs_merged` früher NICHTS (keine Airports = keine Store-Keys)
     # und die Kette starb an reg=null, obwohl das Warehouse den Tag kannte.
-    q_dep = _norm_iata(request.args.get('dep_iata'))
-    q_arr = _norm_iata(request.args.get('arr_iata'))
-    if len(flight_no) < 3:
-        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    q_dep = _norm_iata(dep_iata)
+    q_arr = _norm_iata(arr_iata)
     mkey = ('live', flight_no, date or '', reg or '', q_dep or '', q_arr or '')
     memo = _memo_get(mkey)
     if memo is not None:
-        return jsonify(memo)
+        return memo
     merged_fn = _life_app('_flight_obs_merged')
     my = (merged_fn(flight_no, date=date, dep_iata=q_dep, arr_iata=q_arr,
                     free_only=True) if merged_fn else None)
@@ -11015,7 +11151,24 @@ def ax_flight_live(token):
     # echte Ist-Landung nach. merged_fn wird nach dem paid-Write neu gelesen.
     _apply_paid_arrival_escalation(payload, flight_no, date, dep, dest, pos,
                                    merged_fn)
-    return jsonify(_memo_put(mkey, payload))
+    return _memo_put(mkey, payload)
+
+
+@aerox_data_bp.route('/api/ax/flight-live/<token>', methods=['GET'])
+def ax_flight_live(token):
+    """Legacy iOS path-token route; retained unchanged for compatibility."""
+    from flask import request
+    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    date = (request.args.get('date') or '').strip()[:10] or None
+    reg = (request.args.get('reg') or '').strip().upper() or None
+    dep_iata = _norm_iata(request.args.get('dep_iata'))
+    arr_iata = _norm_iata(request.args.get('arr_iata'))
+    if len(flight_no) < 3:
+        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    return jsonify(flight_live_payload(
+        flight_no=flight_no, date=date, reg=reg,
+        dep_iata=dep_iata, arr_iata=arr_iata,
+    ))
 
 
 def _derive_on_time(delay_known, delay_min, cancelled):
@@ -11123,26 +11276,17 @@ def ax_my_flight_status(token):
     return jsonify(_memo_put(mkey, payload))
 
 
-@aerox_data_bp.route('/api/ax/turnaround/<token>', methods=['GET'])
-def ax_turnaround(token):
-    """#4 Turnaround → nächster Sektor. Query: flight_no, dep, arr (=Wende-
-    Flughafen), date, next_flight_no, next_arr. Gleiche Reg → same_aircraft:true +
-    Bodenzeit + next_gate; neue Maschine → deren Inbound-Chain (#1) + Prognose
-    (#2). Ehrlich: same_aircraft:null wenn eine Reg-Seite unbekannt ist."""
-    from flask import request
-    cur_fn = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
-    cur_dep = _norm_iata(request.args.get('dep'))
-    turn = _norm_iata(request.args.get('arr'))          # Wende-Flughafen
-    date = (request.args.get('date') or '').strip()[:10] or None
-    next_fn = (request.args.get('next_flight_no') or '').replace(' ', '').upper().strip()
-    next_arr = _norm_iata(request.args.get('next_arr'))
-    if len(cur_fn) < 3 or not turn or len(next_fn) < 3:
-        return jsonify({'ok': False, 'error': 'need_current_and_next_sector'}), 400
+def turnaround_payload(*, current_flight, current_dep=None, turnaround_airport,
+                       date=None, next_flight, next_arr=None):
+    """Build the legacy turnaround response from validated lookup facts."""
+    cur_fn = current_flight
+    cur_dep = current_dep
+    turn = turnaround_airport
+    next_fn = next_flight
     mkey = ('turn', cur_fn, date or '', turn, next_fn)
     memo = _memo_get(mkey)
     if memo is not None:
-        return jsonify(memo)
-    from datetime import timedelta
+        return memo
     merged_fn = _life_app('_flight_obs_merged')
     # Reg der ANKOMMENDEN (aktuellen) Maschine + Soll-Ankunft am Wende-Flughafen.
     cur = (merged_fn(cur_fn, date=date, dep_iata=cur_dep, arr_iata=turn,
@@ -11183,7 +11327,32 @@ def ax_turnaround(token):
         # Neue (oder unbestimmte) Maschine → welcher Zubringer bringt sie?
         payload['inbound_chain'] = chain
         payload['dep_delay_forecast'] = forecast
-    return jsonify(_memo_put(mkey, payload))
+    return _memo_put(mkey, payload)
+
+
+@aerox_data_bp.route('/api/ax/turnaround/<token>', methods=['GET'])
+def ax_turnaround(token):
+    """#4 Turnaround → nächster Sektor. Query: flight_no, dep, arr (=Wende-
+    Flughafen), date, next_flight_no, next_arr. Gleiche Reg → same_aircraft:true +
+    Bodenzeit + next_gate; neue Maschine → deren Inbound-Chain (#1) + Prognose
+    (#2). Ehrlich: same_aircraft:null wenn eine Reg-Seite unbekannt ist."""
+    from flask import request
+    cur_fn = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    cur_dep = _norm_iata(request.args.get('dep'))
+    turn = _norm_iata(request.args.get('arr'))          # Wende-Flughafen
+    date = (request.args.get('date') or '').strip()[:10] or None
+    next_fn = (request.args.get('next_flight_no') or '').replace(' ', '').upper().strip()
+    next_arr = _norm_iata(request.args.get('next_arr'))
+    if len(cur_fn) < 3 or not turn or len(next_fn) < 3:
+        return jsonify({'ok': False, 'error': 'need_current_and_next_sector'}), 400
+    return jsonify(turnaround_payload(
+        current_flight=cur_fn,
+        current_dep=cur_dep,
+        turnaround_airport=turn,
+        date=date,
+        next_flight=next_fn,
+        next_arr=next_arr,
+    ))
 
 
 def _local_to_utc(s, iata):
@@ -11283,30 +11452,25 @@ def _recap_utc(iso):
     return dt.astimezone(timezone.utc)
 
 
-@aerox_data_bp.route('/api/ax/flight-recap/<token>', methods=['GET'])
-def ax_flight_recap(token):
+def flight_recap_payload(*, owner_token, flight_no, date=None, dep_iata=None,
+                         arr_iata=None):
     """#5 Post-Flight-Recap. Query: flight_no, date, dep_iata, arr_iata (die
     beiden Airports gibt der Roster-Leg mit — nötig, damit der Dual-Side-Resolver
     die richtige Board/Warehouse-Zeile findet). Finalizer-Wahrheit (on_time/late/
     cancelled, delay_known), Block-/Flugzeit wenn aus Obs ableitbar, tatsächliche
     Ab-/Ankunftszeiten. Gratis. Solange nichts Bekanntes vorliegt: status='pending'
     + „wird noch ermittelt" (NIE „pünktlich" behaupten)."""
-    from flask import request
-    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
-    date = (request.args.get('date') or '').strip()[:10] or None
-    q_dep = _norm_iata(request.args.get('dep_iata'))
-    q_arr = _norm_iata(request.args.get('arr_iata'))
-    if len(flight_no) < 3:
-        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    q_dep = _norm_iata(dep_iata)
+    q_arr = _norm_iata(arr_iata)
     # ⚠️ TOKEN IM MEMO-KEY (seit 10.08.2026 PFLICHT): die Antwort hängt jetzt am
     # EIGENEN Roster des Nutzers (`_recap_roster_leg`). Ohne Token im Schlüssel
     # bekäme der Kollege auf demselben Flug die Zeiten eines anderen serviert —
     # der Memo-Cache ist prozessweit geteilt.
-    mkey = ('recap', (token or '')[:64], flight_no, date or '',
+    mkey = ('recap', (owner_token or '')[:64], flight_no, date or '',
             q_dep or '', q_arr or '')
     memo = _memo_get(mkey)
     if memo is not None:
-        return jsonify(memo)
+        return memo
     # ── ANKUNFTSTAG MITGEBEN (Owner-Befund 10.08.2026) ────────────────────
     # `_flight_obs_merged` hat seit dem 16.07. den Parameter `arr_date` — gebaut
     # für genau diese Lage (Nico, LH423 BOS→FRA über Nacht). Sein Docstring
@@ -11318,7 +11482,7 @@ def ax_flight_recap(token):
     # Ankunft der Instanz von vorgestern (06:35 statt 06:14) in der Karte. Den
     # richtigen Tag kennt der eigene Roster-Leg — der wird hier ohnehin
     # geladen, kostet also nichts extra.
-    leg = _recap_roster_leg(token, flight_no, date, q_dep, q_arr)
+    leg = _recap_roster_leg(owner_token, flight_no, date, q_dep, q_arr)
     arr_date = None
     if isinstance(leg, dict):
         _ra = _recap_utc(leg.get('arr_iso'))
@@ -11334,7 +11498,7 @@ def ax_flight_recap(token):
         payload = {'ok': True, 'flight': flight_no, 'date': date,
                    'status': 'pending', 'delay_known': False,
                    'message': 'wird noch ermittelt'}
-        return jsonify(_memo_put(mkey, payload))
+        return _memo_put(mkey, payload)
     dep = _norm_iata(m.get('dep_iata'))
     dest = _norm_iata(m.get('arr_iata'))
     cancelled = bool(m.get('cancelled'))
@@ -11464,4 +11628,20 @@ def ax_flight_recap(token):
         'block_time_min': block_min,
         'message': ('wird noch ermittelt' if status == 'pending' else None),
     }
-    return jsonify(_memo_put(mkey, payload))
+    return _memo_put(mkey, payload)
+
+
+@aerox_data_bp.route('/api/ax/flight-recap/<token>', methods=['GET'])
+def ax_flight_recap(token):
+    """Legacy iOS path-token route; retained for compatibility."""
+    from flask import request
+    flight_no = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    date = (request.args.get('date') or '').strip()[:10] or None
+    dep_iata = _norm_iata(request.args.get('dep_iata'))
+    arr_iata = _norm_iata(request.args.get('arr_iata'))
+    if len(flight_no) < 3:
+        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    return jsonify(flight_recap_payload(
+        owner_token=token, flight_no=flight_no, date=date,
+        dep_iata=dep_iata, arr_iata=arr_iata,
+    ))

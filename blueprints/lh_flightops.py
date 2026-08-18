@@ -174,12 +174,27 @@ def _flow_put(state, verifier, user_token):
         log.warning('[lh_flightops] flow_put disk: %s', type(e).__name__)
 
 
-def _flow_take(state):
+def _flow_take(state, expected_user_token=None):
+    """Consume a PKCE flow once, optionally bound to its authenticated owner.
+
+    The `/api/me` exchange must not let a bearer exchange another user's
+    browser callback.  A mismatched owner deliberately leaves the state intact
+    so an unrelated request cannot burn a valid in-progress login.
+    """
     now = time.time()
     # Fastpath: derselbe Worker
     with _flow_lock:
-        hit = _flow_store.pop(state, None)
-    if hit and hit[0] >= now:
+        hit = _flow_store.get(state)
+        if hit and hit[0] < now:
+            _flow_store.pop(state, None)
+            hit = None
+        if (hit and expected_user_token is not None and
+                not secrets.compare_digest(str(hit[1].get('user_token') or ''),
+                                           str(expected_user_token))):
+            return None
+        if hit:
+            _flow_store.pop(state, None)
+    if hit:
         _flow_rm(state)
         return hit[1]
     # Cross-Worker: von Disk lesen (single-use → löschen)
@@ -188,11 +203,20 @@ def _flow_take(state):
         if p and os.path.exists(p):
             with open(p) as f:
                 rec = json.load(f)
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-            if rec.get('exp', 0) >= now:
+            if rec.get('exp', 0) < now:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+                return None
+            if (rec.get('exp', 0) >= now and
+                    (expected_user_token is None or
+                     secrets.compare_digest(str(rec.get('user_token') or ''),
+                                            str(expected_user_token)))):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
                 return {'verifier': rec.get('verifier'), 'user_token': rec.get('user_token')}
     except Exception as e:
         log.warning('[lh_flightops] flow_take disk: %s', type(e).__name__)
@@ -4439,13 +4463,10 @@ def enrich_sectors_boarding(user_token, sectors, now_ts=None):
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
-@lh_flightops_bp.route('/api/lh/flightops/oauth/start', methods=['GET'])
-def flightops_oauth_start():
-    """Schritt 1: Authorize-URL bauen (PKCE-Challenge + state serverseitig).
-    Query `token` = AeroX-User-Token (an den der Crew-Login gebunden wird)."""
+def _flightops_oauth_start_for(user_token):
+    """Build a PKCE authorize URL for one already-authorized AeroX owner."""
     if not flightops_configured():
         return jsonify({'ok': False, 'error': 'not_configured'}), 503
-    user_token = (request.args.get('token') or '').strip()
     if not user_token:
         return jsonify({'ok': False, 'error': 'token_required'}), 400
     verifier, challenge = _pkce_pair()
@@ -4459,8 +4480,13 @@ def flightops_oauth_start():
                     'state': state, 'redirect_uri': _REDIRECT_URI})
 
 
-@lh_flightops_bp.route('/api/lh/flightops/oauth/exchange', methods=['POST'])
-def flightops_oauth_exchange():
+@lh_flightops_bp.route('/api/lh/flightops/oauth/start', methods=['GET'])
+def flightops_oauth_start():
+    """Legacy iOS start route; its token-bearing query is retained unchanged."""
+    return _flightops_oauth_start_for((request.args.get('token') or '').strip())
+
+
+def _flightops_oauth_exchange_for(expected_owner=None):
     """Schritt 2: Code (den die App per Custom-Scheme empfangen hat) gegen Token
     tauschen (serverseitig, Secret sicher) und per-Crew speichern.
     Body: {code, state}. Der User wird über den state-gebundenen Flow aufgelöst."""
@@ -4471,7 +4497,7 @@ def flightops_oauth_exchange():
     state = (body.get('state') or '').strip()
     if not code or not state:
         return jsonify({'ok': False, 'error': 'code_state_required'}), 400
-    flow = _flow_take(state)
+    flow = _flow_take(state, expected_user_token=expected_owner)
     if not flow:
         return jsonify({'ok': False, 'error': 'state_invalid_or_expired'}), 400
     tok = _exchange_code(code, flow['verifier'])
@@ -4503,6 +4529,12 @@ def flightops_oauth_exchange():
                   (flow.get('user_token') or '')[:8])
         return jsonify({'ok': False, 'error': 'store_failed'}), 503
     return jsonify({'ok': True, 'connected': True, 'scope': tok.get('scope')})
+
+
+@lh_flightops_bp.route('/api/lh/flightops/oauth/exchange', methods=['POST'])
+def flightops_oauth_exchange():
+    """Legacy iOS exchange; ownership continues to come from the PKCE state."""
+    return _flightops_oauth_exchange_for()
 
 
 @lh_flightops_bp.route('/lh/oauth/callback', methods=['GET'])
@@ -4732,6 +4764,95 @@ def flightops_import(token):
         if not _history:
             _crew_prefetch_kick(token, resp)
     return jsonify(payload), status
+
+
+def _me_flightops_owner():
+    """Resolve the Android owner from Authorization, never a client field."""
+    try:
+        import app as _app
+        token, error = _app._header_only_owner()
+    except Exception:
+        return None, (jsonify({'ok': False, 'error': 'auth_unavailable'}), 503)
+    return token, error
+
+
+def _me_flightops_no_query():
+    if request.args:
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    return None
+
+
+def _me_flightops_valid_date(value):
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+        return False
+    try:
+        _dt.datetime.strptime(value, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+
+@lh_flightops_bp.route('/api/me/lh/flightops/status', methods=['GET'])
+def me_flightops_status():
+    """Header-authenticated FlightOps grant status for Android."""
+    error = _me_flightops_no_query()
+    if error is not None:
+        return error
+    token, error = _me_flightops_owner()
+    if error is not None:
+        return error
+    return flightops_status(token)
+
+
+@lh_flightops_bp.route('/api/me/lh/flightops/oauth/start', methods=['GET'])
+def me_flightops_oauth_start():
+    """Start an owner-bound PKCE flow without putting credentials in the URL."""
+    error = _me_flightops_no_query()
+    if error is not None:
+        return error
+    token, error = _me_flightops_owner()
+    if error is not None:
+        return error
+    return _flightops_oauth_start_for(token)
+
+
+@lh_flightops_bp.route('/api/me/lh/flightops/oauth/exchange', methods=['POST'])
+def me_flightops_oauth_exchange():
+    """Exchange only a PKCE state created by this Authorization owner."""
+    error = _me_flightops_no_query()
+    if error is not None:
+        return error
+    body = request.get_json(silent=True)
+    if (not isinstance(body, dict) or set(body) != {'code', 'state'} or
+            not all(isinstance(body.get(key), str) and body[key].strip()
+                    for key in ('code', 'state'))):
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    token, error = _me_flightops_owner()
+    if error is not None:
+        return error
+    return _flightops_oauth_exchange_for(expected_owner=token)
+
+
+@lh_flightops_bp.route('/api/me/lh/flightops/import', methods=['POST'])
+def me_flightops_import():
+    """Import the authenticated owner's official LH roster in a bounded window."""
+    error = _me_flightops_no_query()
+    if error is not None:
+        return error
+    body = request.get_json(silent=True)
+    if body is None and not request.data:
+        body = {}
+    if (not isinstance(body, dict) or
+            not set(body).issubset({'from_date', 'to_date'}) or
+            any(not _me_flightops_valid_date(value)
+                for value in body.values()) or
+            ('from_date' in body and 'to_date' in body and
+             body['from_date'] > body['to_date'])):
+        return jsonify({'ok': False, 'error': 'invalid_body'}), 400
+    token, error = _me_flightops_owner()
+    if error is not None:
+        return error
+    return flightops_import(token)
 
 
 @lh_flightops_bp.route('/api/lh/flightops/ping', methods=['GET'])

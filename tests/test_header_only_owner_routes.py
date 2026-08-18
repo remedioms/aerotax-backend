@@ -245,6 +245,96 @@ def test_flightops_crewlist_me_rejects_legacy_access_and_bad_leg(monkeypatch):
     assert response.get_json()['error'] == 'unauthorized'
 
 
+def test_me_lh_flightops_status_and_start_bind_only_the_header_owner(monkeypatch):
+    """Android cannot select an LH grant owner via query or body."""
+    from blueprints import lh_flightops as fo
+
+    monkeypatch.setitem(sys.modules, 'app', A)
+    monkeypatch.setattr(A, '_header_only_owner', lambda: (TOKEN, None))
+    seen = []
+    monkeypatch.setattr(
+        fo, 'flightops_status',
+        lambda token: seen.append(('status', token)) or A.jsonify({'ok': True}),
+    )
+    monkeypatch.setattr(
+        fo, '_flightops_oauth_start_for',
+        lambda token: seen.append(('start', token)) or A.jsonify({'ok': True}),
+    )
+
+    with A.app.test_request_context('/api/me/lh/flightops/status'):
+        assert fo.me_flightops_status().status_code == 200
+    with A.app.test_request_context('/api/me/lh/flightops/oauth/start'):
+        assert fo.me_flightops_oauth_start().status_code == 200
+    with A.app.test_request_context('/api/me/lh/flightops/status?token=ATTACKER'):
+        response, status = fo.me_flightops_status()
+    assert status == 400
+    assert response.get_json()['error'] == 'query_not_allowed'
+    assert seen == [('status', TOKEN), ('start', TOKEN)]
+
+
+def test_me_lh_flightops_exchange_requires_exact_body_and_state_owner(monkeypatch):
+    from blueprints import lh_flightops as fo
+
+    monkeypatch.setitem(sys.modules, 'app', A)
+    monkeypatch.setattr(A, '_header_only_owner', lambda: (TOKEN, None))
+    seen = []
+    monkeypatch.setattr(
+        fo, '_flightops_oauth_exchange_for',
+        lambda expected_owner=None: seen.append(expected_owner) or A.jsonify({'ok': True}),
+    )
+
+    with A.app.test_request_context(
+            '/api/me/lh/flightops/oauth/exchange', method='POST',
+            json={'code': 'one-time-code', 'state': 'state'}):
+        assert fo.me_flightops_oauth_exchange().status_code == 200
+    with A.app.test_request_context(
+            '/api/me/lh/flightops/oauth/exchange', method='POST',
+            json={'code': 'one-time-code', 'state': 'state', 'owner': 'ATTACKER'}):
+        response, status = fo.me_flightops_oauth_exchange()
+    assert status == 400
+    assert response.get_json()['error'] == 'invalid_body'
+    assert seen == [TOKEN]
+
+
+def test_lh_flightops_owner_mismatch_does_not_consume_the_pkce_state():
+    from blueprints import lh_flightops as fo
+
+    state = 'owner-bound-state-for-test'
+    with fo._flow_lock:
+        fo._flow_store[state] = (
+            fo.time.time() + 60,
+            {'verifier': 'test-verifier', 'user_token': TOKEN},
+        )
+    assert fo._flow_take(state, expected_user_token='AT-ATTACKER') is None
+    assert fo._flow_take(state, expected_user_token=TOKEN) == {
+        'verifier': 'test-verifier', 'user_token': TOKEN,
+    }
+
+
+def test_me_lh_flightops_import_validates_only_the_bounded_window(monkeypatch):
+    from blueprints import lh_flightops as fo
+
+    monkeypatch.setitem(sys.modules, 'app', A)
+    monkeypatch.setattr(A, '_header_only_owner', lambda: (TOKEN, None))
+    seen = []
+    monkeypatch.setattr(
+        fo, 'flightops_import',
+        lambda token: seen.append((token, A.request.get_json())) or A.jsonify({'ok': True}),
+    )
+
+    with A.app.test_request_context(
+            '/api/me/lh/flightops/import', method='POST',
+            json={'from_date': '2026-08-01', 'to_date': '2026-08-31'}):
+        assert fo.me_flightops_import().status_code == 200
+    with A.app.test_request_context(
+            '/api/me/lh/flightops/import', method='POST',
+            json={'history': True}):
+        response, status = fo.me_flightops_import()
+    assert status == 400
+    assert response.get_json()['error'] == 'invalid_body'
+    assert seen == [(TOKEN, {'from_date': '2026-08-01', 'to_date': '2026-08-31'})]
+
+
 def test_layover_group_legacy_path_needs_a_real_matching_account(monkeypatch):
     # test_calculation.py deliberately re-imports app during the full suite;
     # this blueprint resolves app lazily, so pin it to the collected instance.

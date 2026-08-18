@@ -35,3 +35,7 @@ CREATE POLICY family_shares_service_all ON family_shares
     FOR ALL TO service_role
     USING (true)
     WITH CHECK (true);
+
+-- Family share rows hold bearer-like account tokens. The service-role policy
+-- is the only intended caller; revoke Data API grants as a second boundary.
+REVOKE ALL ON TABLE public.family_shares FROM public, anon, authenticated;

@@ -251,3 +251,41 @@ def test_auth_payload_keeps_legacy_contract_and_adds_modern_fields(monkeypatch):
     assert payload['token'] == 'AT-LEGACY123456'
     assert payload['user_id'] == 'USR-123'
     assert payload['access_token'] == 'AXA-new'
+
+
+def test_auth_routing_hint_is_minimal_and_omitted_without_profile(monkeypatch):
+    user = {'token': 'AT-ROUTING123456', 'user_id': 'USR-ROUTING'}
+    monkeypatch.setattr(A, '_profile_load', lambda _token: {
+        'profile': {'account_type': 'crew', 'airline': 'LH'}})
+    assert A._auth_routing_hint(user) == {
+        'account_kind': 'crew', 'onboarding_completed': True}
+
+    monkeypatch.setattr(A, '_profile_load', lambda _token: {'profile': {}})
+    assert A._auth_routing_hint(user) is None
+
+
+def test_auth_routing_hint_preserves_family_and_incomplete_crew(monkeypatch):
+    user = {'token': 'AT-ROUTING123456', 'user_id': 'USR-ROUTING'}
+    monkeypatch.setattr(A, '_profile_load', lambda _token: {
+        'profile': {'account_type': 'family'}})
+    assert A._auth_routing_hint(user) == {
+        'account_kind': 'family', 'onboarding_completed': True}
+
+    monkeypatch.setattr(A, '_profile_load', lambda _token: {
+        'profile': {'account_type': 'crew', 'name': 'New Crew'}})
+    assert A._auth_routing_hint(user) == {
+        'account_kind': 'crew', 'onboarding_completed': False}
+
+
+def test_auth_routing_hint_accepts_established_employer_and_fails_closed(monkeypatch):
+    user = {'token': 'AT-ROUTING123456', 'user_id': 'USR-ROUTING'}
+    monkeypatch.setattr(A, '_profile_load', lambda _token: {
+        'profile': {'employers': [{'airline_icao': 'DLH'}]}})
+    assert A._auth_routing_hint(user) == {
+        'account_kind': 'crew', 'onboarding_completed': True}
+
+    def unavailable(_token):
+        raise RuntimeError('profile unavailable')
+
+    monkeypatch.setattr(A, '_profile_load', unavailable)
+    assert A._auth_routing_hint(user) is None

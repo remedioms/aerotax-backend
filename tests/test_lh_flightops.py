@@ -3932,7 +3932,7 @@ def test_exchange_stempelt_verbindung_und_zaehlt_reconnects(monkeypatch):
     import time as _t
     alt = _t.time() - 30 * 86400
     monkeypatch.setattr(fo, 'flightops_configured', lambda: True)
-    monkeypatch.setattr(fo, '_flow_take', lambda s: {
+    monkeypatch.setattr(fo, '_flow_take', lambda s, expected_user_token=None: {
         'user_token': 'AT-U', 'verifier': 'V'})
     monkeypatch.setattr(fo, '_exchange_code',
                         lambda c, v: {'access': 'A', 'refresh': 'R2',
@@ -3958,7 +3958,7 @@ def test_erstverbindung_zaehlt_keinen_reconnect(monkeypatch):
     """Wer sich ZUM ERSTEN MAL verbindet, hat 0 Reconnects — sonst sähe jeder
     Neu-User wie ein Grant-Burn-Opfer aus."""
     monkeypatch.setattr(fo, 'flightops_configured', lambda: True)
-    monkeypatch.setattr(fo, '_flow_take', lambda s: {
+    monkeypatch.setattr(fo, '_flow_take', lambda s, expected_user_token=None: {
         'user_token': 'AT-N', 'verifier': 'V'})
     monkeypatch.setattr(fo, '_exchange_code',
                         lambda c, v: {'access': 'A', 'refresh': 'R', 'scope': 's'})

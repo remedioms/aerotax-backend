@@ -76,3 +76,13 @@ alter table public.layover_guest_sessions enable row level security;
 
 -- Absichtlich keine Client-RLS-Policies: Zugriff ausschliesslich ueber das
 -- Backend mit Service Role. Browser sehen weder Hashes noch interne group_id.
+-- Revoke direct Data API access as well: RLS is the row boundary, while these
+-- grants keep legacy/default privileges from becoming an exposure after a
+-- future policy change. The trigger runs during service-role inserts and does
+-- not need a callable public function.
+revoke all on table public.layover_guest_invites
+    from public, anon, authenticated;
+revoke all on table public.layover_guest_sessions
+    from public, anon, authenticated;
+revoke all on function public.enforce_layover_guest_limit()
+    from public, anon, authenticated;

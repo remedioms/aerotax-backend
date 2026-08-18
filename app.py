@@ -32126,6 +32126,10 @@ def add_comment(token, post_id):
     if _wall_post_apply_counters(post_id, comment_delta=1) is None:
         _wall_disk_counter_bump(post_id, comment_delta=1)
     response_c = dict(c)
+    # Additive ownership projection for authenticated clients.  The raw author
+    # credential remains server-only; clients need this boolean to avoid
+    # offering moderation actions on their own comment.
+    response_c['is_mine'] = True
     response_c.pop('author_token', None)
     # Push an Post-Author (wenn nicht self-comment)
     try:
@@ -32193,6 +32197,10 @@ def get_comments(token, post_id):
         return av
     # Strip author_token; anonyme Kommentare zusätzlich von Profil-Resten säubern.
     for c in comments:
+        # The authenticated viewer gets only this derived ownership bit, never
+        # the author credential.  It is deliberately set before stripping the
+        # internal field so anonymous comments stay anonymous.
+        c['is_mine'] = c.get('author_token') == token
         if c.get('is_anonymous'):
             if not c.get('anon_handle'):
                 c['anon_handle'] = _anon_handle_for(c.get('author_token'))
@@ -39019,6 +39027,47 @@ def _auth_ensure_user_id(email, user):
     return None
 
 
+def _auth_routing_hint(user):
+    """Return the smallest authoritative root-routing fact, or ``None``.
+
+    This is deliberately derived from the same owner profile used by the app's
+    profile route.  It is not an entitlement, does not contain profile data and
+    fails open: a profile-store issue simply omits the additive response field.
+    """
+    token = (user or {}).get('token')
+    if not token:
+        return None
+    try:
+        profile = ((_profile_load(token) or {}).get('profile') or {})
+        if not isinstance(profile, dict):
+            return None
+        account_type = str(profile.get('account_type') or '').strip().lower()
+        if account_type == 'family':
+            return {'account_kind': 'family', 'onboarding_completed': True}
+        has_employer = any(
+            isinstance(employer, dict) and any(
+                isinstance(employer.get(key), str) and employer[key].strip()
+                for key in ('airline_name', 'airline_icao', 'position', 'homebase')
+            )
+            for employer in (profile.get('employers') or [])
+        )
+        has_crew_basics = any(
+            isinstance(profile.get(key), str) and profile[key].strip()
+            for key in ('homebase', 'airline', 'position')
+        ) or has_employer
+        # Older iOS profiles may not carry account_type. A professional crew
+        # fact is the same established-account evidence used by Flutter.
+        if account_type == 'crew' or has_crew_basics:
+            return {
+                'account_kind': 'crew',
+                'onboarding_completed': bool(has_crew_basics),
+            }
+    except Exception as exc:
+        app.logger.warning(
+            f'[auth] routing_hint_omitted err={type(exc).__name__}: {str(exc)[:120]}')
+    return None
+
+
 def _auth_success_payload(email, user, issue_session=True):
     user_id = _auth_ensure_user_id(email, user)
     payload = {
@@ -39033,6 +39082,9 @@ def _auth_success_payload(email, user, issue_session=True):
             user.get('token'), user_id=user_id, client=_auth_session_client_label())
         if modern:
             payload.update(modern)
+    routing_hint = _auth_routing_hint(user)
+    if routing_hint is not None:
+        payload['routing_hint'] = routing_hint
     return payload
 
 def _user_auth_path():
@@ -39796,24 +39848,34 @@ def auth_refresh_session():
         'user_id': user_id or user.get('user_id'),
     }
     payload.update(issued)
+    routing_hint = _auth_routing_hint(user)
+    if routing_hint is not None:
+        payload['routing_hint'] = routing_hint
     return jsonify(payload)
 
 
 @app.route('/api/auth/revoke-session', methods=['POST'])
 def auth_revoke_session():
-    """Revoke the current modern session. Legacy logout remains local-only."""
+    """Revoke the current modern session. Legacy logout remains local-only.
+
+    The refresh token is retained in the body for installed-client wire
+    compatibility, but never authorizes this destructive action by itself.
+    A normalized, currently valid AXA access principal supplies ``access_hash``
+    in the request context; revoking that hash avoids a leaked foreign AXR
+    token being used as a cross-account logout capability.
+    """
     body = request.get_json(silent=True) or {}
     try:
         from flask import g as _g
         access_hash = getattr(_g, 'aerox_access_token_hash', None)
     except Exception:
         access_hash = None
-    refresh_token = body.get('refresh_token')
-    # Idempotent by design: logout must never get stuck on a missing/already
-    # rotated session. The endpoint still requires some credential material.
-    if not access_hash and not refresh_token:
-        return jsonify({'ok': False, 'error': 'session_token_required'}), 400
-    _auth_session_revoke(access_hash=access_hash, refresh_token=refresh_token)
+    # Idempotent by design: logout must never get stuck on an already revoked
+    # current session.  It must nevertheless be bound to that current session;
+    # body.refresh_token alone is otherwise a cross-account logout capability.
+    if not access_hash:
+        return jsonify({'ok': False, 'error': 'session_binding_required'}), 401
+    _auth_session_revoke(access_hash=access_hash)
     return jsonify({'ok': True})
 
 
@@ -40251,7 +40313,8 @@ def auth_set_password():
     """Passwort für ein Sign-in-with-Apple-Konto festlegen (Christoph Ernst,
     Support 2026-07-21: „von Apple anmelden auf Passwort umstellen") — danach
     funktioniert zusätzlich der E-Mail+Passwort-Login (die Apple-Anmeldung
-    bleibt parallel gültig). Body: {token, password[, old_password]}.
+    bleibt parallel gültig). Body: {token, password[, old_password]} plus
+    passender Authorization-Bearer.
     Hat das Konto schon ein Passwort, ist `old_password` Pflicht (kein stiller
     Passwort-Tausch über einen geleakten Token)."""
     body = request.get_json(silent=True) or {}
@@ -40261,6 +40324,13 @@ def auth_set_password():
         return jsonify({'ok': False, 'error': 'auth_required'}), 400
     if len(new_pw) < 8:
         return jsonify({'ok': False, 'error': 'password_too_short'}), 400
+    # The account token is still present in the body for established iOS and
+    # Android payloads, but must no longer by itself authorize a password
+    # creation/change.  Both clients already send this request through their
+    # authenticated API boundary; requiring the same principal here prevents a
+    # leaked body token from becoming a password-takeover capability.
+    if not _request_bearer_matches(token):
+        return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
     email, user = _auth_find_user_by('token', token)
     if not user or not email:
         return jsonify({'ok': False, 'error': 'invalid_token'}), 401
@@ -40284,9 +40354,9 @@ def auth_delete_account():
 
     Auth-Modi:
     - Email/Password: body{email, password} → verifiziert via hash
-    - Token-based (Apple-Sign-In oder loggedin): body{token} → identifiziert
-      user via token-match in users-dict (apple-sign-in user hat keinen
-      password_hash, daher diese Variante)
+    - Token-based (Apple-Sign-In oder loggedin): body{token} plus passender
+      Authorization-Bearer → identifiziert user via token-match in users-dict
+      (Apple-Sign-In-User haben keinen password_hash, daher diese Variante)
     """
     body = request.get_json(silent=True) or {}
     email = (body.get('email') or '').strip().lower()
@@ -40304,6 +40374,14 @@ def auth_delete_account():
             return jsonify({'ok': False, 'error': 'invalid_credentials'}), 401
         user_email = email
     elif bearer_token:
+        # Like ``/api/auth/set-password``, the established account token stays
+        # in the body for client compatibility but is an identifier, never a
+        # standalone destructive capability.  ``before_request`` normalizes a
+        # valid AXA session bearer to its legacy AT principal, so this accepts
+        # both current and legacy authenticated clients while rejecting a
+        # leaked body token before any account row is read or deleted.
+        if not _request_bearer_matches(bearer_token):
+            return jsonify({'ok': False, 'error': 'token_binding_required'}), 401
         # Find user via stored token (Apple-Sign-In / authenticated session)
         ex_email, ex_user = _auth_find_user_by('token', bearer_token)
         if ex_user is not None:
@@ -40688,26 +40766,19 @@ def _redact_export_secrets(obj):
 def auth_export_data():
     """DSGVO Art. 15 — User exportiert alle gespeicherten Daten als JSON.
 
-    Auth via Bearer-Token im Authorization-Header ODER per ?token=... Query-Param
-    ODER per body.token (POST). iOS APIClient.exportData() schickt den Header.
+    Auth only via the current Authorization Bearer.  Query/body account tokens
+    must never select an export: they are identifiers, not data-export
+    capabilities.  Both native clients already use their authenticated request
+    boundaries, and modern AXA bearers are normalized before this handler.
 
     Response: application/json mit Content-Disposition attachment header
     (iOS speichert direkt als file). Felder: profile, wall_posts (own),
     wall_comments (own), friends, employers, voice_notes_metadata,
     briefings, ical_events, license_wallet_items.
     """
-    # Token aus Header > Query > Body
-    auth_h = (request.headers.get('Authorization') or '').strip()
-    token = None
-    if auth_h.lower().startswith('bearer '):
-        token = auth_h[7:].strip()
+    token = _request_bearer_token()
     if not token:
-        token = (request.args.get('token') or '').strip()
-    if not token and request.method == 'POST':
-        body = request.get_json(silent=True) or {}
-        token = (body.get('token') or '').strip()
-    if not token:
-        return jsonify({'ok': False, 'error': 'missing_token'}), 401
+        return jsonify({'ok': False, 'error': 'bearer_required'}), 401
 
     # Validate via auth_users (gleiche Quelle wie _validate_token_exists)
     user_email = _validate_token_exists(token)
@@ -81292,6 +81363,184 @@ def me_friend_passport():
 @app.route('/api/me/ax/shuttle-options', methods=['GET'])
 def me_ax_shuttle_options():
     return _header_only_dispatch(ax_shuttle_options)
+
+
+@app.route('/api/me/ax/flight-inbound-chain', methods=['GET'])
+def me_ax_flight_inbound_chain():
+    """Header-authenticated Android alias for the inbound-aircraft chain.
+
+    The established iOS endpoint remains path-token based for compatibility.
+    This alias deliberately accepts operational lookup facts only; the owner is
+    always the validated bearer and is never selectable through a URL value.
+    """
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    allowed = {'flight_no', 'date', 'dep_iata', 'reg', 'arr_iata', 'dep_iso'}
+    if any(key not in allowed for key in request.args):
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    flight = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    dep = (request.args.get('dep_iata') or '').strip().upper()
+    if not re.fullmatch(r'[A-Z0-9]{3,8}', flight) or not re.fullmatch(r'[A-Z]{3}', dep):
+        return jsonify({'ok': False, 'error': 'need_flight_no_and_dep_iata'}), 400
+    date = (request.args.get('date') or '').strip() or None
+    if date is not None:
+        try:
+            from datetime import date as _date
+            if _date.fromisoformat(date).isoformat() != date:
+                raise ValueError('not canonical')
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid_date'}), 400
+    reg = (request.args.get('reg') or '').strip().upper() or None
+    if reg is not None and not re.fullmatch(r'[A-Z0-9][A-Z0-9-]{2,11}', reg):
+        return jsonify({'ok': False, 'error': 'invalid_registration'}), 400
+    arr = (request.args.get('arr_iata') or '').strip().upper() or None
+    if arr is not None and not re.fullmatch(r'[A-Z]{3}', arr):
+        return jsonify({'ok': False, 'error': 'invalid_arr_iata'}), 400
+    dep_iso_raw = (request.args.get('dep_iso') or '').strip() or None
+    dep_iso = None
+    if dep_iso_raw is not None:
+        try:
+            from datetime import datetime as _datetime, timezone as _timezone
+            dep_iso = _datetime.fromisoformat(dep_iso_raw.replace('Z', '+00:00'))
+            if dep_iso.tzinfo is None:
+                raise ValueError('offset required')
+            dep_iso = dep_iso.astimezone(_timezone.utc)
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid_dep_iso'}), 400
+    from blueprints.aerox_data_blueprint import inbound_chain_payload
+    # `token` is intentionally consumed only by the header gate above.  The
+    # data builder is account-agnostic and must never receive or emit a bearer.
+    del token
+    return jsonify(inbound_chain_payload(
+        flight_no=flight,
+        date=date,
+        dep_iata=dep,
+        reg_hint=reg,
+        arr_iata=arr,
+        dep_iso=dep_iso,
+    ))
+
+
+@app.route('/api/me/ax/flight-live', methods=['GET'])
+def me_ax_flight_live():
+    """Header-authenticated Android alias for the own-aircraft live lookup.
+
+    The path-token iOS route remains available.  This endpoint deliberately
+    accepts only flight lookup facts; a bearer is consumed by the header gate
+    and never forwarded to the data builder or response.
+    """
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    allowed = {'flight_no', 'date', 'reg', 'dep_iata', 'arr_iata'}
+    if any(key not in allowed for key in request.args):
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    flight = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    if not re.fullmatch(r'[A-Z0-9]{3,8}', flight):
+        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    date = (request.args.get('date') or '').strip() or None
+    if date is not None:
+        try:
+            from datetime import date as _date
+            if _date.fromisoformat(date).isoformat() != date:
+                raise ValueError('not canonical')
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid_date'}), 400
+    reg = (request.args.get('reg') or '').strip().upper() or None
+    if reg is not None and not re.fullmatch(r'[A-Z0-9][A-Z0-9-]{2,11}', reg):
+        return jsonify({'ok': False, 'error': 'invalid_registration'}), 400
+    dep = (request.args.get('dep_iata') or '').strip().upper() or None
+    if dep is not None and not re.fullmatch(r'[A-Z]{3}', dep):
+        return jsonify({'ok': False, 'error': 'invalid_dep_iata'}), 400
+    arr = (request.args.get('arr_iata') or '').strip().upper() or None
+    if arr is not None and not re.fullmatch(r'[A-Z]{3}', arr):
+        return jsonify({'ok': False, 'error': 'invalid_arr_iata'}), 400
+    from blueprints.aerox_data_blueprint import flight_live_payload
+    del token
+    return jsonify(flight_live_payload(
+        flight_no=flight, date=date, reg=reg, dep_iata=dep, arr_iata=arr,
+    ))
+
+
+@app.route('/api/me/ax/flight-recap', methods=['GET'])
+def me_ax_flight_recap():
+    """Header-authenticated Android alias for the post-flight recap.
+
+    The validated bearer stays server-side as the owner scope for roster facts;
+    credentials are neither accepted nor emitted as URL/payload data.
+    """
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    allowed = {'flight_no', 'date', 'dep_iata', 'arr_iata'}
+    if any(key not in allowed for key in request.args):
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    flight = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    if not re.fullmatch(r'[A-Z0-9]{3,8}', flight):
+        return jsonify({'ok': False, 'error': 'need_flight_no'}), 400
+    date = (request.args.get('date') or '').strip() or None
+    if date is not None:
+        try:
+            from datetime import date as _date
+            if _date.fromisoformat(date).isoformat() != date:
+                raise ValueError('not canonical')
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid_date'}), 400
+    dep = (request.args.get('dep_iata') or '').strip().upper() or None
+    if dep is not None and not re.fullmatch(r'[A-Z]{3}', dep):
+        return jsonify({'ok': False, 'error': 'invalid_dep_iata'}), 400
+    arr = (request.args.get('arr_iata') or '').strip().upper() or None
+    if arr is not None and not re.fullmatch(r'[A-Z]{3}', arr):
+        return jsonify({'ok': False, 'error': 'invalid_arr_iata'}), 400
+    from blueprints.aerox_data_blueprint import flight_recap_payload
+    return jsonify(flight_recap_payload(
+        owner_token=token, flight_no=flight, date=date,
+        dep_iata=dep, arr_iata=arr,
+    ))
+
+
+@app.route('/api/me/ax/turnaround', methods=['GET'])
+def me_ax_turnaround():
+    """Header-authenticated Android alias for the legacy turnaround lookup."""
+    token, error = _header_only_owner()
+    if error is not None:
+        return error
+    allowed = {'flight_no', 'dep', 'arr', 'date', 'next_flight_no', 'next_arr'}
+    if any(key not in allowed for key in request.args):
+        return jsonify({'ok': False, 'error': 'query_not_allowed'}), 400
+    current = (request.args.get('flight_no') or '').replace(' ', '').upper().strip()
+    current_dep = (request.args.get('dep') or '').strip().upper() or None
+    turnaround = (request.args.get('arr') or '').strip().upper()
+    next_flight = (request.args.get('next_flight_no') or '').replace(' ', '').upper().strip()
+    next_arr = (request.args.get('next_arr') or '').strip().upper() or None
+    if (not re.fullmatch(r'[A-Z0-9]{3,8}', current)
+            or not re.fullmatch(r'[A-Z]{3}', turnaround)
+            or not re.fullmatch(r'[A-Z0-9]{3,8}', next_flight)):
+        return jsonify({'ok': False, 'error': 'need_current_and_next_sector'}), 400
+    if current_dep is not None and not re.fullmatch(r'[A-Z]{3}', current_dep):
+        return jsonify({'ok': False, 'error': 'invalid_dep_iata'}), 400
+    if next_arr is not None and not re.fullmatch(r'[A-Z]{3}', next_arr):
+        return jsonify({'ok': False, 'error': 'invalid_next_arr_iata'}), 400
+    date = (request.args.get('date') or '').strip() or None
+    if date is not None:
+        try:
+            from datetime import date as _date
+            if _date.fromisoformat(date).isoformat() != date:
+                raise ValueError('not canonical')
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid_date'}), 400
+    from blueprints.aerox_data_blueprint import turnaround_payload
+    # The bearer proves the caller but is never part of a lookup or response.
+    del token
+    return jsonify(turnaround_payload(
+        current_flight=current,
+        current_dep=current_dep,
+        turnaround_airport=turnaround,
+        date=date,
+        next_flight=next_flight,
+        next_arr=next_arr,
+    ))
 
 
 @app.route('/api/me/airport/board', methods=['GET'])

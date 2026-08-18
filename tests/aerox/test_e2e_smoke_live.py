@@ -144,8 +144,16 @@ def _delete_account_email_pw(email: str, password: str = PASSWORD) -> dict:
 
 
 def _delete_account_token(token: str) -> dict:
-    return _json(_request("POST", "/api/auth/delete-account",
-                          json_body={"token": token}))
+    # The body token is only an account identifier. Mirror APIClient's
+    # authenticated request boundary so the destructive token-only path also
+    # proves the bearer binding in the live smoke when it is exercised.
+    access = _TOKEN_BINDINGS.get(token, token)
+    return _json(requests.post(
+        _url("/api/auth/delete-account"),
+        json={"token": token},
+        headers={"Authorization": f"Bearer {access}"},
+        timeout=DEFAULT_TIMEOUT,
+    ))
 
 
 # ---------------------------------------------------------------------------

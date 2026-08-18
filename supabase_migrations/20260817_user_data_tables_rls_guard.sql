@@ -31,8 +31,10 @@ alter table if exists public.family_requests enable row level security;
 alter table if exists public.feed_statuses enable row level security;
 alter table if exists public.flight_observations enable row level security;
 
-revoke all on table public.family_requests from anon, authenticated;
-revoke all on table public.feed_statuses from anon, authenticated;
-revoke all on table public.flight_observations from anon, authenticated;
+-- `anon` and `authenticated` inherit PUBLIC privileges.  Revoke that role as
+-- well so an old broad grant cannot survive this defence-in-depth migration.
+revoke all on table public.family_requests from public, anon, authenticated;
+revoke all on table public.feed_statuses from public, anon, authenticated;
+revoke all on table public.flight_observations from public, anon, authenticated;
 
 notify pgrst, 'reload schema';

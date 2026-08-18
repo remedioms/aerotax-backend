@@ -2163,25 +2163,48 @@ def _authenticated_family_owner_token():
     """
     try:
         bearer_fn = _app_attr('_request_bearer_token')
-        finder = _app_attr('_auth_find_user_by')
         bearer = bearer_fn() if callable(bearer_fn) else None
-        found = finder('token', bearer) if bearer and callable(finder) else None
-        auth_rec = found[1] if isinstance(found, tuple) and len(found) > 1 else None
-        prof = _load_crew_profile(bearer) if auth_rec else {}
-        account_type = str((auth_rec or {}).get('account_type')
-                           or (prof or {}).get('account_type') or '').lower()
-        return bearer if account_type == 'family' else None
+        return bearer if _is_family_account_token(bearer) else None
     except Exception:
         return None
+
+
+def _is_family_account_token(token):
+    """Whether a validated normal account token belongs to a Family account.
+
+    Pairing capabilities (``AT-FAM-…``) are handled separately.  A generic
+    valid ``AT-…`` session must not be able to exercise Family-only routes just
+    because it possesses a valid bearer token.  The account type is resolved
+    only from the server's auth/profile records, never from a request field.
+    """
+    if not token:
+        return False
+    try:
+        finder = _app_attr('_auth_find_user_by')
+        found = finder('token', token) if callable(finder) else None
+        auth_rec = found[1] if isinstance(found, tuple) and len(found) > 1 else None
+        if not isinstance(auth_rec, dict):
+            return False
+        profile = _load_crew_profile(token)
+        account_type = str(
+            auth_rec.get('account_type')
+            or (profile or {}).get('account_type')
+            or ''
+        ).strip().lower()
+        return account_type == 'family'
+    except Exception:
+        # Fail closed: a store/profile lookup failure must never widen a
+        # Family-only route to every otherwise valid account session.
+        return False
 
 
 def family_bearer_capability():
     """Return the verified Family credential from ``Authorization``.
 
-    A Family caller can hold either its normal ``AT-…`` account credential or
-    a least-privilege ``AT-FAM-…`` pairing capability.  Header-only routes
-    must require possession of that exact credential, never just any active
-    app session.
+    A Family caller can hold either its server-recorded Family ``AT-…``
+    account credential or a least-privilege ``AT-FAM-…`` pairing capability.
+    Header-only routes must require that exact Family identity, never merely
+    any active app session.
     """
     bearer_fn = _app_attr('_request_bearer_token')
     token = bearer_fn() if callable(bearer_fn) else None
@@ -2200,7 +2223,12 @@ def family_bearer_capability():
             return None, (unavailable() if callable(unavailable) else
                           (jsonify({'ok': False, 'error': 'auth_store_unavailable'}), 503))
         if result.state is state_type.VALID:
-            return token, None
+            if _is_family_account_token(token):
+                return token, None
+            return None, (
+                jsonify({'ok': False, 'error': 'family_account_required'}),
+                403,
+            )
     return None, (jsonify({'ok': False, 'error': 'unauthorized'}), 401)
 
 
@@ -2649,7 +2677,11 @@ def _load_crew_roster_days(crew_token, days_limit):
                 tage = (snap_fn(crew_token) or {}).get('tage') or []
             except Exception:
                 tage = []
-    today = _date.today()
+    # Match the Family response window's Europe/Berlin roster-day boundary.
+    # `_date.today()` is UTC on the host and can otherwise exclude the last
+    # requested day around midnight even though `_family_public_roster_days`
+    # correctly filters against `_fw_today()`.
+    today = _fw_today()
     cutoff = today + _td(days=days_limit)
     out = []
     for _i, day in enumerate(tage):
@@ -2814,6 +2846,110 @@ def family_roster(family_token):
         # nur Initialen (User: „Name UND Foto vom Crew-Member fehlt").
         'crew_avatar_url': _crew_avatar(crew_token),
     })
+
+
+_FAMILY_ROSTER_PUBLIC_DAY_FIELDS = (
+    'datum', 'klass', 'marker', 'routing', 'layover_ort', 'route_label',
+    'layover_city', 'start_time', 'end_time', 'ical_sectors',
+)
+
+
+def _family_public_roster_days(crew_token, days_limit, start_offset=0):
+    """Project the existing Family roster source onto its explicit public shape.
+
+    ``_load_crew_roster_days`` is already the privacy-filtered reader used by
+    the single-person endpoint.  Keeping this second allowlist at the batch
+    boundary makes a future source-field addition unable to leak payroll,
+    tax, or account data through the combined calendar by accident.
+    """
+    # The source reader includes historical days by design. Ask only far enough
+    # into the future for this bounded window; the response projection below is
+    # the public, server-enforced range regardless of source behaviour.
+    source_days = max(1, start_offset + days_limit)
+    rows = _load_crew_roster_days(crew_token, source_days)
+    today = _fw_today()
+    start = today + _dt.timedelta(days=start_offset)
+    end = start + _dt.timedelta(days=max(0, days_limit - 1))
+    visible = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = _dt.date.fromisoformat(str(row.get('datum') or '')[:10])
+        except (TypeError, ValueError):
+            continue
+        if start <= day <= end:
+            visible.append(row)
+    return [
+        {field: row.get(field) for field in _FAMILY_ROSTER_PUBLIC_DAY_FIELDS
+         if field in row}
+        for row in visible
+    ]
+
+
+def family_roster_week_payload(family_token, days_limit, start_offset=0):
+    """Read all currently authorised Family rosters in one HTTP response.
+
+    Crew membership is resolved exclusively from the server-side scoped-token
+    and grant models.  The client neither supplies nor receives a raw crew
+    credential.  A failed roster source remains a row-local ``available:false``
+    result so one transient source failure never suppresses other paired crew.
+    """
+    crew = []
+    for crew_token in _resolve_crews_for_family(family_token):
+        opaque_id = hashlib.sha256(
+            f'{crew_token}:{family_token}'.encode('utf-8')
+        ).hexdigest()[:16]
+        try:
+            days = _family_public_roster_days(
+                crew_token, days_limit, start_offset=start_offset)
+            crew.append({
+                'crew_token': opaque_id,
+                # A confirmed Family pairing is the existing roster consent;
+                # per-field grants remain for the separate live-status feed.
+                'shared': True,
+                'available': True,
+                'days': days,
+            })
+        except Exception as exc:
+            _log().info(
+                f'[family-roster-week] roster_read_skip {type(exc).__name__}')
+            crew.append({
+                'crew_token': opaque_id,
+                'shared': True,
+                'available': False,
+                'days': [],
+            })
+    return {'ok': True, 'count': len(crew), 'crew': crew}
+
+
+@family_watch_bp.route('/api/me/family-roster/week', methods=['GET'])
+def me_family_roster_week():
+    """Header-authenticated combined weekly roster for the Family calendar.
+
+    This is deliberately a single batch read: it ignores any client-supplied
+    crew selector and relies on ``family_roster_week_payload`` for all pairing
+    and grant scope checks.
+    """
+    family_token, error = family_bearer_capability()
+    if error is not None:
+        return error
+    try:
+        days_limit = min(max(int(request.args.get('days') or 7), 1), 84)
+    except Exception:
+        days_limit = 7
+    try:
+        start_offset = min(
+            max(int(request.args.get('start_offset') or 0), -21), 63)
+    except Exception:
+        start_offset = 0
+    # Bound the complete reader window at today +63 even for malformed query
+    # combinations. The client never selects a crew; pairing resolution stays
+    # exclusively in ``family_roster_week_payload``.
+    days_limit = min(days_limit, 64 - start_offset)
+    return jsonify(
+        family_roster_week_payload(
+            family_token, days_limit, start_offset=start_offset))
 
 
 @family_watch_bp.route('/api/me/family-roster', methods=['GET'])

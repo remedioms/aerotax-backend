@@ -36,7 +36,11 @@ import blueprints.adsb_blueprint as ADSB
 import blueprints.aerox_data_blueprint as BPD
 import blueprints.family_watch as FW
 
-TODAY = dt.datetime.now().date().isoformat()
+# The loader queries roster rows in its canonical Europe/Berlin roster day.
+# Keep the fixture on that same boundary; the host's local date can differ
+# late in the US evening while the backend has already moved to the next
+# roster day.
+TODAY = FW._fw_today().isoformat()
 CHAIN = ['BCN', 'FRA', 'ARN', 'FRA']
 
 
