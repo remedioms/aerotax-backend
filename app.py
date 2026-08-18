@@ -22789,6 +22789,21 @@ def _calendar_feed_url_requires_pdf(url):
         return False
 
 
+def _calendar_feed_url_is_company_intranet(url):
+    """True fuer Portal-Links, die nur im Firmennetz aufloesen.
+
+    Eurowings flybase (Owner-Audit 2026-08-18): 5 von 5 Eurowings-Usern
+    trugen den flybase-Link aus dem Crew-Portal ein — von aussen liefert er
+    eine LEERE Antwort (F5-/Login-gebunden), der Import sah wie Erfolg mit
+    0 Events aus und die Crew sah nie einen Dienstplan. Gleiche Klasse wie
+    der Discover-Guard: ehrlich ablehnen statt still leer importieren."""
+    try:
+        cleaned = _normalize_feed_scheme(_sanitize_feed_url(url or ''))
+        return 'flybase.eurowings.com' in cleaned.lower()
+    except Exception:
+        return False
+
+
 def _maybe_refresh_calendar_feed(token, base_url=None):
     """Stößt (gedrosselt, im Daemon-Thread) einen Re-Import des gespeicherten
     calendar_feed an, wenn der letzte Import älter als 6 h ist. Wirft nie.
@@ -22836,7 +22851,8 @@ def _maybe_refresh_calendar_feed(token, base_url=None):
         # Discover CrewAccess liefert Login-HTML statt iCal. Der API-Import
         # antwortet fuer solche Links absichtlich mit ``discover_needs_pdf``;
         # ein interner Auto-Refresh waere daher garantiert ein 400er.
-        if _calendar_feed_url_requires_pdf(url):
+        if _calendar_feed_url_requires_pdf(url) \
+                or _calendar_feed_url_is_company_intranet(url):
             return
         imported_at = (feed.get('imported_at') or '').strip()
         if imported_at:
@@ -59352,6 +59368,16 @@ def import_calendar_feed(token):
                         'message': 'Discover bietet keinen Kalender-Link. '
                                    'Bitte lade dein Roster-PDF aus CrewAccess '
                                    'hoch (PDF auswaehlen).'}), 400
+    # EUROWINGS-GUARD (Owner 2026-08-18): flybase.eurowings.com loest nur im
+    # Firmennetz auf — von aussen kommt eine leere Antwort und der Import sah
+    # wie Erfolg mit 0 Events aus (5 von 5 echten Versuchen). Ehrlicher Fehler
+    # mit den Wegen, die bei Eurowings wirklich funktionieren.
+    if _calendar_feed_url_is_company_intranet(url):
+        return jsonify({'ok': False, 'error': 'intranet_only_link',
+                        'message': 'Dieser Link funktioniert nur im '
+                                   'Eurowings-Firmennetz. Nutze offblock.de '
+                                   'oder veroeffentliche deinen iPhone-'
+                                   'Kalender als Link.'}), 400
     # HTTP raus · nur HTTPS akzeptieren (sonst Klartext-Cookies leakable).
     # Leerer/unbrauchbarer Rest nach dem Sanitize = ungültige URL → bad_url,
     # damit alte Clients (die client-seitig NICHT sanitizen) eine ehrliche
@@ -59417,6 +59443,21 @@ def import_calendar_feed(token):
         if not url_2:
             return jsonify({'ok': False, 'error': 'fetch_failed', 'detail': 'upstream_error'}), 502
         err_1 = 'fetch_failed'
+    # KEIN-KALENDER-GUARD (Owner 2026-08-18, Eurowings-Befund): eine Antwort
+    # ohne BEGIN:VCALENDAR (leer, Login-HTML) ist ein FEHLER, kein leerer
+    # Dienstplan. Vorher wurde events=[] mit frischem imported_at als Erfolg
+    # gespeichert — der User sah einfach nichts (Fehler sah aus wie Leere).
+    # Nur URL-Fetches: Direkt-ICS (PDF/Geraet) ist immer synthetisiertes iCal.
+    if text is not None and not ics_text_direct \
+            and 'BEGIN:VCALENDAR' not in text.upper():
+        _calendar_feed_note_refresh_failure(token, url)
+        if not url_2:
+            return jsonify({'ok': False, 'error': 'not_an_ical',
+                            'message': 'Unter dem Link liegt kein Kalender. '
+                                       'Pruefe den kopierten Link oder nutze '
+                                       'den PDF-Weg.'}), 502
+        err_1 = 'not_an_ical'
+        text = None
     if text is not None:
         if _condor_private_ics:
             # CREWLISTE (Owner 18.08.): STRUKTURIERT lesen, solange der
@@ -59469,6 +59510,14 @@ def import_calendar_feed(token):
             if ferr2 == 'fetch_failed':
                 _calendar_feed_note_refresh_failure(token, url_2,
                                                     slot='calendar_feed_2')
+        elif 'BEGIN:VCALENDAR' not in (text2 or '').upper():
+            # Kein-Kalender-Guard fuer den Zweitlink (per-Link-Fehler, blockt
+            # den Duty-Link nicht) — sonst wuerde Login-HTML als „leerer
+            # Off-Days-Kalender" durchs Reconcile laufen.
+            err_2 = 'not_an_ical_2'
+            _shadow_text_2 = None
+            _calendar_feed_note_refresh_failure(token, url_2,
+                                                slot='calendar_feed_2')
         else:
             if _condor_private_ics:
                 _condor_crew_ingest(token, text2, 'server_ics')
@@ -62165,6 +62214,19 @@ def import_roster_pdf(token):
             # SWISS uses the same local-time semantics with different labels
             # and split-arrival rows that omit the repeated flight number.
             ics, perr = _swiss_roster_text_to_ics(text)
+        if perr == 'unsupported_pdf_format':
+            # Cargolux "Personal Crew Schedule Report": coordinate table,
+            # explicitly UTC, with multi-leg +1 rows and multi-day layovers.
+            # The parser crops before the Crew column and ignores hotel/
+            # qualification appendices so no coworker/contact data is stored.
+            from cargolux_roster_pdf import parse_cargolux_calendar
+            cv_events, cv_year, cv_month, cv_report, perr = \
+                parse_cargolux_calendar(data, text)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    cv_events, cv_year, cv_month,
+                    prodid='AeroX Cargolux Roster PDF Import')
+                periods.append((cv_report or {}).get('period'))
         if perr == 'unsupported_pdf_format':
             # Condor CUBE duty plans (UTC or Local FRA) and the strict SAP
             # flight-hours statement both carry sufficient calendar facts.

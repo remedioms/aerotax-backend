@@ -292,7 +292,11 @@ def test_endpunkt_zwei_quellen_im_selben_sync_hinterlassen_keine_eintraege(
     """Der Befund als Wiederholung: Baseline, dann Quelle B, 583 ms später
     Quelle A — am Ende darf KEIN Eintrag in der Liste stehen, und der
     Snapshot muss wieder den echten Stand tragen."""
-    d1, d2 = _heute_plus(1), _heute_plus(0)
+    # Beide Tage in der ZUKUNFT (wie das Original-Fixture 17./16.08. am
+    # 16.08.): mit d2=heute kippte der Test nach Feierabend der Tagesflüge,
+    # weil die Entfernung dann ehrlich als `past_auto` in den Verlauf wandert —
+    # das ist past-Logik, nicht der Rückkipper, den dieser Test festnagelt.
+    d1, d2 = _heute_plus(2), _heute_plus(1)
     echt = [_tag_sfo(d1), _tag_bcn(d2)]
     fremd = [_tag_ath(d1)]                     # Quelle B: anderer Tag-Stand,
     #                                            der 16.08. fehlt ihr ganz
