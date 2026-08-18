@@ -57603,6 +57603,16 @@ def _build_ical_sectors(events, identity_mode='legacy'):
                     'dep_iso': _dep, 'arr_iso': _arr,
                 })
             continue
+        # DH-URTEIL VOR der Flugnummern-Regex (Christopher Magin 05.08./08.08.):
+        # myTime-Summaries wie „DH LH 122: FRA-MUC" tragen den Deadhead-Marker
+        # NUR im Summary-Text — die Regex unten greift nur „LH 122", der Marker
+        # ging verloren und `dh` wurde nie gesetzt (X-AEROX-DH liefert myTime
+        # nicht). Folge: iOS `isDeadhead` griff nie, § 9 (4) a MTV (DH zählt
+        # zur Hälfte) rechnete falsch. Token-Regel wie iOS
+        # `flightNumberLooksDeadhead`: „DH" nur als EIGENSTÄNDIGES Wort oder
+        # „DEADHEAD" als Substring — NICHT bei „DHA-JED" (IATA-Paar), „DH8 400"
+        # (Dash-8-Muster) oder „DHL" (Carrier), dort klebt am DH ein Wortzeichen.
+        _summ_dh = bool(re.search(r'\bDH\b', summ)) or 'DEADHEAD' in summ
         # LEON (leon.aero, AeroWest): „(AWH23E) FLIGHT LBG - OXF" + Kennzeichen
         # aus der LOCATION-Klammer „LBG - OXF (D-CAWX)". VOR dem generischen
         # Regex — der fände sonst nur die Route ohne Callsign (Suffix-Buchstabe
@@ -57672,7 +57682,10 @@ def _build_ical_sectors(events, identity_mode='legacy'):
         # Containment prüft „enthält mindestens diese Keys" — zusätzliche
         # optionale Keys stören dort nicht, geänderte oder immer-vorhandene
         # (null-)Keys hätten die Row nur unnötig aufgebläht.
-        if ev.get('ax_dh') is True:
+        # `dh` aus ZWEI Quellen: X-AEROX-DH (LH-Gratis-Ernte-Feeds) ODER dem
+        # Summary-Urteil oben (myTime liefert das X-Prop nicht). Bleibt ein
+        # NUR-wenn-wahr-Key — Feeds ohne DH erzeugen byte-identische Dicts.
+        if ev.get('ax_dh') is True or _summ_dh:
             _sec['dh'] = True
         if isinstance(ev.get('ax_day_of_shift'), int):
             _sec['day_of_shift'] = ev['ax_day_of_shift']
