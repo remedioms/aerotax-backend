@@ -60364,16 +60364,23 @@ _IOS_PDF_CID_RE = re.compile(r'\(cid:(\d{1,5})\)')
 
 
 def _repair_ios_reprinted_roster_text(text):
-    """Repariert Discover-PDFs, die über iOS „Drucken → Als PDF sichern"
-    entstanden sind.
+    """Repariert Roster-PDFs, die über iOS „Drucken → Als PDF sichern"
+    entstanden sind (Discover-Jeppesen UND CrewAccess/Lufthansa City).
 
-    iOS 26 schreibt bei diesem Jeppesen/NotoSans-Dokument eine defekte
+    iOS 26 schreibt bei diesen NotoSans-Dokumenten eine defekte
     ToUnicode-CMap. pdfplumber liefert deshalb ausschließlich Tokens wie
     ``(cid:53)(cid:82)…`` statt „Roster". Die eingebetteten CIDs entsprechen
-    bei genau diesem Export stabil ``Unicode-Codepoint - 29``. Wir wenden die
+    bei diesen Exporten stabil ``Unicode-Codepoint - 29``. Wir wenden die
     Abbildung nur bei vielen CID-Tokens an und übernehmen das Ergebnis nur,
-    wenn danach alle drei Discover-Strukturmarker vorhanden sind. Fremde PDFs
-    oder vereinzelte legitime CID-Tokens bleiben unverändert.
+    wenn danach die Strukturmarker EINES bekannten Formats vollständig
+    vorhanden sind (Discover-Trio ODER CrewAccess-Trio). Fremde PDFs oder
+    vereinzelte legitime CID-Tokens bleiben unverändert.
+
+    CrewAccess-Fall (Christoph S., LHX/MUC, 18.08.: ``unsupported_pdf_format``
+    trotz inhaltlich einwandfreier „Roster Preview"): die Reparatur dekodierte
+    perfekt, wurde aber verworfen, weil nur Discover-Marker als Beweis
+    galten — danach scheiterte JEDER Parser am CID-Müll. Betrifft jeden, der
+    seinen CrewAccess-Plan druckt statt direkt herunterzuladen.
     """
     raw = text or ''
     matches = list(_IOS_PDF_CID_RE.finditer(raw))
@@ -60393,7 +60400,15 @@ def _repair_ios_reprinted_roster_text(text):
         and re.search(r'(?im)^\s*Period:\s*[A-Za-z]+\s+\d{4}\s*$', candidate)
         and _DISCOVER_HEADER in candidate
     )
-    return candidate if is_discover else raw
+    is_crewaccess = (
+        re.search(r'(?i)\b(?:Roster Preview|Released Roster|Published Roster)\b',
+                  candidate[:400])
+        and re.search(r'(?im)^\s*Planning period:\s*[A-Za-z]+\s+\d{4}\s*$',
+                      candidate)
+        and 'Date Report (UTC) Tags Pos Activity From To Start (UTC) End (UTC)'
+            in candidate
+    )
+    return candidate if (is_discover or is_crewaccess) else raw
 
 
 # ── KI-Lese-Fallback für den Roster-Import (Owner-Auftrag 2026-08-06) ────────
