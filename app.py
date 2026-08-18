@@ -55033,7 +55033,27 @@ def _ics_parse_dt(value, params, tz_lookup=None):
     if tzid:
         try:
             tzinfo = None
-            if isinstance(tz_lookup, dict):
+            # IANA-TZID = DIE Autorität für sich selbst (Fehlerklasse
+            # „Zeitpunkt statt Kalendertag"/Sommerzeit, Befund 2026-08-18):
+            # Ein im ICS MITGELIEFERTES VTIMEZONE mit demselben Namen darf
+            # eine bekannte IANA-Zone NICHT überschreiben. Reale Roster-Feeds
+            # liefern für `TZID:Europe/Berlin` teils nur einen STANDARD-Block
+            # (TZOFFSETTO:+0100) ohne DAYLIGHT — dateutil.tzical rechnet dann
+            # das GANZE Jahr mit +01:00. Eine Ankunft „09:05 Ortszeit FRA" im
+            # Sommer wird so zu 08:05Z statt 07:05Z, und jede Fläche, die den
+            # Instant in Europe/Berlin rendert, zeigt 10:05 — GENAU EINE STUNDE
+            # ZU SPÄT. Die Abflug-Seite an einer DST-freien Station (z.B. BLR,
+            # Asia/Kolkata) bleibt dabei richtig, der Fehler sieht deshalb wie
+            # ein reines „ETA in LT FRA stimmt nicht" aus.
+            # Nicht-IANA-TZIDs (eigene Zonennamen, Outlook-Windows-Namen)
+            # behalten exakt die alte Rangfolge: mitgeliefertes VTIMEZONE
+            # zuerst, dann die Windows-Map.
+            if _zi_ok:
+                try:
+                    tzinfo = _ZI(tzid)
+                except Exception:
+                    tzinfo = None
+            if tzinfo is None and isinstance(tz_lookup, dict):
                 tzinfo = tz_lookup.get(tzid)
             if tzinfo is None and _zi_ok:
                 mapped = _ICS_WINDOWS_TZ_MAP.get(tzid.upper(), tzid)
@@ -57486,6 +57506,23 @@ def _ics_events_to_briefings(events, existing=None):
             existing_b['ical_start_iso'] = merged_start
             existing_b['ical_end_iso'] = merged_end
             existing_b['ical_imported_at'] = datetime.now().isoformat()
+            # BODEN-BLÖCKE MIT EIGENEN ZEITEN (Tibor/SBAO 18.08.2026): ein
+            # Airport-Standby NACH dem Flug („LH 1109 · Standby (SBAO)
+            # 08:00–09:30") überlebte den Tages-Merge nur als Summary-Wort —
+            # seine DTSTART/DTEND gingen verloren und die Tages-Timeline
+            # (rendert nur ical_sectors) zeigte ihn gar nicht. Getimte
+            # Standby-/Reserve-Events reisen jetzt additiv als
+            # `ground_events` mit ihren ECHTEN Zeiten mit (nie geraten;
+            # Tag 1 only — Folgetage tragen keine eigenen Zeiten).
+            if (i == 0 and start_iso and end_iso
+                    and _feed_summary_is_standby(day_summary)):
+                _ge = existing_b.setdefault('ground_events', [])
+                _eintrag = {'label': day_summary[:60],
+                            'start_iso': start_iso, 'end_iso': end_iso}
+                if location and re.fullmatch(r'[A-Z]{3}', location.strip().upper()):
+                    _eintrag['station'] = location.strip().upper()
+                if _eintrag not in _ge and len(_ge) < 6:
+                    _ge.append(_eintrag)
             # SWISS: die EXPLIZITE Report-Zeit aus der DESCRIPTION („Reporting
             # time: 11:15") als LH-Stil-Briefing-Token dem SUMMARY voranstellen —
             # so liest der iOS-Client (briefingTimeFromSummary/reportTime) die echte

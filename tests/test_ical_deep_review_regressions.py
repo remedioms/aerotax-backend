@@ -62,6 +62,35 @@ def test_embedded_vtimezone_is_used_for_custom_tzid():
     assert event['start_iso'] == '2026-08-03T12:00:00Z'
 
 
+def test_broken_vtimezone_does_not_override_known_iana_zone():
+    """Sommerzeit-Regression (Britta, BLR→FRA, 18.08.2026).
+
+    Ein Roster-Feed liefert für `TZID:Europe/Berlin` nur einen STANDARD-Block
+    (+01:00) ohne DAYLIGHT. Vorher gewann dieses mitgelieferte VTIMEZONE über
+    die IANA-Zone → die Sommer-Ankunft „09:05 Ortszeit FRA" wurde zu 08:05Z
+    statt 07:05Z, und jede Fläche, die den Instant in Europe/Berlin rendert,
+    zeigte 10:05 — genau eine Stunde zu spät. Die Abflug-Seite an einer
+    DST-freien Station (BLR = Asia/Kolkata) blieb dabei korrekt.
+    """
+    zone = '\r\n'.join([
+        'BEGIN:VTIMEZONE', 'TZID:Europe/Berlin', 'BEGIN:STANDARD',
+        'DTSTART:19701025T030000', 'TZOFFSETFROM:+0200',
+        'TZOFFSETTO:+0100', 'TZNAME:CET', 'END:STANDARD',
+        'END:VTIMEZONE',
+    ])
+    text = _calendar(
+        _event(['UID:blr-fra',
+                'DTSTART;TZID=Asia/Kolkata:20260818T030500',
+                'DTEND;TZID=Europe/Berlin:20260818T090500',
+                'SUMMARY:LH 755: BLR-FRA', 'LOCATION:BLR - FRA']),
+        timezone_block=zone)
+    event = A._parse_ics_to_events_v2(text)[0]
+    # 09:05 CEST = 07:05Z (nicht 08:05Z)
+    assert event['end_iso'] == '2026-08-18T07:05:00Z'
+    # 03:05 IST = 21:35Z am Vortag — DST-freie Station bleibt unberührt
+    assert event['start_iso'] == '2026-08-17T21:35:00Z'
+
+
 def test_recurring_flight_keeps_absolute_times_for_every_occurrence():
     text = _calendar(_event([
         'UID:daily-flight', 'DTSTART;TZID=Europe/Berlin:20260803T080000',
