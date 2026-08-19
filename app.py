@@ -44929,6 +44929,84 @@ def _route_track_flight_set(frm, to, day, lo_iso, hi_iso, flight_nos=None):
     return {_fn_norm(r.get('flight')) for r in rows if r.get('flight')}
 
 
+def _route_track_alias_groups(registrations, lo_iso, hi_iso, anchor_flights):
+    """Operational callsign aliases for route flights, proven by one aircraft.
+
+    Some outstation observations are persisted under an operational callsign
+    (for example ``LH07Y``), while the arrival board and route-tagged track use
+    the commercial number (``LH1109``). ``aircraft_track`` contains both names
+    on the same registration during the same flight.  Build alias groups only
+    when their observation intervals overlap and at least one name is already
+    anchored by a route-tagged track.  This deliberately never pairs flights
+    by timetable proximity alone.
+
+    Best-effort and additive: DB/reference failures return no groups, preserving
+    the previous response shape.
+    """
+    regs = sorted({str(r or '').replace('-', '').upper().strip()
+                   for r in (registrations or []) if str(r or '').strip()})
+    anchors = {_fn_norm(f) for f in (anchor_flights or []) if _fn_norm(f)}
+    if sb is None or not regs or not anchors:
+        return []
+    try:
+        rows = ((sb.table('aircraft_track')
+                 .select('reg,flight,seen_ts')
+                 .in_('reg', regs)
+                 .gte('seen_ts', lo_iso).lt('seen_ts', hi_iso)
+                 .limit(8000).execute()).data or [])
+    except Exception:
+        return []
+
+    def _track_name(raw):
+        # FR24 commonly stores the ICAO callsign (DLH07Y), while boards use the
+        # IATA form (LH07Y). The baked airline reference performs that exact,
+        # evidence-based carrier conversion; unknown prefixes remain untouched.
+        iata = _wh_callsign_to_iata_flightno(raw)
+        return _fn_norm(iata or raw)
+
+    by_reg = {}
+    for row in rows:
+        reg = str(row.get('reg') or '').replace('-', '').upper().strip()
+        name = _track_name(row.get('flight'))
+        seen = str(row.get('seen_ts') or '').strip()
+        if not reg or not name or not seen:
+            continue
+        try:
+            ts = datetime.fromisoformat(seen.replace('Z', '+00:00')).timestamp()
+        except Exception:
+            continue
+        interval = by_reg.setdefault(reg, {}).setdefault(name, [ts, ts])
+        interval[0] = min(interval[0], ts)
+        interval[1] = max(interval[1], ts)
+
+    out = []
+    overlap_slack_s = 10 * 60
+    for aliases in by_reg.values():
+        names = list(aliases)
+        adjacent = {name: set() for name in names}
+        for idx, left in enumerate(names):
+            l0, l1 = aliases[left]
+            for right in names[idx + 1:]:
+                r0, r1 = aliases[right]
+                if max(l0, r0) <= min(l1, r1) + overlap_slack_s:
+                    adjacent[left].add(right)
+                    adjacent[right].add(left)
+        unseen = set(names)
+        while unseen:
+            seed = unseen.pop()
+            component = {seed}
+            stack = [seed]
+            while stack:
+                current = stack.pop()
+                for neighbour in adjacent[current] & unseen:
+                    unseen.remove(neighbour)
+                    component.add(neighbour)
+                    stack.append(neighbour)
+            if len(component) > 1 and component & anchors:
+                out.append(component)
+    return out
+
+
 @app.route('/api/ax/route-history/<frm>/<to>', methods=['GET'])
 def ax_route_history(frm, to):
     """Strecken-Historie (Pünktlichkeit pro Tag) für ein Städtepaar — aus den
@@ -45035,20 +45113,24 @@ def ax_route_history(frm, to):
         except Exception:
             return []
 
-    def _fetch_trk(d_i, fns):
+    def _fetch_trk(d_i, fns, regs):
         # has_track-Existenz-Set (Perf-Fund 175): eine gebündelte Query je Tag.
         try:
             from datetime import datetime as _dtc, timezone as _tzc
             _d0 = _dtc.strptime(d_i, '%Y-%m-%d').replace(tzinfo=_tzc.utc)
-            return _route_track_flight_set(
+            _lo = _d0.strftime('%Y-%m-%dT00:00:00Z')
+            _hi = (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+            track_set = _route_track_flight_set(
                 frm, to, d_i,
-                _d0.strftime('%Y-%m-%dT00:00:00Z'),
-                (_d0 + _td(days=1)).strftime('%Y-%m-%dT00:00:00Z'),
+                _lo, _hi,
                 flight_nos=fns)
+            alias_groups = _route_track_alias_groups(
+                regs, _lo, _hi, track_set)
+            return track_set, alias_groups
         except Exception:
-            return set()
+            return set(), []
 
-    def _trk_query_fns(dep_rows, arr_rows):
+    def _trk_query_evidence(dep_rows, arr_rows):
         """Flugnummern-Schlüsselliste für den flight-indizierten Track-Read
         (Latenz-Wurzel 2026-07-22, Doku an `_route_track_flight_set`): pro
         route-relevanter Board-Row die ROHE Schreibweise + `_fn_norm`-Variante
@@ -45057,7 +45139,7 @@ def ax_route_history(frm, to):
         Entry auf eine NIE beobachtete Operating-Nummer umlabeln — deren Track
         muss der Read trotzdem sehen). None = Fallback auf den alten
         origin/dest-Scan, falls die Liste unerwartet groß würde (URL-Limit)."""
-        fns = set()
+        fns, regs = set(), set()
         for rws, match in ((dep_rows or [], to), (arr_rows or [], frm)):
             for r in rws:
                 if (r.get('dest_iata') or '').upper() != match:
@@ -45071,7 +45153,11 @@ def ax_route_history(frm, to):
                 op = cs_map.get(n)
                 if op:
                     fns.add(op)
-        return fns if len(fns) <= 300 else None
+                reg = str(r.get('reg') or '').replace('-', '').upper().strip()
+                if reg:
+                    regs.add(reg)
+        return (fns if len(fns) <= 300 else None,
+                regs if len(regs) <= 200 else set())
 
     def _fetch_day_rows(i):
         from concurrent.futures import ThreadPoolExecutor as _RH_TPE
@@ -45100,18 +45186,18 @@ def ax_route_history(frm, to):
         # er braucht die Flugnummern des Tages als Index-Schlüssel. Die
         # Serialisierung kostet ~0,25 s, der unkeyed origin/dest-Scan kostete
         # 8–9 s — Netto-Gewinn ~8 s pro Tag (Messung 2026-07-22, Hetzner→SB).
-        fns = _trk_query_fns(r, ar)
+        fns, regs = _trk_query_evidence(r, ar)
         if fns is not None and not fns:
-            trk = set()      # kein Flug am Tag → gar keine Track-Query
+            trk, aliases = set(), []  # kein Flug → gar keine Track-Query
         else:
             def _trk_task():
                 try:
-                    return _fetch_trk(d_i, fns)
+                    return _fetch_trk(d_i, fns, regs)
                 finally:
                     _close_current_thread_supabase_client()
             with _RH_TPE(max_workers=1) as _trk_ex:
-                trk = _trk_ex.submit(_trk_task).result()
-        return i, (r, ar, trk)
+                trk, aliases = _trk_ex.submit(_trk_task).result()
+        return i, (r, ar, trk, aliases)
     _day_rows = {}
     if ndays > 1:
         from concurrent.futures import ThreadPoolExecutor as _RH_TPE
@@ -45126,7 +45212,7 @@ def ax_route_history(frm, to):
 
     for i in range(ndays):
         d = (base - _td(days=i)).strftime('%Y-%m-%d')
-        rows, arr_rows, trk_prefetch = _day_rows[i]
+        rows, arr_rows, trk_prefetch, track_alias_groups = _day_rows[i]
         if i == 0:
             rows = [r for r in (rows or [])
                     if _row_in_day_and_flown(r, d, board_ap)]
@@ -45134,6 +45220,32 @@ def ax_route_history(frm, to):
                         if _row_in_day_and_flown(r, d, to)]
         flights = []
         by_fn = {}
+        # CALLSIGN-ALIAS-MERGE (Tibor SZG→FRA, 2026-08-19): der Outstation-
+        # Abflug lag als LH07Y vor, die Ankunft und echte Route als LH1109.
+        # `track_alias_groups` enthält ausschließlich durch dieselbe Tail-Reg
+        # und überlappende Track-Zeiten bewiesene Namen. Eine DEP-Row darf damit
+        # auf die passende sichtbare ARR-Flugnummer normalisiert werden; reine
+        # Uhrzeitnähe reicht ausdrücklich NICHT als Beweis.
+        arr_keys = {_fn_norm(r.get('flight')) for r in (arr_rows or [])
+                    if (r.get('dest_iata') or '').upper() == frm
+                    and _fn_norm(r.get('flight'))}
+        dep_alias_to_arr = {}
+        for group in (track_alias_groups or []):
+            arr_candidates = sorted(group & arr_keys)
+            if not arr_candidates:
+                continue
+            for dep_key in group - arr_keys:
+                # Bei mehreren Marketing-Nummern desselben physischen Flugs
+                # gewinnt derselbe Carrier und danach eine rein numerische
+                # Linienflugnummer (LH1109 vor dem Ops-Callsign LH7Y).
+                dep_prefix = re.match(r'^([A-Z]{2}|[A-Z]\d|\d[A-Z])', dep_key or '')
+                prefix = dep_prefix.group(1) if dep_prefix else ''
+                def _arr_rank(key):
+                    suffix = key[len(prefix):] if prefix and key.startswith(prefix) else key
+                    return (0 if prefix and key.startswith(prefix) else 1,
+                            0 if suffix.isdigit() else 1,
+                            len(key), key)
+                dep_alias_to_arr[dep_key] = min(arr_candidates, key=_arr_rank)
         # DUAL-SIDE-MERGE (Owner-Direktive 2026-07-03): haben BEIDE Seiten
         # denselben Flug beobachtet, wird NICHT mehr gedroppt (vorher: dep
         # gewinnt, arr-Beobachtung weg), sondern EIN Eintrag mit dep_delay_min
@@ -45151,7 +45263,9 @@ def ax_route_history(frm, to):
                     continue
                 # Normalisiert (SQ026==SQ26), damit auch der dep/arr-Dual-Side-
                 # Merge Schreibweisen-Varianten derselben Nummer trifft.
-                fn_key = _fn_norm(r.get('flight'))
+                source_fn_key = _fn_norm(r.get('flight'))
+                fn_key = (dep_alias_to_arr.get(source_fn_key, source_fn_key)
+                          if side == 'dep' else source_fn_key)
                 # „Unbekannt ≠ Pünktlich" (LH400): die Row-Builder liefern
                 # delay_min bereits als None + delay_known=False, wenn der Delay
                 # NIE wirklich beobachtet wurde (nur vor Abflug gesehen, kein
@@ -45184,6 +45298,8 @@ def ax_route_history(frm, to):
                              'delay_known': known,
                              'cancelled': canc, 'status': status,
                              'obs': side}
+                    if source_fn_key and fn_key and source_fn_key != fn_key:
+                        entry['also_as'] = [source_fn_key]
                     if gaveup:
                         entry['gaveup'] = True
                     if side == 'dep':
