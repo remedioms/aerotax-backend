@@ -1388,7 +1388,14 @@ def _fr24_corridor_position_row(hit, callsign=''):
     if not hex_id:
         flight_id = str(hit.get('flight_id') or '').strip().lower()
         hex_id = f'fr24-{flight_id}' if flight_id else (reg or cs or 'fr24').lower()
-    on_ground = bool((alt_ft or 0) < 200 and (gs_kt or 0) < 50)
+    # „Am Boden" nur mit BELEG (beide Messwerte vorhanden und niedrig) — wie
+    # die uebrigen Quellen (ADB/Watch: None statt geraten). Vorher zaehlte ein
+    # fehlender Wert als 0, d.h. ein echter Korridor-Treffer OHNE alt/speed
+    # wurde als on_ground=True geliefert und vom FlightDeck-Client verworfen —
+    # genau der Tap, fuer den der Fallback gebaut ist (Owner 19.08.: „soll
+    # immer einmal beim Klick suchen").
+    on_ground = (bool(alt_ft < 200 and gs_kt < 50)
+                 if alt_ft is not None and gs_kt is not None else None)
     return [
         hex_id, cs, reg, obs_ts, obs_ts, lon, lat,
         (alt_ft * 0.3048) if alt_ft is not None else None,
