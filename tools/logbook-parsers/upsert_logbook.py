@@ -70,7 +70,8 @@ def _complete_upload_after_verified(cur, upload_id, token, enqueue=True):
     cur.execute("""
         update public.ax_logbook_upload
         set processed=true, status='completed', completed_at=now(),
-            push_enqueued_at=now()
+            push_enqueued_at=now(), error_code=null, error_message=null,
+            data_b64=null, payload_purged_at=now(), purge_after=null
         where id=%s and token=%s and status <> 'completed'
         returning id
     """, (upload_id, token))

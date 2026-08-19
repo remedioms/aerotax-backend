@@ -48,6 +48,9 @@ def test_pending_upload_completes_and_enqueues_one_scoped_push():
     assert len(cur.calls) == 3
     update_sql, update_params = cur.calls[1]
     assert "status='completed'" in update_sql
+    assert 'error_code=null' in update_sql
+    assert 'data_b64=null' in update_sql
+    assert 'payload_purged_at=now()' in update_sql
     assert update_params == (9, 'AT-owner')
 
     push_sql, push_params = cur.calls[2]
