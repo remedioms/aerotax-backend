@@ -61800,6 +61800,33 @@ def _roster_pdf_upload_finish(job_ids, status, error_code=None,
     ids = sorted({value for value in job_ids if type(value) is int and value > 0})
     if not ids or not SB_AVAILABLE:
         return False
+    review_mail_ids = []
+    if status == 'review':
+        # Ein nicht verstandenes PDF bleibt fuer automatische Airline-Retries
+        # absichtlich ``processed=false``. Diese Retries verwenden deshalb
+        # dieselbe Upload-Zeile erneut. Nur der ERSTE Uebergang nach ``review``
+        # darf den Owner informieren; sonst erzeugt ein einzelner Upload bei
+        # jedem Backoff-Lauf erneut dieselbe Mail samt PDF-Anhang.
+        try:
+            def _load_review_states():
+                return (sb.table('ax_logbook_upload').select('id,status')
+                        .in_('id', ids).execute())
+            current, failed = _supabase_execute_with_timeout(
+                'roster_pdf_queue_review_state', _load_review_states,
+                timeout_s=8)
+            states = {
+                int(row.get('id')): str(row.get('status') or '')
+                for row in (getattr(current, 'data', None) or [])
+                if row.get('id') is not None
+            }
+            review_mail_ids = (ids if failed else [
+                job_id for job_id in ids if states.get(job_id) != 'review'
+            ])
+        except Exception:
+            # Der Upload soll auch bei einem degradierten Status-Read nicht
+            # still verschwinden. In diesem seltenen Fall bleibt das bisherige
+            # fail-open-Meldeverhalten bestehen.
+            review_mail_ids = ids
     now = datetime.now(timezone.utc).isoformat()
     values = {
         'status': status,
@@ -61815,24 +61842,27 @@ def _roster_pdf_upload_finish(job_ids, status, error_code=None,
     elif status == 'review':
         values['purge_after'] = (
             datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
-        # OWNER-MELDER (Christoph S./LHX 18.08.): ein fehlgeschlagener
-        # Roster-Upload einer UNTERSTUETZTEN Airline landete bisher STILL im
-        # Review-Status — der Owner erfuhr davon nur, wenn der Nutzer selbst
-        # mailte. Kompakte Mail (keine Datei-Kopie: die Quelle liegt durabel
-        # in der Upload-Zeile), best effort und niemals blockierend.
-        try:
-            _roster_pdf_review_owner_mail(ids, error_code, error_message)
-        except Exception as mail_exc:
-            app.logger.warning(
-                f'[roster-pdf] review-mail-fail ids={ids} '
-                f'err={type(mail_exc).__name__}: {str(mail_exc)[:120]}')
     try:
         def _finish():
             return (sb.table('ax_logbook_upload').update(values)
                     .in_('id', ids).execute())
         _, failed = _supabase_execute_with_timeout(
             'roster_pdf_queue_finish', _finish, timeout_s=8)
-        return not failed
+        if failed:
+            return False
+        # OWNER-MELDER (Christoph S./LHX 18.08.): ein fehlgeschlagener
+        # Roster-Upload einer UNTERSTUETZTEN Airline darf nicht still im
+        # Review-Status landen. Erst NACH dem dauerhaften Status-Write mailen
+        # und nur fuer zuvor noch nicht gemeldete Zeilen.
+        if status == 'review' and review_mail_ids:
+            try:
+                _roster_pdf_review_owner_mail(
+                    review_mail_ids, error_code, error_message)
+            except Exception as mail_exc:
+                app.logger.warning(
+                    f'[roster-pdf] review-mail-fail ids={review_mail_ids} '
+                    f'err={type(mail_exc).__name__}: {str(mail_exc)[:120]}')
+        return True
     except Exception as exc:
         app.logger.warning(
             f'[roster-pdf] queue-finish-fail ids={ids} status={status} '

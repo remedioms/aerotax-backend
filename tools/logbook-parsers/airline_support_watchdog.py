@@ -207,7 +207,14 @@ def _mark_retry(backend, row, error):
         values['next_attempt_at'] = (now + timedelta(minutes=delay)).isoformat()
     (backend.sb.table('airline_support_requests').update(values)
      .eq('id', row['id']).eq('status', STATUS_PROCESSING).execute())
-    if attempts == 1 or terminal:
+    # PDF-Fehler haben bereits beim ersten Upload genau eine Review-Mail samt
+    # Datei aus `_roster_pdf_upload_finish` erzeugt. Der erste automatische
+    # Retry darf dafuer nicht noch eine zweite "Parser-Aufmerksamkeit"-Mail
+    # schicken. iCal hat keinen vorgelagerten Melder und meldet weiterhin beim
+    # ersten Fehlschlag; der letzte Versuch meldet fuer beide Quellen erneut.
+    first_unreported_failure = (
+        attempts == 1 and row.get('source_kind') != 'pdf')
+    if first_unreported_failure or terminal:
         _alert_owner(row, error)
 
 

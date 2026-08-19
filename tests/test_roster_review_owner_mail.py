@@ -39,6 +39,39 @@ class _FakeSB:
         return _FakeTable(self._rows)
 
 
+class _FinishTable:
+    def __init__(self, rows, updates):
+        self._rows = rows
+        self._updates = updates
+        self._mode = 'read'
+
+    def select(self, *args):
+        self._mode = 'read'
+        return self
+
+    def update(self, values):
+        self._mode = 'update'
+        self._updates.append(values)
+        return self
+
+    def in_(self, *args):
+        return self
+
+    def execute(self):
+        rows = self._rows if self._mode == 'read' else []
+        return types.SimpleNamespace(data=rows)
+
+
+class _FinishSB:
+    def __init__(self, rows, updates):
+        self._rows = rows
+        self._updates = updates
+
+    def table(self, name):
+        assert name == 'ax_logbook_upload'
+        return _FinishTable(self._rows, self._updates)
+
+
 def _lauf(monkeypatch, rows):
     captured = {}
 
@@ -82,3 +115,28 @@ def test_zu_grosses_pdf_bleibt_in_der_tabelle(monkeypatch):
                              'data_b64': 'x' * 10}])
     assert 'attachments' not in p
     assert 'zu gross' in p['text']
+
+
+def test_review_mail_only_for_first_transition(monkeypatch):
+    updates = []
+    mails = []
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(app, 'sb', _FinishSB([
+        {'id': 606, 'status': 'review'},
+        {'id': 607, 'status': 'pending'},
+    ], updates))
+    monkeypatch.setattr(
+        app, '_supabase_execute_with_timeout',
+        lambda _name, fn, timeout_s=8: (fn(), False))
+    monkeypatch.setattr(
+        app, '_roster_pdf_review_owner_mail',
+        lambda ids, code, message: mails.append((ids, code, message)))
+
+    assert app._roster_pdf_upload_finish(
+        [606, 607], 'review', 'unsupported_pdf_format',
+        'Das Dienstplanformat wird geprüft.') is True
+
+    assert len(updates) == 1
+    assert updates[0]['status'] == 'review'
+    assert mails == [([607], 'unsupported_pdf_format',
+                      'Das Dienstplanformat wird geprüft.')]

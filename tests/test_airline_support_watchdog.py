@@ -65,14 +65,15 @@ def test_ical_retry_decrypts_and_uses_canonical_import_without_logging_url():
     assert calls == [('AT-OWNER', 'https://private.example/roster.ics')]
 
 
-def test_retry_schedule_reaches_final_attempt_inside_24_hours(monkeypatch):
+def test_ical_retry_schedule_alerts_and_reaches_final_attempt_inside_24_hours(
+        monkeypatch):
     query = _Query([{'id': 7}])
     backend = SimpleNamespace(sb=_SB(query))
     alerts = []
     monkeypatch.setattr(worker, '_alert_owner',
                         lambda row, error: alerts.append((row['id'], error)))
     row = {'id': 7, 'attempt_count': 0, 'airline_name': 'Example',
-           'source_kind': 'pdf'}
+           'source_kind': 'ical_url'}
 
     worker._mark_retry(backend, row, 'unsupported_pdf_format')
 
@@ -81,6 +82,22 @@ def test_retry_schedule_reaches_final_attempt_inside_24_hours(monkeypatch):
     assert query.updated['next_attempt_at'] is not None
     assert alerts == [(7, 'unsupported_pdf_format')]
     assert sum(worker.BACKOFF_MINUTES) < 24 * 60
+
+
+def test_first_pdf_retry_does_not_duplicate_upload_review_mail(monkeypatch):
+    query = _Query([{'id': 9}])
+    backend = SimpleNamespace(sb=_SB(query))
+    alerts = []
+    monkeypatch.setattr(worker, '_alert_owner',
+                        lambda row, error: alerts.append((row['id'], error)))
+    row = {'id': 9, 'attempt_count': 0, 'airline_name': 'Example',
+           'source_kind': 'pdf'}
+
+    worker._mark_retry(backend, row, 'unsupported_pdf_format')
+
+    assert query.updated['attempt_count'] == 1
+    assert query.updated['status'] == 'pending'
+    assert alerts == []
 
 
 def test_sixth_failure_moves_to_private_review_queue(monkeypatch):
