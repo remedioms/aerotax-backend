@@ -34762,6 +34762,14 @@ def _crew_hotel_token_hash(token):
     return _hashlib.sha256(('crewhotel:' + (token or '')).encode()).hexdigest()[:32]
 
 
+# Hotels mit PERSÖNLICHEN Zugangsdaten pro Gast (Owner 19.08.: „da muss ja
+# nicht jedes mal gefragt werden oder keine info"): in der DB als Sentinel im
+# vorhandenen wifi_code-Feld (kein Schema-Change). Alte Clients bekommen beim
+# Serve wifi_code=null (sehen den Sentinel NIE als Code), neue Clients das
+# Flag `wifi_personal` und blenden die WLAN-Zeile aus.
+_CREW_HOTEL_WIFI_PERSONAL = '§personal§'
+
+
 def _crew_hotel_wifi_code(value):
     """Printable WLAN code, character-for-character useful to the crew.
 
@@ -34818,6 +34826,11 @@ def _crew_hotel_dir_serve(airline):
             # Defense in depth for permissive test doubles/future select('*'):
             # contributor identity is moderation metadata, never client data.
             row.pop('wifi_updated_by', None)
+            # Personal-Sentinel NIE als Code ausliefern: alte Clients zeigten
+            # ihn sonst wortwörtlich als WLAN-Passwort an.
+            if row.get('wifi_code') == _CREW_HOTEL_WIFI_PERSONAL:
+                row['wifi_code'] = None
+                row['wifi_personal'] = True
             official = (row.pop('official_name', None) or '').strip()
             if official and official != (row.get('hotel') or '').strip():
                 row['hotel_crowd'] = row.get('hotel')
@@ -34939,12 +34952,24 @@ def ax_crew_hotels_wifi():
     iata = str(body.get('iata') or '').strip().upper()
     hotel = ' '.join(str(body.get('hotel') or '').split())
     base = str(body.get('base') or '').strip().upper() or None
-    code = _crew_hotel_wifi_code(body.get('wifi_code'))
+    # `personal: true` = das Hotel vergibt Zugangsdaten PRO GAST — es gibt
+    # keinen Crew-Code. Gespeichert als Sentinel im selben Feld.
+    personal = body.get('personal') is True
+    code = (_CREW_HOTEL_WIFI_PERSONAL if personal
+            else _crew_hotel_wifi_code(body.get('wifi_code')))
     if len(iata) != 3 or not iata.isalpha():
         return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
     if len(hotel) < 3 or len(hotel) > 160:
         return jsonify({'ok': False, 'error': 'invalid_hotel'}), 400
     if code is None:
+        # Diagnose OHNE Inhalt (Passwortfeld!): nur Längen vor/nach dem
+        # Control-Char-Filter. Prod-Fall 19.08.: Build 360 schickte einen
+        # Code, der serverseitig leer ankam — Kategorie war im Log unsichtbar.
+        raw = str(body.get('wifi_code') or '')
+        app.logger.info(
+            '[crew-hotel] wifi reject invalid_wifi_code tok=%s raw_len=%d '
+            'stripped_len=%d', (token or '')[:8], len(raw),
+            len(raw.strip()))
         return jsonify({'ok': False, 'error': 'invalid_wifi_code'}), 400
     if (airline == 'CONDOR'
             and (not has_calendar
@@ -34998,7 +35023,9 @@ def ax_crew_hotels_wifi():
             'updated_at': now_iso,
         }).eq('id', selected['id']).execute()
         return jsonify({'ok': True, 'status': status,
-                        'wifi_code': code, 'wifi_updated_at': now_iso})
+                        'wifi_code': None if personal else code,
+                        'wifi_personal': True if personal else None,
+                        'wifi_updated_at': now_iso})
     except Exception as e:
         print(f"[crew-hotel] wifi update fail: {type(e).__name__}")
         return jsonify({'ok': False, 'error': 'db'}), 500
