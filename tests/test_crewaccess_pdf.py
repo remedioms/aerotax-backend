@@ -104,6 +104,30 @@ Created 16Aug2026 16:17 (UTC) by 000000X 1 ( 1)
     assert 'DTSTART:20260901T085000Z' not in ics
 
 
+def test_parser_accepts_complete_printed_previous_month():
+    """Some CrewAccess exports prefix every day of the previous month.
+
+    The repeated day numbers are unambiguous because the PDF also prints the
+    weekday.  A September 2026 roster therefore resolves ``01 Sat`` to August
+    and the later ``01 Tue`` to September without guessing.
+    """
+    text = """Roster Preview
+Planning period: September 2026
+Date Report (UTC) Tags Pos Activity From To Start (UTC) End (UTC) A/C Layover Trip ID
+01 Sat NF
+31 Mon NF
+01 Tue O
+07 Mon 13:20 FAM_C EC 1870 MUC FCO 14:40 16:15 32N 01833
+Created 16Aug2026 16:17 (UTC) by 000000X 1 ( 1)
+"""
+    ics, err = backend._crewaccess_text_to_ics(text, carrier='VL')
+    assert err is None
+    assert 'DTSTART;VALUE=DATE:20260801' in ics
+    assert 'DTSTART;VALUE=DATE:20260831' in ics
+    assert 'DTSTART;VALUE=DATE:20260901' in ics
+    assert 'DTSTART:20260907T144000Z' in ics
+
+
 def test_parser_rejects_contradictory_printed_weekday():
     text = """Roster Preview
 Planning period: September 2026

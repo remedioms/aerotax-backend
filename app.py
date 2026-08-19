@@ -60143,12 +60143,17 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
         """Resolve printed CrewAccess dates across month boundaries.
 
         Preview PDFs commonly append the first day of the following month.
-        The printed weekday is authoritative enough to distinguish that row
-        from day 01 of the planning month.  Reject contradictions instead of
-        silently placing a flight on the wrong date.
+        Some released exports also prefix the complete previous calendar
+        month (usually ``NF`` rows) before the actual planning period.  The
+        printed weekday is authoritative enough to distinguish those rows
+        from the same day number in the planning month.  Reject contradictions
+        instead of silently placing a flight on the wrong date.
         """
         serial = year * 12 + month - 1
         period_start = _date(year, month, 1)
+        previous_serial = serial - 1
+        previous_start = _date(
+            previous_serial // 12, previous_serial % 12 + 1, 1)
         next_serial = serial + 1
         period_end = (_date(next_serial // 12, next_serial % 12 + 1, 1)
                       - _td(days=1))
@@ -60160,7 +60165,7 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
                     shifted // 12, shifted % 12 + 1, int(dom))
             except ValueError:
                 continue
-            if (period_start - _td(days=7) <= candidate
+            if (previous_start <= candidate
                     <= period_end + _td(days=7)
                     and candidate.strftime('%a') == weekday):
                 candidates.append(candidate)
