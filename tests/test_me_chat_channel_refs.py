@@ -122,6 +122,19 @@ def test_channel_ref_resolver_is_order_independent(monkeypatch):
             == A._dm_channel(OWNER, FRIEND))
 
 
+def test_channel_ref_resolver_allows_separator_inside_encrypted_ref(monkeypatch):
+    """URL-safe base64 can contain ``__``; it is payload, not a third member."""
+    public_ref = 'AXU-ciphertext__with__separator'
+    monkeypatch.setattr(
+        A, '_token_from_public_user_ref',
+        lambda value: FRIEND if value == public_ref else None)
+    monkeypatch.setattr(A, '_crew_dm_pair_authorized', lambda a, b: True)
+
+    channel = f'dm__{OWNER}__{public_ref}'
+    assert (A._me_chat_channel_internal(OWNER, channel)
+            == A._dm_channel(OWNER, FRIEND))
+
+
 def test_channel_ref_resolver_fails_closed_without_relationship(monkeypatch):
     monkeypatch.setattr(A, '_crew_dm_pair_authorized', lambda a, b: False)
     stranger_channel = f'dm__{OWNER}__{A._public_user_ref(STRANGER)}'

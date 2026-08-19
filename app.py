@@ -34873,6 +34873,53 @@ def ax_crew_hotels():
     return jsonify({'airline': airline, 'count': len(hotels), 'hotels': hotels})
 
 
+def _crew_hotel_edit1(a, b):
+    """True bei Edit-Distanz ≤ 1 (ein Tippfehler: ersetzt/eingefügt/gelöscht)."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = j = diff = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        diff += 1
+        if diff > 1:
+            return False
+        if len(a) == len(b):
+            i += 1
+        j += 1
+    return diff + (len(b) - j) <= 1
+
+
+def _crew_hotel_names_similar(a, b):
+    """True, wenn zwei Hotelnamen dasselbe Haus meinen — Tippfehler-tolerant.
+
+    Roster-Namen sind Airline-Freitext („Hilton Union Squaire", Prod 19.08.),
+    das Verzeichnis trägt den Klarnamen („Hilton San Francisco Union Square").
+    Regel: JEDES tragende Wort des kürzeren Namens muss im längeren vorkommen —
+    exakt, oder ab 4 Zeichen mit Edit-Distanz ≤ 1. Mindestens ZWEI tragende
+    Wörter nötig: „Hilton" allein darf nie ein bestimmtes Haus treffen, und
+    „Hilton Financial District" matcht nicht auf „Hilton Union Square"
+    (district/financial fehlen dort)."""
+    stop = {'hotel', 'the'}
+    wa = [w for w in _crew_hotel_key(a).split() if w not in stop]
+    wb = [w for w in _crew_hotel_key(b).split() if w not in stop]
+    if not wa or not wb:
+        return False
+    shorter, longer = (wa, wb) if len(wa) <= len(wb) else (wb, wa)
+    if len(shorter) < 2:
+        return False
+    return all(
+        any(word == cand or (len(word) >= 4 and _crew_hotel_edit1(word, cand))
+            for cand in longer)
+        for word in shorter)
+
+
 @app.route('/api/ax/crew-hotels/wifi', methods=['POST'])
 def ax_crew_hotels_wifi():
     """Current WLAN code for an existing crew hotel.
@@ -34918,6 +34965,15 @@ def ax_crew_hotels_wifi():
                        _crew_hotel_key(row.get('hotel')),
                        _crew_hotel_key(row.get('official_name')),
                    }]
+        if not matches:
+            # Roster-Freitext vs. Verzeichnis-Klarname (Prod 19.08.: „Hilton
+            # Union Squaire" ↔ „Hilton San Francisco Union Square" → 404,
+            # WLAN-Code unsicherbar). Tippfehler-toleranter Wort-Match als
+            # zweites Netz — weiterhin airline- und stations-gebunden.
+            matches = [row for row in rows
+                       if _crew_hotel_names_similar(hotel, row.get('hotel'))
+                       or _crew_hotel_names_similar(
+                           hotel, row.get('official_name'))]
         if not matches:
             return jsonify({'ok': False, 'error': 'unknown_hotel'}), 404
 
@@ -62481,7 +62537,7 @@ def _pdf_informational_only_kind(text):
 
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
 def import_roster_pdf(token):
-    """Roster-PDF-Upload for CrewAccess, Discover and Lufthansa CAS.
+    """Roster-PDF-Upload for CrewAccess, Discover, SAS and Lufthansa CAS.
 
     Repeated multipart ``pdf`` fields form one archive import. CAS revisions
     are resolved day-by-day before the single calendar write. Optional
@@ -62567,6 +62623,18 @@ def import_roster_pdf(token):
             # SWISS uses the same local-time semantics with different labels
             # and split-arrival rows that omit the repeated flight number.
             ics, perr = _swiss_roster_text_to_ics(text)
+        if perr == 'unsupported_pdf_format':
+            # SAS Airside exports contain complete dates and station-local
+            # STD/STA values across several months.  Scheduled times win over
+            # historical ATD/ATA values so the calendar remains a roster.
+            from sas_roster_pdf import parse_sas_airside_calendar
+            sas_events, sas_year, sas_month, sas_report, perr = \
+                parse_sas_airside_calendar(text, homebase=homebase_hint)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    sas_events, sas_year, sas_month,
+                    prodid='AeroX SAS Airside Roster PDF Import')
+                periods.append((sas_report or {}).get('period'))
         if perr == 'unsupported_pdf_format':
             # Cargolux "Personal Crew Schedule Report": coordinate table,
             # explicitly UTC, with multi-leg +1 rows and multi-day layovers.
@@ -83711,8 +83779,17 @@ def _me_chat_channel_internal(token, channel_id):
     raw = str(channel_id or '')
     if not raw.startswith('dm__') or _PUBLIC_USER_REF_PREFIX not in raw:
         return raw
-    parts = raw[len('dm__'):].split('__')
-    if len(parts) != 2:
+    # AXU uses URL-safe base64 and may itself contain ``__``.  Splitting the
+    # whole channel on that sequence therefore rejects a key-dependent subset
+    # of valid handles.  Anchor the separator on the caller's known raw token;
+    # a public channel without the caller still fails closed.
+    own = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
+    body = raw[len('dm__'):]
+    if own and body.startswith(own + '__'):
+        parts = [own, body[len(own) + 2:]]
+    elif own and body.endswith('__' + own):
+        parts = [body[:-(len(own) + 2)], own]
+    else:
         return None
     resolved = []
     for part in parts:
@@ -83723,7 +83800,6 @@ def _me_chat_channel_internal(token, channel_id):
             resolved.append(internal)
         else:
             resolved.append(part)
-    own = re.sub(r'[^A-Za-z0-9_-]', '', token or '')[:64]
     if not own or own not in resolved:
         return None
     peer = resolved[1] if resolved[0] == own else resolved[0]
