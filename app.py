@@ -57360,6 +57360,97 @@ def _normalize_thirdparty_roster_events(events):
     return events
 
 
+# ── easyJet Crew-Roster-iCal ────────────────────────────────────────────────
+# Der easyJet-Feed liefert DTSTART als Report-/Duty-Beginn. Die echten UTC-
+# Flugzeiten stehen ausschließlich in LOCATION:
+#   SUMMARY:8111  LGW-ALC
+#   LOCATION:(1120Z-1355Z) LGW
+# Ein generischer iCal-Import interpretiert sonst 10:20Z (Report) als Abflug
+# und kennt weder Carrier noch strukturierte Sektoren. Die Normalisierung ist
+# absichtlich auf ein easyJet-Profil gegated: persönliche Kalenderereignisse
+# mit ähnlich aussehendem Text dürfen niemals umgeschrieben werden.
+_EASYJET_FLIGHT_RE = re.compile(
+    r'^\s*(\d{1,4})\s+([A-Z]{3})\s*[-–]\s*([A-Z]{3})\s*$', re.I)
+_EASYJET_BLOCK_RE = re.compile(
+    r'^\s*\((\d{2})(\d{2})Z-(\d{2})(\d{2})Z\)\s*([A-Z]{3})\s*$', re.I)
+_EASYJET_STANDBY_RE = re.compile(
+    r'^\s*(CSBL|CSBY|LSBY|PSBL)\s+(?P<station>[A-Z]{3})\s*[-–]\s*'
+    r'(?P=station)\s*$', re.I)
+
+
+def _easyjetify_roster_events(events, token=None):
+    """Normalisiert ausschließlich bestätigte easyJet-Profile in-place.
+
+    Flugnummern erhalten den U2-Prefix; `_exact_leg_times` bewahrt die im Feed
+    ausdrücklich gelieferten Zulu-Blockzeiten, während DTSTART unverändert als
+    Reportzeit bleibt. Die vier im realen Feed belegten Boden-Codes werden zu
+    Standby-Markern, damit sie weder als LGW-LGW-Pseudo-Flug noch als Blockzeit
+    zählen. Unvollständige/implausible Events bleiben unverändert; wir raten
+    keine Zeiten oder Routen.
+    """
+    try:
+        if not token:
+            return events
+        profile = (_profile_load(token) or {}).get('profile') or {}
+        if _canonical_airline_key(profile.get('airline')) != 'EASYJET':
+            return events
+        for ev in (events or []):
+            summary = (ev.get('summary') or '').strip()
+            standby = _EASYJET_STANDBY_RE.match(summary)
+            if standby:
+                code = standby.group(1).upper()
+                station = standby.group('station').upper()
+                ev['summary'] = f'Standby {station} ({code})'
+                ev['location'] = station
+                continue
+
+            flight = _EASYJET_FLIGHT_RE.match(summary)
+            block = _EASYJET_BLOCK_RE.match(
+                (ev.get('location') or '').strip())
+            if not flight or not block:
+                continue
+            number, frm, to = (flight.group(1), flight.group(2).upper(),
+                               flight.group(3).upper())
+            if frm == to or block.group(5).upper() != frm:
+                continue
+            try:
+                report = datetime.fromisoformat(
+                    (ev.get('start_iso') or '').replace('Z', '+00:00'))
+                if report.tzinfo is None:
+                    report = report.replace(tzinfo=timezone.utc)
+                report = report.astimezone(timezone.utc)
+                dep = report.replace(hour=int(block.group(1)),
+                                     minute=int(block.group(2)),
+                                     second=0, microsecond=0)
+                while dep < report:
+                    dep += timedelta(days=1)
+                arr = dep.replace(hour=int(block.group(3)),
+                                  minute=int(block.group(4)))
+                while arr <= dep:
+                    arr += timedelta(days=1)
+                report_gap = (dep - report).total_seconds() / 60.0
+                block_min = int((arr - dep).total_seconds() / 60.0)
+                if not (0 <= report_gap <= 6 * 60
+                        and 20 <= block_min <= 18 * 60):
+                    continue
+            except Exception:
+                continue
+            normalized_number = str(int(number))
+            ev['summary'] = f'U2{normalized_number} {frm} - {to}'
+            ev['_exact_leg_times'] = [
+                (dep.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                 arr.strftime('%Y-%m-%dT%H:%M:%SZ'))]
+            ev['_exact_block_minutes'] = block_min
+    except Exception as e:
+        try:
+            app.logger.warning(
+                f'[ics-easyjet] normalize-fail: {type(e).__name__}: '
+                f'{str(e)[:120]}')
+        except Exception:
+            pass
+    return events
+
+
 def _generic_layover_synthesis(events, token=None):
     """Layover-Synthese für Feeds OHNE eigene LAYOVER-Events (Condor/cube,
     offblock, Edelweiss-Outlook, …): aufeinanderfolgende Flug-Legs a→b mit
@@ -57423,11 +57514,13 @@ def _generic_layover_synthesis(events, token=None):
             # Edelweiss-Stempel: echte letzte Ankunft / erster Abflug des
             # Folge-Duty statt Duty-Ende/Report (macht die Layover-Spanne
             # zur ehrlichen Boden-Zeit — Yanic-Punkt 4 „Layover verkürzt").
-            _a_wk = a[0].get('_wk_leg_times')
-            _b_wk = b[0].get('_wk_leg_times')
-            a_end = ((_a_wk[-1][1] if _a_wk else '')
+            _a_bounds = (a[0].get('_exact_leg_times')
+                         or a[0].get('_wk_leg_times'))
+            _b_bounds = (b[0].get('_exact_leg_times')
+                         or b[0].get('_wk_leg_times'))
+            a_end = ((_a_bounds[-1][1] if _a_bounds else '')
                      or (a[0].get('end_iso') or '')).strip()
-            b_start = ((_b_wk[0][0] if _b_wk else '')
+            b_start = ((_b_bounds[0][0] if _b_bounds else '')
                        or (b[0].get('start_iso') or '')).strip()
             gap_min = _iso_minutes_between(a_end, b_start)
             if gap_min is None or not (6 * 60 <= gap_min <= _max_gap_min):
@@ -57914,9 +58007,10 @@ def _ics_events_to_briefings(events, existing=None):
                     # Edelweiss-Duty mit _edelweissify-Stempel: Block = echte
                     # Flugzeit-Summe (Duty-Fenster minus Report-/Boden-/
                     # Duty-Ende-Offsets) statt der Offset-Heuristik unten.
-                    _wk_blk = ev.get('_wk_block_minutes')
-                    if _wk_blk and 0 < int(_wk_blk) < 24 * 60:
-                        block_min += int(_wk_blk)
+                    _exact_blk = (ev.get('_exact_block_minutes')
+                                  or ev.get('_wk_block_minutes'))
+                    if _exact_blk and 0 < int(_exact_blk) < 24 * 60:
+                        block_min += int(_exact_blk)
                     else:
                         dur = _iso_minutes_between(start_iso, end_iso)
                         if dur and 0 < dur < 24 * 60:
@@ -57947,11 +58041,13 @@ def _ics_events_to_briefings(events, existing=None):
                     # Gleichverteilungs-Interpolation. Ein-Leg ohne Stempel
                     # bleibt der bisherige Pfad (DTSTART/DTEND).
                     _parsed = _ics_parse_multi_leg_summary(summary)
-                    _wkb = ev.get('_wk_leg_times')
-                    if _wkb and len(_wkb) != len(_parsed):
-                        _wkb = None
+                    _exact_bounds = (ev.get('_exact_leg_times')
+                                     or ev.get('_wk_leg_times'))
+                    if (_exact_bounds
+                            and len(_exact_bounds) != len(_parsed)):
+                        _exact_bounds = None
                     if len(_parsed) >= 2:
-                        _bounds = _wkb or _ics_multi_leg_bounds(
+                        _bounds = _exact_bounds or _ics_multi_leg_bounds(
                             start_iso, end_iso, len(_parsed))
                         _leg_items = [
                             (f or '', frm2, to2,
@@ -57965,8 +58061,10 @@ def _ics_events_to_briefings(events, existing=None):
                         # laufen intern durch den Alt-Parser → unverändert.
                         _f1, _frm1, _to1 = _parsed[0]
                         _leg_items = [(_f1 or '', _frm1, _to1,
-                                       (_wkb[0][0] if _wkb else start_iso),
-                                       (_wkb[0][1] if _wkb else end_iso))]
+                                       (_exact_bounds[0][0]
+                                        if _exact_bounds else start_iso),
+                                       (_exact_bounds[0][1]
+                                        if _exact_bounds else end_iso))]
                     else:
                         _flt, _frm, _to = _ics_parse_flight_leg_summary(summary)
                         _leg_items = ([(_flt or '', _frm, _to, start_iso, end_iso)]
@@ -58107,13 +58205,13 @@ def _build_ical_sectors(events, identity_mode='legacy'):
         # Interpolation. Greift auch bei EINEM gestempelten Leg (der alte
         # Ein-Leg-Pfad nähme sonst Report→Duty-Ende als Flugzeit).
         _mlegs = _ics_parse_multi_leg_summary(ev.get('summary') or '')
-        _wk_bounds = ev.get('_wk_leg_times')
-        if _wk_bounds and len(_wk_bounds) != len(_mlegs):
-            _wk_bounds = None
-        if len(_mlegs) >= 2 or (_mlegs and _wk_bounds):
-            _bounds = _wk_bounds or _ics_multi_leg_bounds(ev.get('start_iso'),
-                                                          ev.get('end_iso'),
-                                                          len(_mlegs))
+        _exact_bounds = (ev.get('_exact_leg_times')
+                         or ev.get('_wk_leg_times'))
+        if _exact_bounds and len(_exact_bounds) != len(_mlegs):
+            _exact_bounds = None
+        if len(_mlegs) >= 2 or (_mlegs and _exact_bounds):
+            _bounds = _exact_bounds or _ics_multi_leg_bounds(
+                ev.get('start_iso'), ev.get('end_iso'), len(_mlegs))
             for _i, (_mf, _mfrm, _mto) in enumerate(_mlegs):
                 _dep, _arr = (_bounds[_i] if _bounds
                               else (ev.get('start_iso') or '',
@@ -59860,6 +59958,7 @@ def import_calendar_feed(token):
     # Briefings, Reconcile und Sektoren dieselbe (korrigierte) Event-Liste sehen.
     # Drittanbieter-Dialekte (Condor C/I+P/U, offblock ✈/ICAO) → LH-Form.
     events = _normalize_thirdparty_roster_events(events)
+    events = _easyjetify_roster_events(events, token=token)
     events = _swissify_roster_events(events, token=token)
     # LH-Tagesbucket (Audit 2026-07-31 Befund 1): Flug-Legs mit expliziter
     # UTC-Zeit aufs UTC-Datum keyen (amtliche LH-Zuordnung, wie die Sektoren) —
@@ -59896,6 +59995,7 @@ def import_calendar_feed(token):
                 _rows = (_legacy_normalized if _name == 'legacy'
                          else _candidate_normalized)
                 _rows = _normalize_thirdparty_roster_events(_rows)
+                _rows = _easyjetify_roster_events(_rows, token=token)
                 _rows = _swissify_roster_events(_rows, token=token)
                 _rows = _lh_rebucket_utc_flight_days(_rows)
                 _rows = _itaify_roster_events(_rows, token=token)
@@ -60286,12 +60386,17 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
         """Resolve printed CrewAccess dates across month boundaries.
 
         Preview PDFs commonly append the first day of the following month.
-        The printed weekday is authoritative enough to distinguish that row
-        from day 01 of the planning month.  Reject contradictions instead of
-        silently placing a flight on the wrong date.
+        Some released exports also prefix the complete previous calendar
+        month (usually ``NF`` rows) before the actual planning period.  The
+        printed weekday is authoritative enough to distinguish those rows
+        from the same day number in the planning month.  Reject contradictions
+        instead of silently placing a flight on the wrong date.
         """
         serial = year * 12 + month - 1
         period_start = _date(year, month, 1)
+        previous_serial = serial - 1
+        previous_start = _date(
+            previous_serial // 12, previous_serial % 12 + 1, 1)
         next_serial = serial + 1
         period_end = (_date(next_serial // 12, next_serial % 12 + 1, 1)
                       - _td(days=1))
@@ -60303,7 +60408,7 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
                     shifted // 12, shifted % 12 + 1, int(dom))
             except ValueError:
                 continue
-            if (period_start - _td(days=7) <= candidate
+            if (previous_start <= candidate
                     <= period_end + _td(days=7)
                     and candidate.strftime('%a') == weekday):
                 candidates.append(candidate)
@@ -63127,6 +63232,7 @@ def upload_calendar_events(token):
             adapted.append(adapted_ev)
         # SWISS-Nachbearbeitung (F1/F5) auch im EKEvent-Pfad — no-op für LH.
         adapted = _normalize_thirdparty_roster_events(adapted)
+        adapted = _easyjetify_roster_events(adapted, token=token)
         adapted = _swissify_roster_events(adapted, token=token)
         # ITA/ER-Duty auch hier (abonnierter iCloud-Kalender via EventKit trägt
         # dieselben Rome-mislabelten Zeiten); Relevanz-Auswahl wie im URL-Pfad.
