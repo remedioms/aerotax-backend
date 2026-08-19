@@ -60019,6 +60019,8 @@ _CREWACCESS_MONTHS = {
 }
 _CREWACCESS_DAY_RE = re.compile(
     r'^(\d{1,2})\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b\s*(.*)$')
+_CREWACCESS_DATED_ROW_RE = re.compile(
+    r'^(\d{1,2})\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b\s*(.*)$')
 # Leg-Zeile: optionale Prefix-Tokens (Tag + Pos, z.B. „ALT_F FO" oder „LCK
 # FO" im Published Roster; nur Pos „FO" im Preview) vor der Flugnummer.
 _CREWACCESS_LEG_RE = re.compile(
@@ -60081,11 +60083,44 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
     from datetime import date as _date, timedelta as _td, timezone as _tzu
     from zoneinfo import ZoneInfo as _ZI
 
-    def day_date(dom):
-        try:
-            return _date(year, month, int(dom))
-        except ValueError:
+    def day_date(dom, weekday, previous=None):
+        """Resolve printed CrewAccess dates across month boundaries.
+
+        Preview PDFs commonly append the first day of the following month.
+        The printed weekday is authoritative enough to distinguish that row
+        from day 01 of the planning month.  Reject contradictions instead of
+        silently placing a flight on the wrong date.
+        """
+        serial = year * 12 + month - 1
+        period_start = _date(year, month, 1)
+        next_serial = serial + 1
+        period_end = (_date(next_serial // 12, next_serial % 12 + 1, 1)
+                      - _td(days=1))
+        candidates = []
+        for offset in (-1, 0, 1):
+            shifted = serial + offset
+            try:
+                candidate = _date(
+                    shifted // 12, shifted % 12 + 1, int(dom))
+            except ValueError:
+                continue
+            if (period_start - _td(days=7) <= candidate
+                    <= period_end + _td(days=7)
+                    and candidate.strftime('%a') == weekday):
+                candidates.append(candidate)
+        if not candidates:
             return None
+        if previous is not None:
+            forward = [candidate for candidate in candidates
+                       if candidate >= previous]
+            if forward:
+                return min(forward)
+        current = [candidate for candidate in candidates
+                   if candidate.year == year and candidate.month == month]
+        if current:
+            return current[0]
+        anchor = _date(year, month, 1)
+        return min(candidates, key=lambda value: abs((value - anchor).days))
 
     events = []   # (uid_suffix, dtstart, dtend, summary, all_day[, tzid, loc])
 
@@ -60143,6 +60178,7 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
 
     in_table = False
     cur_day = None
+    last_day = None
     cur_report = None   # (HH:MM UTC, date) — noch nicht verbrauchte Report-Zeit
     pending = None      # offener Übernacht-Opener: (num, frm, t1, dep_day, report)
     for raw in (text or '').splitlines():
@@ -60157,11 +60193,17 @@ def _crewaccess_text_to_ics(text, carrier='VL'):
             continue
         if not in_table:
             continue
-        dm = _CREWACCESS_DAY_RE.match(line)
+        dm = _CREWACCESS_DATED_ROW_RE.match(line)
         rest = line
         if dm:
-            cur_day = day_date(dm.group(1))
-            rest = (dm.group(2) or '').strip()
+            resolved_day = day_date(dm.group(1), dm.group(2), last_day)
+            if resolved_day is None:
+                return None, 'invalid_roster_day'
+            if last_day is not None and resolved_day < last_day:
+                return None, 'non_monotonic_roster_day'
+            cur_day = resolved_day
+            last_day = resolved_day
+            rest = (dm.group(3) or '').strip()
             cur_report = None
             if cur_day is None:
                 continue
@@ -61388,6 +61430,161 @@ _ROSTER_AI_SYSTEM = (
     "PDF mehrere Monate enthält)."
 )
 
+_ROSTER_AI_OCR_SYSTEM = (
+    "Du transkribierst Crew-Dienstpläne aus PDF-Seiten. Gib ausschließlich "
+    "den vollständigen sichtbaren Dienstplantext zurück, ohne Erklärung, "
+    "Markdown-Tabelle oder Code-Fence. Bewahre Seiten- und Zeilenreihenfolge. "
+    "Trenne sichtbare Tabellenspalten mit genau einem Leerzeichen. Kopiere "
+    "Datumszahl, Wochentag, Report-Zeit, Tags, Position, Aktivität, From, To, "
+    "Start, Ende, A/C, Layover und Trip ID exakt; rechne und korrigiere nichts. "
+    "Transkribiere auch Planning period, Date-Header, OFF Days, Block time und "
+    "Created-Zeilen. Bei unlesbaren Zeichen schreibe [?], niemals einen "
+    "geratenen Wert."
+)
+
+
+def _roster_ai_call_anthropic_pdf(data):
+    """One visual transcription call for an image-only roster PDF."""
+    key = (os.getenv('ANTHROPIC_API_KEY') or '').strip()
+    model = (os.getenv('AEROX_ROSTER_AI_MODEL') or '').strip() or 'claude-opus-5'
+    if not key:
+        return None, model
+    import requests as _requests
+    content = [
+        {
+            'type': 'document',
+            'source': {
+                'type': 'base64',
+                'media_type': 'application/pdf',
+                'data': base64.b64encode(data).decode('ascii'),
+            },
+        },
+        {
+            'type': 'text',
+            'text': ('Transkribiere dieses PDF jetzt nach den Systemregeln. '
+                     'Gib nur den transkribierten Text zurück.'),
+        },
+    ]
+    body = {
+        'model': model,
+        'max_tokens': _ROSTER_AI_MAX_TOKENS,
+        'system': _ROSTER_AI_OCR_SYSTEM,
+        'messages': [{'role': 'user', 'content': content}],
+    }
+    effort = os.getenv('AEROX_ROSTER_AI_EFFORT')
+    effort = 'low' if effort is None else effort.strip()
+    if effort:
+        body['output_config'] = {'effort': effort}
+    resp = _requests.post(
+        'https://api.anthropic.com/v1/messages',
+        headers={'x-api-key': key,
+                 'anthropic-version': '2023-06-01',
+                 'Content-Type': 'application/json'},
+        json=body,
+        timeout=_ROSTER_AI_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    parts = resp.json().get('content') or []
+    raw = ''.join(part.get('text', '') for part in parts
+                  if part.get('type') == 'text').strip()
+    if raw.startswith('```'):
+        raw = re.sub(r'^```[a-zA-Z]*\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+    return raw.strip(), model
+
+
+def _crewaccess_ocr_block_time_matches(text, ics, carrier='VL'):
+    """Checksum an OCR transcript against CrewAccess' printed block total.
+
+    The summary excludes a next-month carry-out row, so only legs whose UTC
+    departure lies in the printed planning month contribute to the checksum.
+    """
+    period = re.search(
+        r'Planning period:\s*([A-Za-z]+)\s+(\d{4})', text or '')
+    total = re.search(
+        r'(?im)^\s*Block\s+time\s+(\d{1,3}):([0-5]\d)\b', text or '')
+    if not period or not total:
+        return False
+    month = _CREWACCESS_MONTHS.get(period.group(1).lower())
+    if not month:
+        return False
+    year = int(period.group(2))
+    expected = int(total.group(1)) * 60 + int(total.group(2))
+    actual = 0
+    legs = 0
+    for block in re.findall(
+            r'BEGIN:VEVENT\r?\n(.*?)\r?\nEND:VEVENT', ics or '', re.DOTALL):
+        summary = re.search(r'(?m)^SUMMARY:(.*)$', block)
+        if not summary or not re.search(
+                rf'\b{re.escape(carrier)}\d{{1,4}}[A-Z]?\s+[A-Z]{{3}}\s+-\s+[A-Z]{{3}}\b',
+                summary.group(1)):
+            continue
+        start = re.search(r'(?m)^DTSTART:(\d{8}T\d{6})Z\r?$', block)
+        end = re.search(r'(?m)^DTEND:(\d{8}T\d{6})Z\r?$', block)
+        if not start or not end:
+            return False
+        try:
+            start_dt = datetime.strptime(start.group(1), '%Y%m%dT%H%M%S')
+            end_dt = datetime.strptime(end.group(1), '%Y%m%dT%H%M%S')
+        except ValueError:
+            return False
+        if start_dt.year == year and start_dt.month == month:
+            duration = int((end_dt - start_dt).total_seconds() // 60)
+            if duration <= 0 or duration > 24 * 60:
+                return False
+            actual += duration
+            legs += 1
+    return legs > 0 and actual == expected
+
+
+def _roster_ai_ocr_pdf_text(data, token, det_error='pdf_no_text'):
+    """Visual OCR for image-only PDFs, accepted only by a known parser.
+
+    This does not create events from free-form model output.  The transcript
+    must pass the deterministic CrewAccess parser, printed-weekday date
+    checks, and the document's own block-time checksum before it is returned.
+    """
+    if (not data or len(data) > 8 * 1024 * 1024
+            or not bytes(data).startswith(b'%PDF-')):
+        return None
+    if not (os.getenv('ANTHROPIC_API_KEY') or '').strip():
+        app.logger.info(f'[roster-ai-ocr] skip-no-key tok={token[:8]} '
+                        f'det_error={det_error}')
+        return None
+    if not _roster_ai_budget_take(token):
+        app.logger.warning(f'[roster-ai-ocr] daily-cap tok={token[:8]} '
+                           f'max={_ROSTER_AI_DAILY_MAX}')
+        return None
+
+    src_sha = _hashlib.sha256(data).hexdigest()
+    app.logger.info(
+        f'[roster-ai-ocr] call tok={token[:8]} det_error={det_error} '
+        f'bytes={len(data)} sha={src_sha[:16]}')
+    try:
+        transcript, model = _roster_ai_call_anthropic_pdf(data)
+    except Exception as exc:
+        app.logger.warning(f'[roster-ai-ocr] call-fail tok={token[:8]} '
+                           f'err={type(exc).__name__}: {str(exc)[:160]}')
+        return None
+    if not transcript or len(transcript) > _ROSTER_AI_MAX_CHARS:
+        app.logger.warning(f'[roster-ai-ocr] empty-or-too-long tok={token[:8]} '
+                           f'model={model}')
+        return None
+
+    ics, parser_error = _crewaccess_text_to_ics(transcript, carrier='VL')
+    if parser_error or not ics:
+        app.logger.warning(f'[roster-ai-ocr] parser-reject tok={token[:8]} '
+                           f'error={parser_error or "empty_ics"} '
+                           f'sha={src_sha[:16]}')
+        return None
+    if not _crewaccess_ocr_block_time_matches(transcript, ics, carrier='VL'):
+        app.logger.warning(f'[roster-ai-ocr] checksum-reject tok={token[:8]} '
+                           f'sha={src_sha[:16]}')
+        return None
+    app.logger.info(f'[roster-ai-ocr] accepted tok={token[:8]} '
+                    f'chars={len(transcript)} sha={src_sha[:16]}')
+    return transcript
+
 
 def _roster_ai_budget_take(token):
     """Tagesdeckel: max. `_ROSTER_AI_DAILY_MAX` KI-Läufe pro Token und Tag.
@@ -62344,6 +62541,15 @@ def import_roster_pdf(token):
                 'Das Dienstplan-PDF konnte nicht gelesen werden.')
             return jsonify({'ok': False, 'error': 'pdf_extract_failed',
                             'monitoring_queued': all(queued)}), 422
+
+        # Screenshot-/Scan-PDFs haben valide Seiten, aber keine Textschicht.
+        # Der visuelle Call liefert nur eine Transkription; akzeptiert wird sie
+        # ausschließlich, wenn der bekannte CrewAccess-Parser plus gedruckter
+        # Blockzeit-Checksumme sie vollständig bestätigen.
+        if not text.strip():
+            text = _roster_ai_ocr_pdf_text(data, token) or ''
+            if text:
+                ai_fallback_used = True
 
         informational_kind = _pdf_informational_only_kind(text)
         if informational_kind:

@@ -87,6 +87,34 @@ def test_parser_red_eye_leg_crosses_midnight():
     assert 'DTEND:20260824T001000Z' in ics
 
 
+def test_parser_uses_printed_weekday_for_next_month_carry_out():
+    """CrewAccess appends the first day of the following month.  The printed
+    weekday must keep that row out of day 01 of the planning month."""
+    text = """Roster Preview
+Planning period: September 2026
+Date Report (UTC) Tags Pos Activity From To Start (UTC) End (UTC) A/C Layover Trip ID
+30 Wed 11:40 JC 1144 FRA BIO 13:00 15:10 32N 834204
+01 Thu 07:50 JC 1087 MRS FRA 08:50 10:35 32N
+Created 16Aug2026 16:17 (UTC) by 000000X 1 ( 1)
+"""
+    ics, err = backend._crewaccess_text_to_ics(text, carrier='VL')
+    assert err is None
+    assert 'DTSTART:20260930T130000Z' in ics
+    assert 'DTSTART:20261001T085000Z' in ics
+    assert 'DTSTART:20260901T085000Z' not in ics
+
+
+def test_parser_rejects_contradictory_printed_weekday():
+    text = """Roster Preview
+Planning period: September 2026
+Date Report (UTC) Tags Pos Activity From To Start (UTC) End (UTC) A/C Layover Trip ID
+30 Fri 11:40 JC 1144 FRA BIO 13:00 15:10 32N 834204
+Created 16Aug2026 16:17 (UTC) by 000000X 1 ( 1)
+"""
+    ics, err = backend._crewaccess_text_to_ics(text, carrier='VL')
+    assert ics is None and err == 'invalid_roster_day'
+
+
 def test_parser_pipeline_roundtrip_sectors():
     ics, err = backend._crewaccess_text_to_ics(SYN_TEXT, carrier='VL')
     assert err is None

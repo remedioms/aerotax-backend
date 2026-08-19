@@ -20,6 +20,7 @@ import io
 import json
 import os
 import sys
+import base64
 
 import pytest
 import requests
@@ -54,6 +55,19 @@ GOOD_ITEMS = [
      'from_iata': 'DUS', 'to_iata': 'PMI', 'flight_no': 'SR101',
      'all_day': False},
 ]
+
+OCR_CREWACCESS_TEXT = """Roster Preview
+Planning period: September 2026
+MUSTER, Test Crew
+Rank: JC Base: FRA
+Date Report (UTC) Tags Pos Activity From To Start (UTC) End (UTC) A/C Layover Trip ID
+30 Wed 11:40 JC 1144 FRA BIO 13:00 15:10 32N 834204
+01 Thu 07:50 JC 1087 MRS FRA 08:50 10:35 32N
+01Sep-30Sep2026 Jan - Sep
+OFF Days 0 0
+Block time 2:10
+Created 16Aug2026 16:17 (UTC) by 000000X 1 ( 1)
+"""
 
 
 class _FakeResponse:
@@ -153,6 +167,69 @@ def test_effort_can_be_switched_off_for_legacy_models(monkeypatch):
     assert backend._roster_ai_fallback_ics(
         UNKNOWN_TEXT, 'AT-TEST-AI-EFFORT', 'unsupported_pdf_format')
     assert 'output_config' not in calls[0]['body']
+
+
+# ── 1b. Bild-PDF: visuelle Transkription, danach deterministischer Parser ─
+def test_image_only_pdf_ocr_requires_known_parser_and_checksum(monkeypatch):
+    calls = []
+    pdf = b'%PDF-1.4\nsynthetic-image-only'
+    _mock_post(monkeypatch, {
+        'content': [{'type': 'text', 'text': OCR_CREWACCESS_TEXT}],
+    }, calls)
+
+    transcript = backend._roster_ai_ocr_pdf_text(
+        pdf, 'AT-TEST-AI-OCR', 'pdf_no_text')
+    assert transcript == OCR_CREWACCESS_TEXT.strip()
+    assert len(calls) == 1
+    content = calls[0]['body']['messages'][0]['content']
+    assert content[0]['type'] == 'document'
+    assert content[0]['source']['media_type'] == 'application/pdf'
+    assert base64.b64decode(content[0]['source']['data']) == pdf
+    # Folgemonatszeile ist nicht Teil der gedruckten September-Blockzeit.
+    ics, err = backend._crewaccess_text_to_ics(transcript, carrier='VL')
+    assert err is None
+    assert backend._crewaccess_ocr_block_time_matches(transcript, ics)
+    assert 'DTSTART:20261001T085000Z' in ics
+
+
+def test_image_only_pdf_ocr_rejects_checksum_mismatch(monkeypatch, caplog):
+    _mock_post(monkeypatch, {
+        'content': [{'type': 'text', 'text':
+                     OCR_CREWACCESS_TEXT.replace('Block time 2:10',
+                                                 'Block time 9:59')}],
+    })
+    caplog.set_level('WARNING')
+    assert backend._roster_ai_ocr_pdf_text(
+        b'%PDF-1.4\nsynthetic', 'AT-TEST-AI-OCR-BAD') is None
+    assert 'checksum-reject' in caplog.text
+
+
+def test_endpoint_image_only_pdf_uses_checked_visual_transcript(monkeypatch):
+    from unittest.mock import patch
+
+    _mock_post(monkeypatch, {
+        'content': [{'type': 'text', 'text': OCR_CREWACCESS_TEXT}],
+    })
+    pdf_bytes = _text_to_pdf('')
+    token = 'AT-TEST-AI-OCR-ENDPOINT'
+    _clear_user_state(token)
+    client = backend.app.test_client()
+    valid = backend._TokenValidationResult(
+        backend._TokenValidationState.VALID, 'ai-ocr@example.test')
+    with patch.object(backend, '_validate_token', return_value=valid), \
+            patch.object(backend, '_BUG004_REQUIRE_TOKEN_BINDING', False), \
+            patch.object(backend, '_roster_pdf_upload_store',
+                         return_value=True):
+        rv = client.post(
+            f'/api/user/roster-pdf/{token}/import',
+            data={'pdf': (io.BytesIO(pdf_bytes), 'scan.pdf'),
+                  'airline': 'Lufthansa City'},
+            content_type='multipart/form-data')
+    payload = rv.get_json() or {}
+    assert rv.status_code == 200, payload
+    assert payload.get('ok') is True
+    assert payload.get('source') == 'ki_fallback'
+    assert payload.get('events_count') == 2
 
 
 # ── 2. Halluzinations-Guard ────────────────────────────────────────────────
