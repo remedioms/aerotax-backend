@@ -69,6 +69,7 @@ STATUS_PROCESSING = "processing"
 STATUS_REVIEW = "review"      # wartet auf Menschen; terminal, App pollt nicht
 STATUS_FAILED = "failed"
 STATUS_COMPLETED = "completed"
+MS_MAM_ENCRYPTED_PREFIX = b"\x00MSMAMARPCRYPT\x00"
 # Endzustände: einmal erreicht, NIE von der Notbremse in main() zurückgedreht.
 TERMINAL_STATUS = (STATUS_COMPLETED, STATUS_FAILED, STATUS_REVIEW)
 
@@ -724,7 +725,7 @@ def process_token_batch(token, rows, events, terminal=None):
             terminal.difference_update(target_ids)
 
     _status(ids, STATUS_PROCESSING)
-    parsed_files, unsupported, seen_sha = [], [], {}
+    parsed_files, unsupported, encrypted, seen_sha = [], [], [], {}
     review = []
 
     for row in rows:
@@ -744,6 +745,13 @@ def process_token_batch(token, rows, events, terminal=None):
             parsed_files.append({"id": rid, "dup_of": seen_sha[sha]})
             continue
         seen_sha[sha] = rid
+        if blob.startswith(MS_MAM_ENCRYPTED_PREFIX):
+            # Microsoft Intune/MAM company protection wraps an otherwise
+            # ordinary-looking '.pdf' in ciphertext. This is permanent for
+            # the server (the employer key is intentionally unavailable), so
+            # retaining it in operator review cannot unlock a parser fix.
+            encrypted.append(rid)
+            continue
         if _is_supported_image(row.get("filename"), blob):
             review.append((
                 rid,
@@ -917,14 +925,17 @@ def process_token_batch(token, rows, events, terminal=None):
     # `completed` oder endgültig `failed` zu werden. Original
     # außerhalb dieses Laufs (früher verarbeitet) ⇒ Inhalt ist erledigt ⇒
     # completed ohne Push.
+    failed_ids = set(encrypted)
     failed_dups = []
     if dups:
         real_ids = {f["id"] for f in real + informational}
         review_ids = set(review_by_id)
+        failed_dups = [f["id"] for f in dups
+                       if f["dup_of"] in failed_ids]
         review_dups = [f["id"] for f in dups if f["dup_of"] in review_ids]
         done_dups = [f["id"] for f in dups
                      if f["dup_of"] in real_ids or f["dup_of"] not in
-                     set(unsupported) | real_ids | review_ids]
+                     set(unsupported) | real_ids | review_ids | failed_ids]
         if review_dups:
             _status(review_dups, STATUS_REVIEW, processed=False,
                     error_code="needs_review",
@@ -934,6 +945,18 @@ def process_token_batch(token, rows, events, terminal=None):
         events.append(("dups", token,
                        {"failed": failed_dups, "review": review_dups,
                         "completed": done_dups}, ""))
+
+    failed = sorted(encrypted + failed_dups)
+    if failed:
+        message = (
+            "Die Datei ist durch Microsoft-Unternehmensschutz verschlüsselt. "
+            "Bitte eine ungeschützte PDF aus Dateien/Downloads exportieren "
+            "und erneut hochladen."
+        )
+        _status(failed, STATUS_FAILED, processed=True,
+                error_code="encrypted_document", error_message=message)
+        _push_failed(token, max(failed))
+        events.append(("failed", token, failed, message))
 
     # Unbekannte Formate sind kein Nutzerfehler. Sie bleiben samt Payload im
     # Review und erzeugen deshalb bewusst keinen „bitte erneut hochladen“-Push.

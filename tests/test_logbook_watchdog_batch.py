@@ -132,6 +132,22 @@ def test_dup_of_unsupported_inherits_review(monkeypatch):
     assert not h.upserts
 
 
+def test_microsoft_mam_encrypted_pdf_and_duplicate_fail_once(monkeypatch):
+    """Operator review cannot decrypt MAM; purge both copies and push once."""
+    blob = w.MS_MAM_ENCRYPTED_PREFIX + b'ciphertext'
+    h = Harness(monkeypatch, {50: (blob, "unsupported"),
+                              51: (blob, "unsupported")})
+    events = []
+    w.process_token_batch(
+        "AT-TEST", [_row(50, blob), _row(51, blob)], events)
+    assert h.statuses_for(50)[-1] == (w.STATUS_FAILED, True)
+    assert h.statuses_for(51)[-1] == (w.STATUS_FAILED, True)
+    assert h.pushes == [("failed", "AT-TEST", 51)]
+    assert not h.upserts
+    assert any(event[0] == "failed" and event[2] == [50, 51]
+               for event in events)
+
+
 def test_merge_conflict_sends_whole_batch_to_review(monkeypatch):
     clash = dict(LEG_A, block_min=999)
     h = Harness(monkeypatch, {7: (b"pdf-7", [clash])},

@@ -24175,6 +24175,7 @@ _LOGBOOK_IMPORT_MAX_BYTES = 15 * 1024 * 1024   # Resend-Attachment-Limit 40MB ge
 _LOGBOOK_IMPORT_EXTS = ('.csv', '.txt', '.tsv', '.xls', '.xlsx', '.numbers',
                         '.pdf', '.json', '.zip', '.jpg', '.jpeg', '.png',
                         '.heic', '.heif', '.webp')
+_LOGBOOK_MS_MAM_ENCRYPTED_PREFIX = b'\x00MSMAMARPCRYPT\x00'
 _LOGBOOK_IMPORT_TS = {}            # token -> [epoch, ...] (in-memory Throttle)
 _LOGBOOK_IMPORT_TS_LOCK = _req_threading.Lock()
 # Uploads pro Token und 24 h. 5 war für das Nachtragen alter Monate zu knapp:
@@ -24413,6 +24414,19 @@ def upload_logbook_import(token):
     if len(blob) > _LOGBOOK_IMPORT_MAX_BYTES:
         return jsonify({'ok': False, 'error': 'file_too_large',
                         'message': 'Datei zu groß (max. 15 MB).'}), 413
+    # Microsoft Intune/MAM can export a company-protected wrapper whose name
+    # still ends in '.pdf'. Its stable MSMAMARPCRYPT header proves that the
+    # bytes are encrypted before they reach AeroX; no PDF/parser can read it
+    # without the employer's MAM key. Reject before disk/Supabase/mail so the
+    # private ciphertext does not sit in the operator review queue for 14 days.
+    if blob.startswith(_LOGBOOK_MS_MAM_ENCRYPTED_PREFIX):
+        return jsonify({
+            'ok': False,
+            'error': 'encrypted_document',
+            'message': ('Die Datei ist durch den Unternehmensschutz '
+                        'verschlüsselt. Bitte eine ungeschützte PDF aus '
+                        'Dateien/Downloads exportieren und erneut hochladen.'),
+        }), 415
     # Dateiname säubern + Endungs-Whitelist (Export-Formate der Logbuch-Apps).
     filename = re.sub(r'[^A-Za-z0-9._ ()-]', '_', filename)[-120:].strip() \
         or 'flugbuch-export'

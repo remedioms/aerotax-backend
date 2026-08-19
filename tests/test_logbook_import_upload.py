@@ -119,6 +119,18 @@ def test_upload_accepts_duty_plan_screenshot(monkeypatch):
     assert sent['filename'] == 'Dienstplan.png'
 
 
+def test_upload_rejects_microsoft_mam_encrypted_pdf(monkeypatch):
+    """A .pdf name must not hide company-protected, unreadable ciphertext."""
+    A._LOGBOOK_IMPORT_TS.clear()
+    blob = A._LOGBOOK_MS_MAM_ENCRYPTED_PREFIX + b'ciphertext'
+    r, sent = _post(_client(), 'tok_upload_mam', 'Flugstunden.pdf', blob,
+                    monkeypatch=monkeypatch)
+    assert r.status_code == 415
+    assert r.get_json()['error'] == 'encrypted_document'
+    assert 'ungeschützte PDF' in r.get_json()['message']
+    assert not sent, 'verschlüsselte Datei darf weder gespeichert noch versandt werden'
+
+
 def test_upload_rejects_oversize(monkeypatch):
     A._LOGBOOK_IMPORT_TS.clear()
     big = b'0' * (A._LOGBOOK_IMPORT_MAX_BYTES + 1)
