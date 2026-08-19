@@ -1318,7 +1318,8 @@ def _fetch_fr24(hex_id, callsign=None):
     return None
 
 
-def _live_position_cascade(hex_param, reg_param='', targeted=False, callsign=''):
+def _live_position_cascade(hex_param, reg_param='', targeted=False, callsign='',
+                           allow_paid=None):
     """Dünner Adapter auf die EINE Positions-Quelle (warehouse_reader.
     position_for_flight). Signatur & Rückgabe UNVERÄNDERT, damit alle
     bestehenden Caller (Route get_adsb_state + Family-Watch-Fan-out
@@ -1347,16 +1348,57 @@ def _live_position_cascade(hex_param, reg_param='', targeted=False, callsign='')
         tried   — Diagnose-Liste (pro Tier + finaler selected/confirmed-Eintrag).
     """
     from blueprints.warehouse_reader import position_for_flight
-    # allow_paid folgt targeted: der bezahlte Tier 4 darf nur feuern, wenn die
-    # Abfrage überhaupt gezielt ist (resolve_position_for_watch mappt
-    # allow_paid→targeted; Family kommt so mit targeted=False = kein Paid).
+    # Standardmäßig folgt allow_paid weiterhin targeted. Der explizite
+    # FlightDeck-Tap kann es für die erste Runde aber abschalten: freie Stores /
+    # ADS-B zuerst, danach der gezielte FR24-Korridor, erst ganz zuletzt ADB.
+    if allow_paid is None:
+        allow_paid = bool(targeted)
     return position_for_flight(
         hex=(hex_param or '').strip().lower() or None,
         reg=(reg_param or '').strip().upper() or None,
         callsign=(callsign or '').strip().upper() or None,
         targeted=bool(targeted),
-        allow_paid=bool(targeted),
+        allow_paid=bool(allow_paid),
     )
+
+
+def _fr24_corridor_position_row(hit, callsign=''):
+    """FR24-Korridor-Treffer in das app-weit verwendete OpenSky-Row-Format.
+
+    Der Korridor wird nur nach einem expliziten FlightDeck-Tap genutzt. Ein
+    fehlender ICAO-Hex ist bei anonymen FR24-LiveFeed-Zeilen normal; dann bleibt
+    die stabile Flight-ID die lokale Kartenidentität. Die echte Registration
+    und Beobachtungszeit bleiben separat in der Row erhalten.
+    """
+    if not isinstance(hit, dict):
+        return None
+    lat = _coerce_float(hit.get('lat'))
+    lon = _coerce_float(hit.get('lon'))
+    if lat is None or lon is None:
+        return None
+    alt_ft = _coerce_float(hit.get('alt'))
+    gs_kt = _coerce_float(hit.get('speed'))
+    obs_ts = _coerce_float(hit.get('obs_ts')) or time.time()
+    if obs_ts > 1e12:  # defensive: einige Feed-Versionen liefern Millisekunden
+        obs_ts /= 1000.0
+    reg = (hit.get('reg') or '').strip().upper() or None
+    cs = (hit.get('callsign') or callsign or '').strip().upper() or None
+    raw_hex = hit.get('hex') or hit.get('icao24')
+    hex_id = (str(raw_hex).strip().lower() if raw_hex else '')
+    if not hex_id:
+        flight_id = str(hit.get('flight_id') or '').strip().lower()
+        hex_id = f'fr24-{flight_id}' if flight_id else (reg or cs or 'fr24').lower()
+    on_ground = bool((alt_ft or 0) < 200 and (gs_kt or 0) < 50)
+    return [
+        hex_id, cs, reg, obs_ts, obs_ts, lon, lat,
+        (alt_ft * 0.3048) if alt_ft is not None else None,
+        on_ground,
+        (gs_kt * 0.514444) if gs_kt is not None else None,
+        _coerce_float(hit.get('track')),
+        None, None,
+        (alt_ft * 0.3048) if alt_ft is not None else None,
+        None, False, 0,
+    ]
 
 
 def resolve_position_for_watch(reg=None, hex_id=None, allow_paid=True, callsign=None):
@@ -1432,6 +1474,9 @@ def get_adsb_state():
         purpose=flight_deck — expliziter Tap im Flugdetail. Dieser neue Pfad
                           schaltet den bezahlten Notnagel nur mit Bearer frei;
                           Hintergrund-Polling setzt ihn niemals.
+        callsign=<ICAO>   — beim FlightDeck-Tap auch ohne bekannte Reg/Hex.
+        from_lat/from_lon/to_lat/to_lon — bekannte Strecke für den gezielten,
+                          rate-limitierten FR24-Korridor-Fallback.
 
     Antwort 200:
         {"hex": "<hex>", "position": <openSky-row> | null, "fetched_at": <unix>, "cached": <bool>}
@@ -1448,6 +1493,7 @@ def get_adsb_state():
 
     hex_param = (request.args.get('hex') or '').strip().lower()
     reg_param = (request.args.get('reg') or '').strip().upper()
+    callsign_param = (request.args.get('callsign') or '').strip().upper()
 
     # Tier-3-Freigabe (BEZAHLTE Quelle, s. _adb_position_attempt): NUR gezielte
     # Abfragen des eigenen Fluges / der Inbound-Maschine / des von Familie
@@ -1460,27 +1506,42 @@ def get_adsb_state():
                 or purpose in ('own', 'inbound', 'watch')
                 or (purpose == 'flight_deck' and has_bearer))
 
-    if not hex_param and not reg_param:
-        return jsonify({"error": "missing hex or reg parameter"}), 400
+    if not hex_param and not reg_param and not callsign_param:
+        return jsonify({"error": "missing hex, reg or callsign parameter"}), 400
+    # Callsign-only ist absichtlich kein neuer öffentlicher Sweep-Endpunkt: nur
+    # der authentifizierte, explizite FlightDeck-Tap darf den Korridor auslösen.
+    if callsign_param and not (purpose == 'flight_deck' and has_bearer):
+        callsign_param = ''
+        if not hex_param and not reg_param:
+            return jsonify({"error": "callsign requires authenticated flight_deck"}), 403
 
     # Wenn Client beides mitschickt (reg+hex) bevorzugen wir den expliziten
     # Hex — sonst Server-Lookup über Backend-Reg-Map.
     if not hex_param and reg_param:
         hex_param = resolve_reg_to_hex(reg_param)
-        if not hex_param:
+        if not hex_param and not callsign_param:
             return jsonify({
                 "error": f"unknown registration {reg_param}",
                 "hint": "pass ?hex=<icao24> if client knows the mapping",
             }), 404
 
+    def _coord(name):
+        try:
+            return float(request.args.get(name))
+        except (TypeError, ValueError):
+            return None
+    corridor = tuple(_coord(n) for n in ('from_lat', 'from_lon', 'to_lat', 'to_lon'))
+    corridor_ready = callsign_param and all(v is not None for v in corridor)
+    identity_key = hex_param or (f'cs:{callsign_param}' if callsign_param else '')
+
     # Fresh-Cache-Hit (60s TTL) — sofort raus. Watch-Touch (Supabase-Upsert)
     # bewusst NICHT vor diesem Early-Return: ein frischer Cache-Hit darf KEINE
     # DB-Schreiblast erzeugen. Wir touchen das Watch-Set erst, wenn wir gleich
     # tatsächlich upstream fetchen (s. unten).
-    cached = _cache_get(hex_param)
+    cached = _cache_get(identity_key) if identity_key else None
     if cached is not None:
         return jsonify({
-            "hex": hex_param,
+            "hex": (cached.get("row") or [hex_param])[0] or hex_param,
             "position": cached["row"],
             "fetched_at": cached["fetched_at"],
             "cached": True,
@@ -1491,7 +1552,8 @@ def get_adsb_state():
     # gerade für diesen Hex → in adsb_watch upserten, damit der Shared-Poller
     # ihn ins aktive Poll-Set aufnimmt (best-effort, bricht die Response nie).
     # Erst NACH dem Fresh-Cache-Hit, damit Cache-Hits keine DB-Writes auslösen.
-    _touch_watch(hex_param, registration=reg_param or None)
+    if hex_param:
+        _touch_watch(hex_param, registration=reg_param or None)
 
     # Cold-Start-Backfill (aircraft_positions, < 24h) wird NUR noch als Datenquelle
     # für den ehrlichen Stale-/Ozean-Fallback WEITER UNTEN vorgeladen — KEIN
@@ -1506,7 +1568,7 @@ def get_adsb_state():
     # (aircraft_positions) mit abgedeckt, kann also nicht mehr verloren gehen, und
     # der 2026-07-05-Root-Cause („2,3h-alter Atlantik-Punkt als aktuell") bleibt
     # ausgeschlossen, weil der Resolver stale Tabellen-Fixe gar nicht erst wählt.
-    backfilled = _backfill_cache_from_sb(hex_param)
+    backfilled = _backfill_cache_from_sb(hex_param) if hex_param else None
 
     # ─── Steps 1 / 2 / 2b: EINE Positions-Quelle für alle „wo ist der Flieger"-
     # Pfade (fr24_live → aircraft_positions → [targeted] adsb.lol → [targeted+paid]
@@ -1514,7 +1576,45 @@ def get_adsb_state():
     # Weg nach extern (targeted-Notnagel); dieser Route-Handler geht selbst nie
     # direkt upstream. ───
     row, source, obs_ts, tried = _live_position_cascade(
-        hex_param, reg_param, targeted=targeted)
+        hex_param, reg_param, targeted=targeted, callsign=callsign_param,
+        # Bei bekannter Strecke bekommt FR24 vor dem bezahlten ADB-Notnagel
+        # genau einen Versuch. Ohne Korridor bleibt die bisherige Reihenfolge.
+        allow_paid=(targeted and not corridor_ready))
+
+    # Kostenloser Feed/Store leer: der authentifizierte FlightDeck-Tap darf den
+    # Flieger einmal gezielt entlang seiner bekannten Route bei FR24 suchen.
+    # Der gRPC-Client ist selbst per Token-Bucket/Circuit-Breaker geschützt; das
+    # Ergebnis landet unten 60 s im normalen Cache.
+    if row is None and targeted and purpose == 'flight_deck' and corridor_ready:
+        try:
+            from blueprints import fr24_grpc
+            fr_hit = fr24_grpc.inbound_by_route(
+                corridor[0], corridor[1], corridor[2], corridor[3],
+                callsign=callsign_param, reg=reg_param or None)
+        except Exception as exc:
+            fr_hit = None
+            tried.append({'upstream': 'fr24_grpc_corridor', 'ok': False,
+                          'reason': str(exc)[:80]})
+        if fr_hit:
+            row = _fr24_corridor_position_row(fr_hit, callsign_param)
+            if row is not None:
+                source = 'fr24'
+                obs_ts = row[3]
+                tried.append({'upstream': 'fr24_grpc_corridor', 'ok': True,
+                              'selected': 'fr24', 'obs_ts': obs_ts})
+        elif not any(t.get('upstream') == 'fr24_grpc_corridor'
+                     and t.get('ok') is False for t in tried):
+            tried.append({'upstream': 'fr24_grpc_corridor', 'ok': True,
+                          'reason': 'miss'})
+
+        # FR24 war ebenfalls leer: falls Hex/Reg bekannt ist, bleibt ADB der
+        # letzte budgetierte Notnagel. Die zweite Runde wird nur nach Total-Miss
+        # gestartet und kann aus dem 60-s-Cache bedienen.
+        if row is None and (hex_param or reg_param):
+            row, source, obs_ts, paid_tried = _live_position_cascade(
+                hex_param, reg_param, targeted=True, callsign=callsign_param,
+                allow_paid=True)
+            tried.extend(paid_tried)
 
     # BREAK A-Fix: der Resolver liefert bei Total-Miss den STRING 'none' (row=None),
     # nie mehr Python-None. Hier auf None zurückmappen, sonst ist der `source is not
@@ -1523,13 +1623,19 @@ def get_adsb_state():
     if source == "none":
         source = None
 
+    response_hex = hex_param or callsign_param.lower()
+    if row is not None and len(row) > 0 and row[0]:
+        response_hex = str(row[0]).strip().lower()
+
     if source == "adb":
         # Tier-4-Treffer: in den normalen Cache — mit dem ECHTEN Beobachtungs-
         # Zeitstempel (reportedAtUtc) als Anzeige-Zeit, Fetch-Zeit=jetzt für die TTL.
-        _cache_put(hex_param, row, "adb", fetched_at=obs_ts, cached_at=time.time())
-        _warm_persist_from_opensky_row(hex_param, row, "adb")
+        _cache_put(response_hex, row, "adb", fetched_at=obs_ts, cached_at=time.time())
+        if identity_key and identity_key != response_hex:
+            _cache_put(identity_key, row, "adb", fetched_at=obs_ts, cached_at=time.time())
+        _warm_persist_from_opensky_row(response_hex, row, "adb")
         return jsonify({
-            "hex": hex_param,
+            "hex": response_hex,
             "position": row,
             "fetched_at": obs_ts,
             "cached": False,
@@ -1551,7 +1657,11 @@ def get_adsb_state():
             _row_age = 1e9
         # Best-effort warm-keep der Supabase-Fallback-Tabelle — bricht die
         # Live-Response nie.
-        _warm_persist_from_opensky_row(hex_param, row, source)
+        # Ein anonymes FR24-LiveFeed-Ergebnis kann statt ICAO24 nur eine
+        # Flight-ID tragen. Das ist ein guter 60-s-Cache-Key, aber kein valider
+        # `hex24`-Wert für aircraft_positions/Supabase.
+        if source != 'fr24' or re.fullmatch(r'[0-9a-f]{6}', response_hex):
+            _warm_persist_from_opensky_row(response_hex, row, source)
         # Frische-Floor: eine Tabellen-Row darf nur als LIVE (cached:false)
         # serviert werden, wenn sie jung genug ist. Ältere echte Beobachtungen
         # werden ehrlich stale-markiert ausgeliefert statt als „jetzt aktuell" —
@@ -1560,7 +1670,7 @@ def get_adsb_state():
         # aber via _warm_persist als Last-Resort-Backfill erhalten.
         if _row_age > _LIVE_TABLE_FLOOR_S:
             return jsonify({
-                "hex": hex_param,
+                "hex": response_hex,
                 "position": row,
                 "fetched_at": obs_ts,
                 "cached": True,
@@ -1571,9 +1681,11 @@ def get_adsb_state():
             }), 200
         # Frische Tabellen-Row → in den 60s-Fresh-Cache: fetched_at=ECHTER obs_ts
         # (Anzeige/BREAK-B), cached_at=jetzt (TTL). Kein Re-Kaskadieren für 60s.
-        _cache_put(hex_param, row, source, fetched_at=obs_ts, cached_at=time.time())
+        _cache_put(response_hex, row, source, fetched_at=obs_ts, cached_at=time.time())
+        if identity_key and identity_key != response_hex:
+            _cache_put(identity_key, row, source, fetched_at=obs_ts, cached_at=time.time())
         return jsonify({
-            "hex": hex_param,
+            "hex": response_hex,
             "position": row,
             "fetched_at": obs_ts,
             "cached": False,
@@ -1582,10 +1694,10 @@ def get_adsb_state():
         }), 200
 
     # ─── Step 3: Last-known-state aus 30-min-Cache ───
-    last_known = _last_known_get(hex_param)
+    last_known = _last_known_get(identity_key) if identity_key else None
     if last_known is not None:
         return jsonify({
-            "hex": hex_param,
+            "hex": response_hex,
             "position": last_known["row"],
             "fetched_at": last_known["fetched_at"],
             "cached": True,
@@ -1601,7 +1713,7 @@ def get_adsb_state():
     # hat Vorrang und lief bereits). ───
     if backfilled is not None:
         return jsonify({
-            "hex": hex_param,
+            "hex": response_hex,
             "position": backfilled["row"],
             "fetched_at": backfilled["fetched_at"],
             "cached": True,
@@ -1617,7 +1729,7 @@ def get_adsb_state():
     # ADS-B-Out. 502 nur, wenn ALLE Upstreams wirklich gescheitert sind. ───
     if any(t.get("ok") for t in tried):
         return jsonify({
-            "hex": hex_param,
+            "hex": response_hex,
             "position": None,
             "fetched_at": time.time(),
             "cached": False,
@@ -1628,7 +1740,7 @@ def get_adsb_state():
     # ─── Alles fehlgeschlagen → 502 mit detaillierter Diagnose ───
     return jsonify({
         "error": "all_upstreams_failed",
-        "hex": hex_param,
+        "hex": response_hex,
         "tried": tried,
     }), 502
 
