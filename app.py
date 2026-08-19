@@ -34748,6 +34748,22 @@ def _crew_hotel_token_hash(token):
     return _hashlib.sha256(('crewhotel:' + (token or '')).encode()).hexdigest()[:32]
 
 
+def _crew_hotel_wifi_code(value):
+    """Printable WLAN code, character-for-character useful to the crew.
+
+    Leading/trailing spaces can be part of a real WPA password and are therefore
+    preserved. Only Unicode control/format characters are removed; an empty or
+    whitespace-only result and values over the DB limit are rejected.
+    """
+    import unicodedata
+    code = str(value or '')
+    code = ''.join(ch for ch in code
+                   if not unicodedata.category(ch).startswith('C'))
+    if not code.strip() or len(code) > 128:
+        return None
+    return code
+
+
 def _crew_hotel_dir_serve(airline):
     """Approved+active Crewhotels EINER Airline. [] bei fehlender Airline/DB.
 
@@ -34766,16 +34782,28 @@ def _crew_hotel_dir_serve(airline):
     try:
         try:
             r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
-                'iata,base,hotel,transfer_min,votes,official_name').eq(
-                'airline', a).eq(
+                'iata,base,hotel,transfer_min,votes,official_name,'
+                'wifi_code,wifi_updated_at').eq('airline', a).eq(
                 'status', 'approved').eq('active', True).limit(3000).execute()
         except Exception:
-            r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
-                'iata,base,hotel,transfer_min,votes').eq('airline', a).eq(
-                'status', 'approved').eq('active', True).limit(3000).execute()
+            # Rolling deploy: a backend image may start before the additive DB
+            # migration is visible. Keep serving the hotel directory without
+            # WLAN data instead of making the complete feature fail.
+            try:
+                r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
+                    'iata,base,hotel,transfer_min,votes,official_name').eq(
+                    'airline', a).eq('status', 'approved').eq(
+                    'active', True).limit(3000).execute()
+            except Exception:
+                r = sb.table(_CREW_HOTEL_DIR_TABLE).select(
+                    'iata,base,hotel,transfer_min,votes').eq('airline', a).eq(
+                    'status', 'approved').eq('active', True).limit(3000).execute()
         out = []
         for row in (r.data or []):
             row = dict(row)
+            # Defense in depth for permissive test doubles/future select('*'):
+            # contributor identity is moderation metadata, never client data.
+            row.pop('wifi_updated_by', None)
             official = (row.pop('official_name', None) or '').strip()
             if official and official != (row.get('hotel') or '').strip():
                 row['hotel_crowd'] = row.get('hotel')
@@ -34829,6 +34857,81 @@ def ax_crew_hotels():
         hotels = [h for h in hotels
                   if str(h.get('iata') or '').strip().upper() in allowed_iatas]
     return jsonify({'airline': airline, 'count': len(hotels), 'hotels': hotels})
+
+
+@app.route('/api/ax/crew-hotels/wifi', methods=['POST'])
+def ax_crew_hotels_wifi():
+    """Current WLAN code for an existing crew hotel.
+
+    The mobile client never writes Supabase directly. We derive the airline from
+    the AeroX token and only update an approved, active hotel in that directory.
+    Condor keeps the stricter own-roster station gate used by hotel suggestions.
+    The contributor token is stored only as a one-way hash for abuse forensics.
+    """
+    token = _request_token()
+    raw_airline, has_calendar = _viewer_airline_and_calendar(token)
+    airline = _canonical_airline_key(raw_airline)
+    if not token or not airline:
+        return jsonify({'ok': False, 'error': 'no_airline'}), 400
+
+    body = request.get_json(silent=True) or {}
+    iata = str(body.get('iata') or '').strip().upper()
+    hotel = ' '.join(str(body.get('hotel') or '').split())
+    base = str(body.get('base') or '').strip().upper() or None
+    code = _crew_hotel_wifi_code(body.get('wifi_code'))
+    if len(iata) != 3 or not iata.isalpha():
+        return jsonify({'ok': False, 'error': 'invalid_iata'}), 400
+    if len(hotel) < 3 or len(hotel) > 160:
+        return jsonify({'ok': False, 'error': 'invalid_hotel'}), 400
+    if code is None:
+        return jsonify({'ok': False, 'error': 'invalid_wifi_code'}), 400
+    if (airline == 'CONDOR'
+            and (not has_calendar
+                 or iata not in _condor_roster_hotel_iatas(token))):
+        return jsonify({'ok': False, 'error': 'station_not_in_own_roster'}), 403
+    if not SB_AVAILABLE:
+        return jsonify({'ok': False, 'error': 'unavailable'}), 503
+
+    try:
+        rows = (sb.table(_CREW_HOTEL_DIR_TABLE).select(
+            'id,base,hotel,official_name,wifi_code').eq(
+            'airline', airline).eq('iata', iata).eq(
+            'status', 'approved').eq('active', True).limit(30)
+            .execute().data) or []
+        wanted = _crew_hotel_key(hotel)
+        matches = [row for row in rows
+                   if wanted in {
+                       _crew_hotel_key(row.get('hotel')),
+                       _crew_hotel_key(row.get('official_name')),
+                   }]
+        if not matches:
+            return jsonify({'ok': False, 'error': 'unknown_hotel'}), 404
+
+        # Match the exact base first. A generic directory row is the fallback,
+        # identical to the iOS resolver; this prevents a FRA hotel's code from
+        # being written onto a different MUC hotel at the same station.
+        selected = next((row for row in matches
+                         if (row.get('base') or '').strip().upper() == (base or '')),
+                        None)
+        if selected is None:
+            selected = next((row for row in matches if not row.get('base')), None)
+        if selected is None and base is None:
+            selected = matches[0]
+        if selected is None:
+            return jsonify({'ok': False, 'error': 'unknown_hotel'}), 404
+        now_iso = datetime.now(timezone.utc).isoformat()
+        status = 'created' if not selected.get('wifi_code') else 'updated'
+        sb.table(_CREW_HOTEL_DIR_TABLE).update({
+            'wifi_code': code,
+            'wifi_updated_at': now_iso,
+            'wifi_updated_by': _crew_hotel_token_hash(token),
+            'updated_at': now_iso,
+        }).eq('id', selected['id']).execute()
+        return jsonify({'ok': True, 'status': status,
+                        'wifi_code': code, 'wifi_updated_at': now_iso})
+    except Exception as e:
+        print(f"[crew-hotel] wifi update fail: {type(e).__name__}")
+        return jsonify({'ok': False, 'error': 'db'}), 500
 
 
 @app.route('/api/ax/crew-hotels/suggest', methods=['POST'])

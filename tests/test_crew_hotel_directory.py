@@ -160,6 +160,138 @@ def test_condor_serve_returns_only_hotels_in_own_roster(client, monkeypatch):
     assert body['hotels'][0]['iata'] == 'JFK'
 
 
+# ── WLAN-Code: airline-gegatet und nur an aktiven Hotels ─────────────────────
+
+def test_serve_includes_wifi_code_without_contributor_hash(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'iata': 'SFO', 'base': 'FRA', 'hotel': 'Hilton Union Square',
+         'transfer_min': 30, 'votes': 3, 'wifi_code': 'Crew-2026!',
+         'wifi_updated_at': '2026-08-18T20:00:00+00:00',
+         'wifi_updated_by': 'must-not-leave-server'},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    body = client.get('/api/ax/crew-hotels?token=AT-x').get_json()
+
+    assert body['hotels'][0]['wifi_code'] == 'Crew-2026!'
+    assert 'wifi_updated_by' not in body['hotels'][0]
+
+
+def test_wifi_code_updates_exact_active_hotel(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'id': 'hotel-sfo', 'iata': 'SFO', 'base': 'FRA',
+         'hotel': 'Hilton Union Square', 'official_name': None,
+         'wifi_code': None},
+        {'id': 'hotel-lax', 'iata': 'LAX', 'base': 'FRA',
+         'hotel': 'Other Hotel', 'official_name': None,
+         'wifi_code': None},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-secret',
+                    data=json.dumps({'iata': 'SFO', 'base': 'FRA',
+                                     'hotel': 'Hilton Union Square',
+                                     'wifi_code': ' Crew 2026! '}),
+                    content_type='application/json')
+
+    assert r.status_code == 200
+    assert r.get_json()['wifi_code'] == ' Crew 2026! '
+    table, payload = fake.sink['updates'][-1]
+    assert table == 'crew_hotel_directory'
+    assert payload['wifi_code'] == ' Crew 2026! '
+    assert payload['wifi_updated_by'] != 'AT-secret'
+    assert len(payload['wifi_updated_by']) == 32
+
+
+def test_wifi_code_accepts_official_display_name(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'id': 'hotel-yul', 'iata': 'YUL', 'base': None,
+         'hotel': 'Crowd Hotel Name', 'official_name': 'Sofitel Montréal',
+         'wifi_code': 'old'},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-x',
+                    data=json.dumps({'iata': 'YUL', 'hotel': 'Sofitel Montréal',
+                                     'wifi_code': 'new-code'}),
+                    content_type='application/json')
+
+    assert r.status_code == 200
+    assert r.get_json()['status'] == 'updated'
+
+
+def test_wifi_code_rejects_unknown_hotel(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'id': 'hotel-sfo', 'iata': 'SFO', 'base': 'FRA',
+         'hotel': 'Hilton Union Square', 'official_name': None},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-x',
+                    data=json.dumps({'iata': 'SFO', 'hotel': 'Fake Hotel',
+                                     'wifi_code': 'code'}),
+                    content_type='application/json')
+
+    assert r.status_code == 404
+    assert r.get_json()['error'] == 'unknown_hotel'
+    assert fake.sink['updates'] == []
+
+
+def test_wifi_code_never_crosses_homebase_rows(client, monkeypatch):
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'id': 'hotel-fra', 'iata': 'SFO', 'base': 'FRA',
+         'hotel': 'Hilton Union Square', 'official_name': None},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-x',
+                    data=json.dumps({'iata': 'SFO', 'base': 'MUC',
+                                     'hotel': 'Hilton Union Square',
+                                     'wifi_code': 'code'}),
+                    content_type='application/json')
+
+    assert r.status_code == 404
+    assert r.get_json()['error'] == 'unknown_hotel'
+    assert fake.sink['updates'] == []
+
+
+def test_wifi_code_rejects_controls_and_whitespace_only(client, monkeypatch):
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-x',
+                    data=json.dumps({'iata': 'SFO', 'hotel': 'Hotel',
+                                     'wifi_code': '\n\t'}),
+                    content_type='application/json')
+    assert r.status_code == 400
+    assert r.get_json()['error'] == 'invalid_wifi_code'
+
+
+def test_condor_wifi_rejects_station_outside_own_roster(client, monkeypatch):
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    monkeypatch.setattr(app, '_profile_load',
+                        lambda t: {'profile': {'airline': 'Condor'}})
+    monkeypatch.setattr(app, '_ical_briefings_load', lambda t: {
+        '2099-07-03': {'ical_imported_at': '2099-06-01T00:00:00',
+                       'ical_layover_ort': 'JFK'},
+    })
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-condor',
+                    data=json.dumps({'iata': 'LAX', 'hotel': 'Other Hotel',
+                                     'wifi_code': 'code'}),
+                    content_type='application/json')
+    assert r.status_code == 403
+    assert r.get_json()['error'] == 'station_not_in_own_roster'
+
+
 # ── Suggest: schreibt status='suggested' mit Profil-Airline ────────────────────
 
 def test_suggest_writes_suggested_row(client, monkeypatch):
