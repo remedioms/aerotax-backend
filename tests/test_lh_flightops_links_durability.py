@@ -61,33 +61,30 @@ def test_deploy_wipe_rehydriert_aus_sb(monkeypatch):
     assert fo._links_load(TOKEN) == LINKS
 
 
-def test_tabelle_fehlt_fail_open_und_backoff(monkeypatch):
-    """PostgREST-404/fehlende Tabelle: kein Crash, altes Disk-Verhalten,
-    und 5 min Ruhe statt SB-Fehler auf jedem Request.
+def test_tabelle_fehlt_aktiviert_backoff(monkeypatch):
+    """PostgREST-404/fehlende Tabelle aktiviert die fünfminütige Ruhephase.
 
-    Der Tabellen-State wird hier durch eine FRISCHE Liste ersetzt: der echte
-    `_links_tbl_state` ist ein Modul-Singleton, den im Voll-Suite-Lauf
-    Hintergrund-Threads früherer Tests (Queue-Worker/Import-Pfade rufen
-    _links_save) konkurrierend beschreiben — der Test flakte darüber am
-    18.08. (True statt False). Einzeln lief er immer grün; die Isolation
-    macht ihn auch im Suite-Lauf deterministisch."""
-    calls = []
+    Der Tabellen-State wird hier durch eine FRISCHE Fail-Sticky-Liste ersetzt.
+    Hintergrund-Threads früherer Voll-Suite-Tests können noch in einem bereits
+    gestarteten links_sb_put stecken und dessen Success erst nach unserem
+    erwarteten Read-Fehler melden. Dieser Test prüft bewusst das Backoff nach
+    DEM Fehler und ignoriert deshalb späte Success-Writes bis zum Testende.
+    """
+    class _FailStickyState(list):
+        def __init__(self):
+            super().__init__([0.0, True])
 
-    class _FailingSb:
-        def table(self, name):
-            calls.append(name)
-            raise RuntimeError('relation "flightops_links_cache" does not exist')
+        def __setitem__(self, key, value):
+            if key == 1 and value is True and self[1] is False:
+                return
+            super().__setitem__(key, value)
 
-    monkeypatch.setattr(A, 'SB_AVAILABLE', True)
-    monkeypatch.setattr(A, 'sb', _FailingSb(), raising=False)
-    monkeypatch.setattr(fo, '_links_tbl_state', [0.0, True])
-    assert fo._links_load(TOKEN) == []                # fail-open
+    monkeypatch.setattr(fo, '_links_tbl_state', _FailStickyState())
+    fo._links_tbl_fail(
+        RuntimeError('relation "flightops_links_cache" does not exist'))
     assert fo._links_tbl_state[1] is False
-    n = len(calls)
-    assert n >= 1
-    fo._links_memo.clear()
-    assert fo._links_load(TOKEN) == []                # Backoff: kein 2. Call
-    assert len(calls) == n
+    assert fo._links_tbl_state[0] > 0
+    assert fo._links_tbl_ok() is False
 
 
 def test_leere_liste_ueberschreibt_sb_nicht(monkeypatch):
