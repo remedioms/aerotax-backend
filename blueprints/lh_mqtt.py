@@ -1363,6 +1363,44 @@ def _users_for_flight(rows, carrier, num, topic_date):
     return out
 
 
+# Turnaround-Fenster für den Live-Activity-Sprung aufs Anschluss-Leg: nur ein
+# Abflug BINNEN dieser Spanne nach der Landung gilt als selber Umlauf. Alles
+# danach ist Layover/Feierabend — dort bleibt GELANDET stehen und Sweep/App
+# beenden die Karte. Fenster = Zeitpunkt ± Zeitraum, kein Kalendertag.
+_LA_NEXT_LEG_MAX_S = 6 * 3600
+
+
+def _next_sector_after(rows, token, sector, facts=None):
+    """Der nächste GEPLANTE Sektor DESSELBEN Users nach `sector` — oder None.
+
+    Konservativ: Abflug am Ankunftsflughafen des gelandeten Legs, NACH der
+    Landung (echte `est_arr` aus den Fakten vor Roster-`arr_iso`), binnen
+    `_LA_NEXT_LEG_MAX_S`. Kein Treffer ⇒ None ⇒ der Fanout zeigt weiter
+    GELANDET (kein geratener Anschluss)."""
+    ref = None
+    for cand in ((facts or {}).get('est_arr'), sector.get('arr_iso')):
+        ref = _parse_iso_utc(cand)
+        if ref is not None:
+            break
+    dest = (sector.get('to') or '').strip().upper()
+    if ref is None or not dest:
+        return None
+    best, best_dep = None, None
+    for tok, s in _iter_sectors(rows):
+        if tok != token or s is sector:
+            continue
+        dep = _parse_iso_utc(s.get('dep_iso'))
+        if dep is None or dep <= ref:
+            continue
+        if (dep - ref).total_seconds() > _LA_NEXT_LEG_MAX_S:
+            continue
+        if (s.get('from') or '').strip().upper() != dest:
+            continue
+        if best_dep is None or dep < best_dep:
+            best, best_dep = s, dep
+    return best
+
+
 def _build_push(kind, flight_disp, topic_date, facts, sector):
     """(title, body, idempotency_suffix) oder None wenn dieses Event keinen
     Push verdient. Kein erfundenes Datum: fehlende Fakten → ehrliche Texte."""
@@ -1637,8 +1675,19 @@ def lh_mqtt_event():
     if affected:
         try:
             from blueprints.live_activity import push_for_affected
+            # Anschluss-Legs NUR für die Landung: die Karte springt dann aufs
+            # nächste Leg des Umlaufs statt auf GELANDET stehen zu bleiben
+            # (Tibor 19.08.). Pro User höchstens ein Sektor, rein aus `rows`.
+            la_next = None
+            if kind == 'arrived':
+                la_next = {}
+                for _tok, _sec in affected:
+                    _nxt = _next_sector_after(rows, _tok, _sec, facts=facts)
+                    if _nxt is not None:
+                        la_next[_tok] = _nxt
             la_sent = push_for_affected(affected, kind, flight_disp,
-                                        topic_date, facts=facts or None)
+                                        topic_date, facts=facts or None,
+                                        next_sectors=la_next or None)
         except Exception as e:
             log.warning('[lh_mqtt] live-activity fanout fail %s: %s',
                         flight_disp, type(e).__name__)

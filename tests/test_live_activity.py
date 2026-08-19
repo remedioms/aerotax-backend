@@ -1024,7 +1024,8 @@ def test_push_for_affected_signature_contract():
     import inspect
     assert callable(LA.push_for_affected)
     assert list(inspect.signature(LA.push_for_affected).parameters) == \
-        ['affected', 'kind', 'flight_disp', 'topic_date', 'facts']
+        ['affected', 'kind', 'flight_disp', 'topic_date', 'facts',
+         'next_sectors']
 
 
 def test_push_for_affected_sends_for_delay(sb, auth, apns, monkeypatch):
@@ -1263,6 +1264,51 @@ def test_fanout_aktualisiert_arrived_weiterhin(sb, auth, apns):
                                 'arrived', 'LH400', '2026-07-27')
     assert sent == 1
     assert apns['client'].sent[0]['payload']['aps']['event'] == 'update'
+
+
+def test_fanout_arrived_springt_aufs_anschluss_leg(sb, auth, apns):
+    """Tibor 19.08. (LH339 NAP–FRA, danach FRA–HAJ): nach der Landung blieb
+    die Karte auf GELANDET stehen, obwohl er längst im Anschluss saß. Mit
+    `next_sectors` zeigt sie sofort den ABFLUG des Folge-Legs — nur mit
+    Roster-Planzeiten, ohne est*/arrConfirmed-Behauptungen fürs neue Leg."""
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    landed = {'flight': 'LH339', 'from': 'NAP', 'to': 'FRA',
+              'dep_iso': '2026-08-19T04:15:00Z',
+              'arr_iso': '2026-08-19T06:15:00Z'}
+    nxt = {'flight': 'LH 052', 'from': 'FRA', 'to': 'HAJ',
+           'dep_iso': '2026-08-19T07:45:00Z',
+           'arr_iso': '2026-08-19T08:40:00Z'}
+    sent = LA.push_for_affected([(TOKEN, landed)], 'arrived', 'LH339',
+                                '2026-08-19', facts={'est_arr':
+                                                     '2026-08-19T06:15:00Z'},
+                                next_sectors={TOKEN: nxt})
+    assert sent == 1
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['phase'] == 'turnaround' and cs['kicker'] == 'ABFLUG'
+    assert cs['flightNo'] == 'LH052'
+    assert cs['mainTime'] == cs['countdownTarget'] == cs['schedDep'] \
+        == LA._to_apple_date('2026-08-19T07:45:00Z')
+    assert cs['fromIATA'] == 'FRA' and cs['toIATA'] == 'HAJ'
+    # Fürs NEUE Leg ist noch nichts belegt oder gelandet.
+    assert 'arrConfirmed' not in cs and 'estDep' not in cs \
+        and 'estArr' not in cs and 'progress' not in cs
+
+
+def test_fanout_arrived_ohne_anschluss_bleibt_gelandet(sb, auth, apns):
+    """Kein Folge-Sektor (Layover/Feierabend) ⇒ Verhalten wie bisher."""
+    sb._upsert({'p_user_token': TOKEN, 'p_kind': 'update',
+                'p_activity_id': ACT_ID, 'p_la_token': LA_TOKEN_A,
+                'p_bundle_id': BUNDLE, 'p_environment': 'prod',
+                'p_device_id': None, 'p_platform': 'ios'})
+    sent = LA.push_for_affected([(TOKEN, _mqtt_sector(dep_in_h=-8))],
+                                'arrived', 'LH400', '2026-07-27',
+                                next_sectors=None)
+    assert sent == 1
+    cs = apns['client'].sent[0]['payload']['aps']['content-state']
+    assert cs['kicker'] == 'GELANDET'
 
 
 def test_fanout_startet_nicht_ohne_bekannten_abflug(sb, auth, apns):

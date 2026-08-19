@@ -645,7 +645,7 @@ def test_event_triggers_live_activity_for_affected(client, monkeypatch):
     monkeypatch.setattr(lh_mqtt, '_do_push', lambda *a, **k: True)
     monkeypatch.setattr(LA, 'push_for_affected',
                         lambda affected, kind, flight_disp, topic_date,
-                        facts=None: calls.append(
+                        facts=None, next_sectors=None: calls.append(
                             (affected, kind, flight_disp, topic_date, facts))
                         or 1)
     d = client.post('/api/internal/lh-mqtt/event',
@@ -695,7 +695,8 @@ def test_departed_event_refreshes_facts_for_live_activity(client, monkeypatch):
                         excluded_tokens=None: 0)
     monkeypatch.setattr(LA, 'push_for_affected',
                         lambda affected, kind, flight_disp, topic_date,
-                        facts=None: (seen.__setitem__('facts', facts), 1)[1])
+                        facts=None, next_sectors=None:
+                        (seen.__setitem__('facts', facts), 1)[1])
     d = client.post('/api/internal/lh-mqtt/event',
                     json=_event_body('Departed')).get_json()
     assert d['kind'] == 'departed' and d['la_sent'] == 1
@@ -715,7 +716,8 @@ def test_est_arr_event_reaches_live_activity(client, monkeypatch):
         'est_arr': '2026-07-22T23:41:00+02:00'})
     monkeypatch.setattr(LA, 'push_for_affected',
                         lambda affected, kind, flight_disp, topic_date,
-                        facts=None: calls.append(kind) or 1)
+                        facts=None, next_sectors=None:
+                        calls.append(kind) or 1)
     d = client.post('/api/internal/lh-mqtt/event',
                     json=_event_body('New Estimated Arrival')).get_json()
     assert d['kind'] == 'est_arr'
@@ -1387,3 +1389,53 @@ def test_hhmm_station_unbekannte_station_faellt_auf_schnitt_zurueck():
     import blueprints.lh_mqtt as mq
     assert mq._hhmm_station('2026-08-12T05:20:00+02:00', 'XXX') == '05:20'
     assert mq._hhmm_station('2026-08-12T05:20:00+02:00', None) == '05:20'
+
+
+# ── Turnaround-Sprung: _next_sector_after (Tibor 19.08.) ────────────────────
+
+_TA_LANDED = {'flight': 'LH339', 'from': 'NAP', 'to': 'FRA',
+              'dep_iso': '2026-08-19T04:15:00Z',
+              'arr_iso': '2026-08-19T06:00:00Z'}
+
+
+def _ta_rows(*sectors, token='user0'):
+    return [{'token': token, 'datum': '2026-08-19',
+             'sectors': [_TA_LANDED, *sectors]}]
+
+
+def test_next_sector_after_findet_das_anschluss_leg():
+    nxt = {'flight': 'LH052', 'from': 'FRA', 'to': 'HAJ',
+           'dep_iso': '2026-08-19T07:45:00Z'}
+    later = {'flight': 'LH053', 'from': 'FRA', 'to': 'HAJ',
+             'dep_iso': '2026-08-19T09:45:00Z'}
+    got = lh_mqtt._next_sector_after(_ta_rows(later, nxt), 'user0', _TA_LANDED)
+    assert got is nxt  # der FRÜHESTE Abflug im Fenster, nicht der letzte
+
+
+def test_next_sector_after_echte_landezeit_schlaegt_roster_ankunft():
+    # est_arr (echte Landung 07:50) liegt NACH dem Plan-Abflug des Kandidaten
+    # 07:45 — der ist damit kein Anschluss mehr. Ohne facts wäre er es.
+    nxt = {'flight': 'LH052', 'from': 'FRA', 'to': 'HAJ',
+           'dep_iso': '2026-08-19T07:45:00Z'}
+    rows = _ta_rows(nxt)
+    assert lh_mqtt._next_sector_after(rows, 'user0', _TA_LANDED) is nxt
+    assert lh_mqtt._next_sector_after(
+        rows, 'user0', _TA_LANDED,
+        facts={'est_arr': '2026-08-19T07:50:00Z'}) is None
+
+
+def test_next_sector_after_kein_anschluss_ausserhalb_fenster_oder_airport():
+    layover = {'flight': 'LH052', 'from': 'FRA', 'to': 'HAJ',
+               'dep_iso': '2026-08-19T14:30:00Z'}          # > 6 h: Layover
+    woanders = {'flight': 'LH900', 'from': 'MUC', 'to': 'HAJ',
+                'dep_iso': '2026-08-19T07:45:00Z'}         # falscher Airport
+    assert lh_mqtt._next_sector_after(
+        _ta_rows(layover, woanders), 'user0', _TA_LANDED) is None
+
+
+def test_next_sector_after_ignoriert_fremde_user():
+    nxt = {'flight': 'LH052', 'from': 'FRA', 'to': 'HAJ',
+           'dep_iso': '2026-08-19T07:45:00Z'}
+    rows = [{'token': 'ANDERER', 'datum': '2026-08-19', 'sectors': [nxt]},
+            {'token': 'user0', 'datum': '2026-08-19', 'sectors': [_TA_LANDED]}]
+    assert lh_mqtt._next_sector_after(rows, 'user0', _TA_LANDED) is None

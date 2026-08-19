@@ -1650,9 +1650,16 @@ def _mqtt_start_attributes(kind, flight_disp, frm, to, dep, now_utc,
             'startedAt': now_utc}
 
 
-def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
+def push_for_affected(affected, kind, flight_disp, topic_date, facts=None,
+                      next_sectors=None):
     """Live-Activity-Fanout für ein LH-MQTT-Event. Returns Anzahl gesendeter
     Pushes (unverändert/skip zählt NICHT).
+
+    `next_sectors` (nur `arrived`): {token: Folge-Sektor} aus dem Roster —
+    dann zeigt die Karte statt des gelandeten Legs sofort den Abflug des
+    Anschluss-Legs (Tibor 19.08.: „wär cool wenns automatisch springen würd
+    auf mein Leg auf dem ich grad bin"). Ohne Eintrag bleibt GELANDET stehen
+    (Dienstende/Layover — dort beendet der Sweep bzw. die App die Karte).
 
     `affected` ist exakt die Liste aus `lh_mqtt._users_for_flight(...)`:
     `[(user_token, sector_dict), …]`.
@@ -1749,6 +1756,40 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
             'depConfirmed': True if _departure_is_proven(kind, facts) else None,
             'arrConfirmed': True if kind == 'arrived' else None,
         }
+        # TURNAROUND-SPRUNG (Tibor 19.08.): Nach der Landung ist das gelandete
+        # Leg für die Crew Vergangenheit — sie sitzt schon im Anschluss. Liegt
+        # im Roster ein Folge-Sektor (vom lh_mqtt-Aufrufer konservativ
+        # bestimmt: gleicher Airport, binnen Turnaround-Fenster), zeigt die
+        # Karte dessen ABFLUG — exakt die Marke, die die App selbst rechnen
+        # würde (`inDutySnapshot`-Turnaround: Mark(nextDep, "ABFLUG")). Nur
+        # Roster-Planzeiten, keine est*-Behauptungen und kein `arrConfirmed`
+        # fürs NEUE Leg — bestätigt ist dort noch nichts.
+        nxt = (next_sectors or {}).get(user_token) if kind == 'arrived' else None
+        if nxt and nxt.get('dep_iso'):
+            nfrm = (nxt.get('from') or '').strip().upper() or None
+            nto = (nxt.get('to') or '').strip().upper() or None
+            ndisp = ''.join(str(nxt.get('flight') or '').split()).upper() or None
+            state.update({
+                'kicker': 'ABFLUG',
+                'mainTime': nxt.get('dep_iso'),
+                'countdownTarget': nxt.get('dep_iso'),
+                'route': f'{nfrm}–{nto}' if nfrm and nto else None,
+                'flightNo': ndisp,
+                'footLeading': ndisp,
+                'deltaMin': None,
+                'fromIATA': nfrm,
+                'toIATA': nto,
+                'fromTZIdentifier': _airport_tz(nfrm),
+                'toTZIdentifier': _airport_tz(nto),
+                'schedDep': nxt.get('dep_iso'),
+                'estDep': None,
+                'schedArr': nxt.get('arr_iso'),
+                'estArr': None,
+                'depConfirmed': None,
+                'arrConfirmed': None,
+            })
+        else:
+            nxt = None
         if state['mainTime'] is None:
             # Ohne Ziel-Zeitpunkt gibt es keine ehrliche Karte.
             continue
@@ -1764,7 +1805,7 @@ def push_for_affected(affected, kind, flight_disp, topic_date, facts=None):
         # rechnen ihn ohnehin pro Render (liveProgress); das Feld hier
         # versorgt ältere Builds. KEINE periodischen Extra-Pushes dafür —
         # Apples Live-Activity-Throttle (s. Kopfkommentar dieses Fanouts).
-        if shows_arrival and est_dep and est_arr:
+        if nxt is None and shows_arrival and est_dep and est_arr:
             try:
                 _d0 = datetime.fromisoformat(str(est_dep).replace('Z', '+00:00'))
                 _d1 = datetime.fromisoformat(str(est_arr).replace('Z', '+00:00'))
