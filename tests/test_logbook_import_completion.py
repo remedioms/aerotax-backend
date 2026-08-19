@@ -71,8 +71,47 @@ def test_upload_id_argument_must_be_positive_and_is_removed_from_metadata():
         '{"source":"manual"}', '--upload-id', '12',
     ])
     assert parsed == ('parsed.json', 'AT-owner', 'Import',
-                      {'source': 'manual'}, 12)
+                      {'source': 'manual'}, [12])
+
+    repeated = MODULE._args([
+        'upsert_logbook.py', 'parsed.json', 'AT-owner', 'Import',
+        '--upload-id', '12', '--upload-id', '13', '--upload-id', '12',
+    ])
+    assert repeated[-1] == [12, 13]
 
     with pytest.raises(SystemExit, match='positiv'):
         MODULE._args(['upsert_logbook.py', 'a.json', 'AT-owner', 'Import',
                       '--upload-id', '0'])
+
+
+def test_duplicate_upload_batch_completes_all_rows_with_one_push():
+    cur = _Cursor([
+        ('AT-owner', 'review'), (12,),
+        ('AT-owner', 'review'), (13,),
+    ])
+
+    completed = MODULE._complete_upload_batch_after_verified(
+        cur, [13, 12, 13], 'AT-owner')
+
+    assert completed == [12, 13]
+    pushes = [call for call in cur.calls
+              if 'enqueue_push_outbox' in call[0]]
+    assert len(pushes) == 1
+    assert pushes[0][1][0] == 'logbook-import-completed:13'
+    assert json.loads(pushes[0][1][2])['data']['job_id'] == 13
+
+
+def test_batch_push_anchor_is_a_newly_completed_upload():
+    cur = _Cursor([
+        ('AT-owner', 'review'), (12,),
+        ('AT-owner', 'completed'),
+    ])
+
+    completed = MODULE._complete_upload_batch_after_verified(
+        cur, [12, 13], 'AT-owner')
+
+    assert completed == [12]
+    pushes = [call for call in cur.calls
+              if 'enqueue_push_outbox' in call[0]]
+    assert len(pushes) == 1
+    assert pushes[0][1][0] == 'logbook-import-completed:12'

@@ -245,6 +245,32 @@ def test_try_parsers_routes_offblock_csv_by_content(tmp_path):
     }]
 
 
+def test_try_parsers_routes_offblock_logbook_header_variant(tmp_path):
+    """Upload #616: dedicated export uses short/title-cased headers."""
+    path = tmp_path / "offblock-logbook.upload"
+    path.write_text(
+        "Type;Date;Function;Departure;Departure Time;Arrival;Arrival Time;"
+        "Registration;Aircraft ICAO;Flight Number;Pilot Flying;Landing Day;"
+        "Landing Night;Total Time;PIC Name;Notes\n"
+        "Flight;01.01.24;Second in Command;FRA;08:00;MUC;09:10;D-AIZI;"
+        "A320;LH100;true;1;0;01:10;Captain Example;line check\n",
+        encoding="utf-8",
+    )
+
+    name, legs, sims, report = logbook_watchdog._try_parsers(str(path))
+
+    assert name == "offblock_duties"
+    assert sims == [] and report["control"] == "OK"
+    assert legs == [{
+        "date": "2024-01-01", "flight": "LH100", "from": "FRA",
+        "to": "MUC", "dep_iso": "2024-01-01T08:00:00Z",
+        "arr_iso": "2024-01-01T09:10:00Z", "block_min": 70,
+        "reg": "D-AIZI", "type": "A320", "pf": True,
+        "ldg_day": 1, "role": "SIC", "pic_name": "Captain Example",
+        "remarks": "line check",
+    }]
+
+
 def test_try_parsers_accepts_expense_statement_without_inventing_legs(
         monkeypatch, tmp_path):
     path = tmp_path / "expense.upload"

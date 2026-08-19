@@ -127,6 +127,28 @@ REQUIRED_HEADERS = {
     'Aircraft registration', 'Aircraft ICAO',
 }
 
+# OffBlock's dedicated Logbook export (observed in upload #616) contains the
+# same facts as the established Duties export, but uses shorter/title-cased
+# column names.  Keep the content router strict by accepting aliases only for
+# known OffBlock fields, then canonicalize them before applying the existing
+# validation and control sums.
+COLUMN_ALIASES = {
+    'Departure place': ('Departure',),
+    'Departure time': ('Departure Time',),
+    'Arrival place': ('Arrival',),
+    'Arrival time': ('Arrival Time',),
+    'Total time': ('Total Time',),
+    'Flight number': ('Flight Number',),
+    'Aircraft registration': ('Registration',),
+    'Pilot flying': ('Pilot Flying',),
+    'Landing day (count)': ('Landing Day',),
+    'Landing night (count)': ('Landing Night',),
+    'PIC': ('PIC Name',),
+    'SIC': ('SIC Name',),
+    'SFO': ('SFO Name',),
+    'FO': ('FO Name',),
+}
+
 # Felder, die beim Cluster-Merge aus schwächeren Zeilen nachgefüllt werden
 # dürfen (Zeiten/Blockzeit NICHT — die kommen ausschließlich vom Gewinner).
 FILL_FIELDS = ('reg', 'type', 'pic_name', 'remarks', 'night_min',
@@ -136,6 +158,30 @@ FILL_FIELDS = ('reg', 'type', 'pic_name', 'remarks', 'night_min',
 def s(row, key):
     """Feld sicher als getrimmter String (CSV liefert None bei Kurzzeilen)."""
     return (row.get(key) or '').strip()
+
+
+def _column_names(canonical):
+    return (canonical,) + COLUMN_ALIASES.get(canonical, ())
+
+
+def _canonical_row(row, number):
+    """Map the two proven OffBlock header variants onto the Duties schema.
+
+    If an export ever contains both spellings, accepting contradictory values
+    would make the result depend on alias order.  Stop for review instead.
+    """
+    canonical = dict(row)
+    for target, aliases in COLUMN_ALIASES.items():
+        values = [(name, s(row, name)) for name in (target,) + aliases
+                  if s(row, name)]
+        distinct = {value.casefold() for _, value in values}
+        if len(distinct) > 1:
+            names = ', '.join(name for name, _ in values)
+            raise ValueError(
+                f'OffBlock-Zeile {number}: widersprüchliche Spalten {names}')
+        if values:
+            canonical[target] = values[0][1]
+    return canonical
 
 
 def fstd_row_is_sim(registration, departure, arrival, flight_number):
@@ -413,7 +459,8 @@ def matches_csv(path):
     try:
         with open(path, encoding='utf-8-sig', newline='') as handle:
             fields = set(csv.DictReader(handle, delimiter=';').fieldnames or [])
-        return REQUIRED_HEADERS <= fields
+        return all(any(name in fields for name in _column_names(required))
+                   for required in REQUIRED_HEADERS)
     except (OSError, UnicodeError, csv.Error):
         return False
 
@@ -430,7 +477,9 @@ def parse_csv(src, *, cutoff=None, keep_planned=False,
     if not matches_csv(src):
         raise ValueError('kein OffBlock-Duties-CSV-Kopf')
     with open(src, encoding='utf-8-sig', newline='') as handle:
-        rows = list(csv.DictReader(handle, delimiter=';'))
+        rows = [_canonical_row(row, number)
+                for number, row in enumerate(
+                    csv.DictReader(handle, delimiter=';'), start=2)]
 
     legs, sims = [], []
     skipped = {'kein_datum': 0, 'summenzeile': 0, 'platzhalter': 0,

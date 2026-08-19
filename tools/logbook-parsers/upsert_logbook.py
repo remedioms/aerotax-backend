@@ -2,6 +2,7 @@
 """Parser-JSON → SB `ax_logbook_import` upserten (Token-PK).
 
   python3 upsert_logbook.py <parsed.json> <token> <filename-label> [meta-json]
+      [--upload-id ID ...]
 
 Direkter Prod-Postgres via flight-warehouse DATABASE_URL. Re-Import
 desselben Users = Upsert derselben Zeile (Overlay bleibt oberste Instanz).
@@ -23,8 +24,8 @@ def _database_url():
 
 def _args(argv):
     args = list(argv[1:])
-    upload_id = None
-    if '--upload-id' in args:
+    upload_ids = []
+    while '--upload-id' in args:
         i = args.index('--upload-id')
         try:
             upload_id = int(args[i + 1])
@@ -33,12 +34,29 @@ def _args(argv):
         del args[i:i + 2]
         if upload_id < 1:
             raise SystemExit('--upload-id muss positiv sein')
+        if upload_id not in upload_ids:
+            upload_ids.append(upload_id)
     if len(args) not in (3, 4):
-        raise SystemExit('usage: upsert_logbook.py parsed.json token label [meta-json] [--upload-id ID]')
-    return args[0], args[1], args[2], (json.loads(args[3]) if len(args) == 4 else {}), upload_id
+        raise SystemExit('usage: upsert_logbook.py parsed.json token label '
+                         '[meta-json] [--upload-id ID ...]')
+    return (args[0], args[1], args[2],
+            (json.loads(args[3]) if len(args) == 4 else {}), upload_ids)
 
 
-def _complete_upload_after_verified(cur, upload_id, token):
+def _enqueue_completion_push(cur, upload_id, token):
+    payload = json.dumps({
+        'title': 'Flugbuch-Import fertig',
+        'body': 'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.',
+        'data': {'type': 'logbook_import_completed',
+                 'localization_key': 'logbook_import_completed',
+                 'job_id': upload_id,
+                 'deep_link': 'aerox://more/logbook'},
+    }, ensure_ascii=False)
+    cur.execute('select * from public.enqueue_push_outbox(%s, %s, %s::jsonb)',
+                (f'logbook-import-completed:{upload_id}', token, payload))
+
+
+def _complete_upload_after_verified(cur, upload_id, token, enqueue=True):
     """Atomically terminalize an operator upload and enqueue exactly one push."""
     cur.execute('select token, status from public.ax_logbook_upload where id=%s for update',
                 (upload_id,))
@@ -58,20 +76,29 @@ def _complete_upload_after_verified(cur, upload_id, token):
     """, (upload_id, token))
     if not cur.fetchone():
         return False
-    payload = json.dumps({
-        'title': 'Flugbuch-Import fertig',
-        'body': 'Deine importierten Flüge und Stunden sind jetzt im Flugbuch.',
-        'data': {'type': 'logbook_import_completed',
-                 'localization_key': 'logbook_import_completed', 'job_id': upload_id,
-                 'deep_link': 'aerox://more/logbook'},
-    }, ensure_ascii=False)
-    cur.execute('select * from public.enqueue_push_outbox(%s, %s, %s::jsonb)',
-                (f'logbook-import-completed:{upload_id}', token, payload))
+    if enqueue:
+        _enqueue_completion_push(cur, upload_id, token)
     return True
 
 
+def _complete_upload_batch_after_verified(cur, upload_ids, token):
+    """Complete duplicate/superseded source uploads with one user push.
+
+    Every row still goes through the same owner/status verification as the
+    single-upload path. The surrounding transaction makes the row updates and
+    the one outbox enqueue atomic.
+    """
+    ids = sorted(set(upload_ids))
+    completed = [upload_id for upload_id in ids
+                 if _complete_upload_after_verified(
+                     cur, upload_id, token, enqueue=False)]
+    if completed:
+        _enqueue_completion_push(cur, max(completed), token)
+    return completed
+
+
 def main():
-    path, token, label, extra, upload_id = _args(sys.argv)
+    path, token, label, extra, upload_ids = _args(sys.argv)
 
     data = json.load(open(path))
     legs, sims = data['legs'], data.get('sim', [])
@@ -119,15 +146,16 @@ def main():
     if not ok:
         conn.rollback()
         raise RuntimeError('Rücklese-Verifikation von ax_logbook_import fehlgeschlagen')
-    completed = (_complete_upload_after_verified(cur, upload_id, token)
-                 if upload_id is not None else False)
+    completed = (_complete_upload_batch_after_verified(cur, upload_ids, token)
+                 if upload_ids else [])
     conn.commit()
     print(f'{token}  {label}')
     print(f'  gespeichert: legs={n_legs} sim={n_sim} ({size // 1024} KB) '
           f'{"OK" if ok else "ABWEICHUNG!"}')
     print(f'  meta: {json.dumps(m, ensure_ascii=False)}')
-    if upload_id is not None:
-        print(f'  upload #{upload_id}: {"completed + push outbox" if completed else "bereits completed"}')
+    if upload_ids:
+        print(f'  uploads {upload_ids}: '
+              f'{"completed + one push outbox" if completed else "bereits completed"}')
 
 
 if __name__ == '__main__':
