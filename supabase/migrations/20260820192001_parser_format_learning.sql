@@ -58,9 +58,10 @@ create index if not exists ax_parser_formats_status_updated_idx
 alter table public.ax_parser_formats enable row level security;
 alter table public.ax_parser_format_evidence enable row level security;
 
-revoke all on table public.ax_parser_formats from public, anon, authenticated;
+revoke all on table public.ax_parser_formats
+    from public, anon, authenticated, service_role;
 revoke all on table public.ax_parser_format_evidence
-    from public, anon, authenticated;
+    from public, anon, authenticated, service_role;
 
 -- The backend must look up a contract before deciding between one and two
 -- reads. All state mutations still go through the atomic RPC below.

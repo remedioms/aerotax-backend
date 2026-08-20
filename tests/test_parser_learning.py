@@ -89,7 +89,17 @@ def test_learning_migration_is_service_only_and_has_no_raw_payload_columns():
     assert "from public, anon, authenticated" in lower
     assert "security definer" in lower
     assert "to service_role" in lower
+    assert "from public, anon, authenticated, service_role" in lower
     table_section = lower.split("create table if not exists public.ax_parser_formats", 1)[1]
     table_section = table_section.split("create table if not exists", 1)[0]
     assert "source_text" not in table_section
     assert "token" not in table_section
+
+    acl_migration = next((root / "supabase" / "migrations").glob(
+        "*_lock_parser_format_acl.sql")).read_text().lower()
+    assert "revoke all on table public.ax_parser_formats from service_role" \
+        in acl_migration
+    assert "grant select on table public.ax_parser_formats to service_role" \
+        in acl_migration
+    assert "grant execute on function public.ax_parser_learning_record" \
+        in acl_migration
