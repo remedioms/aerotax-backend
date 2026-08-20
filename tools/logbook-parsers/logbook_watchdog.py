@@ -338,7 +338,10 @@ def _try_parsers(path):
         return "foreflight_easa", legs, sims, report
     if parse_swiss_historical.matches_pdf(path):
         legs, sims, report = parse_swiss_historical.parse_pdf(path)
-        return "swiss_historical_roster", legs, sims, report
+        parser_name = ("informational_pdf"
+                       if report.get("document_type") == "zero_flight_roster"
+                       else "swiss_historical_roster")
+        return parser_name, legs, sims, report
     try:
         with pdfplumber.open(path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)

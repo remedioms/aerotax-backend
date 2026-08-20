@@ -41,9 +41,11 @@ CREATED_RE = re.compile(
     r"Created\s+(\d{1,2})([A-Za-z]{3})(20\d{2})\s+"
     r"(\d{1,2}):(\d{2})\s+\(([A-Z]{3})\)\s+by\b",
     re.IGNORECASE)
-FLIGHT_RE = re.compile(r"^LX\d{1,4}[A-Z]?$", re.IGNORECASE)
+FLIGHT_RE = re.compile(r"^(?:LX|WK)\d{1,4}[A-Z]?$", re.IGNORECASE)
 CLOCK_RE = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d$")
 IATA_RE = re.compile(r"^[A-Z]{3}$")
+DATED_ROW_RE = re.compile(
+    r"^(\d{1,2})\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b")
 
 MONTHS = {
     name: number for number, name in enumerate(
@@ -91,7 +93,13 @@ def _group_words(page):
 
 def _header_positions(rows):
     for words in rows:
-        by_text = {word["text"]: float(word["x0"]) for word in words}
+        # The 2019-2021 layout labels the last column ``Flt hrs**`` while the
+        # newer export emits ``Flt hrs``.  The stars refer to a footnote and
+        # are not part of the column name.
+        by_text = {
+            word["text"].rstrip("*"): float(word["x0"])
+            for word in words
+        }
         if all(marker in by_text for marker in TABLE_MARKERS):
             return {
                 "date": by_text["Date"], "report": by_text["Report"],
@@ -127,6 +135,69 @@ def _clock(local_day, value, station):
                     hour, minute, tzinfo=ZoneInfo(tz_name))
 
 
+def _month_shift(year, month, offset):
+    serial = year * 12 + month - 1 + offset
+    return serial // 12, serial % 12 + 1
+
+
+def _resolve_printed_days(year, month, printed):
+    """Resolve dated table rows across the surrounding three months.
+
+    Historical exports can begin on the final day of the previous month and
+    end on the first day of the next month.  Day-of-month alone is therefore
+    insufficient.  The printed weekday plus chronological row order forms a
+    strict, non-guessing proof; a sequence with no unique best path is
+    rejected.
+    """
+    weekday_number = {
+        "Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3,
+        "Fri": 4, "Sat": 5, "Sun": 6,
+    }
+    period_start = date(year, month, 1)
+    choices = []
+    for dom_text, weekday in printed:
+        candidates = []
+        for offset in (-1, 0, 1):
+            candidate_year, candidate_month = _month_shift(
+                year, month, offset)
+            try:
+                candidate = date(
+                    candidate_year, candidate_month, int(dom_text))
+            except ValueError:
+                continue
+            if candidate.weekday() == weekday_number[weekday]:
+                candidates.append(candidate)
+        if not candidates:
+            raise ValueError("SWISS roster: Wochentag und Datum widersprechen")
+        choices.append(candidates)
+
+    # Dynamic programming keeps every viable chronological interpretation.
+    # The distance score makes the named planning month win when a 28-day
+    # weekday repetition leaves two otherwise valid paths.
+    states = [(0, [])]
+    for candidates in choices:
+        next_states = []
+        for score, path in states:
+            for candidate in candidates:
+                if path:
+                    gap = (candidate - path[-1]).days
+                    if gap < 0 or gap > 40:
+                        continue
+                next_states.append((
+                    score + abs((candidate - period_start).days),
+                    path + [candidate],
+                ))
+        if not next_states:
+            raise ValueError("SWISS roster: Datumsfolge ist nicht chronologisch")
+        states = next_states
+
+    best_score = min(score for score, _ in states)
+    best = [path for score, path in states if score == best_score]
+    if len(best) != 1:
+        raise ValueError("SWISS roster: Datumsfolge nicht eindeutig")
+    return best[0]
+
+
 def _arrival(dep, dep_day, arr_clock, station, explicit_day=None):
     if explicit_day is not None:
         candidates = [_clock(explicit_day, arr_clock, station)]
@@ -139,6 +210,28 @@ def _arrival(dep, dep_day, arr_clock, station, explicit_day=None):
     if len(valid) != 1:
         raise ValueError("SWISS roster: lokale Ankunft nicht eindeutig")
     return valid[0]
+
+
+def _period_overlap_minutes(leg, year, month, homebase="ZRH"):
+    """Minutes of a leg which SWISS attributes to the named roster month.
+
+    A flight crossing a month boundary is split at midnight in the roster's
+    homebase timezone.  The printed monthly total therefore contains only the
+    matching slice, not necessarily the whole block or the departure month.
+    """
+    timezone_name = airport_tz(homebase)
+    if not timezone_name:
+        raise ValueError(
+            f"SWISS roster: Zeitzone fuer {homebase} nicht aufloesbar")
+    local_timezone = ZoneInfo(timezone_name)
+    next_year, next_month = _month_shift(year, month, 1)
+    period_start = datetime(year, month, 1, tzinfo=local_timezone)
+    period_end = datetime(next_year, next_month, 1, tzinfo=local_timezone)
+    dep = datetime.fromisoformat(leg["dep_iso"].replace("Z", "+00:00"))
+    arr = datetime.fromisoformat(leg["arr_iso"].replace("Z", "+00:00"))
+    overlap_start = max(dep, period_start)
+    overlap_end = min(arr, period_end)
+    return max(0, int((overlap_end - overlap_start).total_seconds() // 60))
 
 
 def _role(position):
@@ -198,21 +291,31 @@ def parse_pdf(path):
         if created.date() < date(year, month, 1):
             raise ValueError("SWISS roster: Erstellzeit liegt vor dem Zeitraum")
 
+        page_rows = []
+        printed = []
+        for page in pdf.pages:
+            rows = _group_words(page)
+            columns = _header_positions(rows)
+            page_rows.append((rows, columns))
+            for words in rows:
+                cell = _cells(words, columns)
+                day_match = DATED_ROW_RE.match(cell.get("date", ""))
+                if day_match:
+                    printed.append(day_match.groups())
+        resolved_days = iter(_resolve_printed_days(year, month, printed))
+
         legs = []
         deadheads = 0
         pending = None
         current_day = None
-        for page in pdf.pages:
-            rows = _group_words(page)
-            columns = _header_positions(rows)
+        for rows, columns in page_rows:
             for words in rows:
                 cell = _cells(words, columns)
-                day_match = re.match(r"^(\d{1,2})\b", cell.get("date", ""))
+                day_match = DATED_ROW_RE.match(cell.get("date", ""))
+                row_day = None
                 if day_match:
-                    try:
-                        current_day = date(year, month, int(day_match.group(1)))
-                    except ValueError as ex:
-                        raise ValueError("SWISS roster: ungueltiges Tagesdatum") from ex
+                    current_day = next(resolved_days)
+                    row_day = current_day
 
                 activity = cell.get("activity", "").replace(" ", "").upper()
                 pos = cell.get("pos", "").upper()
@@ -229,7 +332,12 @@ def parse_pdf(path):
                     if pending["pos"] != pos:
                         raise ValueError("SWISS roster: Overnight-Position widerspricht")
                     if not pending["deadhead"]:
-                        legs.append(_leg(pending, destination, arr_clock, current_day))
+                        # A dated closer proves its local arrival day.  A
+                        # continuation without a repeated date (common for a
+                        # short flight crossing midnight) must instead use the
+                        # bounded 0/+1-day arrival check.
+                        legs.append(_leg(pending, destination, arr_clock,
+                                         row_day))
                     pending = None
                     continue
 
@@ -264,19 +372,25 @@ def parse_pdf(path):
 
         if pending:
             raise ValueError("SWISS roster: Overnight-Leg endet ohne Ankunft")
-        if not legs:
+        if not legs and expected:
             raise ValueError("SWISS roster: keine operativen Legs")
-        parsed = sum(leg["block_min"] for leg in legs)
+        period_key = f"{year:04d}-{month:02d}"
+        parsed = sum(_period_overlap_minutes(leg, year, month)
+                     for leg in legs)
         if parsed != expected:
             raise ValueError(
                 f"SWISS roster: Flugzeit-Summe weicht ab: Quelle={expected} Parser={parsed}")
 
         legs.sort(key=lambda leg: (leg["dep_iso"], leg["flight"]))
         return legs, [], {
-            "month": f"{year:04d}-{month:02d}",
+            "month": period_key,
             "created_at": created.astimezone(timezone.utc).isoformat(),
             "verified_source_block_total": expected,
-            "block_min": parsed,
+            "block_min": sum(leg["block_min"] for leg in legs),
+            "spillover_legs": sum(
+                1 for leg in legs if leg["date"][:7] != period_key),
+            "document_type": ("zero_flight_roster" if not legs
+                              else "historical_roster"),
             "deadheads_skipped": deadheads,
             "legs": len(legs),
         }
