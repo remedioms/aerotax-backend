@@ -1384,6 +1384,26 @@ def test_enrich_sectors_boarding_window_gate_holds_for_new_fields(monkeypatch):
     assert warmed == [] and sec == _sector(far)
 
 
+def test_boarding_window_and_cache_key_use_stable_plan_departure(monkeypatch):
+    """A live delay must not hide marks or change their operating-day key."""
+    _reset_boarding_cache()
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    now = 1785000000.0
+    sched = _dtmod.datetime.utcfromtimestamp(now + 2 * 3600).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+    delayed = _dtmod.datetime.utcfromtimestamp(now + 20 * 3600).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+    sec = _sector(delayed)
+    sec['sched_dep_iso'] = sched
+    key = fo._boarding_key('AT-U', 'LH123', sched[:10], 'MUC')
+    marks = fo.duty_marks_from_times(CHECKIN_MUC)
+    fo._boarding_cache_put(key, marks, now=now)
+
+    assert fo.boarding_candidate_index([sec], now) == 0
+    assert fo.enrich_sectors_boarding('AT-U', [sec], now_ts=now) is True
+    assert sec['boarding_iso'] == marks['boarding_iso']
+
+
 def test_boarding_fetch_caches_all_marks_from_one_call(monkeypatch):
     """0 zusätzliche LH-Calls: EIN Fetch füllt alle Felder."""
     _reset_boarding_cache()

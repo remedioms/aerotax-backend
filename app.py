@@ -24807,6 +24807,41 @@ def _briefing_response_memo_invalidate(token):
         _BRIEFING_RESPONSE_MEMO.pop(token, None)
 
 
+def _briefing_attach_cached_duty_marks(token, data):
+    """Re-read the cache-only LH duty marks on every briefing response.
+
+    The first request intentionally never waits for ``COMMON_CHECK_IN_TIMES``:
+    ``enrich_sectors_boarding`` starts a background warmer on a cold cache.
+    The finished briefing payload is memoized for 20 seconds, though.  Without
+    this small second pass every poll inside that window returned the original
+    payload without boarding/security/crewbus, even after the warmer had
+    already populated its cache.  This helper performs no network I/O and is
+    additive/idempotent, so memo hits stay fast while newly warmed marks become
+    visible on the very next poll.
+    """
+    if not isinstance(data, dict):
+        return False
+    try:
+        from datetime import date as _bd, timedelta as _btd
+        from blueprints.lh_flightops import (
+            enrich_sectors_boarding as _enrich_boarding)
+        _today = _bd.today()
+        _live_days = (_today.isoformat(),
+                      (_today - _btd(days=1)).isoformat(),
+                      (_today + _btd(days=1)).isoformat())
+        wrote = False
+        for _key in _live_days:
+            _day = data.get(_key)
+            if not isinstance(_day, dict):
+                continue
+            _sectors = _day.get('ical_sectors')
+            if isinstance(_sectors, list):
+                wrote = _enrich_boarding(token, _sectors) or wrote
+        return wrote
+    except Exception:
+        return False
+
+
 @app.route('/api/user/briefing/<token>', methods=['GET'])
 def get_briefings(token):
     """Alle Briefing-Items (key: Datum) für User.
@@ -24831,6 +24866,9 @@ def get_briefings(token):
     datum = request.args.get('datum')
     _memo = _briefing_response_memo_get(token)
     if _memo is not None:
+        # A cold first read starts the LH marks warmer.  Re-check its local
+        # cache even while the merged briefing payload itself is memoized.
+        _briefing_attach_cached_duty_marks(token, _memo)
         if datum:
             return jsonify({'datum': datum, 'briefing': _memo.get(datum, {})})
         return jsonify({'count': len(_memo), 'briefings': _memo})
@@ -24929,26 +24967,13 @@ def get_briefings(token):
                 _enrich_leg_delays(_day['ical_sectors'], _k,
                                    homebase=(_hb or None),
                                    deadline=_enrich_deadline)
-                # BOARDING-ZEIT (Owner-Nachforderung 27.07., verdrahtet 30.07.):
-                # `boardingBegin` aus COMMON_CHECK_IN_TIMES ist die einzige
-                # ECHTE Boarding-Zeit im System und wurde bisher serverseitig
-                # geparst und weggeworfen. Sie hängt jetzt als `boarding_iso`
-                # am fälligen Sektor, damit die Widget-/Live-Activity-Kette
-                # ihren dritten Schritt bekommt.
-                #
-                # ⚠️ KEIN NETZ AUF DIESEM PFAD. Die Funktion liest hier nur
-                # ihren Cache; ein Miss wärmt im Hintergrund-Thread (Details +
-                # Quoten-Begründung an `enrich_sectors_boarding`). Deshalb
-                # steht sie auch NICHT unter `_enrich_deadline` — sie kostet
-                # keine Zeit, die zu budgetieren wäre.
-                try:
-                    from blueprints.lh_flightops import (
-                        enrich_sectors_boarding as _enrich_boarding)
-                    _enrich_boarding(token, _day['ical_sectors'])
-                except Exception:
-                    pass
     except Exception:
         pass
+    # BOARDING-ZEIT (Owner-Nachforderung 27.07., verdrahtet 30.07.): cache-only
+    # and deliberately outside the live-delay budget. A miss starts its daemon
+    # warmer; memo hits run the same helper again and expose the result without
+    # waiting for the 20-s briefing memo to expire.
+    _briefing_attach_cached_duty_marks(token, data)
     _briefing_response_memo_put(token, data)
     if datum:
         return jsonify({'datum': datum, 'briefing': data.get(datum, {})})

@@ -1,9 +1,10 @@
 """Regressionen fuer die interaktiven AeroX-Lese-Schnellpfade."""
 
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import app as A
+from blueprints import lh_flightops as fo
 
 
 TOKEN = 'AT-1111111111111111'
@@ -36,6 +37,45 @@ def test_briefing_response_memo_reuses_merged_payload():
     assert first['briefings']['2026-08-07']['remarks'] == 'ready'
     assert calls == {'manual': 1, 'ical': 1}
     assert A._BRIEFING_ENRICH_BUDGET_S < 1.0
+    A._briefing_response_memo_invalidate(TOKEN)
+
+
+def test_briefing_memo_hit_exposes_newly_warmed_boarding_marks():
+    """The 20-s response memo must not conceal a completed marks warmer."""
+    today = date.today().isoformat()
+    dep = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime(
+        '%Y-%m-%dT%H:%M:%SZ')
+    data = {today: {'ical_sectors': [{
+        'flight': 'LH123', 'from': 'FRA', 'to': 'MUC', 'dep_iso': dep,
+    }]}}
+    calls = []
+
+    def cache_only_enrich(_token, sectors, now_ts=None):
+        calls.append(len(calls) + 1)
+        if len(calls) >= 2:
+            sectors[0]['boarding_iso'] = dep
+            return True
+        return False
+
+    A._briefing_response_memo_invalidate(TOKEN)
+    with (
+        patch.object(A, '_maybe_refresh_calendar_feed'),
+        patch.object(A, '_maybe_refresh_flightops'),
+        patch.object(A, '_manual_briefings_load', return_value=data),
+        patch.object(A, '_ical_briefings_load', return_value={}),
+        patch.object(A, '_enrich_leg_delays'),
+        patch.object(A, '_profile_homebase_cached', return_value='FRA'),
+        patch.object(fo, 'enrich_sectors_boarding',
+                     side_effect=cache_only_enrich),
+    ):
+        with A.app.test_request_context(method='GET'):
+            first = A.get_briefings(TOKEN).get_json()
+        with A.app.test_request_context(method='GET'):
+            second = A.get_briefings(TOKEN).get_json()
+
+    assert 'boarding_iso' not in first['briefings'][today]['ical_sectors'][0]
+    assert second['briefings'][today]['ical_sectors'][0]['boarding_iso'] == dep
+    assert calls == [1, 2]
     A._briefing_response_memo_invalidate(TOKEN)
 
 

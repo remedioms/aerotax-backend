@@ -4509,7 +4509,11 @@ def boarding_candidate_index(sectors, now_ts):
     for i, s in enumerate(sectors):
         if not isinstance(s, dict):
             continue
-        ep = _boarding_dep_epoch(s.get('dep_iso'))
+        # Live delay enrichment may move ``dep_iso``.  Windowing and cache
+        # identity must stay anchored to the roster's plan time, otherwise a
+        # delayed flight can jump out of the six-hour duty-mark window or be
+        # cached under the wrong operating date.
+        ep = _boarding_dep_epoch(s.get('sched_dep_iso') or s.get('dep_iso'))
         if ep is None:
             continue
         lead = ep - now_ts
@@ -4544,14 +4548,15 @@ def enrich_sectors_boarding(user_token, sectors, now_ts=None):
         flight = (sec.get('flight') or '').strip()
         dep = (sec.get('from') or '').strip().upper()
         arr = (sec.get('to') or '').strip().upper()
-        date = (sec.get('dep_iso') or '')[:10]
+        plan_dep_iso = sec.get('sched_dep_iso') or sec.get('dep_iso') or ''
+        date = plan_dep_iso[:10]
         if not flight or not dep or not date:
             return False
         # Kein Grant, kein Call. `_access_state` refresht selbst nie.
         if _access_state(user_token)[0] != 'ok':
             return False
         key = _boarding_key(user_token, flight, date, dep)
-        dep_epoch = _boarding_dep_epoch(sec.get('dep_iso'))
+        dep_epoch = _boarding_dep_epoch(plan_dep_iso)
         hit, marks = _boarding_cache_get(
             key, now=now_ts, departure_epoch=dep_epoch)
         if not hit:
