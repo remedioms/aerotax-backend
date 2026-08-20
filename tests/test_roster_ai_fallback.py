@@ -1,8 +1,9 @@
 """KI-Lese-Fallback für den Roster-Import (Owner-Auftrag 2026-08-06).
 
 Wenn ein User einen Dienstplan hochlädt, den KEIN deterministischer Parser
-versteht (unbekannte Airline / neues Format), liest Claude die Roh-Fakten
-EINMALIG strukturiert — statt dass der User „0 Einträge" bekommt.
+versteht (unbekannte Airline / neues Format), liest der konfigurierte
+Modellanbieter die Roh-Fakten strukturiert — OpenAI zweimal unabhängig —
+statt dass der User „0 Einträge" bekommt.
 
 Geprüft werden genau die Leitplanken:
   * DETERMINISTIC-FIRST — bekanntes Format ⇒ kein KI-Call (Spy),
@@ -12,8 +13,8 @@ Geprüft werden genau die Leitplanken:
   * API-Fehler ⇒ Verhalten exakt wie vorher, kein Crash,
   * Lern-Warteschlange: erfolgreicher Lauf wird EINMAL archiviert.
 
-Die Anthropic-API ist IMMER gemockt (`requests.post`) — es geht in keinem Test
-ein Byte nach draußen. Fixture ist SYNTHETISCH (erfundene Airline, keine
+Die Modell-API ist IMMER gemockt (`requests.post`) — es geht in keinem Test ein
+Byte nach draußen. Fixture ist SYNTHETISCH (erfundene Airline, keine
 Personendaten).
 """
 import io
@@ -95,8 +96,11 @@ def _reset_ai_state(monkeypatch):
     """Tagesdeckel ist ein Modul-Global — zwischen Tests leeren."""
     backend._ROSTER_AI_CALLS.clear()
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-test-not-a-real-key')
+    monkeypatch.delenv('OPENAI_API_KEY', raising=False)
     monkeypatch.delenv('AEROX_ROSTER_AI_MODEL', raising=False)
     monkeypatch.delenv('AEROX_ROSTER_AI_EFFORT', raising=False)
+    monkeypatch.delenv('AEROX_ROSTER_OPENAI_MODEL', raising=False)
+    monkeypatch.delenv('AEROX_ROSTER_OPENAI_EFFORT', raising=False)
     # Die Lern-Warteschlange schreibt sonst in den echten Import-Inbox-Pfad.
     monkeypatch.setattr(backend, '_logbook_upload_store',
                         lambda *a, **k: True)
@@ -112,6 +116,27 @@ def _mock_post(monkeypatch, payload, calls=None):
                           'body': json or {}, 'timeout': timeout})
         return _FakeResponse(payload)
     monkeypatch.setattr(requests, 'post', fake_post)
+
+
+def _openai_answer(items):
+    evidence_by_day = {
+        1: '01 SBY DUS 06:00 14:00',
+        2: '02 OFF',
+        3: '03 SR101 DUS PMI 07:30 10:05',
+        4: '04 URLAUB',
+    }
+    enriched = [dict(item, source_evidence=(
+        item.get('source_evidence')
+        or evidence_by_day.get(item.get('day'), ''))) for item in items]
+    return {
+        'output': [{
+            'type': 'message',
+            'content': [{
+                'type': 'output_text',
+                'text': json.dumps({'items': enriched}, ensure_ascii=False),
+            }],
+        }],
+    }
 
 
 # ── 1. Unbekanntes Format + gemockte Antwort → Events, valides ICS, Marker ──
@@ -167,6 +192,77 @@ def test_effort_can_be_switched_off_for_legacy_models(monkeypatch):
     assert backend._roster_ai_fallback_ics(
         UNKNOWN_TEXT, 'AT-TEST-AI-EFFORT', 'unsupported_pdf_format')
     assert 'output_config' not in calls[0]['body']
+
+
+def test_openai_sol_xhigh_requires_two_identical_structured_reads(monkeypatch):
+    calls = []
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test-openai-not-real')
+    _mock_post(monkeypatch, _openai_answer(GOOD_ITEMS), calls)
+
+    ics = backend._roster_ai_fallback_ics(
+        UNKNOWN_TEXT, 'AT-TEST-OPENAI-DOUBLE', 'unsupported_pdf_format')
+
+    assert ics
+    assert len(calls) == 2
+    for call in calls:
+        assert call['url'] == 'https://api.openai.com/v1/responses'
+        assert call['headers']['Authorization'] == \
+            'Bearer sk-test-openai-not-real'
+        assert call['timeout'] == 180
+        assert call['body']['model'] == 'gpt-5.6-sol'
+        assert call['body']['reasoning'] == {'effort': 'xhigh'}
+        assert call['body']['store'] is False
+        response_format = call['body']['text']['format']
+        assert response_format['type'] == 'json_schema'
+        assert response_format['strict'] is True
+        assert response_format['schema']['additionalProperties'] is False
+
+
+def test_openai_double_read_disagreement_fails_closed(monkeypatch, caplog):
+    calls = []
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test-openai-not-real')
+    answers = [_openai_answer(GOOD_ITEMS), _openai_answer(GOOD_ITEMS[:-1])]
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
+        calls.append(url)
+        return _FakeResponse(answers[len(calls) - 1])
+
+    monkeypatch.setattr(requests, 'post', fake_post)
+    caplog.set_level('WARNING')
+
+    assert backend._roster_ai_fallback_ics(
+        UNKNOWN_TEXT, 'AT-TEST-OPENAI-MISMATCH',
+        'unsupported_pdf_format') is None
+    assert len(calls) == 2
+    assert 'double-read-mismatch' in caplog.text
+
+
+def test_openai_double_read_accepts_same_facts_in_different_order(monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test-openai-not-real')
+    answers = [_openai_answer(GOOD_ITEMS),
+               _openai_answer(list(reversed(GOOD_ITEMS)))]
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        answer = answers[len(calls)]
+        calls.append(answer)
+        return _FakeResponse(answer)
+
+    monkeypatch.setattr(requests, 'post', fake_post)
+    assert backend._roster_ai_fallback_ics(
+        UNKNOWN_TEXT, 'AT-TEST-OPENAI-ORDER',
+        'unsupported_pdf_format')
+    assert len(calls) == 2
+
+
+def test_openai_source_evidence_must_exist_and_contain_facts(monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test-openai-not-real')
+    bad = [dict(GOOD_ITEMS[0], source_evidence='01 SBY DUS 06:00 18:00')]
+    _mock_post(monkeypatch, _openai_answer(bad))
+
+    assert backend._roster_ai_fallback_ics(
+        UNKNOWN_TEXT, 'AT-TEST-OPENAI-EVIDENCE',
+        'unsupported_pdf_format') is None
 
 
 # ── 1b. Bild-PDF: visuelle Transkription, danach deterministischer Parser ─
@@ -454,6 +550,45 @@ def test_endpoint_marks_ai_read_import_honestly(monkeypatch):
     assert payload.get('source') == 'ki_fallback'
     assert payload.get('ki_hint') == backend._ROSTER_AI_HINT
     assert payload.get('events_count', 0) >= 3
+
+
+def test_endpoint_restores_previous_calendar_if_second_display_check_differs(
+        monkeypatch):
+    """A post-persist mismatch must never leave the rejected plan visible."""
+    from unittest.mock import patch
+
+    _mock_post(monkeypatch, _answer(GOOD_ITEMS))
+    real_contract = backend._airline_display_contract
+    contract_calls = []
+
+    def disagree_after_persist(events):
+        result = real_contract(events)
+        contract_calls.append(result)
+        if len(contract_calls) == 2:
+            result = dict(result)
+            result['sector_count'] = int(result.get('sector_count') or 0) + 1
+        return result
+
+    monkeypatch.setattr(
+        backend, '_airline_display_contract', disagree_after_persist)
+    pdf_bytes = _text_to_pdf(UNKNOWN_TEXT)
+    token = 'AT-TEST-AI-DISPLAY-ROLLBACK'
+    _clear_user_state(token)
+    client = backend.app.test_client()
+    valid = backend._TokenValidationResult(
+        backend._TokenValidationState.VALID, 'ai-rollback@example.test')
+    with patch.object(backend, '_validate_token', return_value=valid), \
+            patch.object(backend, '_BUG004_REQUIRE_TOKEN_BINDING', False), \
+            patch.object(backend, '_roster_pdf_upload_store',
+                         return_value=True):
+        rv = client.post(f'/api/user/roster-pdf/{token}/import',
+                         data={'pdf': (io.BytesIO(pdf_bytes), 'plan.pdf')},
+                         content_type='multipart/form-data')
+
+    assert rv.status_code == 422
+    assert len(contract_calls) == 2
+    assert backend._airline_request_profile_feed(token) == {}
+    assert backend._ical_briefings_load(token) == {}
 
 
 # ── 6. Lern-Warteschlange (Owner-Zusatz 2026-08-06) ────────────────────────

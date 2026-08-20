@@ -61817,8 +61817,10 @@ def _repair_ios_reprinted_roster_text(text):
 # ── KI-Lese-Fallback für den Roster-Import (Owner-Auftrag 2026-08-06) ────────
 # ZWECK: Wenn ein User einen Dienstplan hochlädt, dessen Format KEIN
 # deterministischer Parser versteht (unbekannte Airline / neues Format), liest
-# Claude die Roh-Fakten EINMALIG strukturiert — statt dass der User „0
-# Einträge" bekommt.
+# ein starkes Modell die Roh-Fakten strukturiert — statt dass der User „0
+# Einträge" bekommt. OpenAI Sol liest bei vorhandenem Server-Secret zweimal
+# unabhängig; Anthropic bleibt der bestehende Rückfall für Installationen ohne
+# OpenAI-Secret.
 #
 # LEITPLANKEN (nicht verhandelbar):
 #  1. DETERMINISTIC-FIRST — dieser Pfad hängt AUSSCHLIESSLICH am expliziten
@@ -61832,10 +61834,13 @@ def _repair_ios_reprinted_roster_text(text):
 #     (Log-Marker `hallucination-drop`). Fehlt ein Wert, bleibt er leer.
 #  3. Der Fallback darf einen Import NIE schlechter machen: jeder Fehler wird
 #     geloggt und lässt den bisherigen „0 Einträge"-Weg unverändert.
-#  4. Kosten-/Missbrauchsdeckel: max. 3 Läufe pro Token und Tag, Quelltext auf
-#     60.000 Zeichen gekappt, EIN Versuch (kein Retry-Hämmern), Timeout 90 s.
-#  5. DATENSCHUTZ: Der Quelltext geht an Anthropic. Geloggt werden nur Länge,
-#     sha-Präfix und Token-Präfix — NIE Inhalt.
+#  4. Kosten-/Missbrauchsdeckel: max. 3 logische Läufe pro Token und Tag,
+#     Quelltext auf 60.000 Zeichen gekappt, keine Retries. OpenAI führt pro
+#     Lauf zwei unabhängige Reads aus; Anthropic bleibt ein einzelner
+#     Kompatibilitäts-Read.
+#  5. DATENSCHUTZ: Der Quelltext geht nur an den serverseitig konfigurierten
+#     Modellanbieter. Geloggt werden nur Länge, sha-Präfix und Token-Präfix —
+#     NIE Inhalt oder API-Key. OpenAI-Responses werden nicht gespeichert.
 #
 # Ergebnis-Events tragen `X-AEROX-SOURCE:ki_fallback` → additives Feld
 # `ax_source` im Event-Dict, damit Diagnose/Forensik sie erkennt.
@@ -61851,6 +61856,9 @@ _ROSTER_AI_CALLS = {}                  # (token, 'YYYYMMDD') -> int
 _ROSTER_AI_CALLS_LOCK = _req_threading.Lock()
 _ROSTER_AI_HHMM_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
 _ROSTER_AI_IATA_RE = re.compile(r'^[A-Z]{3}$')
+_ROSTER_OPENAI_TIMEOUT_S = 180
+_ROSTER_OPENAI_DEFAULT_MODEL = 'gpt-5.6-sol'
+_ROSTER_OPENAI_DEFAULT_EFFORT = 'xhigh'
 
 _ROSTER_AI_SYSTEM = (
     "Du liest Crew-Dienstpläne (Roster) und gibst NUR die Roh-Fakten "
@@ -62070,6 +62078,113 @@ def _roster_ai_parse_json(raw_text):
     return items if isinstance(items, list) else []
 
 
+_ROSTER_OPENAI_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'items': {
+            'type': 'array',
+            'maxItems': 400,
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'day': {'type': 'integer'},
+                    'month_hint': {'type': 'string'},
+                    'summary': {'type': 'string'},
+                    'location': {'type': ['string', 'null']},
+                    'start_hhmm': {'type': ['string', 'null']},
+                    'end_hhmm': {'type': ['string', 'null']},
+                    'from_iata': {'type': ['string', 'null']},
+                    'to_iata': {'type': ['string', 'null']},
+                    'flight_no': {'type': ['string', 'null']},
+                    'all_day': {'type': 'boolean'},
+                    'source_evidence': {'type': 'string'},
+                },
+                'required': [
+                    'day', 'month_hint', 'summary', 'location',
+                    'start_hhmm', 'end_hhmm', 'from_iata', 'to_iata',
+                    'flight_no', 'all_day',
+                    'source_evidence',
+                ],
+                'additionalProperties': False,
+            },
+        },
+    },
+    'required': ['items'],
+    'additionalProperties': False,
+}
+
+
+def _roster_ai_openai_response_text(payload):
+    """Text aus einer RAW-Responses-API-Antwort, ohne SDK-Abhängigkeit."""
+    if not isinstance(payload, dict):
+        return ''
+    # Test-/Proxy-Kompatibilität; die echte REST-Antwort trägt Message-Items.
+    direct = payload.get('output_text')
+    if isinstance(direct, str):
+        return direct
+    chunks = []
+    for item in payload.get('output') or []:
+        if not isinstance(item, dict) or item.get('type') != 'message':
+            continue
+        for part in item.get('content') or []:
+            if (isinstance(part, dict)
+                    and part.get('type') == 'output_text'
+                    and isinstance(part.get('text'), str)):
+                chunks.append(part['text'])
+    return ''.join(chunks)
+
+
+def _roster_ai_call_openai_once(text):
+    """Ein unabhängiger, schema-strikter Sol-Leselauf via Responses API."""
+    key = (os.getenv('OPENAI_API_KEY') or '').strip()
+    model = ((os.getenv('AEROX_ROSTER_OPENAI_MODEL') or '').strip()
+             or _ROSTER_OPENAI_DEFAULT_MODEL)
+    effort = ((os.getenv('AEROX_ROSTER_OPENAI_EFFORT') or '').strip()
+              or _ROSTER_OPENAI_DEFAULT_EFFORT)
+    if not key:
+        return None, model
+    import requests as _requests
+    body = {
+        'model': model,
+        # Dienstpläne sind private Nutzerdokumente. Das Modell bekommt sie nur
+        # für diesen Request; serverseitige Response-Speicherung bleibt aus.
+        'store': False,
+        'reasoning': {'effort': effort},
+        'max_output_tokens': _ROSTER_AI_MAX_TOKENS,
+        'input': [
+            {'role': 'system', 'content': _ROSTER_AI_SYSTEM},
+            {'role': 'user', 'content': (
+                'Lies diesen Dienstplan unabhängig, vollständig und in '
+                'Quellreihenfolge. `source_evidence` muss die kürzeste '
+                'unveränderte Quellzeile sein, die Tag, Aktivität und alle '
+                'zurückgegebenen Zeiten/Flugfakten belegt. Gib nur die '
+                'belegten Roh-Fakten im verlangten Schema zurück.\n\n'
+                + text)},
+        ],
+        'text': {'format': {
+            'type': 'json_schema',
+            'name': 'aerox_roster_facts',
+            'strict': True,
+            'schema': _ROSTER_OPENAI_SCHEMA,
+        }},
+    }
+    response = _requests.post(
+        'https://api.openai.com/v1/responses',
+        headers={'Authorization': f'Bearer {key}',
+                 'Content-Type': 'application/json'},
+        json=body, timeout=_ROSTER_OPENAI_TIMEOUT_S)
+    response.raise_for_status()
+    raw = _roster_ai_openai_response_text(response.json())
+    return _roster_ai_parse_json(raw), model
+
+
+def _roster_ai_call_openai_double(text):
+    """Zwei frische Reads; der Caller validiert und vergleicht beide."""
+    first, model = _roster_ai_call_openai_once(text)
+    second, _ = _roster_ai_call_openai_once(text)
+    return [first, second], model
+
+
 def _roster_ai_call_anthropic(text):
     """RAW-HTTP-Call gegen die Messages-API (Muster
     `_redaktion_call_anthropic`): x-api-key + anthropic-version, kein SDK
@@ -62150,8 +62265,8 @@ def _roster_ai_validate_items(items, text):
         Quelltext vorkommt,
       * eine zurückgegebene Uhrzeit kein HH:MM ist oder NICHT wörtlich im
         Quelltext steht,
-      * es ein Ganztags-Marker ohne Zeiten ist, dessen `summary` nicht wörtlich
-        im Quelltext steht (das wäre eine reine Erfindung).
+      * die Modell-Evidenz keine echte Quellzeile ist oder Tag, Summary bzw.
+        zurückgegebene Fakten nicht in genau dieser Zeile stehen.
     Optionale Felder (IATA-Codes, Flugnummer, Location) werden EINZELN
     fallengelassen, wenn sie nicht im Text stehen — der Tag bleibt erhalten,
     nur die unbelegte Angabe verschwindet.
@@ -62159,7 +62274,7 @@ def _roster_ai_validate_items(items, text):
     from datetime import date as _date
     src = text or ''
     src_upper = src.upper()
-    src_squeezed = re.sub(r'\s+', '', src_upper)
+    src_words = ' '.join(src_upper.split())
     out = []
     dropped = 0
     for raw_item in (items or [])[:400]:
@@ -62178,7 +62293,17 @@ def _roster_ai_validate_items(items, text):
         if not 1 <= day <= 31:
             dropped += 1
             continue
-        if f'{day:02d}' not in src and str(day) not in src:
+        evidence = raw_item.get('source_evidence')
+        evidence = str(evidence or '').strip()
+        evidence_words = ' '.join(evidence.upper().split())
+        if evidence and (not evidence_words or evidence_words not in src_words):
+            dropped += 1
+            continue
+        fact_src = evidence if evidence else src
+        fact_upper = fact_src.upper()
+        fact_words = ' '.join(fact_upper.split())
+        fact_squeezed = re.sub(r'\s+', '', fact_upper)
+        if not re.search(rf'(?<!\d)0?{day}(?!\d)', fact_src):
             dropped += 1
             continue
         try:
@@ -62195,7 +62320,7 @@ def _roster_ai_validate_items(items, text):
             if not value:
                 clean[field] = None
                 continue
-            if not _ROSTER_AI_HHMM_RE.match(value) or value not in src:
+            if not _ROSTER_AI_HHMM_RE.match(value) or value not in fact_src:
                 times_ok = False
                 break
             clean[field] = value
@@ -62207,10 +62332,10 @@ def _roster_ai_validate_items(items, text):
             value = raw_item.get(field)
             value = value.strip().upper() if isinstance(value, str) else ''
             clean[field] = (value if _ROSTER_AI_IATA_RE.match(value)
-                            and value in src_upper else None)
+                            and value in fact_upper else None)
         flight = raw_item.get('flight_no')
         flight = re.sub(r'\s+', '', flight.upper()) if isinstance(flight, str) else ''
-        clean['flight_no'] = (flight[:8] if flight and flight in src_squeezed
+        clean['flight_no'] = (flight[:8] if flight and flight in fact_squeezed
                               else None)
 
         summary = raw_item.get('summary')
@@ -62219,7 +62344,7 @@ def _roster_ai_validate_items(items, text):
         # zu erfinden wäre ein Fake-Wert.
         all_day = (bool(raw_item.get('all_day'))
                    or not (clean['start_hhmm'] and clean['end_hhmm']))
-        if all_day and (not summary or summary.upper() not in src_upper):
+        if not summary or summary.upper() not in fact_words:
             dropped += 1
             continue
 
@@ -62359,7 +62484,7 @@ def _roster_ai_learn_store(token, capped_text, valid_items, model, src_sha):
 
 
 def _roster_ai_fallback_ics(text, token, det_error):
-    """EIN KI-Lese-Versuch für einen Upload, den kein Parser versteht.
+    """KI-Lesepfad für einen Upload, den kein Parser versteht.
 
     Liefert einen ICS-String oder None. Wirft NIE — jeder Fehlerpfad landet im
     Log und lässt den bisherigen „0 Einträge"-Weg unverändert.
@@ -62367,7 +62492,9 @@ def _roster_ai_fallback_ics(text, token, det_error):
     src = text or ''
     if not src.strip():
         return None
-    if not (os.getenv('ANTHROPIC_API_KEY') or '').strip():
+    openai_enabled = bool((os.getenv('OPENAI_API_KEY') or '').strip())
+    anthropic_enabled = bool((os.getenv('ANTHROPIC_API_KEY') or '').strip())
+    if not openai_enabled and not anthropic_enabled:
         app.logger.info(f'[roster-ai] skip-no-key tok={token[:8]} '
                         f'det_error={det_error}')
         return None
@@ -62385,17 +62512,38 @@ def _roster_ai_fallback_ics(text, token, det_error):
         f'chars={len(capped)} truncated={len(src) > _ROSTER_AI_MAX_CHARS} '
         f'sha={src_sha[:16]}')
     try:
-        items, model = _roster_ai_call_anthropic(capped)
+        if openai_enabled:
+            readings, model = _roster_ai_call_openai_double(capped)
+        else:
+            items, model = _roster_ai_call_anthropic(capped)
+            readings = [items]
     except Exception as exc:
         app.logger.warning(f'[roster-ai] call-fail tok={token[:8]} '
                            f'err={type(exc).__name__}: {str(exc)[:160]}')
         return None
-    if not items:
+    if not readings or any(not items for items in readings):
         app.logger.warning(f'[roster-ai] empty-answer tok={token[:8]} '
                            f'model={model}')
         return None
 
-    valid, dropped = _roster_ai_validate_items(items, capped)
+    checked = [_roster_ai_validate_items(items, capped)
+               for items in readings]
+    valid, dropped = checked[0]
+    if len(checked) == 2:
+        second_valid, second_dropped = checked[1]
+        dropped += second_dropped
+        first_facts = sorted(
+            json.dumps(item, sort_keys=True, ensure_ascii=False)
+            for item in valid)
+        second_facts = sorted(
+            json.dumps(item, sort_keys=True, ensure_ascii=False)
+            for item in second_valid)
+        if first_facts != second_facts:
+            app.logger.warning(
+                f'[roster-ai] double-read-mismatch tok={token[:8]} '
+                f'first={len(valid)} second={len(second_valid)} '
+                f'sha={src_sha[:16]}')
+            return None
     if dropped:
         app.logger.warning(
             f'[roster-ai] hallucination-drop tok={token[:8]} '
@@ -62703,6 +62851,40 @@ def _airline_request_profile_feed(token):
     except Exception:
         pass
     return {}
+
+
+def _roster_ai_restore_calendar_snapshot(token, previous_feed,
+                                         previous_briefings):
+    """Best-effort rollback if the post-persist display proof disagrees.
+
+    The second proof intentionally runs against durable state. If it rejects,
+    the just-written AI result must not remain visible to the user. Restore
+    only the two calendar-owned structures on top of the freshest profile so
+    unrelated concurrent profile fields are not rolled back.
+    """
+    try:
+        current = _profile_load(token, fresh=True) or {}
+        profile = dict(current.get('profile') or {})
+        restored_feed = (dict(previous_feed)
+                         if isinstance(previous_feed, dict) else {})
+        profile['calendar_feed'] = restored_feed
+
+        disk_full = dict(_profile_load_from_disk(token) or {})
+        disk_full['token'] = token
+        disk_full['profile'] = profile
+        disk_full['calendar_feed'] = restored_feed
+        disk_full['_updated_at'] = datetime.now().isoformat()
+        profile_ok = (_profile_save(
+            token, profile, full_disk_payload=disk_full) is not False)
+        briefings_ok = _ical_briefings_save(
+            token, previous_briefings
+            if isinstance(previous_briefings, dict) else {})
+        return bool(profile_ok and briefings_ok)
+    except Exception as exc:
+        app.logger.error(
+            f'[roster-ai] rollback-fail tok={token[:8]} '
+            f'err={type(exc).__name__}')
+        return False
 
 
 def _airline_display_contract(events):
@@ -63387,6 +63569,40 @@ def import_roster_pdf(token):
         return jsonify({'ok': False, 'error': 'no_roster_days',
                         'monitoring_queued': all(queued)}), 422
 
+    # Erste Anzeigeprüfung, BEVOR ein KI-gelesener Plan den gespeicherten
+    # Kalender berührt. Dieselbe Konvertierung baut später die iOS-Briefings
+    # und Sektoren; damit reicht kein formal valides ICS, dessen Flüge in der
+    # App unsichtbar oder zeitlich unplausibel wären.
+    ai_display_contract_before = None
+    ai_previous_feed = {}
+    ai_previous_briefings = {}
+    if ai_fallback_used:
+        try:
+            ai_candidate_events = _parse_ics_to_events(ics, token=token)
+            ai_display_contract_before = _airline_display_contract(
+                ai_candidate_events)
+        except Exception:
+            ai_display_contract_before = {
+                'ok': False, 'error': 'display_contract_internal_error'}
+        if not ai_display_contract_before.get('ok'):
+            error = (ai_display_contract_before.get('error')
+                     or 'ai_display_contract_failed')
+            app.logger.warning(
+                f'[roster-ai] pre-display-reject tok={token[:8]} '
+                f'error={error}')
+            _roster_pdf_upload_finish(
+                queued, 'review', error,
+                'Der gelesene Dienstplan wird in der Kalenderansicht geprüft.')
+            return jsonify({
+                'ok': False, 'error': error,
+                'monitoring_queued': all(queued),
+            }), 422
+        # Snapshot only after the pre-check passed and immediately before the
+        # single writer. A failed post-check can therefore restore the exact
+        # user-visible calendar that existed before this AI import.
+        ai_previous_feed = dict(_airline_request_profile_feed(token) or {})
+        ai_previous_briefings = dict(_ical_briefings_load(token) or {})
+
     # Interner Dispatch in die EINE Feed-Pipeline (wallreply-Muster) — kein
     # Fetch, volles Parse/Merge/Briefings/Reconcile/Sektoren-Verhalten.
     # `source` explizit — hier ist es WIRKLICH ein PDF (s. _DIRECT_ICS_SOURCES).
@@ -63401,6 +63617,31 @@ def import_roster_pdf(token):
         payload = resp_obj.get_json() or {}
     except Exception:
         payload = {}
+    # Zweite, unabhängige Anzeigeprüfung AM tatsächlich persistierten Feed.
+    # Die Airline-Warteschlange prüft denselben Contract vor der globalen
+    # Katalog-Freischaltung ein drittes Mal. Ein Unterschied zwischen Vorher-
+    # und Nachher-Form blockiert fail-closed und behält die Quelle im Review.
+    if status == 200 and payload.get('ok') and ai_fallback_used:
+        persisted_feed = _airline_request_profile_feed(token)
+        persisted_events = (persisted_feed.get('events')
+                            if isinstance(persisted_feed, dict) else None)
+        ai_display_contract_after = _airline_display_contract(
+            persisted_events if isinstance(persisted_events, list) else [])
+        if (not ai_display_contract_after.get('ok')
+                or ai_display_contract_after.get('display_mode') !=
+                ai_display_contract_before.get('display_mode')
+                or ai_display_contract_after.get('sector_count') !=
+                ai_display_contract_before.get('sector_count')):
+            error = (ai_display_contract_after.get('error')
+                     or 'ai_display_contract_mismatch')
+            rollback_ok = _roster_ai_restore_calendar_snapshot(
+                token, ai_previous_feed, ai_previous_briefings)
+            status = 422 if rollback_ok else 503
+            payload = {'ok': False, 'error': (
+                error if rollback_ok else 'ai_display_contract_rollback_failed')}
+            app.logger.warning(
+                f'[roster-ai] post-display-reject tok={token[:8]} '
+                f'error={error} rollback={rollback_ok}')
     if status == 200 and payload.get('ok'):
         payload['source'] = 'pdf'
         if ai_fallback_used:
@@ -63409,6 +63650,11 @@ def import_roster_pdf(token):
             # unbekannte Felder nicht an — kein UI-Zwang, aber das Feld ist da.
             payload['source'] = _ROSTER_AI_MARKER
             payload['ki_hint'] = _ROSTER_AI_HINT
+            payload['ai_verification'] = {
+                'independent_reads': (2 if
+                    (os.getenv('OPENAI_API_KEY') or '').strip() else 1),
+                'display_contract_checks': 2,
+            }
         if informational_documents:
             payload['informational_files'] = len(informational_documents)
         periods = [period for period in periods if period]
