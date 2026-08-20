@@ -62349,6 +62349,7 @@ def _roster_pdf_upload_finish(job_ids, status, error_code=None,
 # The durable support queue only accepts a source which is already owner-bound
 # (the encrypted calendar feed or the private roster-PDF inbox).
 _AIRLINE_REQUEST_SOURCE_KINDS = frozenset(('ical_url', 'pdf'))
+_AIRLINE_DISPLAY_CONTRACT_VERSION = 'calendar-v1'
 
 # Die Airlines, die die App im Onboarding fest anbietet (iOS-Spiegel:
 # OnboardingView.builtInAirlines). Tippt jemand unter „Andere" einen Namen,
@@ -62419,6 +62420,103 @@ def _airline_request_profile_feed(token):
     return {}
 
 
+def _airline_display_contract(events):
+    """Fail-closed proof that a new airline can reach the calendar UI.
+
+    A successful import is not enough: the normalized payload must contain at
+    least one structured flight sector and every sector must carry the fields
+    used by iOS (flight, route and absolute departure/arrival instants).  The
+    returned report is also the capability required by
+    ``_airline_catalog_promote``; this keeps future callers from bypassing the
+    check accidentally.
+    """
+    report = {
+        'version': _AIRLINE_DISPLAY_CONTRACT_VERSION,
+        'ok': False,
+        'error': 'display_contract_no_calendar_events',
+        'events_count': len(events) if isinstance(events, list) else 0,
+        'briefing_days': 0,
+        'flight_days': 0,
+        'sector_count': 0,
+    }
+    if not isinstance(events, list) or not events:
+        return report
+    try:
+        # A route-looking source event which the normal sector builder cannot
+        # represent is exactly the class of bug that used to make a freshly
+        # added airline look "supported" while its flights stayed invisible.
+        for event in events:
+            if not isinstance(event, dict):
+                report['error'] = 'display_contract_invalid_event'
+                return report
+            summary = str(event.get('summary') or '')
+            location = str(event.get('location') or '')
+            route_like = bool(_ics_parse_multi_leg_summary(summary)) or bool(
+                re.search(r'\b[A-Z]{3}\s*[-–]\s*[A-Z]{3}\b',
+                          location.upper()))
+            if route_like and not _build_ical_sectors([event]):
+                report['error'] = 'display_contract_unparsed_route_event'
+                return report
+
+        sectors_by_day = _build_ical_sectors(events)
+        sectors = [sector for rows in sectors_by_day.values()
+                   for sector in rows]
+        report['flight_days'] = len(sectors_by_day)
+        report['sector_count'] = len(sectors)
+        if not sectors:
+            report['error'] = 'display_contract_no_flight_sectors'
+            return report
+
+        for sector in sectors:
+            flight = re.sub(
+                r'\s+', '', str((sector or {}).get('flight') or '')).upper()
+            if (not re.fullmatch(r'[A-Z0-9]{2,10}', flight)
+                    or not re.search(r'[A-Z]', flight)
+                    or not re.search(r'\d', flight)):
+                report['error'] = 'display_contract_missing_flight_number'
+                return report
+            origin = str((sector or {}).get('from') or '').strip().upper()
+            destination = str((sector or {}).get('to') or '').strip().upper()
+            if (not re.fullmatch(r'[A-Z]{3}', origin)
+                    or not re.fullmatch(r'[A-Z]{3}', destination)
+                    or origin == destination):
+                report['error'] = 'display_contract_invalid_route'
+                return report
+            try:
+                departure = datetime.fromisoformat(
+                    str(sector.get('dep_iso') or '').replace('Z', '+00:00'))
+                arrival = datetime.fromisoformat(
+                    str(sector.get('arr_iso') or '').replace('Z', '+00:00'))
+            except Exception:
+                report['error'] = 'display_contract_invalid_times'
+                return report
+            if departure.tzinfo is None or arrival.tzinfo is None:
+                report['error'] = 'display_contract_invalid_times'
+                return report
+            duration = (arrival - departure).total_seconds()
+            if duration <= 0 or duration > 24 * 60 * 60:
+                report['error'] = 'display_contract_invalid_duration'
+                return report
+
+        # Exercise the same final payload shape consumed by iOS.  This catches
+        # bucket/key mismatches where valid sectors exist but never attach to a
+        # visible calendar day.
+        briefings, _ = _ics_events_to_briefings(events)
+        _attach_sectors(briefings, events)
+        report['briefing_days'] = len(briefings)
+        for day, expected in sectors_by_day.items():
+            visible = (briefings.get(day) or {}).get('ical_sectors') or []
+            if len(visible) != len(expected):
+                report['error'] = 'display_contract_day_alignment'
+                return report
+        report['ok'] = True
+        report['error'] = None
+        return report
+    except Exception:
+        report['error'] = 'display_contract_internal_error'
+        return report
+
+
 def _airline_request_store(row):
     if not SB_AVAILABLE:
         return None
@@ -62435,7 +62533,20 @@ def _airline_request_store(row):
         return None
 
 
-def _airline_catalog_promote(display_name, normalized_name, source_kind):
+def _airline_catalog_promote(display_name, normalized_name, source_kind,
+                             *, display_contract):
+    if (not isinstance(display_contract, dict)
+            or display_contract.get('ok') is not True
+            or display_contract.get('version') !=
+            _AIRLINE_DISPLAY_CONTRACT_VERSION
+            or int(display_contract.get('sector_count') or 0) < 1):
+        app.logger.warning(
+            '[airline-request] catalog-blocked name=%s error=%s',
+            normalized_name,
+            ((display_contract or {}).get('error')
+             if isinstance(display_contract, dict)
+             else 'display_contract_missing'))
+        return False
     if not SB_AVAILABLE:
         return False
     now = datetime.now(timezone.utc).isoformat()
@@ -62592,14 +62703,18 @@ def submit_airline_support_request(token):
         if not source_url_enc:
             return jsonify({'ok': False, 'error': 'source_encryption_failed'}), 503
         stored_url = _normalize_feed_scheme(_sanitize_feed_url(feed.get('url') or ''))
-        source_verified = bool(stored_events and stored_url == source_url)
+        source_ready = bool(stored_events and stored_url == source_url)
     else:
         source = _airline_request_pdf_source(token, body.get('source_sha256'))
         if source is None:
             return jsonify({'ok': False, 'error': 'pdf_source_not_found'}), 400
         source_upload_id, source_filename = source.get('id'), str(source.get('filename') or '')[:120] or None
         source_fingerprint = source.get('sha256')
-        source_verified = bool(stored_events and source.get('status') == 'completed')
+        source_ready = bool(stored_events and source.get('status') == 'completed')
+    display_contract = (_airline_display_contract(stored_events)
+                        if source_ready else None)
+    source_verified = bool(
+        source_ready and display_contract and display_contract.get('ok'))
     status = 'supported' if source_verified else 'pending'
     now = datetime.now(timezone.utc).isoformat()
     stored = _airline_request_store({
@@ -62610,12 +62725,16 @@ def submit_airline_support_request(token):
         'source_fingerprint': source_fingerprint, 'status': status,
         'import_source': str(body.get('import_source') or '')[:40] or None,
         'events_count': len(stored_events) if source_verified else None,
+        'last_error': (None if source_verified or not source_ready else
+                       display_contract.get('error')),
         'updated_at': now, 'completed_at': now if source_verified else None,
     })
     if stored is None:
         return jsonify({'ok': False, 'error': 'request_store_failed'}), 503
     if source_verified:
-        _airline_catalog_promote(airline_name, normalized_name, source_kind)
+        _airline_catalog_promote(
+            airline_name, normalized_name, source_kind,
+            display_contract=display_contract)
         # „Hat geklappt" auf Anhieb — der Watchdog sieht diese Zeile nie,
         # also meldet der Endpoint selbst (Owner 2026-08-17).
         _airline_request_success_mail(

@@ -13,6 +13,22 @@ import app as A
 TOKEN = 'AT-1234567890abcdef'
 
 
+def _displayable_events():
+    return [{
+        'summary': 'NAX123 OSL - LGW',
+        'location': 'OSL - LGW',
+        'start': '2026-08-20', 'end': '2026-08-20',
+        'start_iso': '2026-08-20T08:00:00Z',
+        'end_iso': '2026-08-20T10:20:00Z',
+        '_multiday_dates': ['2026-08-20'],
+    }, {
+        'summary': 'Off Day', 'location': '',
+        'start': '2026-08-21', 'end': '2026-08-21',
+        'start_iso': '', 'end_iso': '',
+        '_multiday_dates': ['2026-08-21'],
+    }]
+
+
 def _no_catalog(monkeypatch):
     monkeypatch.setattr(A, '_airline_catalog_load', lambda: [])
 
@@ -96,7 +112,7 @@ def test_immediate_success_sends_it_works_mail(monkeypatch):
     _no_catalog(monkeypatch)
     monkeypatch.setattr(A, '_airline_request_profile_feed',
                         lambda _token: {'url': 'https://private.example/r.ics',
-                                        'events': [{'id': 1}, {'id': 2}]})
+                                        'events': _displayable_events()})
     monkeypatch.setattr(A, '_calendar_feed_encrypt_value',
                         lambda value, field: 'encrypted')
     monkeypatch.setattr(A, '_airline_request_store',
@@ -119,6 +135,39 @@ def test_immediate_success_sends_it_works_mail(monkeypatch):
     assert 'Dienstplan-Einträge: 2' in text
     # Niemals die Quelle selbst in der Mail.
     assert 'private.example' not in text and TOKEN not in text
+
+
+def test_immediate_import_without_displayable_sectors_stays_pending(
+        monkeypatch):
+    stored_rows = []
+    promoted = []
+    _no_catalog(monkeypatch)
+    monkeypatch.setattr(A, '_airline_request_profile_feed', lambda _token: {
+        'url': 'https://private.example/r.ics',
+        'events': [{'summary': 'Off Day', 'start': '2026-08-20',
+                    '_multiday_dates': ['2026-08-20']}],
+    })
+    monkeypatch.setattr(A, '_calendar_feed_encrypt_value',
+                        lambda value, field: 'encrypted')
+    monkeypatch.setattr(
+        A, '_airline_request_store',
+        lambda row: stored_rows.append(row) or dict(row, id=43))
+    monkeypatch.setattr(
+        A, '_airline_catalog_promote',
+        lambda *_args, **_kwargs: promoted.append(True))
+
+    with A.app.test_request_context(
+            f'/api/user/airline-request/{TOKEN}', method='POST',
+            json={'airline_name': 'Norse Atlantic', 'homebase': 'OSL',
+                  'source_kind': 'ical_url',
+                  'source_url': 'https://private.example/r.ics'}):
+        response = A.submit_airline_support_request(TOKEN)
+
+    assert response.get_json()['status'] == 'pending'
+    assert stored_rows[0]['status'] == 'pending'
+    assert stored_rows[0]['last_error'] == \
+        'display_contract_no_flight_sectors'
+    assert promoted == []
 
 
 def test_pending_request_stays_silent_until_the_watchdog_runs(monkeypatch):

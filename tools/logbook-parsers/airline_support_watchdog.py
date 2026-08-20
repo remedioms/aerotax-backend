@@ -141,13 +141,49 @@ def _retry_pdf(backend, row):
         payload.get('error') or f'http_{status}')
 
 
-def _stored_event_count(backend, token):
+def _stored_display_contract(backend, token):
     feed = backend._airline_request_profile_feed(token)
     events = feed.get('events') if isinstance(feed, dict) else None
-    return len(events) if isinstance(events, list) else 0
+    events = events if isinstance(events, list) else []
+    return feed, len(events), backend._airline_display_contract(events)
 
 
-def _mark_supported(backend, row, events_count):
+def _stored_source_verified(backend, row, feed):
+    """Tie persisted events to the private source from this request.
+
+    Completed PDF rows intentionally purge ``data_b64``.  Their status remains
+    durable, so a later parser rollout can validate the already-persisted
+    calendar instead of requiring private source bytes that no longer exist.
+    """
+    if row.get('source_kind') == 'ical_url':
+        source_url = backend._calendar_feed_decrypt_value(
+            row.get('source_url_enc'), 'url')
+        stored_url = str((feed or {}).get('url') or '')
+        try:
+            source_url = backend._normalize_feed_scheme(
+                backend._sanitize_feed_url(source_url))
+            stored_url = backend._normalize_feed_scheme(
+                backend._sanitize_feed_url(stored_url))
+        except Exception:
+            return False
+        return bool(source_url and source_url == stored_url)
+    if row.get('source_kind') == 'pdf':
+        upload_id = row.get('source_upload_id')
+        if not upload_id:
+            return False
+        result = (backend.sb.table('ax_logbook_upload')
+                  .select('id,status').eq('id', upload_id)
+                  .eq('token', row['token']).limit(1).execute())
+        rows = _result_rows(result)
+        return bool(rows and rows[0].get('status') == 'completed')
+    return False
+
+
+def _mark_supported(backend, row, events_count, display_contract):
+    if not backend._airline_catalog_promote(
+            row['airline_name'], row['normalized_name'], row['source_kind'],
+            display_contract=display_contract):
+        return False
     now = datetime.now(timezone.utc).isoformat()
     (backend.sb.table('airline_support_requests').update({
         'status': STATUS_SUPPORTED,
@@ -157,9 +193,8 @@ def _mark_supported(backend, row, events_count):
         'updated_at': now,
         'completed_at': now,
     }).eq('id', row['id']).eq('status', STATUS_PROCESSING).execute())
-    backend._airline_catalog_promote(
-        row['airline_name'], row['normalized_name'], row['source_kind'])
     _notify_supported(backend, row, events_count)
+    return True
 
 
 def _notify_supported(backend, row, events_count):
@@ -222,18 +257,38 @@ def process_row(backend, row):
     if not _claim(backend, row):
         return
     try:
+        feed, event_count, display_contract = _stored_display_contract(
+            backend, row['token'])
+        if (display_contract.get('ok')
+                and _stored_source_verified(backend, row, feed)):
+            if _mark_supported(
+                    backend, row, event_count, display_contract):
+                _log(
+                    f'supported id={row["id"]} '
+                    f'airline={row["normalized_name"]}')
+                return
+            _mark_retry(backend, row, 'catalog_promotion_failed')
+            return
         if row.get('source_kind') == 'ical_url':
             imported, error = _retry_ical(backend, row)
         elif row.get('source_kind') == 'pdf':
             imported, error = _retry_pdf(backend, row)
         else:
             imported, error = False, 'invalid_source_kind'
-        event_count = _stored_event_count(backend, row['token'])
-        if imported and event_count > 0:
-            _mark_supported(backend, row, event_count)
-            _log(f'supported id={row["id"]} airline={row["normalized_name"]}')
+        _feed, event_count, display_contract = _stored_display_contract(
+            backend, row['token'])
+        if imported and display_contract.get('ok'):
+            if _mark_supported(
+                    backend, row, event_count, display_contract):
+                _log(
+                    f'supported id={row["id"]} '
+                    f'airline={row["normalized_name"]}')
+            else:
+                _mark_retry(backend, row, 'catalog_promotion_failed')
         else:
-            _mark_retry(backend, row, error or 'no_calendar_events')
+            _mark_retry(
+                backend, row,
+                error if not imported else display_contract.get('error'))
             _log(f'retry id={row["id"]} attempt={int(row.get("attempt_count") or 0) + 1}')
     except Exception as exc:  # fail closed; next cron run retries it
         _mark_retry(backend, row, type(exc).__name__)

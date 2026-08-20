@@ -65,6 +65,73 @@ def test_ical_retry_decrypts_and_uses_canonical_import_without_logging_url():
     assert calls == [('AT-OWNER', 'https://private.example/roster.ics')]
 
 
+def test_completed_pdf_remains_verified_after_private_payload_was_purged():
+    query = _Query([{'id': 650, 'status': 'completed'}])
+    backend = SimpleNamespace(sb=_SB(query))
+
+    assert worker._stored_source_verified(backend, {
+        'token': 'AT-SAS', 'source_kind': 'pdf', 'source_upload_id': 650,
+    }, {}) is True
+
+
+def test_existing_sas_calendar_can_pass_gate_without_rereading_purged_pdf(
+        monkeypatch):
+    report = {'ok': True, 'version': 'calendar-v1', 'sector_count': 78}
+    row = {
+        'id': 4, 'token': 'AT-SAS', 'airline_name': 'SAS',
+        'normalized_name': 'sas', 'homebase': 'CPH', 'source_kind': 'pdf',
+        'source_upload_id': 650, 'attempt_count': 3,
+    }
+    promoted = []
+    monkeypatch.setattr(worker, '_claim', lambda _backend, _row: True)
+    monkeypatch.setattr(
+        worker, '_stored_display_contract',
+        lambda _backend, _token: ({}, 231, report))
+    monkeypatch.setattr(
+        worker, '_stored_source_verified',
+        lambda _backend, _row, _feed: True)
+    monkeypatch.setattr(
+        worker, '_mark_supported',
+        lambda _backend, _row, count, contract:
+        promoted.append((count, contract)) or True)
+    monkeypatch.setattr(
+        worker, '_retry_pdf',
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError('completed private PDF must not be reread')))
+
+    worker.process_row(SimpleNamespace(), row)
+
+    assert promoted == [(231, report)]
+
+
+def test_successful_import_with_bad_display_contract_is_not_promoted(
+        monkeypatch):
+    row = {
+        'id': 5, 'token': 'AT-NEW', 'airline_name': 'Example',
+        'normalized_name': 'example', 'source_kind': 'ical_url',
+        'attempt_count': 0,
+    }
+    bad = {'ok': False, 'error': 'display_contract_no_flight_sectors'}
+    reports = iter([({}, 0, bad), ({}, 4, bad)])
+    retries = []
+    monkeypatch.setattr(worker, '_claim', lambda _backend, _row: True)
+    monkeypatch.setattr(
+        worker, '_stored_display_contract',
+        lambda _backend, _token: next(reports))
+    monkeypatch.setattr(worker, '_retry_ical', lambda *_args: (True, None))
+    monkeypatch.setattr(
+        worker, '_mark_supported',
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError('invalid display payload must not be promoted')))
+    monkeypatch.setattr(
+        worker, '_mark_retry',
+        lambda _backend, _row, error: retries.append(error))
+
+    worker.process_row(SimpleNamespace(), row)
+
+    assert retries == ['display_contract_no_flight_sectors']
+
+
 def test_ical_retry_schedule_alerts_and_reaches_final_attempt_inside_24_hours(
         monkeypatch):
     query = _Query([{'id': 7}])

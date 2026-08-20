@@ -73,6 +73,18 @@ def test_sas_airside_optional_duty_and_meal_columns_before_flight():
     assert 'SK461 OSL - CPH' in ics
 
 
+def test_sas_airside_passes_the_new_airline_calendar_display_contract():
+    ics, _ = _calendar()
+    events = backend._parse_ics_to_events(ics)
+
+    report = backend._airline_display_contract(events)
+
+    assert report['ok'] is True
+    assert report['version'] == 'calendar-v1'
+    assert report['flight_days'] == 3
+    assert report['sector_count'] == 4
+
+
 def test_sas_airside_rejects_foreign_and_changed_layouts():
     result = parse_sas_airside_calendar('Irgendein anderer Dienstplan')
     assert result[-1] == 'unsupported_pdf_format'
