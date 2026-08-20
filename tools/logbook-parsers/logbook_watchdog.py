@@ -967,7 +967,8 @@ def _try_parsers(path):
                 and ("Einsatzplan" in text[:1500]
                      or "Dienstplan" in text[:1500]))
             or ("Duty plan requested at" in text[:1000]
-                and "All times: Local FRA" in text[:1000])
+                and ("All times: Local FRA" in text[:1000]
+                     or "All times: UTC" in text[:1000]))
             or ("Individual duty plan" in text[:1000]
                 and "NetLine/Crew(CFG)" in text[:1000])):
         payload = parse_roster_logbook.parse_sources(

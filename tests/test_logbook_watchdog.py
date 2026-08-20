@@ -363,6 +363,24 @@ def test_try_parsers_routes_jeppesen_roster(monkeypatch, tmp_path):
         "roster_logbook", [OLD[0]], [], payload["report"])
 
 
+def test_try_parsers_routes_condor_utc_roster(monkeypatch, tmp_path):
+    import parse_fcl050_v2
+    import parse_roster_logbook
+    path = tmp_path / "condor-utc-roster.upload"
+    path.write_bytes(b"%PDF-roster")
+    text = ("Duty plan requested at 20AUG26 19:09z - All times: UTC\n"
+            "07/2026")
+    monkeypatch.setattr(pdfplumber, "open",
+                        lambda _path: _FakePDF([_FakePage(text, [])]))
+    monkeypatch.setattr(parse_fcl050_v2, "matches_pdf", lambda _path: False)
+    payload = {"legs": [OLD[0]], "sim": [],
+               "report": {"month": "2026-07"}}
+    monkeypatch.setattr(parse_roster_logbook, "parse_sources",
+                        lambda *_args, **_kwargs: payload)
+    assert logbook_watchdog._try_parsers(str(path)) == (
+        "roster_logbook", [OLD[0]], [], payload["report"])
+
+
 def test_roster_batch_keeps_only_newest_complete_month_revision():
     old = {"id": 1, "parser": "roster_logbook",
            "report": {"coverage_months": ["2026-06"],

@@ -6,7 +6,7 @@ Supported, deliberately narrow formats:
 * Lufthansa Jeppesen ``Acknowledged Roster`` / ``Released Roster``
   (LH and Lufthansa Cargo/YF)
 * Lufthansa ``Crew Assignment System`` roster PDFs
-* Condor ``Duty plan requested at ... - All times: Local FRA``
+* Condor ``Duty plan requested at ... - All times: UTC/Local FRA``
 * Condor NetLine/Crew ``Individual duty plan``
 
 These documents can contain future planned duties. A logbook may only contain
@@ -87,7 +87,7 @@ CONDOR_CREATED = re.compile(
 )
 CONDOR_PERIOD = re.compile(r"\b(0[1-9]|1[0-2])/(20\d{2})\b")
 CONDOR_TOTAL = re.compile(
-    r"BT\s+DH\s+LSW\s+BZW\s+Off claim\s+Off assigned[^\n]*\n"
+    r"BT\s+DH\s+(?:EQH|LSW)\s+BZW\s+Off claim\s+Off assigned[^\n]*\n"
     r"\s*(\d{1,3}):(\d{2})\b")
 CONDOR_FLIGHT = re.compile(
     r"^P\s+"
@@ -95,10 +95,21 @@ CONDOR_FLIGHT = re.compile(
     r"(?P<flight>DE\d{3,4}[A-Z]?)\s+"
     r"(?P<type>[A-Z0-9]{3})\s+(?P<reg>[A-Z0-9]{5})\s+"
     r"(?P<pos>[A-Z]{2})\s+C\d+\s+"
-    r"(?:(?P<report>\d{1,2}:\d{2})\s+)?"
+    r"(?:(?:\d{1,2}:\d{2})\s+){0,2}"
     r"(?P<frm>[A-Z]{3})\s+(?P<start>\d{1,2}:\d{2})\s+-\s+"
     r"(?P<end>\d{1,2}:\d{2})\s+(?P<to>[A-Z]{3})\b"
 )
+
+CONDOR_DUTY_ROLE = {
+    "CP": "PIC",
+    "AC": "PIC",
+    "FO": "FO",
+    "SF": "SFO",
+    "PU": "FB",
+    "ST": "FB",
+    # CUBE uses JU for cabin operating rows in the Local-FRA export.
+    "JU": "FB",
+}
 
 CONDOR_INDIVIDUAL_CREATED = re.compile(
     r"printed by CREWLINK\s+(\d{2})([A-Za-z]{3})(\d{2})\s+"
@@ -461,7 +472,10 @@ def _condor_registration(raw):
 
 
 def parse_condor_text(text):
-    if "Duty plan requested at" not in text or "All times: Local FRA" not in text:
+    is_utc = "All times: UTC" in text
+    is_local_fra = "All times: Local FRA" in text
+    if ("Duty plan requested at" not in text
+            or is_utc == is_local_fra):
         raise ValueError("unsupported Condor duty-plan format")
     created_match = CONDOR_CREATED.search(text)
     period_match = CONDOR_PERIOD.search(text[:1000])
@@ -473,7 +487,7 @@ def parse_condor_text(text):
     created = datetime(2000 + int(year2), _month(mon), int(day), int(hour),
                        int(minute), tzinfo=timezone.utc)
     period = (int(period_match.group(2)), int(period_match.group(1)))
-    berlin = ZoneInfo("Europe/Berlin")
+    clock_tz = timezone.utc if is_utc else ZoneInfo("Europe/Berlin")
     current_day = None
     legs = []
     future = 0
@@ -502,8 +516,8 @@ def parse_condor_text(text):
             raise ValueError("Condor continuation leg without day anchor")
         if match.group("weekday") and current_day.strftime("%a")[:2] != match.group("weekday"):
             raise ValueError("Condor duty-plan weekday/date mismatch")
-        start = _clock(current_day, match.group("start"), berlin)
-        end = _clock(current_day, match.group("end"), berlin)
+        start = _clock(current_day, match.group("start"), clock_tz)
+        end = _clock(current_day, match.group("end"), clock_tz)
         if end <= start:
             end += timedelta(days=1)
         block = int((end - start).total_seconds() // 60)
@@ -513,12 +527,15 @@ def parse_condor_text(text):
         if end.astimezone(timezone.utc) > created:
             future += 1
             continue
+        role = CONDOR_DUTY_ROLE.get(match.group("pos"))
+        if role is None:
+            raise ValueError("unsupported Condor duty-plan crew role")
         legs.append(_leg(
             "DE", match.group("flight")[2:], match.group("frm"),
-            match.group("to"), start, end, match.group("type"), "FB",
+            match.group("to"), start, end, match.group("type"), role,
             registration=_condor_registration(match.group("reg")),
-            remarks=("Condor Duty Plan; Local FRA times; completed before "
-                     "document creation"),
+            remarks=(f"Condor Duty Plan; {'UTC' if is_utc else 'Local FRA'} "
+                     "times; completed before document creation"),
         ))
     if not seen_candidate:
         raise ValueError("Condor duty-plan contains no flight rows")
@@ -532,8 +549,10 @@ def parse_condor_text(text):
         "format": "condor_duty_plan",
         "created_at": created.isoformat(),
         "period": f"{period[0]:04d}-{period[1]:02d}",
+        "coverage_months": [f"{period[0]:04d}-{period[1]:02d}"],
         "future_legs_excluded": future,
         "deadheads_excluded": 0,
+        "time_basis": "UTC" if is_utc else "Europe/Berlin",
         "verified_source_block_total": expected_block_min,
     }
 

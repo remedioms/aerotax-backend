@@ -151,6 +151,24 @@ P Mo 20 DE1142 32B DAIAG JU C5 12:30 DUS 13:45 - 16:15 SUF
     assert meta["verified_source_block_total"] == 537
 
 
+def test_condor_uses_utc_time_two_checkin_clocks_and_cockpit_role():
+    text = """Duty plan requested at 20AUG26 19:09z - All times: UTC
+07/2026
+BT DH EQH BZW Off claim Off assigned
+03:00 00:00 03:00 03:00 0 0
+P Fr 10 DE1000 32N DANCA CP C1 07:15 07:30 FRA 08:00 - 09:30 PMI
+P DE1001 32N DANCA CP C1 PMI 10:30 - 12:00 FRA
+"""
+    legs, meta = PARSER.parse_condor_text(text)
+    assert [leg["flight"] for leg in legs] == ["DE1000", "DE1001"]
+    assert legs[0]["dep_iso"] == "2026-07-10T08:00:00Z"
+    assert legs[0]["arr_iso"] == "2026-07-10T09:30:00Z"
+    assert all(leg["role"] == "PIC" for leg in legs)
+    assert meta["time_basis"] == "UTC"
+    assert meta["coverage_months"] == ["2026-07"]
+    assert meta["verified_source_block_total"] == 180
+
+
 def test_condor_individual_plan_columns_reconcile_total_and_exclude_future():
     header = """Individual duty plan for [redacted]
 NetLine/Crew(CFG) printed by CREWLINK 03Aug26 19:18 Page 1
