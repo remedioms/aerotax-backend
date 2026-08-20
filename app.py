@@ -62982,7 +62982,7 @@ def _pdf_informational_only_kind(text):
 
 @app.route('/api/user/roster-pdf/<token>/import', methods=['POST'])
 def import_roster_pdf(token):
-    """Roster-PDF-Upload for CrewAccess, Discover, SAS and Lufthansa CAS.
+    """Roster-PDF-Upload for supported deterministic airline formats.
 
     Repeated multipart ``pdf`` fields form one archive import. CAS revisions
     are resolved day-by-day before the single calendar write. Optional
@@ -63080,6 +63080,30 @@ def import_roster_pdf(token):
                     sas_events, sas_year, sas_month,
                     prodid='AeroX SAS Airside Roster PDF Import')
                 periods.append((sas_report or {}).get('period'))
+        if perr == 'unsupported_pdf_format':
+            # Eurowings NetLine/Crew plans are a fixed three-column UTC
+            # schedule.  The printed block-time sum and complete month strip
+            # protect against missing legs or silently dropped ground days.
+            from eurowings_roster_pdf import parse_eurowings_netline_calendar
+            ew_events, ew_year, ew_month, ew_report, perr = \
+                parse_eurowings_netline_calendar(data, text)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    ew_events, ew_year, ew_month,
+                    prodid='AeroX Eurowings NetLine Roster PDF Import')
+                periods.append((ew_report or {}).get('period'))
+        if perr == 'unsupported_pdf_format':
+            # Virgin's flight-based report publishes UTC endpoints, per-leg
+            # block times and a month checksum.  The overview contributes the
+            # explicitly printed LVE/RDO all-day markers.
+            from virgin_atlantic_roster_pdf import parse_virgin_atlantic_calendar
+            vs_events, vs_year, vs_month, vs_report, perr = \
+                parse_virgin_atlantic_calendar(data, text)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    vs_events, vs_year, vs_month,
+                    prodid='AeroX Virgin Atlantic Roster PDF Import')
+                periods.append((vs_report or {}).get('period'))
         if perr == 'unsupported_pdf_format':
             # Cargolux "Personal Crew Schedule Report": coordinate table,
             # explicitly UTC, with multi-leg +1 rows and multi-day layovers.
