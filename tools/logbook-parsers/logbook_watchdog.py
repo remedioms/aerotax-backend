@@ -58,9 +58,19 @@ import urllib.error
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_PARSER_DIR = os.path.dirname(os.path.abspath(__file__))
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(_PARSER_DIR))
+sys.path.insert(0, _PARSER_DIR)
+sys.path.insert(0, _BACKEND_ROOT)
 
 from legkeys import dedupe_keys  # noqa: E402
+from parser_learning import (  # noqa: E402
+    PROMPT_VERSION,
+    document_format_fingerprint,
+    learning_mode,
+    learning_read_count,
+    source_evidence_hash,
+)
 
 ROSTER_MARKER = "AEROX_ROSTER_PDF_V1"
 ROSTER_AI_LEARN_MARKER = "AEROX_ROSTER_AI_LEARN_V1"
@@ -94,8 +104,10 @@ MAX_BLOCK_MERGE_DRIFT_MIN = 1
 
 # Unknown, text-readable logbooks get one quality-first extraction attempt
 # after the deterministic parser cascade has explicitly returned
-# ``unsupported``.  Each chunk is read twice from scratch by Sol.  Nothing is
-# persisted unless both source-validated reads are byte-for-byte equivalent.
+# ``unsupported``. New/quarantined layouts are read twice from scratch by Sol.
+# After two different fully verified documents, each chunk gets one Sol read
+# plus the same deterministic evidence/persistence checks; every tenth import
+# receives a new double-read audit.
 LOGBOOK_AI_MODEL_DEFAULT = "gpt-5.6-sol"
 LOGBOOK_AI_EFFORT_DEFAULT = "xhigh"
 LOGBOOK_AI_TIMEOUT_SECONDS = 180
@@ -196,6 +208,48 @@ def _rest(method, path, payload=None, headers=None, expect_json=True):
     if not expect_json or not body:
         return None
     return json.loads(body)
+
+
+def _parser_learning_state(kind, fingerprint):
+    """Read a backend-only format contract; failure means safe double-read."""
+    if not (os.environ.get("SUPABASE_URL", "").strip()
+            and os.environ.get("SUPABASE_SERVICE_KEY", "").strip()):
+        return None
+    try:
+        rows = _rest(
+            "GET",
+            "ax_parser_formats"
+            f"?kind=eq.{kind}&fingerprint=eq.{fingerprint}"
+            "&select=status,successful_uses,verified_documents,generation"
+            "&limit=1",
+        ) or []
+        return rows[0] if rows and isinstance(rows[0], dict) else None
+    except Exception as exc:  # missing table/network => never reduce checks
+        _log(f"Parser-Lernstatus nicht lesbar ({type(exc).__name__}); "
+             "Doppelprüfung bleibt aktiv")
+        return None
+
+
+def _parser_learning_record(kind, fingerprint, source_sha, outcome, model,
+                            failure_code=None):
+    """Atomically record metadata only; source text and user token stay out."""
+    if not (os.environ.get("SUPABASE_URL", "").strip()
+            and os.environ.get("SUPABASE_SERVICE_KEY", "").strip()):
+        return False
+    try:
+        _rest("POST", "rpc/ax_parser_learning_record", {
+            "p_kind": kind,
+            "p_fingerprint": fingerprint,
+            "p_source_sha": source_sha,
+            "p_outcome": outcome,
+            "p_model": str(model or "")[:80],
+            "p_prompt_version": PROMPT_VERSION,
+            "p_failure_code": (str(failure_code or "")[:120] or None),
+        }, expect_json=False)
+        return True
+    except Exception as exc:  # import success must not depend on telemetry
+        _log(f"Parser-Lernstatus nicht schreibbar ({type(exc).__name__})")
+        return False
 
 
 def _log(msg):
@@ -707,21 +761,39 @@ def _try_openai_logbook(path, token):
     if not chunks:
         return None, "source_requires_too_many_chunks"
 
+    fingerprint = document_format_fingerprint(source, "logbook")
+    source_sha = source_evidence_hash(
+        source, os.environ.get("SUPABASE_SERVICE_KEY", ""))
+    learning_state = _parser_learning_state("logbook", fingerprint)
+    read_count = learning_read_count(learning_state)
+    mode = learning_mode(learning_state)
+
+    def _semantic_failure(code, model_name=LOGBOOK_AI_MODEL_DEFAULT):
+        _parser_learning_record(
+            "logbook", fingerprint, source_sha, "failed", model_name, code)
+        return None, code
+
     combined, model = [], LOGBOOK_AI_MODEL_DEFAULT
     try:
         for chunk in chunks:
             first, model = _logbook_ai_call_once(chunk, token)
-            second, _ = _logbook_ai_call_once(chunk, token)
             first_clean, first_dropped = _logbook_ai_validate_items(first, source)
-            second_clean, second_dropped = _logbook_ai_validate_items(second, source)
-            if first_dropped or second_dropped:
-                return None, "source_evidence_rejected"
-            first_facts = sorted(json.dumps(item, sort_keys=True)
-                                 for item in first_clean)
-            second_facts = sorted(json.dumps(item, sort_keys=True)
-                                  for item in second_clean)
-            if first_facts != second_facts:
-                return None, "independent_reads_disagree"
+            if first_dropped:
+                return _semantic_failure("source_evidence_rejected", model)
+            if read_count == 2:
+                second, _ = _logbook_ai_call_once(chunk, token)
+                second_clean, second_dropped = _logbook_ai_validate_items(
+                    second, source)
+                if second_dropped:
+                    return _semantic_failure(
+                        "source_evidence_rejected", model)
+                first_facts = sorted(json.dumps(item, sort_keys=True)
+                                     for item in first_clean)
+                second_facts = sorted(json.dumps(item, sort_keys=True)
+                                      for item in second_clean)
+                if first_facts != second_facts:
+                    return _semantic_failure(
+                        "independent_reads_disagree", model)
             combined.extend(first_clean)
     except Exception as exc:  # network/provider details stay out of row data
         _log(f"Sol-Flugbuchaufruf fehlgeschlagen: {type(exc).__name__}")
@@ -733,11 +805,12 @@ def _try_openai_logbook(path, token):
         unique[fact] = item
     verified = sorted(unique.values(), key=lambda item: item["_source_line"])
     if not verified:
-        return None, "no_verified_flight_legs"
+        return _semantic_failure("no_verified_flight_legs", model)
     identities = [(item["date"], item["flight"], item["from"], item["to"])
                   for item in verified]
     if len(identities) != len(set(identities)):
-        return None, "duplicate_leg_identity_without_departure_time"
+        return _semantic_failure(
+            "duplicate_leg_identity_without_departure_time", model)
 
     legs = [_logbook_ai_public_leg(item) for item in verified]
     dates = sorted(leg["date"] for leg in legs)
@@ -751,13 +824,26 @@ def _try_openai_logbook(path, token):
             "AEROX_LOGBOOK_OPENAI_EFFORT", "").strip()
             or os.environ.get("AEROX_ROSTER_OPENAI_EFFORT", "").strip()
             or LOGBOOK_AI_EFFORT_DEFAULT),
-        "independent_reads": 2,
+        "independent_reads": read_count,
         "chunks": len(chunks),
         "source_evidence_guard": True,
+        "learning_mode": mode,
         "store": False,
         "legs": len(legs),
         "block_min": sum(leg["block_min"] for leg in legs),
-        "control": "OPENAI_DOUBLE_READ_SOURCE_VERIFIED",
+        "control": ("OPENAI_DOUBLE_READ_SOURCE_VERIFIED"
+                    if read_count == 2 else
+                    "OPENAI_LEARNED_FORMAT_SOURCE_VERIFIED"),
+        # Private process metadata. It is consumed only after the merged
+        # import has been persisted and read back successfully.
+        "_parser_learning": {
+            "kind": "logbook",
+            "fingerprint": fingerprint,
+            "source_sha": source_sha,
+            "outcome": ("double_verified" if read_count == 2
+                        else "single_verified"),
+            "model": model,
+        },
     }
     return ("openai_verified_logbook", legs, [], report), None
 
@@ -1427,6 +1513,18 @@ def process_token_batch(token, rows, events, terminal=None):
         if real:
             meta = _meta_for(merged_legs, merged_sims, label, extra_meta)
             _upsert_import(token, merged_legs, merged_sims, meta)
+            # Learning advances only after the exact merged legs were written
+            # and independently read back. A good model answer alone is not a
+            # production/display success signal.
+            for parsed_file in real:
+                learning = (parsed_file.get("report") or {}).get(
+                    "_parser_learning")
+                if not isinstance(learning, dict):
+                    continue
+                _parser_learning_record(
+                    learning.get("kind"), learning.get("fingerprint"),
+                    learning.get("source_sha"), learning.get("outcome"),
+                    learning.get("model"))
             _bust_import_cache(token)
             _status([f["id"] for f in real], STATUS_COMPLETED, processed=True)
             _push_completed(token, max(f["id"] for f in real))

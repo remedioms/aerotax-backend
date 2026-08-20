@@ -22,6 +22,13 @@ from observability.redaction import (
     install_logging_redaction as _install_logging_redaction,
     redact_url as _redact_observability_url,
 )
+from parser_learning import (
+    PROMPT_VERSION as _PARSER_LEARNING_PROMPT_VERSION,
+    document_format_fingerprint as _document_format_fingerprint,
+    learning_mode as _parser_learning_mode,
+    learning_read_count as _parser_learning_read_count,
+    source_evidence_hash as _parser_learning_source_hash,
+)
 import stripe
 import anthropic
 import pdfplumber
@@ -61818,9 +61825,10 @@ def _repair_ios_reprinted_roster_text(text):
 # ZWECK: Wenn ein User einen Dienstplan hochlädt, dessen Format KEIN
 # deterministischer Parser versteht (unbekannte Airline / neues Format), liest
 # ein starkes Modell die Roh-Fakten strukturiert — statt dass der User „0
-# Einträge" bekommt. OpenAI Sol liest bei vorhandenem Server-Secret zweimal
-# unabhängig; Anthropic bleibt der bestehende Rückfall für Installationen ohne
-# OpenAI-Secret.
+# Einträge" bekommt. OpenAI Sol liest neue/quarantinierte Formate zweimal
+# unabhängig. Nach zwei verschiedenen, vollständig geprüften Dokumenten gilt
+# ein Formatvertrag: ein Sol-Read + Quell-/Anzeigeprüfungen, jeder zehnte Lauf
+# wieder doppelt. Anthropic bleibt der Kompatibilitäts-Rückfall ohne OpenAI-Key.
 #
 # LEITPLANKEN (nicht verhandelbar):
 #  1. DETERMINISTIC-FIRST — dieser Pfad hängt AUSSCHLIESSLICH am expliziten
@@ -61835,9 +61843,8 @@ def _repair_ios_reprinted_roster_text(text):
 #  3. Der Fallback darf einen Import NIE schlechter machen: jeder Fehler wird
 #     geloggt und lässt den bisherigen „0 Einträge"-Weg unverändert.
 #  4. Kosten-/Missbrauchsdeckel: max. 3 logische Läufe pro Token und Tag,
-#     Quelltext auf 60.000 Zeichen gekappt, keine Retries. OpenAI führt pro
-#     Lauf zwei unabhängige Reads aus; Anthropic bleibt ein einzelner
-#     Kompatibilitäts-Read.
+#     Quelltext auf 60.000 Zeichen gekappt, keine Retries. Anthropic bleibt ein
+#     einzelner Kompatibilitäts-Read und trainiert keinen Formatvertrag.
 #  5. DATENSCHUTZ: Der Quelltext geht nur an den serverseitig konfigurierten
 #     Modellanbieter. Geloggt werden nur Länge, sha-Präfix und Token-Präfix —
 #     NIE Inhalt oder API-Key. OpenAI-Responses werden nicht gespeichert.
@@ -62058,6 +62065,58 @@ def _roster_ai_budget_take(token):
             return False
         _ROSTER_AI_CALLS[key] = used + 1
         return True
+
+
+def _roster_ai_learning_state(fingerprint):
+    """Read a service-role-only format contract.
+
+    Any Supabase/schema/network degradation deliberately returns ``None`` so
+    the caller keeps the more expensive two-read verification path.
+    """
+    if not SB_AVAILABLE:
+        return None
+    try:
+        def _read():
+            return (sb.table('ax_parser_formats')
+                    .select('status,successful_uses,verified_documents,generation')
+                    .eq('kind', 'roster').eq('fingerprint', fingerprint)
+                    .limit(1).execute())
+        response, failed = _supabase_execute_with_timeout(
+            'roster_ai_learning_state', _read)
+        rows = getattr(response, 'data', None) or []
+        return rows[0] if not failed and rows else None
+    except Exception as exc:
+        app.logger.info('[roster-ai] learning-state-unavailable '
+                        f'err={type(exc).__name__}; double-read')
+        return None
+
+
+def _roster_ai_learning_record(metadata, outcome=None, failure_code=None):
+    """Persist only hashes/counters after semantic + display verification."""
+    if not SB_AVAILABLE or not isinstance(metadata, dict):
+        return False
+    values = {
+        'p_kind': 'roster',
+        'p_fingerprint': metadata.get('fingerprint'),
+        'p_source_sha': metadata.get('source_sha'),
+        'p_outcome': outcome or metadata.get('outcome'),
+        'p_model': str(metadata.get('model') or '')[:80],
+        'p_prompt_version': _PARSER_LEARNING_PROMPT_VERSION,
+        'p_failure_code': (str(failure_code or '')[:120] or None),
+    }
+    if not all(values.get(key) for key in (
+            'p_fingerprint', 'p_source_sha', 'p_outcome')):
+        return False
+    try:
+        def _write():
+            return sb.rpc('ax_parser_learning_record', values).execute()
+        _, failed = _supabase_execute_with_timeout(
+            'roster_ai_learning_record', _write)
+        return not failed
+    except Exception as exc:
+        app.logger.info('[roster-ai] learning-record-unavailable '
+                        f'err={type(exc).__name__}')
+        return False
 
 
 def _roster_ai_parse_json(raw_text):
@@ -62431,11 +62490,11 @@ def _roster_ai_events(items, base_iata):
 
 
 def _roster_ai_learn_store(token, capped_text, valid_items, model, src_sha):
-    """Lern-Warteschlange (Owner-Zusatz 2026-08-06).
+    """Legacy-Lernwarteschlange für direkte/alte Aufrufer.
 
-    Jeder ERFOLGREICHE KI-Lauf wird als Lern-Beispiel archiviert, damit daraus
-    später ein echter deterministischer Parser gebaut werden kann („einmal
-    lernen, dann für immer können" — Marker-Lexikon-Muster).
+    Der Produktions-Upload benutzt seit dem Formatvertrag-Lernpfad nur noch
+    Hashes/Zähler und ruft diesen Rohtext-Speicher nicht mehr auf. Die Funktion
+    bleibt vorübergehend für alte Installationen und gezielte Parser-Forschung.
 
     Reuse der privaten, service-key-only Import-Inbox (`ax_logbook_upload`) mit
     eigenem note-Marker — kein neues Schema, keine neue Tabelle. Die Zeile
@@ -62483,7 +62542,7 @@ def _roster_ai_learn_store(token, capped_text, valid_items, model, src_sha):
     return bool(stored)
 
 
-def _roster_ai_fallback_ics(text, token, det_error):
+def _roster_ai_fallback_ics(text, token, det_error, learning_result=None):
     """KI-Lesepfad für einen Upload, den kein Parser versteht.
 
     Liefert einen ICS-String oder None. Wirft NIE — jeder Fehlerpfad landet im
@@ -62506,17 +62565,44 @@ def _roster_ai_fallback_ics(text, token, det_error):
     import hashlib as _hl
     capped = src[:_ROSTER_AI_MAX_CHARS]
     src_sha = _hl.sha256(capped.encode('utf-8', 'replace')).hexdigest()
+    fingerprint = _document_format_fingerprint(capped, 'roster')
+    learning_state = (_roster_ai_learning_state(fingerprint)
+                      if openai_enabled else None)
+    read_count = (_parser_learning_read_count(learning_state)
+                  if openai_enabled else 1)
+    mode = (_parser_learning_mode(learning_state)
+            if openai_enabled else 'compatibility_single_read')
+    learning_metadata = {
+        'fingerprint': fingerprint,
+        'source_sha': _parser_learning_source_hash(capped, SUPABASE_KEY),
+        'model': None,
+        'outcome': ('double_verified' if read_count == 2
+                    else 'single_verified'),
+        'read_count': read_count,
+        'mode': mode,
+    }
+
+    def _learning_failure(code):
+        if openai_enabled:
+            _roster_ai_learning_record(
+                learning_metadata, outcome='failed', failure_code=code)
+
     # DATENSCHUTZ: nur Länge + sha-Präfix + Token-Präfix — NIE Inhalt.
     app.logger.info(
         f'[roster-ai] call tok={token[:8]} det_error={det_error} '
         f'chars={len(capped)} truncated={len(src) > _ROSTER_AI_MAX_CHARS} '
-        f'sha={src_sha[:16]}')
+        f'sha={src_sha[:16]} learning={mode} reads={read_count}')
     try:
         if openai_enabled:
-            readings, model = _roster_ai_call_openai_double(capped)
+            if read_count == 2:
+                readings, model = _roster_ai_call_openai_double(capped)
+            else:
+                items, model = _roster_ai_call_openai_once(capped)
+                readings = [items]
         else:
             items, model = _roster_ai_call_anthropic(capped)
             readings = [items]
+        learning_metadata['model'] = model
     except Exception as exc:
         app.logger.warning(f'[roster-ai] call-fail tok={token[:8]} '
                            f'err={type(exc).__name__}: {str(exc)[:160]}')
@@ -62524,6 +62610,7 @@ def _roster_ai_fallback_ics(text, token, det_error):
     if not readings or any(not items for items in readings):
         app.logger.warning(f'[roster-ai] empty-answer tok={token[:8]} '
                            f'model={model}')
+        _learning_failure('empty_answer')
         return None
 
     checked = [_roster_ai_validate_items(items, capped)
@@ -62543,14 +62630,21 @@ def _roster_ai_fallback_ics(text, token, det_error):
                 f'[roster-ai] double-read-mismatch tok={token[:8]} '
                 f'first={len(valid)} second={len(second_valid)} '
                 f'sha={src_sha[:16]}')
+            _learning_failure('independent_reads_disagree')
             return None
     if dropped:
         app.logger.warning(
             f'[roster-ai] hallucination-drop tok={token[:8]} '
             f'dropped={dropped} kept={len(valid)} sha={src_sha[:16]}')
+        # A Sol format contract must cover the complete accepted answer.  A
+        # partially rejected read is useful review evidence, not training.
+        if openai_enabled:
+            _learning_failure('source_evidence_rejected')
+            return None
     if not valid:
         app.logger.warning(f'[roster-ai] no-valid-events tok={token[:8]} '
                            f'sha={src_sha[:16]}')
+        _learning_failure('no_valid_events')
         return None
 
     try:
@@ -62558,8 +62652,10 @@ def _roster_ai_fallback_ics(text, token, det_error):
     except Exception as exc:
         app.logger.warning(f'[roster-ai] build-fail tok={token[:8]} '
                            f'err={type(exc).__name__}: {str(exc)[:160]}')
+        _learning_failure('event_build_failed')
         return None
     if not events:
+        _learning_failure('no_built_events')
         return None
 
     anchor_year, anchor_month = min((v['year'], v['month']) for v in valid)
@@ -62567,14 +62663,22 @@ def _roster_ai_fallback_ics(text, token, det_error):
         events, anchor_year, anchor_month,
         prodid='AeroX KI-Fallback Roster Import',
         extra_lines=(f'X-AEROX-SOURCE:{_ROSTER_AI_MARKER}',))
-    try:
-        _roster_ai_learn_store(token, capped, valid, model, src_sha)
-    except Exception as exc:
-        app.logger.warning(f'[roster-ai] learn-queue-error tok={token[:8]} '
-                           f'err={type(exc).__name__}: {str(exc)[:160]}')
+    if isinstance(learning_result, dict) and openai_enabled:
+        # Production records this only after both pre/post display contracts
+        # and the persistent calendar read-back have succeeded.
+        learning_result.update(learning_metadata)
+    elif learning_result is None:
+        # Compatibility for installations/tests still using the old private
+        # example queue. Production passes ``learning_result`` and therefore
+        # retains no new raw roster text for learning.
+        try:
+            _roster_ai_learn_store(token, capped, valid, model, src_sha)
+        except Exception as exc:
+            app.logger.warning(f'[roster-ai] learn-queue-error tok={token[:8]} '
+                               f'err={type(exc).__name__}: {str(exc)[:160]}')
     app.logger.info(
         f'[roster-ai] ok tok={token[:8]} model={model} events={len(events)} '
-        f'sha={src_sha[:16]}')
+        f'sha={src_sha[:16]} learning={mode}')
     return ics
 
 
@@ -63313,6 +63417,7 @@ def import_roster_pdf(token):
     periods = []
     informational_documents = []
     ai_fallback_used = False
+    ai_learning_results = []
 
     for upload in files:
         data = upload.read()
@@ -63484,10 +63589,14 @@ def import_roster_pdf(token):
             # User-Import kommt hierher; der periodische Sync nie.
             ai_ics = None
             if perr in ('unsupported_pdf_format', 'no_roster_days'):
-                ai_ics = _roster_ai_fallback_ics(text, token, perr)
+                learning_result = {}
+                ai_ics = _roster_ai_fallback_ics(
+                    text, token, perr, learning_result=learning_result)
             if ai_ics:
                 standard_calendars.append(ai_ics)
                 ai_fallback_used = True
+                if learning_result:
+                    ai_learning_results.append(learning_result)
                 app.logger.info(
                     f'[roster-pdf] ai-fallback tok={token[:8]} '
                     f'sha={upload_sha} det_error={perr}')
@@ -63594,6 +63703,9 @@ def import_roster_pdf(token):
         if not ai_display_contract_before.get('ok'):
             error = (ai_display_contract_before.get('error')
                      or 'ai_display_contract_failed')
+            for learning_result in ai_learning_results:
+                _roster_ai_learning_record(
+                    learning_result, outcome='failed', failure_code=error)
             app.logger.warning(
                 f'[roster-ai] pre-display-reject tok={token[:8]} '
                 f'error={error}')
@@ -63641,6 +63753,9 @@ def import_roster_pdf(token):
                 ai_display_contract_before.get('sector_count')):
             error = (ai_display_contract_after.get('error')
                      or 'ai_display_contract_mismatch')
+            for learning_result in ai_learning_results:
+                _roster_ai_learning_record(
+                    learning_result, outcome='failed', failure_code=error)
             rollback_ok = _roster_ai_restore_calendar_snapshot(
                 token, ai_previous_feed, ai_previous_briefings)
             status = 422 if rollback_ok else 503
@@ -63650,6 +63765,8 @@ def import_roster_pdf(token):
                 f'[roster-ai] post-display-reject tok={token[:8]} '
                 f'error={error} rollback={rollback_ok}')
     if status == 200 and payload.get('ok'):
+        for learning_result in ai_learning_results:
+            _roster_ai_learning_record(learning_result)
         payload['source'] = 'pdf'
         if ai_fallback_used:
             # Ehrlich benennen: mindestens ein Upload wurde von der KI gelesen,
@@ -63658,9 +63775,15 @@ def import_roster_pdf(token):
             payload['source'] = _ROSTER_AI_MARKER
             payload['ki_hint'] = _ROSTER_AI_HINT
             payload['ai_verification'] = {
-                'independent_reads': (2 if
-                    (os.getenv('OPENAI_API_KEY') or '').strip() else 1),
+                'independent_reads': max(
+                    [int(item.get('read_count') or 1)
+                     for item in ai_learning_results] or [1]),
                 'display_contract_checks': 2,
+                'learning_mode': (
+                    ai_learning_results[0].get('mode')
+                    if len(ai_learning_results) == 1 else
+                    ('mixed_formats' if ai_learning_results else
+                     'compatibility_single_read')),
             }
         if informational_documents:
             payload['informational_files'] = len(informational_documents)

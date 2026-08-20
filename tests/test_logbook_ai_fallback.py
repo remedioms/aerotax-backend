@@ -129,6 +129,40 @@ def test_unknown_text_logbook_is_read_twice_with_sol_xhigh(monkeypatch, tmp_path
         assert timeout == w.LOGBOOK_AI_TIMEOUT_SECONDS
 
 
+def test_active_learned_format_uses_one_read_and_defers_success_record(
+        monkeypatch, tmp_path):
+    path = tmp_path / "known-layout-new-month.csv"
+    path.write_text(SOURCE)
+    calls = []
+    records = []
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-test-key")
+    monkeypatch.setattr(
+        w, "_parser_learning_state",
+        lambda kind, fingerprint: {
+            "status": "active", "successful_uses": 2,
+            "verified_documents": 2, "generation": 1,
+        })
+    monkeypatch.setattr(
+        w, "_parser_learning_record",
+        lambda *args, **kwargs: records.append((args, kwargs)) or True)
+    monkeypatch.setattr(
+        w.urllib.request, "urlopen",
+        lambda request, timeout: calls.append(json.loads(request.data))
+        or _Response([_item()]))
+
+    result, error = w._try_openai_logbook(str(path), "AT-private-user")
+
+    assert error is None and result
+    report = result[3]
+    assert len(calls) == 1
+    assert report["independent_reads"] == 1
+    assert report["learning_mode"] == "active_single_read"
+    assert report["_parser_learning"]["outcome"] == "single_verified"
+    # Success is recorded by process_token_batch only after DB write/readback.
+    assert records == []
+
+
 def test_disagreeing_reads_return_review_reason(monkeypatch, tmp_path):
     path = tmp_path / "unknown.csv"
     path.write_text(SOURCE)

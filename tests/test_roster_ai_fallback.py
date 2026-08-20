@@ -218,6 +218,35 @@ def test_openai_sol_xhigh_requires_two_identical_structured_reads(monkeypatch):
         assert response_format['schema']['additionalProperties'] is False
 
 
+def test_active_roster_format_uses_one_sol_read_then_defers_db_promotion(
+        monkeypatch):
+    calls = []
+    learning = {}
+    records = []
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test-openai-not-real')
+    monkeypatch.setattr(
+        backend, '_roster_ai_learning_state',
+        lambda fingerprint: {
+            'status': 'active', 'successful_uses': 2,
+            'verified_documents': 2, 'generation': 1,
+        })
+    monkeypatch.setattr(
+        backend, '_roster_ai_learning_record',
+        lambda *args, **kwargs: records.append((args, kwargs)) or True)
+    _mock_post(monkeypatch, _openai_answer(GOOD_ITEMS), calls)
+
+    ics = backend._roster_ai_fallback_ics(
+        UNKNOWN_TEXT, 'AT-TEST-OPENAI-LEARNED',
+        'unsupported_pdf_format', learning_result=learning)
+
+    assert ics and len(calls) == 1
+    assert learning['read_count'] == 1
+    assert learning['mode'] == 'active_single_read'
+    assert learning['outcome'] == 'single_verified'
+    # Endpoint records it only after both display checks and persistence.
+    assert records == []
+
+
 def test_openai_double_read_disagreement_fails_closed(monkeypatch, caplog):
     calls = []
     monkeypatch.setenv('OPENAI_API_KEY', 'sk-test-openai-not-real')
