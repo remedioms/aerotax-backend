@@ -68,7 +68,7 @@ def _pdf(tmp_path, total="14:17", unknown_airport=False, incomplete=False):
     for key, value in (("date", "15 Fri"), ("pos", "DH"),
                        ("activity", "LX2817"), ("from", "GVA"),
                        ("to", "ZRH"), ("dep", "18:45"),
-                       ("arr", "19:37"), ("type", "223")):
+                       ("arr", "19:37")):
         text(COLUMNS[key], 225, value)
 
     text(208, 260, f"Total flight time in May: {total}")
@@ -114,4 +114,3 @@ def test_unknown_airport_timezone_is_never_guessed(tmp_path):
 def test_split_overnight_leg_must_have_an_explicit_arrival_row(tmp_path):
     with pytest.raises(ValueError, match="unvollstaendiges Overnight-Leg|endet ohne Ankunft"):
         parser.parse_pdf(_pdf(tmp_path, incomplete=True, total="1:28"))
-

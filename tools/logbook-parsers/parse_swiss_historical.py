@@ -237,11 +237,16 @@ def parse_pdf(path):
                     continue
                 if pending:
                     raise ValueError("SWISS roster: unvollstaendiges Overnight-Leg")
+                is_deadhead = pos == "DH"
+                # Passenger/deadhead rows legitimately have no aircraft type
+                # in the SWISS source. They still need an unambiguous route and
+                # clock pair, but an A/C requirement applies only to operated
+                # logbook legs.
                 if not current_day or not IATA_RE.fullmatch(origin) \
-                        or not CLOCK_RE.fullmatch(dep_clock) or not aircraft:
+                        or not CLOCK_RE.fullmatch(dep_clock) \
+                        or (not is_deadhead and not aircraft):
                     raise ValueError(f"SWISS roster: unvollstaendige Flugzeile {activity}")
 
-                is_deadhead = pos == "DH"
                 if is_deadhead:
                     deadheads += 1
                 base = {"day": current_day, "pos": pos, "flight": activity,
@@ -275,4 +280,3 @@ def parse_pdf(path):
             "deadheads_skipped": deadheads,
             "legs": len(legs),
         }
-
