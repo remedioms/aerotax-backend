@@ -289,6 +289,7 @@ def _try_parsers(path):
     import parse_foreflight_easa
     import parse_foreflight_csv
     import parse_simple_flights_csv
+    import parse_emirates_cabin_log
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
     import parse_roster_logbook
@@ -342,6 +343,9 @@ def _try_parsers(path):
                        if report.get("document_type") == "zero_flight_roster"
                        else "swiss_historical_roster")
         return parser_name, legs, sims, report
+    if parse_emirates_cabin_log.matches_pdf(path):
+        legs, sims, report = parse_emirates_cabin_log.parse_pdf(path)
+        return "emirates_cabin_log", legs, sims, report
     try:
         with pdfplumber.open(path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
