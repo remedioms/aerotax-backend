@@ -49,6 +49,22 @@ def test_display_contract_rejects_an_easyjet_like_unparsed_numeric_flight():
     assert report['error'] == 'display_contract_unparsed_route_event'
 
 
+def test_display_contract_allows_known_ground_route_beside_real_flights():
+    report = backend._airline_display_contract([
+        _event(),
+        {
+            'summary': 'PRVT FRA - MUC', 'location': '',
+            'start': '2026-08-21', 'end': '2026-08-21',
+            'start_iso': '', 'end_iso': '',
+            '_multiday_dates': ['2026-08-21'],
+        },
+    ])
+
+    assert report['ok'] is True
+    assert report['display_mode'] == 'flight_schedule'
+    assert report['sector_count'] == 1
+
+
 def test_display_contract_rejects_missing_flight_number_and_bad_times():
     missing_flight = backend._airline_display_contract([
         _event(summary='AAA - BBB')

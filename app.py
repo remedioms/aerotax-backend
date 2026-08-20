@@ -62930,7 +62930,14 @@ def _airline_display_contract(events):
             route_like = bool(_ics_parse_multi_leg_summary(summary)) or bool(
                 re.search(r'\b[A-Z]{3}\s*[-–]\s*[A-Z]{3}\b',
                           location.upper()))
-            if route_like and not _build_ical_sectors([event]):
+            # Discover prints private ground transfers as ``PRVT FRA - MUC``.
+            # The route is useful calendar context but deliberately has no
+            # flight number and must not become a flight sector. Only the
+            # existing, closed ground-duty vocabulary may use this exception;
+            # an unknown numeric/easyJet-like route still fails closed below.
+            known_ground_route = _summary_has_ground_duty(summary.upper())
+            if (route_like and not known_ground_route
+                    and not _build_ical_sectors([event])):
                 report['error'] = 'display_contract_unparsed_route_event'
                 return report
 

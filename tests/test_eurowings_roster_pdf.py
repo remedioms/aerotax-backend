@@ -40,6 +40,56 @@ def _synthetic_pdf():
     return stream.getvalue()
 
 
+def _synthetic_split_ew_pdf():
+    """Current EW layout: split weekday/date words and two-letter A/C code."""
+    stream = io.BytesIO()
+    pdf = canvas.Canvas(stream, pagesize=landscape(A4))
+    pdf.setFont("Helvetica", 7)
+    pdf.drawString(30, 580, "Individual duty plan")
+    pdf.drawString(535, 580, "NetLine/Crew(EW) printed by CREWLINK")
+    pdf.drawString(30, 568, "Period: 14Aug26 - 16Aug26")
+
+    days = ((255, "Fri", "14", "FlD", "1000", "1400"),
+            (300, "Sat", "15", "Off", None, None),
+            (345, "Sun", "16", "Sby", "0830", "1630"))
+    for x, weekday, number, status, start, end in days:
+        pdf.drawString(x, 550, weekday)
+        pdf.drawString(x + 6, 547, number)
+        pdf.drawString(x, 539, status)
+        if start:
+            pdf.drawString(x, 532, start)
+            pdf.drawString(x, 525, end)
+
+    pdf.drawString(31, 470, "Fri")
+    pdf.drawString(37, 467, "14")
+    pdf.drawString(73, 458, "EW 4500 GRZ 1115 1245 HAM AB")
+    pdf.drawString(300, 300, "Flight time 01:30 Duty time 04:00")
+    pdf.save()
+    return stream.getvalue()
+
+
+def _synthetic_ground_only_pdf():
+    """EWG training plan with explicit Duty/Simulator clocks and no legs."""
+    stream = io.BytesIO()
+    pdf = canvas.Canvas(stream, pagesize=landscape(A4))
+    pdf.setFont("Helvetica", 7)
+    pdf.drawString(30, 575, "Individual duty plan")
+    pdf.drawString(300, 575, "NetLine/Crew(EWG) printed by CREWLINK")
+    pdf.drawString(30, 558, "Period: 13Aug26 - 15Aug26")
+    days = ((188, "Thu13", "Dty", "1100", "1900"),
+            (230, "Fri14", "Sim", "0525", "0920"),
+            (272, "Sat15", "Off", None, None))
+    for x, day, status, start, end in days:
+        pdf.drawString(x, 530, day)
+        pdf.drawString(x + 2, 519, status)
+        if start:
+            pdf.drawString(x + 2, 511, start)
+            pdf.drawString(x + 2, 505, end)
+    pdf.drawString(300, 300, "Flight time 00:00 Duty time 11:55")
+    pdf.save()
+    return stream.getvalue()
+
+
 def _parse(data=None):
     data = data or _synthetic_pdf()
     with pdfplumber.open(io.BytesIO(data)) as pdf:
@@ -76,6 +126,33 @@ def test_eurowings_passes_calendar_display_contract():
     assert report["ok"] is True
     assert report["sector_count"] == 1
     assert report["flight_days"] == 1
+
+
+def test_eurowings_current_ew_layout_parses_split_dates_and_short_aircraft():
+    (events, year, month, report, error), _ = _parse(_synthetic_split_ew_pdf())
+
+    assert error is None
+    assert (year, month) == (2026, 8)
+    assert report["flight_count"] == 1
+    assert report["block_minutes"] == 90
+    assert any("EW4500 GRZ - HAM" in event[3] for event in events)
+    assert any(event[3] == "Off Day" for event in events)
+    assert any(event[3] == "Standby" for event in events)
+
+
+def test_eurowings_ground_only_plan_keeps_duty_and_simulator_days():
+    (events, year, month, report, error), _ = _parse(
+        _synthetic_ground_only_pdf())
+
+    assert error is None
+    assert report["flight_count"] == 0
+    assert report["block_minutes"] == 0
+    assert [event[3] for event in events] == ["Duty", "Simulator", "Off Day"]
+    ics = backend._pdf_events_to_ics(events, year, month)
+    contract = backend._airline_display_contract(
+        backend._parse_ics_to_events(ics))
+    assert contract["ok"] is True
+    assert contract["display_mode"] == "duty_schedule"
 
 
 def test_eurowings_rejects_foreign_and_checksum_changes():

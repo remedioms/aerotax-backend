@@ -14,16 +14,17 @@ from datetime import date, datetime, timedelta
 import pdfplumber
 
 
-_FORMAT_MARKER = "NetLine/Crew(EWG)"
+_FORMAT_MARKERS = ("NetLine/Crew(EWG)", "NetLine/Crew(EW)")
 _PERIOD_RE = re.compile(
     r"Period:\s*(\d{2})([A-Za-z]{3})(\d{2})\s*-\s*"
     r"(\d{2})([A-Za-z]{3})(\d{2})"
 )
 _DAY_RE = re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(\d{2})\b")
+_WEEKDAY_RE = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$")
 _LEG_RE = re.compile(
     r"\b(EW)\s?(\d{2,4})\s*(?:/\s?\d{1,2})?\s+(?:R\s+)?"
     r"([A-Z]{3})\s+(\d{4})\s+(\d{4})\s+([A-Z]{3})"
-    r"\s+([0-9][0-9A-Z]{2})\b"
+    r"\s+([0-9A-Z]{2,4})\b"
 )
 _FLIGHT_TIME_RE = re.compile(r"\bFlight time\s+(\d{1,3}):(\d{2})\b")
 _MONTHS = {
@@ -31,7 +32,16 @@ _MONTHS = {
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_STATUS = {"fld": "flight", "off": "off", "vac": "vacation", "sby": "standby"}
+_STATUS = {
+    "fld": "flight",
+    "dty": "duty",
+    "off": "off",
+    "vac": "vacation",
+    "sby": "standby",
+    "sim": "simulator",
+    "abs": "absence",
+    "x": "free",
+}
 
 
 def _minutes(hhmm):
@@ -76,13 +86,72 @@ def _day_map(start, end):
     return result
 
 
+def _day_anchors(words, day_map):
+    """Return ``(anchor_word, day_token)`` for both observed overview layouts.
+
+    Older EWG exports emit one word (``Thu13``). Newer EW exports place the
+    weekday and day number as two words with a small vertical offset. The
+    printed weekday and the exact planning period still have to agree, so a
+    nearby arbitrary number can never become a roster date.
+    """
+    result = []
+    seen = set()
+    for word in words:
+        raw = str(word.get("text") or "")
+        match = _DAY_RE.fullmatch(raw)
+        if match and raw in day_map and raw not in seen:
+            result.append((word, raw))
+            seen.add(raw)
+            continue
+        weekday = _WEEKDAY_RE.fullmatch(raw)
+        if not weekday:
+            continue
+        candidates = [
+            candidate for candidate in words
+            if re.fullmatch(r"\d{2}", str(candidate.get("text") or ""))
+            and 0 <= float(candidate.get("x0") or 0)
+            - float(word.get("x0") or 0) <= 12
+            and abs(float(candidate.get("top") or 0)
+                    - float(word.get("top") or 0)) <= 5
+        ]
+        if len(candidates) != 1:
+            continue
+        token = f"{weekday.group(1)}{candidates[0]['text']}"
+        if token not in day_map or token in seen:
+            continue
+        anchor = dict(word)
+        anchor["top"] = min(float(word.get("top") or 0),
+                            float(candidates[0].get("top") or 0))
+        result.append((anchor, token))
+        seen.add(token)
+    return result
+
+
 def _line_words(words, page_width):
     """Linearize strict leg rows inside each of the three schedule columns."""
+    # The lower schedule can use the same joined/split date layouts as the
+    # overview. Its candidate map is intentionally limited to real printed
+    # dates later by the caller's planning-period map.
     day_words = []
     for word in words:
         match = _DAY_RE.fullmatch(str(word.get("text") or ""))
         if match:
             day_words.append((word, match.group(0)))
+            continue
+        weekday = _WEEKDAY_RE.fullmatch(str(word.get("text") or ""))
+        if not weekday:
+            continue
+        candidates = [
+            candidate for candidate in words
+            if re.fullmatch(r"\d{2}", str(candidate.get("text") or ""))
+            and 0 <= float(candidate.get("x0") or 0)
+            - float(word.get("x0") or 0) <= 12
+            and abs(float(candidate.get("top") or 0)
+                    - float(word.get("top") or 0)) <= 5
+        ]
+        if len(candidates) == 1:
+            day_words.append((word,
+                              f"{weekday.group(1)}{candidates[0]['text']}"))
 
     output = []
     column_width = page_width / 3
@@ -122,37 +191,41 @@ def _overview(page, day_map):
         use_text_flow=False,
     ) or []
     anchors = [
-        word for word in words
+        (word, token) for word, token in _day_anchors(words, day_map)
         if float(word.get("top") or 0) < 65
-        and _DAY_RE.fullmatch(str(word.get("text") or ""))
     ]
-    if {str(word["text"]) for word in anchors} != set(day_map):
+    if {token for _, token in anchors} != set(day_map):
         return None, "eurowings_overview_date_mismatch"
 
     rows = {}
-    for anchor in anchors:
-        token = str(anchor["text"])
+    for anchor, token in anchors:
         x0 = float(anchor["x0"])
         candidates = [
             word for word in words
-            if 64 <= float(word.get("top") or 0) <= 74
+            if 5 <= float(word.get("top") or 0)
+            - float(anchor.get("top") or 0) <= 15
             and abs(float(word.get("x0") or 0) - x0) <= 10
             and str(word.get("text") or "").lower() in _STATUS
         ]
         if len(candidates) != 1:
             return None, "eurowings_unparsed_day_status"
-        status = _STATUS[str(candidates[0]["text"]).lower()]
+        status_word = candidates[0]
+        status = _STATUS[str(status_word["text"]).lower()]
         clocks = sorted(
             (word for word in words
-             if 74 < float(word.get("top") or 0) < 87
+             if 2 < float(word.get("top") or 0)
+             - float(status_word.get("top") or 0) < 16
              and abs(float(word.get("x0") or 0) - x0) <= 10
              and re.fullmatch(r"\d{4}", str(word.get("text") or ""))),
             key=lambda word: float(word["top"]),
         )
         values = [str(word["text"]) for word in clocks]
-        if status in ("flight", "standby") and len(values) != 2:
+        if status in ("flight", "standby", "duty", "simulator") \
+                and len(values) != 2:
             return None, "eurowings_missing_duty_times"
-        if status in ("off", "vacation") and values:
+        if status == "absence" and len(values) not in (0, 2):
+            return None, "eurowings_missing_duty_times"
+        if status in ("off", "vacation", "free") and values:
             return None, "eurowings_unexpected_ground_times"
         rows[day_map[token]] = {
             "status": status,
@@ -165,7 +238,7 @@ def _overview(page, day_map):
 def parse_eurowings_netline_calendar(pdf_bytes, extracted_text=""):
     """Return ``(events, year, month, report, error)`` for an EWG plan."""
     source = str(extracted_text or "")
-    if (_FORMAT_MARKER not in source[:1500]
+    if (not any(marker in source[:1500] for marker in _FORMAT_MARKERS)
             or "Individual duty plan" not in source[:500]):
         return None, None, None, None, "unsupported_pdf_format"
     start, end = _period(source)
@@ -215,9 +288,6 @@ def parse_eurowings_netline_calendar(pdf_bytes, extracted_text=""):
             "dep": dep, "arr": arr, "departure": departure,
             "arrival": arrival, "block": block, "aircraft": aircraft,
         })
-    if not legs:
-        return None, None, None, None, "no_roster_days"
-
     checksum = _FLIGHT_TIME_RE.search(source)
     if not checksum:
         return None, None, None, None, "eurowings_missing_flight_checksum"
@@ -233,6 +303,11 @@ def parse_eurowings_netline_calendar(pdf_bytes, extracted_text=""):
     if any(day in flight_days and row["status"] not in ("flight",)
            for day, row in overview.items()):
         return None, None, None, None, "eurowings_unexpected_flight_day"
+    if (not legs
+            and not any(row["status"] in (
+                "duty", "simulator", "standby", "absence")
+                for row in overview.values())):
+        return None, None, None, None, "no_roster_days"
 
     events = []
     marker_count = 0
@@ -245,6 +320,10 @@ def parse_eurowings_netline_calendar(pdf_bytes, extracted_text=""):
             events.append((f"vac-{day:%Y%m%d}", day,
                            day + timedelta(days=1), "Urlaub", True))
             marker_count += 1
+        elif row["status"] == "free":
+            events.append((f"free-{day:%Y%m%d}", day,
+                           day + timedelta(days=1), "Off Day", True))
+            marker_count += 1
         elif row["status"] == "standby":
             duty_start = _clock(day, row["start"])
             duty_end = _clock(day, row["end"])
@@ -252,6 +331,23 @@ def parse_eurowings_netline_calendar(pdf_bytes, extracted_text=""):
                 duty_end += timedelta(days=1)
             events.append((f"standby-{day:%Y%m%d}", duty_start, duty_end,
                            "Standby", False))
+            marker_count += 1
+        elif row["status"] in ("duty", "simulator", "absence"):
+            label = {
+                "duty": "Duty",
+                "simulator": "Simulator",
+                "absence": "Absence",
+            }[row["status"]]
+            if row["start"] and row["end"]:
+                duty_start = _clock(day, row["start"])
+                duty_end = _clock(day, row["end"])
+                if duty_end <= duty_start:
+                    duty_end += timedelta(days=1)
+                events.append((f"ground-{day:%Y%m%d}", duty_start, duty_end,
+                               label, False))
+            else:
+                events.append((f"ground-{day:%Y%m%d}", day,
+                               day + timedelta(days=1), label, True))
             marker_count += 1
 
     day_leg_number = {}
