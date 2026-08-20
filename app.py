@@ -63198,6 +63198,19 @@ def import_roster_pdf(token):
                     prodid='AeroX SAS Airside Roster PDF Import')
                 periods.append((sas_report or {}).get('period'))
         if perr == 'unsupported_pdf_format':
+            # Lufthansa City ground-duty plans use NetLine/Crew(LHX).  Their
+            # three-column layout is accepted only when every period date and
+            # the printed duty/off-day totals agree; comments and qualification
+            # appendices never enter calendar storage.
+            from lhx_netline_roster_pdf import parse_lhx_netline_calendar
+            lhx_events, lhx_year, lhx_month, lhx_report, perr = \
+                parse_lhx_netline_calendar(data, text)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    lhx_events, lhx_year, lhx_month,
+                    prodid='AeroX Lufthansa City NetLine Roster PDF Import')
+                periods.append((lhx_report or {}).get('period'))
+        if perr == 'unsupported_pdf_format':
             # Eurowings NetLine/Crew plans are a fixed three-column UTC
             # schedule.  The printed block-time sum and complete month strip
             # protect against missing legs or silently dropped ground days.
