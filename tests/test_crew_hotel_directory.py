@@ -564,3 +564,89 @@ def test_hangout_audience_cargo_sieht_lufthansa_treffs_und_umgekehrt():
     # Fremde Airlines bleiben draußen (fail-closed wie bisher).
     assert not app._hangout_audience_matches(aud_main, {'airline': 'SWISS'})
     assert not app._hangout_audience_matches(aud_main, {'airline': ''})
+
+
+def test_wifi_code_matches_roster_typo_against_directory_name(client, monkeypatch):
+    """Prod 19.08.: Roster sagt „Hilton Union Squaire" (LH-Freitext), das
+    Verzeichnis „Hilton San Francisco Union Square" → vorher 404, der Code
+    war unsicherbar. Der Wort-Match (Edit-Distanz ≤ 1 pro Wort) muss das
+    Haus finden, ohne die strenge Airline-/Stations-Bindung aufzugeben."""
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'id': 'hotel-sfo', 'iata': 'SFO', 'base': None,
+         'hotel': 'Hilton San Francisco Union Square', 'official_name': None,
+         'wifi_code': None},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-secret',
+                    data=json.dumps({'iata': 'SFO', 'base': 'FRA',
+                                     'hotel': 'Hilton Union Squaire',
+                                     'wifi_code': 'Crew-2026!'}),
+                    content_type='application/json')
+    assert r.status_code == 200
+    assert r.get_json()['ok'] is True
+
+
+def test_wifi_code_brand_alone_never_matches_a_specific_hotel(client, monkeypatch):
+    """Ein-Wort-Namen („Hilton") und disjunkte Häuser derselben Marke dürfen
+    NIE über den Fuzzy-Match schreiben — falscher-Hotel-Schutz bleibt."""
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'id': 'hotel-sfo', 'iata': 'SFO', 'base': None,
+         'hotel': 'Hilton San Francisco Union Square', 'official_name': None,
+         'wifi_code': None},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    for typed in ('Hilton', 'Hilton Financial District'):
+        r = client.post('/api/ax/crew-hotels/wifi?token=AT-secret',
+                        data=json.dumps({'iata': 'SFO',
+                                         'hotel': typed,
+                                         'wifi_code': 'Crew-2026!'}),
+                        content_type='application/json')
+        assert r.status_code == 404, typed
+
+
+def test_crew_hotel_edit1_kernfaelle():
+    assert app._crew_hotel_edit1('squaire', 'square')
+    assert app._crew_hotel_edit1('square', 'squaire')
+    assert app._crew_hotel_edit1('union', 'union')
+    assert not app._crew_hotel_edit1('union', 'inion2')
+    assert not app._crew_hotel_edit1('financial', 'union')
+
+
+def test_wifi_personal_flag_stores_sentinel_and_serves_no_code(client, monkeypatch):
+    """Owner 19.08.: Hotels mit persönlichen Zugangsdaten pro Gast — kein
+    Crew-Code, keine ständige Nachfrage. `personal: true` speichert den
+    Sentinel; der Serve liefert NIE den Sentinel als Code (Alt-Clients!),
+    sondern wifi_code=null + wifi_personal=true."""
+    fake = _FakeSB({'crew_hotel_directory': [
+        {'id': 'hotel-sfo', 'iata': 'SFO', 'base': None,
+         'hotel': 'Hilton San Francisco Union Square', 'official_name': None,
+         'transfer_min': 30, 'votes': 3,
+         'wifi_code': None},
+    ]})
+    monkeypatch.setattr(app, 'sb', fake)
+    monkeypatch.setattr(app, 'SB_AVAILABLE', True)
+    _airline(monkeypatch, 'Lufthansa')
+
+    r = client.post('/api/ax/crew-hotels/wifi?token=AT-secret',
+                    data=json.dumps({'iata': 'SFO',
+                                     'hotel': 'Hilton Union Squaire',
+                                     'personal': True}),
+                    content_type='application/json')
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body['ok'] is True and body['wifi_code'] is None
+    assert body['wifi_personal'] is True
+    table, payload = fake.sink['updates'][-1]
+    assert payload['wifi_code'] == app._CREW_HOTEL_WIFI_PERSONAL
+
+    fake.sink['data']['crew_hotel_directory'][0]['wifi_code'] = \
+        app._CREW_HOTEL_WIFI_PERSONAL
+    serve = client.get('/api/ax/crew-hotels?token=AT-x').get_json()
+    assert serve['hotels'][0]['wifi_code'] is None
+    assert serve['hotels'][0]['wifi_personal'] is True
