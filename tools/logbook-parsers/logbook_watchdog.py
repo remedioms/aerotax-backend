@@ -292,6 +292,7 @@ def _try_parsers(path):
     import parse_lh_flugstunden
     import parse_cfg_flugstunden
     import parse_roster_logbook
+    import parse_swiss_historical
 
     # Der Upload-Endpunkt nimmt CSV/Excel/PDF/JSON/ZIP an. Vorher bekam jede
     # Datei trotzdem die Endung .pdf und lief blind in pdfplumber. Ein valides
@@ -335,6 +336,9 @@ def _try_parsers(path):
     if parse_foreflight_easa.matches_pdf(path):
         legs, sims, report = parse_foreflight_easa.parse_pdf(path)
         return "foreflight_easa", legs, sims, report
+    if parse_swiss_historical.matches_pdf(path):
+        legs, sims, report = parse_swiss_historical.parse_pdf(path)
+        return "swiss_historical_roster", legs, sims, report
     try:
         with pdfplumber.open(path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
