@@ -166,7 +166,7 @@ def test_immediate_import_without_displayable_sectors_stays_pending(
     assert response.get_json()['status'] == 'pending'
     assert stored_rows[0]['status'] == 'pending'
     assert stored_rows[0]['last_error'] == \
-        'display_contract_no_flight_sectors'
+        'display_contract_no_schedulable_duties'
     assert promoted == []
 
 

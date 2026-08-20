@@ -76,7 +76,7 @@ def test_completed_pdf_remains_verified_after_private_payload_was_purged():
 
 def test_existing_sas_calendar_can_pass_gate_without_rereading_purged_pdf(
         monkeypatch):
-    report = {'ok': True, 'version': 'calendar-v1', 'sector_count': 78}
+    report = {'ok': True, 'version': 'calendar-v2', 'sector_count': 78}
     row = {
         'id': 4, 'token': 'AT-SAS', 'airline_name': 'SAS',
         'normalized_name': 'sas', 'homebase': 'CPH', 'source_kind': 'pdf',

@@ -80,7 +80,7 @@ def test_sas_airside_passes_the_new_airline_calendar_display_contract():
     report = backend._airline_display_contract(events)
 
     assert report['ok'] is True
-    assert report['version'] == 'calendar-v1'
+    assert report['version'] == 'calendar-v2'
     assert report['flight_days'] == 3
     assert report['sector_count'] == 4
 

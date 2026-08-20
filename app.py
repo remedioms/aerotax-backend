@@ -62517,7 +62517,7 @@ def _roster_pdf_upload_finish(job_ids, status, error_code=None,
 # The durable support queue only accepts a source which is already owner-bound
 # (the encrypted calendar feed or the private roster-PDF inbox).
 _AIRLINE_REQUEST_SOURCE_KINDS = frozenset(('ical_url', 'pdf'))
-_AIRLINE_DISPLAY_CONTRACT_VERSION = 'calendar-v1'
+_AIRLINE_DISPLAY_CONTRACT_VERSION = 'calendar-v2'
 
 # Die Airlines, die die App im Onboarding fest anbietet (iOS-Spiegel:
 # OnboardingView.builtInAirlines). Tippt jemand unter „Andere" einen Namen,
@@ -62591,12 +62591,18 @@ def _airline_request_profile_feed(token):
 def _airline_display_contract(events):
     """Fail-closed proof that a new airline can reach the calendar UI.
 
-    A successful import is not enough: the normalized payload must contain at
-    least one structured flight sector and every sector must carry the fields
-    used by iOS (flight, route and absolute departure/arrival instants).  The
-    returned report is also the capability required by
-    ``_airline_catalog_promote``; this keeps future callers from bypassing the
-    check accidentally.
+    A successful import is not enough. Flight schedules must contain at least
+    one structured sector with all fields consumed by iOS. A genuine
+    non-flying duty plan (type rating, simulator, ground course, etc.) is also
+    useful and may pass when it contains at least one bounded, timezone-aware
+    timed duty which survives the normal briefing conversion. A feed made only
+    of all-day ``Off Day`` markers still fails closed.
+
+    Any route-looking event which cannot become a sector blocks both modes. A
+    carrier therefore cannot be promoted as a generic duty calendar while its
+    actual flights are silently unparsed. The returned report is also the
+    capability required by ``_airline_catalog_promote``; this keeps future
+    callers from bypassing the check accidentally.
     """
     report = {
         'version': _AIRLINE_DISPLAY_CONTRACT_VERSION,
@@ -62606,6 +62612,8 @@ def _airline_display_contract(events):
         'briefing_days': 0,
         'flight_days': 0,
         'sector_count': 0,
+        'timed_event_count': 0,
+        'display_mode': None,
     }
     if not isinstance(events, list) or not events:
         return report
@@ -62613,6 +62621,7 @@ def _airline_display_contract(events):
         # A route-looking source event which the normal sector builder cannot
         # represent is exactly the class of bug that used to make a freshly
         # added airline look "supported" while its flights stayed invisible.
+        timed_events = []
         for event in events:
             if not isinstance(event, dict):
                 report['error'] = 'display_contract_invalid_event'
@@ -62626,13 +62635,52 @@ def _airline_display_contract(events):
                 report['error'] = 'display_contract_unparsed_route_event'
                 return report
 
+            start_iso = str(event.get('start_iso') or '').strip()
+            end_iso = str(event.get('end_iso') or '').strip()
+            if summary.strip() and start_iso and end_iso:
+                try:
+                    duty_start = datetime.fromisoformat(
+                        start_iso.replace('Z', '+00:00'))
+                    duty_end = datetime.fromisoformat(
+                        end_iso.replace('Z', '+00:00'))
+                    duty_seconds = (duty_end - duty_start).total_seconds()
+                    if (duty_start.tzinfo is not None
+                            and duty_end.tzinfo is not None
+                            and 0 < duty_seconds <= 7 * 24 * 60 * 60):
+                        timed_events.append(event)
+                except Exception:
+                    pass
+
+        report['timed_event_count'] = len(timed_events)
+
         sectors_by_day = _build_ical_sectors(events)
         sectors = [sector for rows in sectors_by_day.values()
                    for sector in rows]
         report['flight_days'] = len(sectors_by_day)
         report['sector_count'] = len(sectors)
+
+        # Exercise the same final payload shape consumed by iOS before either
+        # capability is accepted. This proves that a KLM-style ground/training
+        # schedule is not merely parseable but actually reaches calendar days.
+        briefings, _ = _ics_events_to_briefings(events)
+        _attach_sectors(briefings, events)
+        report['briefing_days'] = len(briefings)
+
         if not sectors:
-            report['error'] = 'display_contract_no_flight_sectors'
+            if not timed_events or not briefings:
+                report['error'] = 'display_contract_no_schedulable_duties'
+                return report
+            timed_days = {
+                str(event.get('start') or event.get('start_iso') or '')[:10]
+                for event in timed_events
+                if str(event.get('start') or event.get('start_iso') or '')[:10]
+            }
+            if not timed_days or any(day not in briefings for day in timed_days):
+                report['error'] = 'display_contract_day_alignment'
+                return report
+            report['display_mode'] = 'duty_schedule'
+            report['ok'] = True
+            report['error'] = None
             return report
 
         for sector in sectors:
@@ -62666,17 +62714,14 @@ def _airline_display_contract(events):
                 report['error'] = 'display_contract_invalid_duration'
                 return report
 
-        # Exercise the same final payload shape consumed by iOS.  This catches
-        # bucket/key mismatches where valid sectors exist but never attach to a
-        # visible calendar day.
-        briefings, _ = _ics_events_to_briefings(events)
-        _attach_sectors(briefings, events)
-        report['briefing_days'] = len(briefings)
+        # Catch bucket/key mismatches where valid sectors exist but never
+        # attach to a visible calendar day.
         for day, expected in sectors_by_day.items():
             visible = (briefings.get(day) or {}).get('ical_sectors') or []
             if len(visible) != len(expected):
                 report['error'] = 'display_contract_day_alignment'
                 return report
+        report['display_mode'] = 'flight_schedule'
         report['ok'] = True
         report['error'] = None
         return report
@@ -62703,11 +62748,19 @@ def _airline_request_store(row):
 
 def _airline_catalog_promote(display_name, normalized_name, source_kind,
                              *, display_contract):
+    flight_capable = (
+        isinstance(display_contract, dict)
+        and int(display_contract.get('sector_count') or 0) >= 1)
+    duty_capable = (
+        isinstance(display_contract, dict)
+        and display_contract.get('display_mode') == 'duty_schedule'
+        and int(display_contract.get('timed_event_count') or 0) >= 1
+        and int(display_contract.get('briefing_days') or 0) >= 1)
     if (not isinstance(display_contract, dict)
             or display_contract.get('ok') is not True
             or display_contract.get('version') !=
             _AIRLINE_DISPLAY_CONTRACT_VERSION
-            or int(display_contract.get('sector_count') or 0) < 1):
+            or not (flight_capable or duty_capable)):
         app.logger.warning(
             '[airline-request] catalog-blocked name=%s error=%s',
             normalized_name,
