@@ -44,6 +44,11 @@ class Harness:
                                  error_code, error_message)))
         monkeypatch.setattr(w, "_download", lambda rid: self.files[rid][0])
         monkeypatch.setattr(w, "_try_parsers", self._parse)
+        # Unknown-format tests stay network-free unless a case explicitly
+        # installs a verified Sol result below.
+        monkeypatch.setattr(
+            w, "_try_openai_logbook",
+            lambda _path, _token: (None, "openai_not_configured"))
         monkeypatch.setattr(w, "_rest", self._rest)
         monkeypatch.setattr(w, "_upsert_import",
                             lambda token, legs, sims, meta:
@@ -327,6 +332,29 @@ def test_mixed_batch_imports_good_and_keeps_unsupported_for_review(monkeypatch):
     assert kinds == {"completed"}
 
 
+def test_unknown_format_imports_only_after_verified_sol_result(monkeypatch):
+    h = Harness(monkeypatch, {60: (b"unknown-layout", "unsupported")})
+    ai_report = {
+        "month": "2026-02",
+        "independent_reads": 2,
+        "source_evidence_guard": True,
+        "control": "OPENAI_DOUBLE_READ_SOURCE_VERIFIED",
+    }
+    monkeypatch.setattr(
+        w, "_try_openai_logbook",
+        lambda _path, token: (("openai_verified_logbook", [LEG_A], [],
+                              ai_report), None))
+    events = []
+
+    w.process_token_batch(
+        "AT-TEST", [_row(60, b"unknown-layout")], events)
+
+    assert h.upserts[0][1] == [LEG_A]
+    assert h.upserts[0][3]["watchdog"]["upload_ids"] == [60]
+    assert h.statuses_for(60)[-1] == (w.STATUS_COMPLETED, True)
+    assert h.pushes == [("completed", "AT-TEST", 60)]
+
+
 def test_mixed_batch_imports_good_while_bad_file_waits_for_review(monkeypatch):
     """Ein einzelner defekter Monat blockiert nicht mehr den ganzen Upload."""
     h = Harness(monkeypatch, {13: (b"good", [LEG_A]),
@@ -368,6 +396,22 @@ def test_unsupported_batch_waits_for_review_without_failure_push(monkeypatch):
     assert h.pushes == []
     for rid in (20, 21, 22):
         assert h.statuses_for(rid)[-1] == (w.STATUS_REVIEW, False)
+
+
+def test_sol_cost_cap_defers_extra_unknown_file_to_next_cron(monkeypatch):
+    files = {rid: (f"unknown-{rid}".encode(), "unsupported")
+             for rid in range(70, 74)}
+    h = Harness(monkeypatch, files)
+    events = []
+    rows = [_row(rid, files[rid][0]) for rid in sorted(files)]
+
+    w.process_token_batch("AT-TEST", rows, events)
+
+    for rid in (70, 71, 72):
+        assert h.statuses_for(rid)[-1] == (w.STATUS_REVIEW, False)
+    assert h.statuses_for(73)[-1] == (w.STATUS_PENDING, False)
+    assert any(event[0] == "deferred" and event[2] == [73]
+               for event in events)
 
 
 def test_review_never_pushes_upload_again(monkeypatch):

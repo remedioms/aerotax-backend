@@ -18,6 +18,9 @@ Ablauf pro Lauf:
      LH-Flugstundenübersicht Cockpit+Kabine, Condor/CFG). Jeder Parser prüft
      seine verfügbaren Kontrollen selbst und bricht bei Abweichung ab — der
      Wächter erbt diese Garantien, statt eigene Leseheuristik zu erfinden.
+     Nur wenn alle Parser explizit ``unsupported`` melden, darf Sol/xhigh eine
+     textlesbare Quelle zweimal unabhängig lesen. Jedes Feld wird danach gegen
+     genau eine Quellzeile geprüft; Abweichung/Teilbeleg → Review, kein Import.
   4. Legs werden mit einem BESTEHENDEN Import VERSCHMOLZEN (Union über
      Leg-Schlüssel) — `ax_logbook_import` ist eine Zeile pro Token, ein
      naives Upsert würde die Historie des Nutzers löschen.
@@ -88,6 +91,72 @@ SOURCE_KEEP = 3               # meta.source wächst sonst mit jedem Import
 # Schlüssel ist genau eine Minute deshalb dieselbe Messung; größere
 # Abweichungen bleiben ein harter Konflikt und gehen weiterhin in `review`.
 MAX_BLOCK_MERGE_DRIFT_MIN = 1
+
+# Unknown, text-readable logbooks get one quality-first extraction attempt
+# after the deterministic parser cascade has explicitly returned
+# ``unsupported``.  Each chunk is read twice from scratch by Sol.  Nothing is
+# persisted unless both source-validated reads are byte-for-byte equivalent.
+LOGBOOK_AI_MODEL_DEFAULT = "gpt-5.6-sol"
+LOGBOOK_AI_EFFORT_DEFAULT = "xhigh"
+LOGBOOK_AI_TIMEOUT_SECONDS = 180
+LOGBOOK_AI_MAX_SOURCE_CHARS = 80000
+LOGBOOK_AI_CHUNK_CHARS = 24000
+LOGBOOK_AI_MAX_CHUNKS = 4
+LOGBOOK_AI_MAX_OUTPUT_TOKENS = 48000
+LOGBOOK_AI_MAX_FILES_PER_TOKEN_RUN = 3
+
+LOGBOOK_AI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "legs": {
+            "type": "array",
+            "maxItems": 400,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "date_text": {"type": "string"},
+                    "flight_no": {"type": "string"},
+                    "from_iata": {"type": "string"},
+                    "to_iata": {"type": "string"},
+                    "block_time": {"type": "string"},
+                    "aircraft_type": {"type": ["string", "null"]},
+                    "registration": {"type": ["string", "null"]},
+                    "role": {"type": ["string", "null"]},
+                    "landings_day_text": {"type": ["string", "null"]},
+                    "landings_night_text": {"type": ["string", "null"]},
+                    "night_time": {"type": ["string", "null"]},
+                    "source_evidence": {"type": "string"},
+                },
+                "required": [
+                    "date_text", "flight_no", "from_iata", "to_iata",
+                    "block_time", "aircraft_type", "registration", "role",
+                    "landings_day_text", "landings_night_text",
+                    "night_time", "source_evidence",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["legs"],
+    "additionalProperties": False,
+}
+
+LOGBOOK_AI_SYSTEM = """You extract operated flight legs from a crew logbook.
+Return raw source facts only; never infer, translate, repair, or calculate a
+value. Every returned value must appear literally in the same single source
+line copied to source_evidence. Return one item per operated flight row.
+
+Required acceptance facts: an exact date token, flight number, three-letter
+origin, three-letter destination, and an exact block/duration token. If any of
+those is absent from a row, omit that row. Do not return totals, positioning as
+a passenger, private trips, duties, standby, off days, simulators, headings,
+or summary lines. Optional aircraft, registration, role, landing counts, and
+night time stay null unless printed in that same line. Keep source order.
+
+block_time and night_time must be copied exactly (for example 08:15, 1:32, or
+1.5). landing count fields are exact printed integer tokens as strings. Copy
+source_evidence as the shortest complete, unchanged source line supporting all
+fields. Output only the requested JSON schema."""
 
 
 def _env(name):
@@ -258,6 +327,439 @@ def _is_supported_image(filename, blob):
         return (len(blob) >= 12 and blob[:4] == b'RIFF'
                 and blob[8:12] == b'WEBP')
     return False
+
+
+# ── Guarded Sol fallback for unknown logbook layouts ───────────────────────
+
+def _logbook_ai_source_text(path):
+    """Return a bounded, line-oriented source representation.
+
+    The evidence guard below accepts facts from one physical source line only.
+    PDF text, delimited text and spreadsheet rows can provide that guarantee;
+    images and genuinely binary formats deliberately stay in manual review.
+    """
+    try:
+        with open(path, "rb") as handle:
+            blob = handle.read()
+    except OSError as exc:
+        return None, f"source_read_{type(exc).__name__}"
+
+    try:
+        if blob.startswith(b"%PDF-"):
+            import pdfplumber
+            with pdfplumber.open(path) as pdf:
+                pages = [page.extract_text(x_tolerance=2, y_tolerance=3) or ""
+                         for page in pdf.pages]
+            source = "\n".join(pages)
+        elif blob.startswith(b"PK\x03\x04"):
+            import openpyxl
+            workbook = openpyxl.load_workbook(
+                path, read_only=True, data_only=True)
+            lines = []
+            for sheet in workbook.worksheets:
+                for row_number, row in enumerate(
+                        sheet.iter_rows(values_only=True), 1):
+                    values = []
+                    for value in row:
+                        if value is None:
+                            values.append("")
+                        elif isinstance(value, datetime):
+                            values.append(value.isoformat(sep=" "))
+                        else:
+                            values.append(str(value).replace("\n", " ").strip())
+                    if any(values):
+                        lines.append(
+                            f"[{sheet.title}!R{row_number}]\t" + "\t".join(values))
+            workbook.close()
+            source = "\n".join(lines)
+        else:
+            source = None
+            for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+                try:
+                    candidate = blob.decode(encoding)
+                except UnicodeError:
+                    continue
+                if "\x00" not in candidate:
+                    source = candidate
+                    break
+            if source is None:
+                return None, "source_not_text_readable"
+    except Exception as exc:  # format/OCR failures stay private and fail closed
+        return None, f"source_extract_{type(exc).__name__}"
+
+    source = "\n".join(line.rstrip() for line in (source or "").splitlines())
+    if not source.strip():
+        return None, "source_has_no_text"
+    if len(source) > LOGBOOK_AI_MAX_SOURCE_CHARS:
+        return None, "source_too_large_for_complete_read"
+    if max((len(line) for line in source.splitlines()), default=0) > \
+            LOGBOOK_AI_CHUNK_CHARS:
+        return None, "source_line_too_large"
+    return source, None
+
+
+def _logbook_ai_chunks(source):
+    """Split only between lines; later chunks receive a small header copy."""
+    lines = source.splitlines()
+    header = lines[:12]
+    chunks, current = [], []
+    current_chars = 0
+    for line in lines:
+        extra = len(line) + 1
+        if current and current_chars + extra > LOGBOOK_AI_CHUNK_CHARS:
+            chunks.append("\n".join(current))
+            current = list(header)
+            current_chars = sum(len(value) + 1 for value in current)
+        current.append(line)
+        current_chars += extra
+    if current:
+        chunks.append("\n".join(current))
+    return chunks if len(chunks) <= LOGBOOK_AI_MAX_CHUNKS else []
+
+
+_LOGBOOK_AI_MONTHS = {
+    "JAN": 1, "JANUARY": 1, "JANUAR": 1,
+    "FEB": 2, "FEBRUARY": 2, "FEBRUAR": 2,
+    "MAR": 3, "MARCH": 3, "MAERZ": 3, "MÄRZ": 3,
+    "APR": 4, "APRIL": 4,
+    "MAY": 5, "MAI": 5,
+    "JUN": 6, "JUNE": 6, "JUNI": 6,
+    "JUL": 7, "JULY": 7, "JULI": 7,
+    "AUG": 8, "AUGUST": 8,
+    "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10, "OKT": 10, "OKTOBER": 10,
+    "NOV": 11, "NOVEMBER": 11,
+    "DEC": 12, "DECEMBER": 12, "DEZ": 12, "DEZEMBER": 12,
+}
+
+
+def _logbook_ai_parse_date(value, source):
+    raw = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", raw)
+    if match:
+        parts = tuple(int(item) for item in match.groups())
+        try:
+            return datetime(parts[0], parts[1], parts[2]).date().isoformat()
+        except ValueError:
+            return None
+
+    match = re.fullmatch(r"(\d{1,2})([./-])(\d{1,2})\2(\d{4})", raw)
+    if match:
+        first, separator, second, year = match.groups()
+        first, second, year = int(first), int(second), int(year)
+        header = source.upper().replace(" ", "")
+        month_first = bool(re.search(r"M{1,2}[/.-]D{1,2}[/.-]Y{2,4}", header))
+        day_first = bool(re.search(r"D{1,2}[/.-]M{1,2}[/.-]Y{2,4}", header))
+        if first > 12:
+            day, month = first, second
+        elif second > 12:
+            month, day = first, second
+        elif month_first and not day_first:
+            month, day = first, second
+        elif day_first and not month_first:
+            day, month = first, second
+        else:
+            return None  # ambiguous numeric date: never guess locale
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
+
+    match = re.fullmatch(
+        r"(\d{1,2})\s+([A-Za-zÄÖÜäöü]+)\s+(\d{4})", raw)
+    if match:
+        day, month_name, year = match.groups()
+        folded = month_name.upper().replace("Ä", "AE")
+        month = (_LOGBOOK_AI_MONTHS.get(month_name.upper())
+                 or _LOGBOOK_AI_MONTHS.get(folded))
+        if month:
+            try:
+                return datetime(int(year), month, int(day)).date().isoformat()
+            except ValueError:
+                return None
+    return None
+
+
+def _logbook_ai_parse_duration(value, source, allow_zero=False):
+    raw = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,3}):([0-5]\d)", raw)
+    if match:
+        minutes = int(match.group(1)) * 60 + int(match.group(2))
+    elif re.fullmatch(r"\d{1,2}[.,]\d{1,4}", raw):
+        exact = float(raw.replace(",", ".")) * 60
+        if abs(exact - round(exact)) > 1e-8:
+            return None
+        minutes = int(round(exact))
+    elif (re.fullmatch(r"\d{1,4}", raw)
+          and re.search(r"(?i)\b(?:block|duration|flight\s*time)\b[^\n]{0,30}\bmin",
+                        source)):
+        minutes = int(raw)
+    else:
+        return None
+    lower = 0 if allow_zero else 1
+    return minutes if lower <= minutes <= 24 * 60 else None
+
+
+def _logbook_ai_response_text(payload):
+    if not isinstance(payload, dict):
+        return ""
+    if isinstance(payload.get("output_text"), str):
+        return payload["output_text"]
+    parts = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if (isinstance(content, dict)
+                    and content.get("type") == "output_text"
+                    and isinstance(content.get("text"), str)):
+                parts.append(content["text"])
+    return "".join(parts)
+
+
+def _logbook_ai_call_once(source_chunk, token):
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("openai_not_configured")
+    model = (os.environ.get("AEROX_LOGBOOK_OPENAI_MODEL", "").strip()
+             or os.environ.get("AEROX_ROSTER_OPENAI_MODEL", "").strip()
+             or LOGBOOK_AI_MODEL_DEFAULT)
+    effort = (os.environ.get("AEROX_LOGBOOK_OPENAI_EFFORT", "").strip()
+              or os.environ.get("AEROX_ROSTER_OPENAI_EFFORT", "").strip()
+              or LOGBOOK_AI_EFFORT_DEFAULT)
+    body = {
+        "model": model,
+        "store": False,
+        "safety_identifier": "ax-logbook-" + hashlib.sha256(
+            str(token or "").encode()).hexdigest()[:24],
+        "reasoning": {"effort": effort},
+        "max_output_tokens": LOGBOOK_AI_MAX_OUTPUT_TOKENS,
+        "input": [
+            {"role": "system", "content": LOGBOOK_AI_SYSTEM},
+            {"role": "user", "content": (
+                "Read this complete line-bounded logbook chunk independently. "
+                "Some document header lines may be repeated between chunks; "
+                "do not turn headers into flights.\n\n" + source_chunk)},
+        ],
+        "text": {"format": {
+            "type": "json_schema",
+            "name": "aerox_logbook_legs",
+            "strict": True,
+            "schema": LOGBOOK_AI_SCHEMA,
+        }},
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(
+            request, timeout=LOGBOOK_AI_TIMEOUT_SECONDS) as response:
+        payload = json.loads(response.read())
+    raw = _logbook_ai_response_text(payload)
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return [], model
+    legs = parsed.get("legs") if isinstance(parsed, dict) else None
+    return (legs if isinstance(legs, list) else []), model
+
+
+def _logbook_ai_validate_items(items, source):
+    """Validate every returned fact against one exact source line."""
+    if not re.search(
+            r"(?i)\b(?:block(?:zeit)?|blk|duration|flight\s*time|flugzeit)\b",
+            source):
+        return [], len(items or [])
+    line_positions = {}
+    for index, line in enumerate(source.splitlines()):
+        normalized = " ".join(line.split())
+        if normalized:
+            line_positions.setdefault(normalized, index)
+
+    clean, dropped = [], 0
+    for raw in (items or [])[:400]:
+        if not isinstance(raw, dict):
+            dropped += 1
+            continue
+        evidence = " ".join(str(raw.get("source_evidence") or "").split())
+        if not evidence or evidence not in line_positions:
+            dropped += 1
+            continue
+        evidence_upper = evidence.upper()
+        evidence_tokens = re.findall(r"[A-Z0-9]+", evidence_upper)
+        joined_tokens = set(evidence_tokens)
+        joined_tokens.update(
+            evidence_tokens[index] + evidence_tokens[index + 1]
+            for index in range(len(evidence_tokens) - 1))
+
+        exact_fields = ("date_text", "block_time")
+        if any(str(raw.get(field) or "").strip() not in evidence
+               for field in exact_fields):
+            dropped += 1
+            continue
+        codes = {}
+        valid = True
+        for field in ("flight_no", "from_iata", "to_iata"):
+            value = re.sub(r"\s+", "", str(raw.get(field) or "").upper())
+            if not value:
+                valid = False
+                break
+            codes[field] = value
+        if not valid:
+            dropped += 1
+            continue
+        if (not re.fullmatch(r"[A-Z0-9]{1,10}", codes["flight_no"])
+                or not re.search(r"[A-Z]", codes["flight_no"])
+                or not re.search(r"\d", codes["flight_no"])
+                or codes["flight_no"] not in joined_tokens
+                or not re.fullmatch(r"[A-Z]{3}", codes["from_iata"])
+                or codes["from_iata"] not in evidence_tokens
+                or not re.fullmatch(r"[A-Z]{3}", codes["to_iata"])
+                or codes["to_iata"] not in evidence_tokens
+                or codes["from_iata"] == codes["to_iata"]):
+            dropped += 1
+            continue
+
+        date_iso = _logbook_ai_parse_date(raw.get("date_text"), source)
+        block_min = _logbook_ai_parse_duration(raw.get("block_time"), source)
+        if not date_iso or block_min is None:
+            dropped += 1
+            continue
+
+        leg = {
+            "date": date_iso,
+            "flight": codes["flight_no"],
+            "from": codes["from_iata"],
+            "to": codes["to_iata"],
+            "block_min": block_min,
+            "_source_line": line_positions[evidence],
+            "_source_evidence": evidence,
+        }
+        for source_field, target_field in (
+                ("aircraft_type", "type"),
+                ("registration", "reg"),
+                ("role", "role")):
+            value = str(raw.get(source_field) or "").strip()
+            if value:
+                pattern = re.escape(" ".join(value.upper().split()))
+                pattern = pattern.replace(r"\ ", r"\s+")
+                if not re.search(
+                        rf"(?<![A-Z0-9]){pattern}(?![A-Z0-9])",
+                        evidence_upper):
+                    valid = False
+                    break
+                leg[target_field] = value.upper()[:32]
+        if not valid:
+            dropped += 1
+            continue
+
+        for source_field, target_field in (
+                ("landings_day_text", "ldg_day"),
+                ("landings_night_text", "ldg_night")):
+            value = str(raw.get(source_field) or "").strip()
+            if value:
+                if (not re.fullmatch(r"\d{1,3}", value)
+                        or not re.search(rf"(?<!\d){re.escape(value)}(?!\d)",
+                                         evidence)):
+                    valid = False
+                    break
+                leg[target_field] = int(value)
+        if not valid:
+            dropped += 1
+            continue
+
+        night = str(raw.get("night_time") or "").strip()
+        if night:
+            if night not in evidence:
+                dropped += 1
+                continue
+            night_min = _logbook_ai_parse_duration(
+                night, source, allow_zero=True)
+            if night_min is None or night_min > block_min:
+                dropped += 1
+                continue
+            leg["night_min"] = night_min
+        clean.append(leg)
+
+    # Without departure timestamps, equal identity keys would collapse during
+    # the normal merge. Reject rather than silently lose a repeated sector.
+    identities = [(leg["date"], leg["flight"], leg["from"], leg["to"])
+                  for leg in clean]
+    if len(identities) != len(set(identities)):
+        return [], dropped + 1
+    return clean, dropped
+
+
+def _logbook_ai_public_leg(item):
+    return {key: value for key, value in item.items()
+            if not key.startswith("_source_")}
+
+
+def _try_openai_logbook(path, token):
+    """Return a normal parser tuple or ``(None, private_error_code)``."""
+    if not os.environ.get("OPENAI_API_KEY", "").strip():
+        return None, "openai_not_configured"
+    source, error = _logbook_ai_source_text(path)
+    if error:
+        return None, error
+    chunks = _logbook_ai_chunks(source)
+    if not chunks:
+        return None, "source_requires_too_many_chunks"
+
+    combined, model = [], LOGBOOK_AI_MODEL_DEFAULT
+    try:
+        for chunk in chunks:
+            first, model = _logbook_ai_call_once(chunk, token)
+            second, _ = _logbook_ai_call_once(chunk, token)
+            first_clean, first_dropped = _logbook_ai_validate_items(first, source)
+            second_clean, second_dropped = _logbook_ai_validate_items(second, source)
+            if first_dropped or second_dropped:
+                return None, "source_evidence_rejected"
+            first_facts = sorted(json.dumps(item, sort_keys=True)
+                                 for item in first_clean)
+            second_facts = sorted(json.dumps(item, sort_keys=True)
+                                  for item in second_clean)
+            if first_facts != second_facts:
+                return None, "independent_reads_disagree"
+            combined.extend(first_clean)
+    except Exception as exc:  # network/provider details stay out of row data
+        _log(f"Sol-Flugbuchaufruf fehlgeschlagen: {type(exc).__name__}")
+        return None, f"openai_call_{type(exc).__name__}"
+
+    unique = {}
+    for item in combined:
+        fact = json.dumps(item, sort_keys=True)
+        unique[fact] = item
+    verified = sorted(unique.values(), key=lambda item: item["_source_line"])
+    if not verified:
+        return None, "no_verified_flight_legs"
+    identities = [(item["date"], item["flight"], item["from"], item["to"])
+                  for item in verified]
+    if len(identities) != len(set(identities)):
+        return None, "duplicate_leg_identity_without_departure_time"
+
+    legs = [_logbook_ai_public_leg(item) for item in verified]
+    dates = sorted(leg["date"] for leg in legs)
+    first_month, last_month = dates[0][:7], dates[-1][:7]
+    report = {
+        "month": (first_month if first_month == last_month
+                  else f"{first_month}–{last_month}"),
+        "document_type": "openai_verified_logbook",
+        "model": model,
+        "reasoning_effort": (os.environ.get(
+            "AEROX_LOGBOOK_OPENAI_EFFORT", "").strip()
+            or os.environ.get("AEROX_ROSTER_OPENAI_EFFORT", "").strip()
+            or LOGBOOK_AI_EFFORT_DEFAULT),
+        "independent_reads": 2,
+        "chunks": len(chunks),
+        "source_evidence_guard": True,
+        "store": False,
+        "legs": len(legs),
+        "block_min": sum(leg["block_min"] for leg in legs),
+        "control": "OPENAI_DOUBLE_READ_SOURCE_VERIFIED",
+    }
+    return ("openai_verified_logbook", legs, [], report), None
 
 
 # ── Parser-Erkennung ────────────────────────────────────────────────────────
@@ -737,6 +1239,9 @@ def process_token_batch(token, rows, events, terminal=None):
 
     _status(ids, STATUS_PROCESSING)
     parsed_files, unsupported, encrypted, seen_sha = [], [], [], {}
+    unsupported_reasons = {}
+    ai_deferred = []
+    ai_attempts = 0
     review = []
 
     for row in rows:
@@ -778,7 +1283,20 @@ def process_token_batch(token, rows, events, terminal=None):
         try:
             name, legs, sims, report = _try_parsers(path)
             if name == "unsupported":
-                unsupported.append(rid)
+                if ai_attempts >= LOGBOOK_AI_MAX_FILES_PER_TOKEN_RUN:
+                    ai_deferred.append(rid)
+                else:
+                    ai_attempts += 1
+                    ai_result, ai_error = _try_openai_logbook(path, token)
+                    if ai_result:
+                        ai_name, ai_legs, ai_sims, ai_report = ai_result
+                        parsed_files.append({
+                            "id": rid, "parser": ai_name, "legs": ai_legs,
+                            "sims": ai_sims, "report": ai_report,
+                        })
+                    else:
+                        unsupported.append(rid)
+                        unsupported_reasons[rid] = ai_error or "unknown"
             else:
                 parsed_files.append({"id": rid, "parser": name, "legs": legs,
                                      "sims": sims, "report": report})
@@ -922,14 +1440,27 @@ def process_token_batch(token, rows, events, terminal=None):
                        "erkannt; enthält keine einzelnen Flugbuch-Legs"))
 
     if unsupported:
-        message = (
-            "Dateiformat wird noch nicht unterstützt; Originaldatei wurde "
-            "für die Parser-Erweiterung aufbewahrt."
-        )
-        _status(unsupported, STATUS_REVIEW, processed=False,
-                error_code="unsupported_format", error_message=message)
-        review_by_id.update({rid: message for rid in unsupported})
-        events.append(("review", token, unsupported, message))
+        messages = {}
+        for rid in unsupported:
+            reason = unsupported_reasons.get(rid, "unknown")
+            message = (
+                "Dateiformat wird noch nicht unterstützt; die Sol-"
+                "Doppelprüfung konnte keine vollständig belegten Legs "
+                f"freigeben ({reason}). Originaldatei wurde für die Parser-"
+                "Erweiterung aufbewahrt."
+            )
+            messages[rid] = message
+            _status([rid], STATUS_REVIEW, processed=False,
+                    error_code="unsupported_format", error_message=message)
+        review_by_id.update(messages)
+        events.append(("review", token, unsupported,
+                       "; ".join(f"#{rid}: {messages[rid]}"
+                                 for rid in unsupported)))
+
+    if ai_deferred:
+        _status(ai_deferred, STATUS_PENDING, processed=False)
+        events.append(("deferred", token, ai_deferred,
+                       "Sol-Kostenlimit dieses Laufs; nächster Cron-Lauf"))
 
     # Byte-Dubletten erben das Schicksal ihres ORIGINALS — eine Kopie eines
     # noch unbekannten Formats wartet ebenfalls auf `review`, statt fälschlich
@@ -941,20 +1472,27 @@ def process_token_batch(token, rows, events, terminal=None):
     if dups:
         real_ids = {f["id"] for f in real + informational}
         review_ids = set(review_by_id)
+        deferred_ids = set(ai_deferred)
         failed_dups = [f["id"] for f in dups
                        if f["dup_of"] in failed_ids]
         review_dups = [f["id"] for f in dups if f["dup_of"] in review_ids]
+        deferred_dups = [f["id"] for f in dups
+                         if f["dup_of"] in deferred_ids]
         done_dups = [f["id"] for f in dups
                      if f["dup_of"] in real_ids or f["dup_of"] not in
-                     set(unsupported) | real_ids | review_ids | failed_ids]
+                     set(unsupported) | real_ids | review_ids | failed_ids
+                     | deferred_ids]
         if review_dups:
             _status(review_dups, STATUS_REVIEW, processed=False,
                     error_code="needs_review",
                     error_message="Identische Datei wartet bereits auf Prüfung.")
+        if deferred_dups:
+            _status(deferred_dups, STATUS_PENDING, processed=False)
         if done_dups:
             _status(done_dups, STATUS_COMPLETED, processed=True)
         events.append(("dups", token,
                        {"failed": failed_dups, "review": review_dups,
+                        "deferred": deferred_dups,
                         "completed": done_dups}, ""))
 
     failed = sorted(encrypted + failed_dups)
