@@ -11786,6 +11786,39 @@ def put_user_profile(token):
         except (TypeError, ValueError):
             return jsonify({'ok': False,
                             'error': 'invalid_monthly_target_hours'}), 400
+    # Private operative Spesenregel (z. B. Cargolux 4 EUR je Stunde ausserhalb
+    # der Homebase). ``auto`` ist absichtlich nur ein Modus: der verifizierte
+    # Airline-Standard bleibt zentral im Client/Regelwerk und kann nicht durch
+    # einen beliebigen Profil-PUT global umgeschrieben werden. ``custom`` ist
+    # eine rein persoenliche vertragliche Abweichung. Beide Felder leben in
+    # metadata-jsonb und fehlen in _PUBLIC_PROFILE_FIELDS.
+    if 'expense_hourly_rate_mode' in body:
+        _expense_mode = body.get('expense_hourly_rate_mode')
+        if _expense_mode not in ('auto', 'custom'):
+            return jsonify({'ok': False,
+                            'error': 'invalid_expense_hourly_rate_mode'}), 400
+        profile['expense_hourly_rate_mode'] = _expense_mode
+        if _expense_mode == 'auto':
+            # JSONEncoder laesst das optionale Rate-Feld beim Reset weg. Darum
+            # muss der Modus selbst einen vorher gespeicherten Wert entfernen.
+            profile.pop('expense_hourly_rate_eur', None)
+    if 'expense_hourly_rate_eur' in body:
+        try:
+            import math as _math_expense_rate
+            _expense_rate = float(body.get('expense_hourly_rate_eur'))
+            if (not _math_expense_rate.isfinite(_expense_rate)
+                    or not 0.01 <= _expense_rate <= 100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({'ok': False,
+                            'error': 'invalid_expense_hourly_rate_eur'}), 400
+        _effective_expense_mode = body.get(
+            'expense_hourly_rate_mode',
+            profile.get('expense_hourly_rate_mode'))
+        if _effective_expense_mode != 'custom':
+            return jsonify({'ok': False,
+                            'error': 'expense_hourly_rate_requires_custom_mode'}), 400
+        profile['expense_hourly_rate_eur'] = _expense_rate
     # Private MTV-/Stunden-Konfiguration. Diese Felder dienen ausschließlich
     # dazu, die eigene Auswahl auf einem zweiten Gerät wiederherzustellen. Sie
     # stehen absichtlich NICHT in _PUBLIC_PROFILE_FIELDS und verleihen allein

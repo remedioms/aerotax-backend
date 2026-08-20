@@ -212,6 +212,68 @@ def test_profile_monthly_target_hours_rejects_invalid_values(client, user):
             "invalid_monthly_target_hours"
 
 
+def test_profile_expense_hourly_rate_roundtrips_owner_only_and_resets(client,
+                                                                     user):
+    """Persoenliche Spesensaetze syncen privat; Auto entfernt den Override."""
+    token = user["token"]
+    custom = client.put(
+        f"/api/user/profile/{token}",
+        json={"airline": "Cargolux",
+              "expense_hourly_rate_mode": "custom",
+              "expense_hourly_rate_eur": 4.25},
+        headers=_bearer(token))
+    assert custom.status_code == 200, custom.get_data(as_text=True)
+
+    owner = client.get(f"/api/user/profile/{token}", headers=_bearer(token))
+    owner_profile = json.loads(owner.get_data(as_text=True)).get("profile") or {}
+    assert owner_profile.get("expense_hourly_rate_mode") == "custom"
+    assert owner_profile.get("expense_hourly_rate_eur") == 4.25
+
+    public = client.get(f"/api/user/profile/{token}")
+    public_profile = json.loads(public.get_data(as_text=True)).get("profile") or {}
+    assert "expense_hourly_rate_mode" not in public_profile
+    assert "expense_hourly_rate_eur" not in public_profile
+
+    automatic = client.put(
+        f"/api/user/profile/{token}",
+        json={"expense_hourly_rate_mode": "auto"},
+        headers=_bearer(token))
+    assert automatic.status_code == 200, automatic.get_data(as_text=True)
+    owner = client.get(f"/api/user/profile/{token}", headers=_bearer(token))
+    owner_profile = json.loads(owner.get_data(as_text=True)).get("profile") or {}
+    assert owner_profile.get("expense_hourly_rate_mode") == "auto"
+    assert "expense_hourly_rate_eur" not in owner_profile
+
+
+def test_profile_expense_hourly_rate_rejects_invalid_values(client, user):
+    token = user["token"]
+    for value in (0, 101, "not-a-number"):
+        response = client.put(
+            f"/api/user/profile/{token}",
+            json={"expense_hourly_rate_mode": "custom",
+                  "expense_hourly_rate_eur": value},
+            headers=_bearer(token))
+        assert response.status_code == 400
+        assert json.loads(response.get_data(as_text=True)).get("error") == \
+            "invalid_expense_hourly_rate_eur"
+
+    invalid_mode = client.put(
+        f"/api/user/profile/{token}",
+        json={"expense_hourly_rate_mode": "verified-by-user"},
+        headers=_bearer(token))
+    assert invalid_mode.status_code == 400
+    assert json.loads(invalid_mode.get_data(as_text=True)).get("error") == \
+        "invalid_expense_hourly_rate_mode"
+
+    orphan_rate = client.put(
+        f"/api/user/profile/{token}",
+        json={"expense_hourly_rate_eur": 4},
+        headers=_bearer(token))
+    assert orphan_rate.status_code == 400
+    assert json.loads(orphan_rate.get_data(as_text=True)).get("error") == \
+        "expense_hourly_rate_requires_custom_mode"
+
+
 def test_profile_tariff_settings_reject_invalid_values(client, user):
     token = user["token"]
     invalid = {
