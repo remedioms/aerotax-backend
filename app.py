@@ -37061,7 +37061,8 @@ def flight_times(flightno):
     import time
     import requests as _requests
     from blueprints.aerox_data_blueprint import _paid_budget_ok, _paid_budget_inc
-    key = os.environ.get('AERODATABOX_KEY', '')
+    key = (os.environ.get('AERODATABOX_KEY', '')
+           if _aerodatabox_non_board_enabled() else '')
     fn = (flightno or '').strip().upper().replace(' ', '')
     # Default-Datum in der Heimatzone, nicht UTC (Full-Review 2026-08-01):
     # Zwischen 00:00 und 02:00 Berliner Zeit ist der UTC-Tag noch der gestrige.
@@ -37218,7 +37219,8 @@ def aircraft_age(hex):
         except Exception as e:
             app.logger.warning(f'[age] cache-get {str(e)[:100]}')
     # 2) AeroDataBox-Lookup (Baujahr).
-    key = os.environ.get('AERODATABOX_KEY', '')
+    key = (os.environ.get('AERODATABOX_KEY', '')
+           if _aerodatabox_non_board_enabled() else '')
     if not key:
         return jsonify({'ok': False, 'error': 'not_configured'})
     try:
@@ -44122,10 +44124,55 @@ _NATIVE_BOARD_SCRAPERS = {
 _BOARD_PREFER_AERODATABOX = {'MUC'}
 
 
-def _aerodatabox_board(iata, flight_type='departure'):
-    """Board (Abflug/Ankunft) eines beliebigen IATA-Airports via AeroDataBox
-    (RapidAPI, env-gated AERODATABOX_KEY). Liefert Rows im FRA-Contract oder None
-    (kein Key / Quelle down / leer → Caller degradiert ehrlich). KEINE Erfindung."""
+def _aerodatabox_non_board_enabled():
+    """Explicit escape hatch; production defaults to live-board-only.
+
+    The shared provider key used to be consumed by route, position, aircraft-age
+    and punctuality fallbacks as well as board polling.  Those paths all have
+    free alternatives and now see no key unless an operator consciously opts
+    back in.  The live-board wrapper below is intentionally exempt.
+    """
+    import os as _os
+    return (_os.environ.get('ADB_ALLOW_NON_BOARD') or '').strip().lower() in (
+        '1', 'true', 'yes')
+
+
+def _aerodatabox_board_budget_caps():
+    """Hard caps for the dedicated AeroDataBox live-board allowance.
+
+    AeroDataBox FIDS is Tier 2 (two units per request).  The defaults fit the
+    documented 600-unit free allowance and deliberately leave all other paid
+    provider budgets untouched.  Operators with a larger plan can raise these
+    two values without changing code.
+    """
+    import os as _os
+    try:
+        day_cap = int(_os.environ.get('ADB_BOARD_DAILY_UNIT_CAP', '20'))
+    except (TypeError, ValueError):
+        day_cap = 20
+    try:
+        month_cap = int(_os.environ.get('ADB_BOARD_MONTHLY_UNIT_CAP', '600'))
+    except (TypeError, ValueError):
+        month_cap = 600
+    return max(0, day_cap), max(0, month_cap)
+
+
+def _aerodatabox_board_budget_keys():
+    """UTC day/month keys used by the shared Supabase paid-call guard."""
+    import time as _t
+    return ('adb_board:' + _t.strftime('%Y%m%d', _t.gmtime()),
+            'adb_board:' + _t.strftime('%Y%m', _t.gmtime()))
+
+
+def _aerodatabox_board_upstream(iata, flight_type='departure'):
+    """Perform ONE paid AeroDataBox FIDS request and return a cache payload.
+
+    This helper deliberately has no callers outside the cost-controlled wrapper
+    below.  A single 12-hour departure window costs two provider units; the old
+    implementation fetched 24 hours in two calls and consumed four units per
+    refresh.  Structured error markers let ``paid_fetch`` negative-cache 429s
+    and auth failures instead of hammering an exhausted allowance.
+    """
     import os as _os
     key = _os.environ.get('AERODATABOX_KEY')
     if not key:
@@ -44136,7 +44183,6 @@ def _aerodatabox_board(iata, flight_type='departure'):
     try:
         import requests
         from datetime import datetime, timezone, timedelta
-        import re as _re
     except Exception:
         return None
     arr = (flight_type == 'arrival')
@@ -44146,7 +44192,7 @@ def _aerodatabox_board(iata, flight_type='departure'):
         now = datetime.now(timezone.utc)
 
     def _adb_window(frm_dt, to_dt):
-        """Ein AeroDataBox-Call für ein <=12h-Fenster. Rohe Items oder None."""
+        """Ein AeroDataBox-Call für ein <=12h-Fenster."""
         frm = frm_dt.strftime('%Y-%m-%dT%H:%M')
         to = to_dt.strftime('%Y-%m-%dT%H:%M')
         url = ('https://aerodatabox.p.rapidapi.com/flights/airports/iata/'
@@ -44160,39 +44206,26 @@ def _aerodatabox_board(iata, flight_type='departure'):
                              headers={'X-RapidAPI-Key': key,
                                       'X-RapidAPI-Host': 'aerodatabox.p.rapidapi.com'},
                              timeout=15)
+            if r.status_code == 429:
+                return {'_ax_error': 'rate_limited'}
+            if r.status_code in (401, 403):
+                return {'_ax_error': 'auth'}
             if r.status_code != 200:
-                return None
+                return {'_ax_error': 'upstream_error'}
             body = r.json() or {}
         except Exception:
-            return None
-        return body.get('arrivals' if arr else 'departures') or []
+            return {'_ax_error': 'upstream_error'}
+        if not isinstance(body, dict):
+            return {'_ax_error': 'invalid_payload'}
+        return {'data': body.get('arrivals' if arr else 'departures') or []}
 
-    # AeroDataBox: max 12h pro Call. EIN 12h-Fenster ab jetzt schnitt Langstrecken-
-    # Flüge ab, die erst später am Tag abfliegen (LH-Langstrecke). Darum ZWEI
-    # aufeinanderfolgende 12h-Fenster (= 24h ab jetzt) holen und mergen → der ganze
-    # verbleibende Betriebstag ist sichtbar. Dedup über (number, scheduledTime).
-    # KEINE Erfindung — nur nicht mehr droppen. Schlägt der erste Call fehl → None
-    # (ehrlich Quelle-down); der zweite ist best-effort (None → einfach kein Extra).
-    first = _adb_window(now, now + timedelta(hours=12))
-    if first is None:
-        return None
-    second = _adb_window(now + timedelta(hours=12), now + timedelta(hours=24)) or []
-    items = []
-    seen_keys = set()
-    for f in list(first) + list(second):
-        try:
-            mv0 = (f.get('movement') or f.get('arrival' if arr else 'departure')
-                   or f.get('departure' if arr else 'arrival') or {})
-            sch0 = ((mv0.get('scheduledTime') or {}).get('local')
-                    or (mv0.get('scheduledTime') or {}).get('utc') or '')
-            dk = ((f.get('number') or '').strip(), sch0)
-        except Exception:
-            dk = None
-        if dk is not None:
-            if dk in seen_keys:
-                continue
-            seen_keys.add(dk)
-        items.append(f)
+    # The standby/live table needs upcoming departures, not a full-day archive.
+    # One provider-allowed 12 h window keeps each refresh at exactly Tier-2 = 2
+    # units. Historical rows continue to come from airport_delay_obs.
+    upstream = _adb_window(now, now + timedelta(hours=12))
+    if upstream.get('_ax_error'):
+        return upstream
+    items = upstream.get('data') or []
 
     def _t_local(v):
         node = v or {}
@@ -44208,12 +44241,14 @@ def _aerodatabox_board(iata, flight_type='departure'):
             row['flight'] = (f.get('number') or '').replace('  ', ' ').strip()
             if not row['airline'] and row['flight']:
                 row['airline'] = (row['flight'].split(' ')[0] or '')[:3]
-            # Beim Board-Eintrag steht das ANDERE Ende unter movement.airport.
-            # AeroDataBox liefert je nach API-Variante 'movement' ODER ein nach der
-            # Richtung benanntes Sub-Objekt ('departure'/'arrival') — beides stützen.
-            mv = (f.get('movement') or f.get('arrival' if arr else 'departure')
-                  or f.get('departure' if arr else 'arrival') or {})
-            ap = mv.get('airport') or {}
+            # Time/gate belong to the queried side; the destination/origin label
+            # belongs to the opposite side. Some AeroDataBox response variants
+            # collapse this into `movement`, so preserve that representation.
+            collapsed_mv = f.get('movement') or {}
+            mv = collapsed_mv or f.get('arrival' if arr else 'departure') or {}
+            other_mv = (collapsed_mv
+                        or f.get('departure' if arr else 'arrival') or {})
+            ap = other_mv.get('airport') or {}
             row['dest_iata'] = (ap.get('iata') or '').strip().upper()
             row['dest_name'] = _clean_city_name(ap.get('name'), row['dest_iata'])
             sched = _t_local(mv.get('scheduledTime'))
@@ -44240,10 +44275,61 @@ def _aerodatabox_board(iata, flight_type='departure'):
             out.append(row)
         except Exception:
             continue
-    return out
+    return {'data': out}
 
 
-def _native_board_cached(iata, flight_type, allow_paid=True):
+def _aerodatabox_board(iata, flight_type='departure'):
+    """Shared, hard-budgeted AeroDataBox board used only by the live table.
+
+    All workers and all users share one Supabase result/negative cache per
+    airport and direction.  Concurrent opens therefore collapse to one paid
+    request.  No distributed cost-control means fail-closed (no paid request).
+    Returns ``(rows, negative_reason)`` so the endpoint can distinguish an
+    exhausted paid source from a genuinely unsupported airport.
+    """
+    import hashlib as _hashlib
+    import json as _json
+    import os as _os
+    key = _os.environ.get('AERODATABOX_KEY')
+    iata = (iata or '').upper().strip()
+    ft = 'arrival' if flight_type == 'arrival' else 'departure'
+    if not key or len(iata) != 3:
+        return None, 'not_configured'
+    try:
+        from blueprints.aerox_data_blueprint import (
+            _sb as _adb_sb, _budget_key_used, _budget_local_adjust)
+        from blueprints.paid_cost_control import paid_fetch
+        day_key, month_key = _aerodatabox_board_budget_keys()
+        day_cap, month_cap = _aerodatabox_board_budget_caps()
+        canonical = _json.dumps({'iata': iata, 'type': ft}, sort_keys=True)
+        call_key = ('adb:live-board:'
+                    + _hashlib.sha256(canonical.encode('utf-8')).hexdigest())
+        outcome = paid_fetch(
+            sb=_adb_sb(), call_key=call_key, provider='aerodatabox_board',
+            day_key=day_key, month_key=month_key, reserve_units=2,
+            day_cap=day_cap, month_cap=month_cap,
+            fetch=lambda: _aerodatabox_board_upstream(iata, ft),
+            # A request attempt is conservatively charged at Tier 2 even when
+            # the provider rejects it; this prevents repeated 429 spend loops.
+            actual_units=lambda _payload: 2,
+            budget_used=_budget_key_used, budget_adjust=_budget_local_adjust,
+            positive_ttl=30 * 60,
+            negative_ttls={'rate_limited': 6 * 3600, 'auth': 6 * 3600,
+                           'not_found': 60 * 60, 'upstream_error': 10 * 60},
+            allow_local=(_os.environ.get('AX_PAID_CONTROL_ALLOW_LOCAL') == '1'
+                         or bool(_os.environ.get('PYTEST_CURRENT_TEST'))),
+            logger=app.logger)
+    except Exception as exc:
+        app.logger.warning('[adb-board] guard failure %s', type(exc).__name__)
+        return None, 'control_unavailable'
+    payload = outcome.payload if isinstance(outcome.payload, dict) else None
+    rows = payload.get('data') if payload else None
+    if isinstance(rows, list):
+        return rows, None
+    return None, outcome.negative_reason or 'upstream_error'
+
+
+def _native_board_cached(iata, flight_type, allow_paid=False):
     """Gecachtes Native-Board (12 Min TTL). Reihenfolge: nativer Scraper →
     AeroDataBox-Board → None. Gibt (rows, source) zurück; None-rows = alle
     (erlaubten) Quellen down/leer/kein-Key → Caller degradiert ehrlich.
@@ -44252,8 +44338,9 @@ def _native_board_cached(iata, flight_type, allow_paid=True):
     allow_paid=False (free_only-Fan-out, Friends/Family/Radar): BEIDE
     AeroDataBox-Zweige (prefer-ADB UND Scraper-None-Fallback) werden
     STRUKTURELL übersprungen — liefert der (gratis) native Scraper nichts,
-    kommt schlicht (None, None) zurück statt bezahlter Spend. Der bezahlte
-    Pfad (Default) bleibt unverändert."""
+    kommt schlicht (None, None) zurück statt bezahlter Spend. Bezahlter Zugriff
+    ist nur noch ein explizites Opt-in; der Default bleibt
+    free-only, damit Poller/Radar/Family das Live-Tafel-Kontingent nie leeren."""
     import time as _t
     iata = (iata or '').upper().strip()
     ft = 'arrival' if flight_type == 'arrival' else 'departure'
@@ -44279,7 +44366,7 @@ def _native_board_cached(iata, flight_type, allow_paid=True):
     # zurück. NUR wenn bezahlter Spend erlaubt ist.
     if prefer_adb and allow_paid:
         try:
-            rows = _aerodatabox_board(iata, ft)
+            rows, _reason = _aerodatabox_board(iata, ft)
         except Exception:
             rows = None
         if rows:
@@ -44293,7 +44380,7 @@ def _native_board_cached(iata, flight_type, allow_paid=True):
             result = (rows, iata.lower() + '_native')
     if result[0] is None and allow_paid and not prefer_adb:
         try:
-            rows = _aerodatabox_board(iata, ft)
+            rows, _reason = _aerodatabox_board(iata, ft)
         except Exception:
             rows = None
         if rows is not None:
@@ -50252,6 +50339,7 @@ def airport_board(token):
         return jsonify(_payload)
     src = None
     flights = None
+    paid_board_reason = None
     if iata in ('FRA', 'EDDF') or airport in ('FRA', 'EDDF'):
         flights = _fra_board_cached(ftype)
         src = 'fraport'
@@ -50344,6 +50432,27 @@ def airport_board(token):
                     src = 'airport_delay_obs'
         except Exception as _e_fb:
             print(f"[board] obs-fallback fail {out_airport}: {_e_fb}")
+    if flights is None and ftype == 'departure' and len(out_airport) == 3:
+        # EXKLUSIVER PAID-FALLBACK: AeroDataBox darf nur die von einem Nutzer
+        # tatsächlich geöffnete LIVE-ABFLUGTAFEL bedienen. Erst freie/native
+        # Quellen und persistierte NAS-Beobachtungen versuchen, dann genau einen
+        # zentral gecachten 12-h-FIDS-Call. Poller/Radar/Family bleiben free-only.
+        try:
+            _adb_rows, paid_board_reason = _aerodatabox_board(
+                out_airport, 'departure')
+            if _adb_rows is not None:
+                flights = _adb_rows
+                src = 'aerodatabox_live_board'
+                try:
+                    _queue_board_delay_merge(
+                        _adb_rows, _airport_local_now(out_airport).strftime('%Y-%m-%d'),
+                        _store_key_for(out_airport, ftype))
+                except Exception:
+                    pass
+        except Exception as _e_adb:
+            paid_board_reason = 'upstream_error'
+            app.logger.warning('[adb-board] endpoint fallback %s',
+                               type(_e_adb).__name__)
     if flights is None:
         # GRACEFUL DEGRADE (User „bei der Tafel fehlen wieder Flüge"): bevor wir
         # eine LEERE Tafel / source_unavailable melden, die zuletzt erfolgreich
@@ -50390,6 +50499,11 @@ def airport_board(token):
             reason = 'source_down'
             msg = ('Tafel für ' + out_airport
                    + ' gerade nicht erreichbar — bitte später erneut.')
+        elif paid_board_reason not in (None, 'not_configured', 'not_found'):
+            reason = 'paid_source_unavailable'
+            msg = ('Die Live-Tafel für ' + out_airport
+                   + ' ist gerade nicht verfügbar; das geschützte '
+                     'AeroDataBox-Kontingent wird nicht weiter belastet.')
         else:
             reason = 'no_free_source'
             msg = ('Für ' + out_airport + ' gibt es keine freie Tafel-Quelle — '
@@ -50500,7 +50614,8 @@ def airport_board(token):
                 'departed_today': departed_out,
                 'source': src,
                 'cached_ttl': (_AIRPORT_BOARD_TTL if src == 'fraport'
-                               else _NATIVE_BOARD_TTL)}
+                               else (30 * 60 if src == 'aerodatabox_live_board'
+                                     else _NATIVE_BOARD_TTL))}
     _airport_board_response_memo_put(_response_memo_key, _payload)
     return jsonify(_payload)
 
@@ -50543,7 +50658,8 @@ def _aerodatabox_flight_by_number(number, date_iso=None):
     ein kompaktes Dict (Soll-Ab/-An, Route, Status, Gate/Terminal) oder None
     (kein Key / Quelle down / kein Treffer → Caller degradiert ehrlich)."""
     import os as _os
-    key = _os.environ.get('AERODATABOX_KEY')
+    key = (_os.environ.get('AERODATABOX_KEY')
+           if _aerodatabox_non_board_enabled() else None)
     if not key:
         return None
     num = (number or '').upper().replace(' ', '').strip()
@@ -50657,7 +50773,8 @@ def _aerodatabox_flight_by_reg(registration, date_iso=None):
     Das ist die Tier-1-Quelle des iOS-Live-Fliegers: Tail bekannt → woher kommt
     sie, wann landet sie, welcher Status — VOR jedem Flugnummer-/ADS-B-Fallback."""
     import os as _os
-    key = _os.environ.get('AERODATABOX_KEY')
+    key = (_os.environ.get('AERODATABOX_KEY')
+           if _aerodatabox_non_board_enabled() else None)
     if not key:
         return None
     reg = (registration or '').upper().replace(' ', '').strip()
@@ -52493,7 +52610,8 @@ def _aerodatabox_punctuality(iata, airline):
     None bei Quelle-down/leer (Caller degradiert dann ehrlich). KEINE Erfindung —
     1:1 was AeroDataBox liefert."""
     import os as _os
-    key = _os.environ.get('AERODATABOX_KEY')
+    key = (_os.environ.get('AERODATABOX_KEY')
+           if _aerodatabox_non_board_enabled() else None)
     if not key:
         return None
     iata = (iata or '').upper().strip()
@@ -53110,10 +53228,9 @@ _NAS_SCRAPED_BOARD_CODES = frozenset({
 # Standard-Airport-Set für den server-seitigen Poller. FRA + MUC sind Pflicht
 # (User-Brief), die großen DE-Bases sind sinnvolle Defaults. Über die Env-Variable
 # POLL_BOARDS_AIRPORTS (Komma-Liste, z.B. "FRA,MUC,BER,JFK") überschreibbar.
-# Deutsche Hubs = freie Native-Scraper (beide Richtungen). Große EU-Hubs danach =
-# AeroDataBox (Budget) → liefern Gate/Route für viele Radar-Flieger; bei leerem
-# Budget degradieren sie still. Für Nicht-Deutsche pollt der Poller nur Abflüge
-# (halbiert die Calls — Abflug trägt Route+Gate, die wir brauchen).
+# Nur freie Native-/Fraport-Scraper stehen im Hintergrund-Set. AeroDataBox ist
+# exklusiv für eine tatsächlich geöffnete Live-Abflugtafel reserviert und wird
+# von diesem Poller nie aufgerufen.
 _POLL_BOARDS_DEFAULT = ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ',
                         # Avinor-Gruppe (freier Native-Scraper, Gates+Zeiten):
                         'OSL', 'BGO', 'TRD', 'SVG', 'TOS', 'BOO', 'AES', 'KRS',
@@ -53127,9 +53244,7 @@ _POLL_BOARDS_DEFAULT = ('FRA', 'MUC', 'BER', 'DUS', 'HAM', 'HAJ',
                         # Fraport-Greece-Gruppe:
                         'SKG', 'RHO', 'CFU', 'CHQ', 'KGS', 'ZTH',
                         # ANA-Portugal-Gruppe:
-                        'LIS', 'OPO', 'FAO', 'FNC',
-                        # Größte EU-Hubs OHNE freie Quelle (AeroDataBox, best-effort):
-                        'CDG', 'AMS', 'MAD', 'BCN', 'ZRH', 'VIE', 'ARN', 'DUB')
+                        'LIS', 'OPO', 'FAO', 'FNC')
 # Welche Codes haben einen FREIEN Native-/Fraport-Scraper (beide Richtungen ok)?
 _FREE_BOARD_CODES = frozenset({'FRA', 'EDDF', 'MUC', 'DUS', 'HAJ', 'FMO',
                                'LEJ', 'DRS', 'ERF', 'DTM', 'RLG', 'KSF', 'SCN', 'HAM', 'BER',
@@ -53169,8 +53284,8 @@ def _poll_boards_airports():
 def _poll_boards_once(airports):
     """Holt + persistiert die Abflug- UND Ankunfts-Tafel für jeden Airport (beide
     Richtungen → Store-Keys '<AP>' / '<AP>#ARR'). Das Fetchen läuft über die
-    gecachten Board-Helfer (FRA = Fraport-Tagestafel, sonst Native-Scraper/
-    AeroDataBox); `_punctuality_stats` merged + persistiert nach airport_delay_obs.
+    gecachten FREE-Board-Helfer (FRA = Fraport-Tagestafel, sonst Native-Scraper);
+    `_punctuality_stats` merged + persistiert nach airport_delay_obs.
     Liefert ein Diagnose-Dict {airport#dir: sample_size|'no_flights'|'err:…'}.
     Niemals raise — jeder Airport degradiert einzeln."""
     results = {}
@@ -53178,8 +53293,8 @@ def _poll_boards_once(airports):
         ap = (ap or '').upper().strip()
         if not ap:
             continue
-        # Budget-Schutz: Airports OHNE freien Scraper (AeroDataBox) nur ABFLÜGE
-        # pollen — der Abflug-Record trägt Route + Gate; Ankünfte sparen wir.
+        # Airports ohne freie Quelle bleiben hier leer; bezahlte Live-Tafeln
+        # werden ausschließlich on demand im User-Endpoint geladen.
         directions = ('departure', 'arrival') if ap in _FREE_BOARD_CODES else ('departure',)
         for ftype in directions:
             tag = ap if ftype == 'departure' else (ap + '#ARR')
@@ -53188,11 +53303,12 @@ def _poll_boards_once(airports):
                     flights = (_fra_day_board_cached(ftype) if ftype == 'departure'
                                else _fra_board_cached(ftype))
                 elif ap in _NATIVE_BOARD_SCRAPERS:
-                    rows, _src = (_native_board_cached(ap, ftype) or (None, None))
+                    rows, _src = (_native_board_cached(
+                        ap, ftype, allow_paid=False) or (None, None))
                     flights = rows
                 else:
-                    # Letzter Versuch über AeroDataBox-Board (env-gated).
-                    rows, _src = (_native_board_cached(ap, ftype) or (None, None))
+                    rows, _src = (_native_board_cached(
+                        ap, ftype, allow_paid=False) or (None, None))
                     flights = rows
                 # MUC-QUOTA-LOCH-FALLBACK (Scraping-Audit 19.07: MUC hatte
                 # tagsüber 2-6h-Persistenz-Löcher — Muster passt zu erschöpfter
@@ -53672,7 +53788,8 @@ def _scrape_boards_once(airports, deadline_ts=None):
                     flights = (_fra_day_board_cached(ftype) if ftype == 'departure'
                                else _fra_board_cached(ftype))
                 else:
-                    rows, _src = (_native_board_cached(ap, ftype) or (None, None))
+                    rows, _src = (_native_board_cached(
+                        ap, ftype, allow_paid=False) or (None, None))
                     flights = rows
                 if not flights:
                     ap_out[key] = 0

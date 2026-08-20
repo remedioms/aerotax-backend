@@ -420,8 +420,8 @@ def test_flight_times_keeps_active_reg():
     assert d['aircraft'] == 'B744'
 
 
-def test_flight_times_board_request_falls_back_when_free_gate_is_missing():
-    """Eine freie Teilantwort darf den gezielten Gate-Fallback nicht stoppen."""
+def test_flight_times_board_request_does_not_spend_live_board_allowance():
+    """Gate enrichment stays free-only; ADB is reserved for the airport board."""
     import blueprints.aerox_data_blueprint as BP
     m = _merged(delay_known=True)
     m.update({'dep_iata': 'FRA', 'arr_iata': 'BOS', 'sched_dep': '13:30',
@@ -436,7 +436,7 @@ def test_flight_times_board_request_falls_back_when_free_gate_is_missing():
     try:
         with patch.object(A, '_flight_obs_merged', return_value=m), \
                 patch.object(A, '_tail_recently_active', return_value=True), \
-                patch('requests.get', return_value=paid), \
+                patch('requests.get', return_value=paid) as get, \
                 patch.object(BP, '_paid_budget_ok', return_value=True), \
                 patch.object(BP, '_paid_budget_inc'), \
                 patch.dict(A.os.environ, {'AERODATABOX_KEY': 'test'}):
@@ -447,8 +447,9 @@ def test_flight_times_board_request_falls_back_when_free_gate_is_missing():
         A._FLIGHT_TIMES_CACHE.clear()
     data = response.get_json()
     assert data['ok'] is True
-    assert data['departure']['gate'] == 'Z69'
-    assert data['departure']['terminal'] == '1'
+    assert data['departure']['gate'] is None
+    assert data['departure']['terminal'] is None
+    get.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

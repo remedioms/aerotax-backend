@@ -54,6 +54,7 @@ def _isolated(monkeypatch):
 
     # ADB-Key vorhanden (langer Key = RapidAPI-Kanal); HTTP wird eh gemockt.
     monkeypatch.setenv('AERODATABOX_KEY', 'x' * 40)
+    monkeypatch.setenv('ADB_ALLOW_NON_BOARD', '1')
 
     # Budget-Helper deterministisch: frei + Inkremente beobachtbar.
     monkeypatch.setattr(BPD, '_paid_budget_ok', lambda: True)

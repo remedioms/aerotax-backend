@@ -1412,7 +1412,12 @@ def _aerodatabox_route(cs, reg=None, lat=None, lon=None, track=None, date=None, 
     Reg-gekeyt bevorzugt (an die physische Maschine gebunden → immun gegen
     Flugnummer-Recycling), sonst nummern-gekeyt mit Leg-Disambiguierung.
     Wirft NIE; None bei fehlendem Key, Quota (429) oder keinem Treffer."""
-    key = os.environ.get('AERODATABOX_KEY', '')
+    # The provider allowance is reserved for the user-opened airport live board.
+    # Route resolution has free warehouse/ADS-B/FR24 fallbacks and may only opt
+    # back into this shared key through an explicit operational override.
+    allow_non_board = (os.environ.get('ADB_ALLOW_NON_BOARD') or '').strip().lower()
+    key = (os.environ.get('AERODATABOX_KEY', '')
+           if allow_non_board in ('1', 'true', 'yes') else '')
     if not key:
         return None
     # BEZAHLT + quota-limitiert → harter Tages-Budget-Guard (free-first-Constraint).

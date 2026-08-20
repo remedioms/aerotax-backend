@@ -96,6 +96,7 @@ def _isolated(monkeypatch):
     # Reg→Hex ohne Backend-Map; ADB-Key vorhanden (HTTP eh gemockt).
     monkeypatch.setattr(ADSB, 'resolve_reg_to_hex', lambda r: '3c64a8')
     monkeypatch.setenv('AERODATABOX_KEY', 'x' * 40)
+    monkeypatch.setenv('ADB_ALLOW_NON_BOARD', '1')
 
     # Budget deterministisch frei + Inkremente beobachtbar.
     monkeypatch.setattr(BPD, '_paid_budget_ok', lambda: True)

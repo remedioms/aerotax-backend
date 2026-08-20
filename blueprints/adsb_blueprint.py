@@ -923,7 +923,9 @@ def _adb_position_http(reg, date):
     Objekte oder None bei Fehler/Quota/Netz (still degradieren). Kanal-
     Erkennung identisch zu _aerodatabox_route (aerox_data_blueprint):
     kurzer cuid-Key = api.market-Direktportal, langer Key = RapidAPI."""
-    key = os.environ.get('AERODATABOX_KEY', '')
+    allow_non_board = (os.environ.get('ADB_ALLOW_NON_BOARD') or '').strip().lower()
+    key = (os.environ.get('AERODATABOX_KEY', '')
+           if allow_non_board in ('1', 'true', 'yes') else '')
     if not key:
         return None
     if len(key) <= 32:
@@ -958,7 +960,9 @@ def _adb_position_attempt(hex_id, reg_hint):
     Budget wird VOR dem HTTP-Call geprüft und (nur) bei tatsächlichem Call
     inkrementiert. Positionen ohne Zeitstempel oder älter als
     _ADB_POS_MAX_AGE_S werden verworfen (nichts erfinden)."""
-    if not os.environ.get('AERODATABOX_KEY', ''):
+    allow_non_board = (os.environ.get('ADB_ALLOW_NON_BOARD') or '').strip().lower()
+    if (allow_non_board not in ('1', 'true', 'yes')
+            or not os.environ.get('AERODATABOX_KEY', '')):
         return None, None, 'no_key'
     reg = (_normalize_registration(reg_hint)
            or _hex_to_reg(hex_id) or _hex_to_reg_sb(hex_id))
