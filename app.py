@@ -63762,6 +63762,19 @@ def import_roster_pdf(token):
                     prodid='AeroX SAS Airside Roster PDF Import')
                 periods.append((sas_report or {}).get('period'))
         if perr == 'unsupported_pdf_format':
+            # Austrian Arbeitsunfaehigkeitsmeldungen are valid crew-calendar
+            # evidence even though they are not airline rosters. Persist only
+            # the printed inclusive sick-day period; all medical/person data
+            # is intentionally ignored and the source PDF is purged normally.
+            from at_sick_leave_pdf import parse_at_sick_leave_calendar
+            sick_events, sick_year, sick_month, sick_report, perr = \
+                parse_at_sick_leave_calendar(text)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    sick_events, sick_year, sick_month,
+                    prodid='AeroX Austrian Sick Leave PDF Import')
+                periods.append((sick_report or {}).get('period'))
+        if perr == 'unsupported_pdf_format':
             # Lufthansa City ground-duty plans use NetLine/Crew(LHX).  Their
             # three-column layout is accepted only when every period date and
             # the printed duty/off-day totals agree; comments and qualification
