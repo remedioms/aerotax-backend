@@ -73,6 +73,21 @@ def test_source_guard_builds_only_literal_verified_leg():
     }
 
 
+def test_source_guard_accepts_logbook_without_flight_number_column():
+    evidence = "2026-08-01 FRA JFK 08:15 A350 D-AIXA FO 1 0 02:15"
+    source = "Date Route Block time Type Reg Role LDG Night\n" + evidence
+    item = _item(
+        flight_no=None,
+        source_evidence=evidence,
+    )
+
+    legs, dropped = w._logbook_ai_validate_items([item], source)
+
+    assert dropped == 0 and len(legs) == 1
+    assert legs[0]["flight"] is None
+    assert legs[0]["from"] == "FRA" and legs[0]["to"] == "JFK"
+
+
 @pytest.mark.parametrize("change", [
     {"registration": "D-FAKE"},
     {"block_time": "09:15"},

@@ -127,7 +127,7 @@ LOGBOOK_AI_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "date_text": {"type": "string"},
-                    "flight_no": {"type": "string"},
+                    "flight_no": {"type": ["string", "null"]},
                     "from_iata": {"type": "string"},
                     "to_iata": {"type": "string"},
                     "block_time": {"type": "string"},
@@ -158,12 +158,14 @@ Return raw source facts only; never infer, translate, repair, or calculate a
 value. Every returned value must appear literally in the same single source
 line copied to source_evidence. Return one item per operated flight row.
 
-Required acceptance facts: an exact date token, flight number, three-letter
-origin, three-letter destination, and an exact block/duration token. If any of
-those is absent from a row, omit that row. Do not return totals, positioning as
-a passenger, private trips, duties, standby, off days, simulators, headings,
-or summary lines. Optional aircraft, registration, role, landing counts, and
-night time stay null unless printed in that same line. Keep source order.
+Required acceptance facts: an exact date token, three-letter origin,
+three-letter destination, and an exact block/duration token. A flight number
+is optional and must stay null when the logbook has no flight-number column.
+If a required fact is absent from a row, omit that row. Do not return totals,
+positioning as a passenger, private trips, duties, standby, off days,
+simulators, headings, or summary lines. Optional aircraft, registration,
+role, landing counts, and night time stay null unless printed in that same
+line. Keep source order.
 
 block_time and night_time must be copied exactly (for example 08:15, 1:32, or
 1.5). landing count fields are exact printed integer tokens as strings. Copy
@@ -670,19 +672,23 @@ def _logbook_ai_validate_items(items, source):
             continue
         codes = {}
         valid = True
-        for field in ("flight_no", "from_iata", "to_iata"):
+        for field in ("from_iata", "to_iata"):
             value = re.sub(r"\s+", "", str(raw.get(field) or "").upper())
             if not value:
                 valid = False
                 break
             codes[field] = value
+        codes["flight_no"] = re.sub(
+            r"\s+", "", str(raw.get("flight_no") or "").upper())
         if not valid:
             dropped += 1
             continue
-        if (not re.fullmatch(r"[A-Z0-9]{1,10}", codes["flight_no"])
-                or not re.search(r"[A-Z]", codes["flight_no"])
-                or not re.search(r"\d", codes["flight_no"])
-                or codes["flight_no"] not in joined_tokens
+        flight = codes["flight_no"]
+        if ((flight and (
+                not re.fullmatch(r"[A-Z0-9]{1,10}", flight)
+                or not re.search(r"[A-Z]", flight)
+                or not re.search(r"\d", flight)
+                or flight not in joined_tokens))
                 or not re.fullmatch(r"[A-Z]{3}", codes["from_iata"])
                 or codes["from_iata"] not in evidence_tokens
                 or not re.fullmatch(r"[A-Z]{3}", codes["to_iata"])
@@ -699,7 +705,7 @@ def _logbook_ai_validate_items(items, source):
 
         leg = {
             "date": date_iso,
-            "flight": codes["flight_no"],
+            "flight": flight or None,
             "from": codes["from_iata"],
             "to": codes["to_iata"],
             "block_min": block_min,
