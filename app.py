@@ -57784,6 +57784,167 @@ def _easyjetify_roster_events(events, token=None):
     return events
 
 
+# ── SunExpress Crew-iCal ────────────────────────────────────────────────────
+# Der reale SunExpress-Feed fasst einen ganzen Duty-Block in EIN VEVENT:
+#   SUMMARY:✈️ AYT TBS AYT
+#   DESCRIPTION:2105Z-2315Z ... AYT-TBS XQ302 TCSNN
+#               0015Z-0240Z ... TBS-AYT XQ303 TCSNN
+# DTSTART/DTEND sind Report/Duty-Ende. Flugnummern und echte UTC-Blockzeiten
+# stehen ausschließlich in DESCRIPTION. Ohne Adapter sah die App nur die Route
+# ohne Flugnummer und der Airline-Anzeigevertrag blockierte korrekt.
+_SUNEXPRESS_LEG_RE = re.compile(
+    r'^\s*(?P<dep>\d{4})Z-(?P<arr>\d{4})Z\s+'
+    r'\d{4}L-\d{4}L\s+\(?(?P<from>[A-Z]{3})-(?P<to>[A-Z]{3})\)?\s+'
+    r'(?:(?P<positioning>Positioning)\s+)?'
+    r'(?P<flight>XQ\d{1,4})(?:\s+(?P<tail>TC[A-Z0-9]{2,5}))?\s*$',
+    re.IGNORECASE,
+)
+_SUNEXPRESS_GROUND_RE = re.compile(
+    r'^\s*[^A-Za-z0-9]*Unknown\s*-\s*(GT|OAT)\s*$', re.IGNORECASE)
+_SUNEXPRESS_LOCATION_ROUTE_RE = re.compile(
+    r'^\s*\(\d{4}Z-\d{4}Z\)\s*([A-Z]{3})-([A-Z]{3})\s*$', re.IGNORECASE)
+_SUNEXPRESS_STANDBY_RE = re.compile(
+    r'^\s*[^A-Za-z0-9]*Stand-?by(?:\s+\d+)?\s*-\s*(SB\d+)\s*$',
+    re.IGNORECASE,
+)
+_SUNEXPRESS_STATION_LOCATION_RE = re.compile(
+    r'^\s*\(\d{4}Z-\d{4}Z\)\s*([A-Z]{3})\s*$', re.IGNORECASE)
+_SUNEXPRESS_CHECKIN_RE = re.compile(
+    r'^\s*(\d{4})Z\s+(\d{4})L\s+Check\s+In\s*$', re.IGNORECASE)
+
+
+def _sunexpressify_roster_events(events, token=None):
+    """Normalize only verified SunExpress profile events in-place.
+
+    Every route line must satisfy the closed SunExpress DESCRIPTION contract;
+    otherwise the event stays untouched and the existing display proof keeps
+    failing closed. Unknown GT/OAT rows remain visible ground positioning with
+    an arrow (never a fake flight sector), and the printed local Check-In time
+    becomes a normal briefing marker.
+    """
+    try:
+        if not token:
+            return events
+        profile = (_profile_load(token) or {}).get('profile') or {}
+        if _canonical_airline_key(profile.get('airline')) != 'SUN EXPRESS':
+            return events
+        for ev in (events or []):
+            summary = (ev.get('summary') or '').strip()
+            location = (ev.get('location') or '').strip()
+
+            standby = _SUNEXPRESS_STANDBY_RE.match(summary)
+            station_loc = _SUNEXPRESS_STATION_LOCATION_RE.match(location)
+            if standby and station_loc:
+                station = station_loc.group(1).upper()
+                ev['summary'] = f'Standby {station} ({standby.group(1).upper()})'
+                ev['location'] = station
+                continue
+
+            ground = _SUNEXPRESS_GROUND_RE.match(summary)
+            ground_route = _SUNEXPRESS_LOCATION_ROUTE_RE.match(location)
+            if ground and ground_route:
+                code = ground.group(1).upper()
+                frm, to = ground_route.group(1).upper(), ground_route.group(2).upper()
+                label = 'Ground Transfer' if code == 'GT' else 'Ground Positioning'
+                ev['summary'] = f'{label} {frm} → {to} ({code})'
+                ev['location'] = frm
+                continue
+
+            # RFC-5545 DESCRIPTION arrives from both parser generations with
+            # either real line breaks or the literal escaped ``\\n`` form.
+            description = str(ev.get('description') or '').replace('\\n', '\n')
+            if summary.startswith('✈') and 'Check In' in description:
+                checkin = _SUNEXPRESS_CHECKIN_RE.search(description)
+                stations = re.findall(r'\b[A-Z]{3}\b', summary.upper())
+                if checkin and len(stations) == 1:
+                    local = checkin.group(2)
+                    ev['summary'] = (
+                        f'{local[:2]}:{local[2:]} LT Briefing {stations[0]}')
+                    ev['location'] = stations[0]
+                    continue
+
+            if not summary.startswith('✈'):
+                continue
+            route_lines = [
+                line.strip() for line in description.splitlines()
+                if re.search(r'\b[A-Z]{3}-[A-Z]{3}\b', line.upper())
+            ]
+            parsed = []
+            for line in route_lines:
+                match = _SUNEXPRESS_LEG_RE.match(line)
+                if not match:
+                    parsed = []
+                    break
+                parsed.append(match)
+            if not parsed or len(parsed) != len(route_lines):
+                continue
+            try:
+                report = datetime.fromisoformat(
+                    (ev.get('start_iso') or '').replace('Z', '+00:00'))
+                duty_end = datetime.fromisoformat(
+                    (ev.get('end_iso') or '').replace('Z', '+00:00'))
+                if report.tzinfo is None:
+                    report = report.replace(tzinfo=timezone.utc)
+                if duty_end.tzinfo is None:
+                    duty_end = duty_end.replace(tzinfo=timezone.utc)
+                report = report.astimezone(timezone.utc)
+                duty_end = duty_end.astimezone(timezone.utc)
+                cursor = report
+                bounds = []
+                summaries = []
+                operating_block = 0
+                for match in parsed:
+                    dep_raw, arr_raw = match.group('dep'), match.group('arr')
+                    dep = report.replace(
+                        hour=int(dep_raw[:2]), minute=int(dep_raw[2:]),
+                        second=0, microsecond=0)
+                    while dep < cursor:
+                        dep += timedelta(days=1)
+                    arr = dep.replace(
+                        hour=int(arr_raw[:2]), minute=int(arr_raw[2:]))
+                    while arr <= dep:
+                        arr += timedelta(days=1)
+                    gap_min = (dep - cursor).total_seconds() / 60.0
+                    block_min = int((arr - dep).total_seconds() / 60.0)
+                    if not (0 <= gap_min <= 8 * 60
+                            and 20 <= block_min <= 18 * 60):
+                        raise ValueError('implausible_sunexpress_leg')
+                    frm = match.group('from').upper()
+                    to = match.group('to').upper()
+                    flight = match.group('flight').upper()
+                    positioning = bool(match.group('positioning'))
+                    summaries.append(
+                        f'{"DH " if positioning else ""}{flight} {frm} - {to}')
+                    bounds.append((
+                        dep.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        arr.strftime('%Y-%m-%dT%H:%M:%SZ')))
+                    if not positioning:
+                        operating_block += block_min
+                    cursor = arr
+                first_gap = (datetime.fromisoformat(
+                    bounds[0][0].replace('Z', '+00:00'))
+                    - report).total_seconds() / 60.0
+                end_gap = (duty_end - datetime.fromisoformat(
+                    bounds[-1][1].replace('Z', '+00:00'))
+                           ).total_seconds() / 60.0
+                if not (0 <= first_gap <= 6 * 60 and 0 <= end_gap <= 6 * 60):
+                    continue
+            except Exception:
+                continue
+            ev['summary'] = ' | '.join(summaries)
+            ev['_exact_leg_times'] = bounds
+            if operating_block:
+                ev['_exact_block_minutes'] = operating_block
+    except Exception as e:
+        try:
+            app.logger.warning(
+                f'[ics-sunexpress] normalize-fail: {type(e).__name__}: '
+                f'{str(e)[:120]}')
+        except Exception:
+            pass
+    return events
+
+
 def _generic_layover_synthesis(events, token=None):
     """Layover-Synthese für Feeds OHNE eigene LAYOVER-Events (Condor/cube,
     offblock, Edelweiss-Outlook, …): aufeinanderfolgende Flug-Legs a→b mit
@@ -60296,6 +60457,7 @@ def import_calendar_feed(token):
     # Drittanbieter-Dialekte (Condor C/I+P/U, offblock ✈/ICAO) → LH-Form.
     events = _normalize_thirdparty_roster_events(events)
     events = _easyjetify_roster_events(events, token=token)
+    events = _sunexpressify_roster_events(events, token=token)
     events = _swissify_roster_events(events, token=token)
     # LH-Tagesbucket (Audit 2026-07-31 Befund 1): Flug-Legs mit expliziter
     # UTC-Zeit aufs UTC-Datum keyen (amtliche LH-Zuordnung, wie die Sektoren) —
@@ -60333,6 +60495,7 @@ def import_calendar_feed(token):
                          else _candidate_normalized)
                 _rows = _normalize_thirdparty_roster_events(_rows)
                 _rows = _easyjetify_roster_events(_rows, token=token)
+                _rows = _sunexpressify_roster_events(_rows, token=token)
                 _rows = _swissify_roster_events(_rows, token=token)
                 _rows = _lh_rebucket_utc_flight_days(_rows)
                 _rows = _itaify_roster_events(_rows, token=token)
@@ -64270,6 +64433,7 @@ def upload_calendar_events(token):
         # SWISS-Nachbearbeitung (F1/F5) auch im EKEvent-Pfad — no-op für LH.
         adapted = _normalize_thirdparty_roster_events(adapted)
         adapted = _easyjetify_roster_events(adapted, token=token)
+        adapted = _sunexpressify_roster_events(adapted, token=token)
         adapted = _swissify_roster_events(adapted, token=token)
         # ITA/ER-Duty auch hier (abonnierter iCloud-Kalender via EventKit trägt
         # dieselben Rome-mislabelten Zeiten); Relevanz-Auswahl wie im URL-Pfad.
