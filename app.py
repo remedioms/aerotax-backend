@@ -63720,6 +63720,20 @@ def import_roster_pdf(token):
                     prodid='AeroX Lufthansa City NetLine Roster PDF Import')
                 periods.append((lhx_report or {}).get('period'))
         if perr == 'unsupported_pdf_format':
+            # Lufthansa City cabin initial-training plans are multi-week
+            # weekday matrices rather than operational rosters. The parser
+            # accepts them only when the printed weekday/date strip is
+            # complete and every training day has its own time/location
+            # contract; detailed course prose and trainer names stay out.
+            from lhx_training_schedule_pdf import parse_lhx_training_calendar
+            training_events, training_year, training_month, \
+                training_report, perr = parse_lhx_training_calendar(data, text)
+            if perr is None:
+                ics = _pdf_events_to_ics(
+                    training_events, training_year, training_month,
+                    prodid='AeroX Lufthansa City Training PDF Import')
+                periods.append((training_report or {}).get('period'))
+        if perr == 'unsupported_pdf_format':
             # Eurowings NetLine/Crew plans are a fixed three-column UTC
             # schedule.  The printed block-time sum and complete month strip
             # protect against missing legs or silently dropped ground days.
