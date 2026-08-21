@@ -83,6 +83,19 @@ def test_duty_description_becomes_exact_numbered_sectors(monkeypatch):
     ]
 
 
+def test_sunexpress_runs_before_generic_aircraft_symbol_rewrite(monkeypatch):
+    """Production pipeline must preserve the SunExpress duty marker first."""
+    monkeypatch.setattr(A, '_profile_load', lambda _token: _profile())
+    events = A._parse_ics_to_events(SUNEXPRESS_ICS)
+
+    events = A._sunexpressify_roster_events(
+        events, token='sunexpress-test')
+    events = A._normalize_thirdparty_roster_events(events)
+
+    assert events[0]['summary'] == 'XQ302 AYT - TBS | XQ303 TBS - AYT'
+    assert len(events[0]['_exact_leg_times']) == 2
+
+
 def test_positioning_and_ground_rows_never_invent_flight_numbers(monkeypatch):
     events = _normalized(monkeypatch)
     positioning = events[1]

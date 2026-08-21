@@ -60455,9 +60455,12 @@ def import_calendar_feed(token):
     # no-op für LH-Feeds; wirft nie. VOR dem Persistieren, damit calendar_feed,
     # Briefings, Reconcile und Sektoren dieselbe (korrigierte) Event-Liste sehen.
     # Drittanbieter-Dialekte (Condor C/I+P/U, offblock ✈/ICAO) → LH-Form.
+    # SunExpress VOR dem generischen offblock-Adapter: dessen bewusst breite
+    # ``✈`` -> ``-``-Normalisierung wuerde sonst das SunExpress-Duty-Signal
+    # entfernen, bevor DESCRIPTION in nummerierte XQ-Sektoren zerlegt wird.
+    events = _sunexpressify_roster_events(events, token=token)
     events = _normalize_thirdparty_roster_events(events)
     events = _easyjetify_roster_events(events, token=token)
-    events = _sunexpressify_roster_events(events, token=token)
     events = _swissify_roster_events(events, token=token)
     # LH-Tagesbucket (Audit 2026-07-31 Befund 1): Flug-Legs mit expliziter
     # UTC-Zeit aufs UTC-Datum keyen (amtliche LH-Zuordnung, wie die Sektoren) —
@@ -60493,9 +60496,9 @@ def import_calendar_feed(token):
             for _name in ('legacy', 'candidate'):
                 _rows = (_legacy_normalized if _name == 'legacy'
                          else _candidate_normalized)
+                _rows = _sunexpressify_roster_events(_rows, token=token)
                 _rows = _normalize_thirdparty_roster_events(_rows)
                 _rows = _easyjetify_roster_events(_rows, token=token)
-                _rows = _sunexpressify_roster_events(_rows, token=token)
                 _rows = _swissify_roster_events(_rows, token=token)
                 _rows = _lh_rebucket_utc_flight_days(_rows)
                 _rows = _itaify_roster_events(_rows, token=token)
@@ -64431,9 +64434,9 @@ def upload_calendar_events(token):
             adapted_ev['_multiday_dates'] = _ics_multiday_dates(adapted_ev)
             adapted.append(adapted_ev)
         # SWISS-Nachbearbeitung (F1/F5) auch im EKEvent-Pfad — no-op für LH.
+        adapted = _sunexpressify_roster_events(adapted, token=token)
         adapted = _normalize_thirdparty_roster_events(adapted)
         adapted = _easyjetify_roster_events(adapted, token=token)
-        adapted = _sunexpressify_roster_events(adapted, token=token)
         adapted = _swissify_roster_events(adapted, token=token)
         # ITA/ER-Duty auch hier (abonnierter iCloud-Kalender via EventKit trägt
         # dieselben Rome-mislabelten Zeiten); Relevanz-Auswahl wie im URL-Pfad.
