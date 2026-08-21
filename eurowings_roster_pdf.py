@@ -40,6 +40,8 @@ _STATUS = {
     "sby": "standby",
     "sim": "simulator",
     "abs": "absence",
+    "sic": "absence",
+    "tsp": "transport",
     "x": "free",
 }
 
@@ -153,22 +155,55 @@ def _line_words(words, page_width):
             day_words.append((word,
                               f"{weekday.group(1)}{candidates[0]['text']}"))
 
+    def geometric_line(row):
+        """Rejoin glyph tokens that CUBE draws as separate text objects.
+
+        A current EW export compresses two rows to fit a busy duty.  There,
+        ``EW 6893 MUC ...`` is extracted as ``E``, ``W``, ``6``, ``8`` ...
+        even though the glyph boxes touch.  Only touching boxes are joined;
+        real field gaps remain spaces and the anchored leg regex stays the
+        final acceptance gate.
+        """
+        result = ""
+        previous = None
+        for candidate in sorted(row, key=lambda item: float(item["x0"])):
+            value = str(candidate.get("text") or "")
+            if not value:
+                continue
+            gap = (None if previous is None else
+                   float(candidate["x0"]) - float(previous["x1"]))
+            result += ("" if gap is None or gap <= 1.0 else " ") + value
+            previous = candidate
+        return result
+
     output = []
+    seen_rows = set()
     column_width = page_width / 3
     for word in words:
-        if str(word.get("text") or "") != "EW":
+        raw = str(word.get("text") or "")
+        if raw not in ("EW", "E"):
+            continue
+        if raw == "E" and not any(
+                str(candidate.get("text") or "") == "W"
+                and 0 <= float(candidate["x0"]) - float(word["x1"]) <= 1.0
+                and abs(float(candidate["top"])
+                        - float(word["top"])) <= 0.5
+                for candidate in words):
             continue
         column = min(2, max(0, int(float(word["x0"]) / column_width)))
+        row_key = (column, round(float(word["top"]), 1))
+        if row_key in seen_rows:
+            continue
+        seen_rows.add(row_key)
         left, right = column * column_width, (column + 1) * column_width
-        same_row = sorted(
-            (candidate for candidate in words
-             if left <= float(candidate["x0"]) < right
-             and float(candidate["x0"]) >= float(word["x0"]) - 0.1
-             and abs(float(candidate["top"]) - float(word["top"])) <= 2.5),
-            key=lambda candidate: float(candidate["x0"]),
-        )
-        line = " ".join(str(candidate.get("text") or "")
-                        for candidate in same_row)
+        same_row = [
+            candidate for candidate in words
+            if left <= float(candidate["x0"]) < right
+            and float(candidate["x0"]) >= float(word["x0"]) - 0.1
+            and abs(float(candidate["top"])
+                    - float(word["top"])) <= 2.5
+        ]
+        line = geometric_line(same_row)
         leg = _LEG_RE.search(line)
         if not leg:
             continue
@@ -220,7 +255,8 @@ def _overview(page, day_map):
             key=lambda word: float(word["top"]),
         )
         values = [str(word["text"]) for word in clocks]
-        if status in ("flight", "standby", "duty", "simulator") \
+        if status in (
+                "flight", "standby", "duty", "simulator", "transport") \
                 and len(values) != 2:
             return None, "eurowings_missing_duty_times"
         if status == "absence" and len(values) not in (0, 2):
@@ -305,7 +341,7 @@ def parse_eurowings_netline_calendar(pdf_bytes, extracted_text=""):
         return None, None, None, None, "eurowings_unexpected_flight_day"
     if (not legs
             and not any(row["status"] in (
-                "duty", "simulator", "standby", "absence")
+                "duty", "simulator", "standby", "absence", "transport")
                 for row in overview.values())):
         return None, None, None, None, "no_roster_days"
 
@@ -332,11 +368,13 @@ def parse_eurowings_netline_calendar(pdf_bytes, extracted_text=""):
             events.append((f"standby-{day:%Y%m%d}", duty_start, duty_end,
                            "Standby", False))
             marker_count += 1
-        elif row["status"] in ("duty", "simulator", "absence"):
+        elif row["status"] in (
+                "duty", "simulator", "absence", "transport"):
             label = {
                 "duty": "Duty",
                 "simulator": "Simulator",
                 "absence": "Absence",
+                "transport": "Transport",
             }[row["status"]]
             if row["start"] and row["end"]:
                 duty_start = _clock(day, row["start"])

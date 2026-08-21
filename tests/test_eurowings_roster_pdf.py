@@ -12,6 +12,7 @@ from reportlab.pdfgen import canvas
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as backend
+import eurowings_roster_pdf
 from eurowings_roster_pdf import parse_eurowings_netline_calendar
 
 
@@ -90,6 +91,30 @@ def _synthetic_ground_only_pdf():
     return stream.getvalue()
 
 
+def _synthetic_absence_transport_pdf():
+    """Observed EW abbreviations: Sic=sick leave, Tsp=timed transport."""
+    stream = io.BytesIO()
+    pdf = canvas.Canvas(stream, pagesize=landscape(A4))
+    pdf.setFont("Helvetica", 7)
+    pdf.drawString(30, 575, "Individual duty plan")
+    pdf.drawString(300, 575, "NetLine/Crew(EWG) printed by CREWLINK")
+    pdf.drawString(30, 558, "Period: 01Aug26 - 03Aug26")
+    days = ((37, "Sat01", "Sic", None, None),
+            (85, "Sun02", "Tsp", "1500", "1620"),
+            (133, "Mon03", "FlD", "1000", "1400"))
+    for x, day, status, start, end in days:
+        pdf.drawString(x, 530, day)
+        pdf.drawString(x + 2, 519, status)
+        if start:
+            pdf.drawString(x + 2, 511, start)
+            pdf.drawString(x + 2, 505, end)
+    pdf.drawString(31, 465, "Mon03")
+    pdf.drawString(73, 455, "EW 100 DUS 1100 1300 PMI 320")
+    pdf.drawString(300, 300, "Flight time 02:00 Duty time 04:00")
+    pdf.save()
+    return stream.getvalue()
+
+
 def _parse(data=None):
     data = data or _synthetic_pdf()
     with pdfplumber.open(io.BytesIO(data)) as pdf:
@@ -153,6 +178,42 @@ def test_eurowings_ground_only_plan_keeps_duty_and_simulator_days():
         backend._parse_ics_to_events(ics))
     assert contract["ok"] is True
     assert contract["display_mode"] == "duty_schedule"
+
+
+def test_eurowings_maps_sickness_and_timed_transport_without_guessing_flights():
+    (events, _, _, report, error), _ = _parse(
+        _synthetic_absence_transport_pdf())
+
+    assert error is None
+    assert report["flight_count"] == 1
+    labels = [event[3] for event in events]
+    assert labels == ["Absence", "Transport", "10:00 UTC Briefing DUS · "
+                      "EW100 DUS - PMI"]
+    transport = next(event for event in events if event[3] == "Transport")
+    assert transport[1].isoformat() == "2026-08-02T15:00:00"
+    assert transport[2].isoformat() == "2026-08-02T16:20:00"
+
+
+def test_eurowings_rejoins_touching_glyph_rows():
+    def word(text, x0, top, width=None):
+        width = width if width is not None else max(3.6, len(text) * 3.6)
+        return {"text": text, "x0": x0, "x1": x0 + width,
+                "top": top, "bottom": top + 6}
+
+    words = [word("Fri14", 30, 100)]
+    x = 73.0
+    for token in ("E", "W"):
+        words.append(word(token, x, 120, 3.6))
+        x += 3.6
+    x += 7.2
+    for value in ("6893", "MUC", "1738", "1944", "PMI", "320"):
+        for glyph in value:
+            words.append(word(glyph, x, 120, 3.6))
+            x += 3.6
+        x += 7.2
+
+    assert eurowings_roster_pdf._line_words(words, 840) == [
+        ("Fri14", ("EW", "6893", "MUC", "1738", "1944", "PMI", "320"))]
 
 
 def test_eurowings_rejects_foreign_and_checksum_changes():

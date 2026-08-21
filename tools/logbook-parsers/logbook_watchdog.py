@@ -875,6 +875,7 @@ def _try_parsers(path):
     import parse_faa_logbook
     import parse_fcl050_v2
     import parse_foreflight_easa
+    import parse_flightlog_easa
     import parse_foreflight_csv
     import parse_simple_flights_csv
     import parse_emirates_cabin_log
@@ -925,6 +926,9 @@ def _try_parsers(path):
     if parse_foreflight_easa.matches_pdf(path):
         legs, sims, report = parse_foreflight_easa.parse_pdf(path)
         return "foreflight_easa", legs, sims, report
+    if parse_flightlog_easa.matches_pdf(path):
+        legs, sims, report = parse_flightlog_easa.parse_pdf(path)
+        return "flightlog_easa", legs, sims, report
     if parse_swiss_historical.matches_pdf(path):
         legs, sims, report = parse_swiss_historical.parse_pdf(path)
         parser_name = ("informational_pdf"
