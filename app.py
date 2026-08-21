@@ -44916,6 +44916,74 @@ def _ax_codeshare_map():
     return _AX_CODESHARE_CACHE['map']
 
 
+def _ax_flight_search_rows(raw_query, limit=20):
+    """Confirmed flight-number prefix matches from the owned warehouse.
+
+    The warehouse stores marketing -> operating flight-number relationships.
+    Searching ``LH506`` therefore finds real aliases such as ``LH5060`` without
+    probing ten unrelated flight endpoints or inventing syntactically possible
+    numbers.  The exact query is intentionally not added here: the client owns
+    that direct result and this helper only supplies confirmed related rows.
+    """
+    compact = re.sub(r'\s+', '', str(raw_query or '')).upper()
+    if not re.fullmatch(r'[A-Z0-9]{2,3}\d{1,4}[A-Z]?', compact):
+        return []
+    query = _fn_norm(compact)
+    if len(query) < 3:
+        return []
+    try:
+        cap = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        cap = 20
+
+    matches = []
+    for marketing, operating in (_ax_codeshare_map() or {}).items():
+        marketing = _fn_norm(marketing)
+        operating = _fn_norm(operating)
+        if not marketing or not operating or marketing == operating:
+            continue
+        if not (marketing.startswith(query) or operating.startswith(query)):
+            continue
+        matches.append({
+            'flight': marketing,
+            'operating_flight': operating,
+            'kind': 'codeshare',
+        })
+
+    def _sort_key(row):
+        value = row['flight']
+        m = re.match(r'^([A-Z0-9]{2,3})(\d+)([A-Z]?)$', value)
+        if not m:
+            return (value != query, value, 99999, '')
+        return (value != query, m.group(1), int(m.group(2)), m.group(3))
+
+    unique = {}
+    for row in sorted(matches, key=_sort_key):
+        unique[(row['flight'], row['operating_flight'])] = row
+    return list(unique.values())[:cap]
+
+
+@app.route('/api/ax/flight-search', methods=['GET'])
+def ax_flight_search():
+    """FR24-style flight-number/prefix search from confirmed Aero X data."""
+    raw = request.args.get('q') or ''
+    compact = re.sub(r'\s+', '', raw).upper()
+    if not re.fullmatch(r'[A-Z0-9]{2,3}\d{1,4}[A-Z]?', compact):
+        return jsonify({'ok': False, 'error': 'bad_flight_query'}), 400
+    try:
+        limit = int(request.args.get('limit') or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    rows = _ax_flight_search_rows(compact, limit=limit)
+    return _public_cache_headers(jsonify({
+        'ok': True,
+        'query': _fn_norm(compact),
+        'source': 'warehouse_codeshares',
+        'count': len(rows),
+        'results': rows,
+    }))
+
+
 def _fold_codeshare_flights(flights, cs_map):
     """Faltet Codeshare-Duplikate EINES Tages der Strecken-Historie zu einer
     Zeile (Owner-Screenshot 2026-07-04: TG7722/UA8841/ET1610/SN7230/NZ4226/
