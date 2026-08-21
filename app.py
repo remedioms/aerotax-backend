@@ -44963,6 +44963,64 @@ def _ax_flight_search_rows(raw_query, limit=20):
     return list(unique.values())[:cap]
 
 
+_AX_FLIGHT_PREFIX_CACHE = {}
+_AX_FLIGHT_PREFIX_TTL_S = 12 * 3600
+
+
+def _ax_lh_prefix_search_rows(raw_query, date_iso, limit=20):
+    """Resolve confirmed LH-Group marketing suffixes via Lufthansa Open API.
+
+    FR24's public API intentionally does not expose its future schedule search.
+    Lufthansa's flight-status response does expose the operating designator for
+    marketing flights, so ``LH5060`` can be truthfully returned as
+    ``LH5060 -> AZ1619``.  Only a three-digit stem is expanded, and both hits
+    and misses are cached; the shared LH facts cache prevents cross-worker
+    duplicate provider calls as well.
+    """
+    compact = re.sub(r'\s+', '', str(raw_query or '')).upper()
+    m = re.fullmatch(r'([A-Z0-9]{2})(\d{3})', compact)
+    if not m:
+        return []
+    try:
+        from blueprints.lh_open_api import is_lh_group, lh_flight_facts
+        if not is_lh_group(compact):
+            return []
+    except Exception:
+        return []
+    day = str(date_iso or '')[:10]
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', day):
+        return []
+    key = (compact, day)
+    now = time.time()
+    cached = _AX_FLIGHT_PREFIX_CACHE.get(key)
+    if cached and now < cached[0]:
+        return [dict(x) for x in cached[1]][:limit]
+
+    rows = []
+    for suffix in range(10):
+        candidate = compact + str(suffix)
+        try:
+            facts = lh_flight_facts(candidate, day, caller='search_prefix') or {}
+        except Exception:
+            facts = {}
+        operating = _fn_norm(facts.get('operated_by'))
+        has_route = bool(facts.get('dep_iata') and facts.get('arr_iata'))
+        if not (operating or has_route):
+            continue
+        rows.append({
+            'flight': candidate,
+            'operating_flight': operating or candidate,
+            'kind': 'codeshare' if operating and operating != candidate else 'flight',
+        })
+    _AX_FLIGHT_PREFIX_CACHE[key] = (now + _AX_FLIGHT_PREFIX_TTL_S,
+                                    [dict(x) for x in rows])
+    if len(_AX_FLIGHT_PREFIX_CACHE) > 256:
+        for old_key, _ in sorted(_AX_FLIGHT_PREFIX_CACHE.items(),
+                                 key=lambda item: item[1][0])[:64]:
+            _AX_FLIGHT_PREFIX_CACHE.pop(old_key, None)
+    return rows[:limit]
+
+
 @app.route('/api/ax/flight-search', methods=['GET'])
 def ax_flight_search():
     """FR24-style flight-number/prefix search from confirmed Aero X data."""
@@ -44975,10 +45033,26 @@ def ax_flight_search():
     except (TypeError, ValueError):
         limit = 20
     rows = _ax_flight_search_rows(compact, limit=limit)
+    source = 'warehouse_codeshares'
+    # Only the useful FR24-style three-digit stem is expanded. This prevents
+    # type-ahead (`LH5`, `LH50`) from spending provider quota while still
+    # making the submitted `LH506` query complete.
+    if not rows and re.fullmatch(r'[A-Z0-9]{2}\d{3}', compact):
+        try:
+            limited = _ip_rate_limited(_client_ip(), endpoint='ax_flight_search',
+                                       limit=6, window_sec=60)
+        except Exception:
+            limited = False
+        if not limited:
+            day = (request.args.get('date') or
+                   datetime.now(timezone.utc).strftime('%Y-%m-%d'))
+            rows = _ax_lh_prefix_search_rows(compact, day, limit=limit)
+            if rows:
+                source = 'lufthansa_flightstatus'
     return _public_cache_headers(jsonify({
         'ok': True,
         'query': _fn_norm(compact),
-        'source': 'warehouse_codeshares',
+        'source': source,
         'count': len(rows),
         'results': rows,
     }))

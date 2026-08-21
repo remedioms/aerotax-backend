@@ -51,3 +51,30 @@ def test_search_endpoint_shape_and_validation():
         ],
     }
     assert client.get('/api/ax/flight-search?q=FRA-GRU').status_code == 400
+
+
+def test_lh_prefix_fallback_returns_only_provider_confirmed_suffixes():
+    def facts(flight, date, caller=None):
+        assert date == '2026-08-21'
+        if flight == 'LH5060':
+            return {'dep_iata': 'FRA', 'arr_iata': 'FCO',
+                    'operated_by': 'AZ1619'}
+        if flight == 'LH5061':
+            return {'dep_iata': 'FRA', 'arr_iata': 'LIN'}
+        return {}
+
+    A._AX_FLIGHT_PREFIX_CACHE.clear()
+    with patch('blueprints.lh_open_api.is_lh_group', return_value=True), \
+         patch('blueprints.lh_open_api.lh_flight_facts', side_effect=facts):
+        rows = A._ax_lh_prefix_search_rows('LH506', '2026-08-21')
+    assert rows == [
+        {'flight': 'LH5060', 'operating_flight': 'AZ1619', 'kind': 'codeshare'},
+        {'flight': 'LH5061', 'operating_flight': 'LH5061', 'kind': 'flight'},
+    ]
+
+
+def test_lh_prefix_fallback_never_expands_partial_or_four_digit_queries():
+    with patch('blueprints.lh_open_api.lh_flight_facts') as fetch:
+        assert A._ax_lh_prefix_search_rows('LH50', '2026-08-21') == []
+        assert A._ax_lh_prefix_search_rows('LH5060', '2026-08-21') == []
+    fetch.assert_not_called()
