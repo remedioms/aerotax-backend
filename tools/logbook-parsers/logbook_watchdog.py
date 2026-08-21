@@ -571,7 +571,7 @@ def _logbook_ai_response_text(payload):
     return "".join(parts)
 
 
-def _logbook_ai_call_once(source_chunk, token):
+def _logbook_ai_call_once(source_chunk, token, pdf_blob=None):
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("openai_not_configured")
@@ -581,6 +581,25 @@ def _logbook_ai_call_once(source_chunk, token):
     effort = (os.environ.get("AEROX_LOGBOOK_OPENAI_EFFORT", "").strip()
               or os.environ.get("AEROX_ROSTER_OPENAI_EFFORT", "").strip()
               or LOGBOOK_AI_EFFORT_DEFAULT)
+    user_text = (
+        "Read this complete line-bounded logbook chunk independently. "
+        "The optional PDF shows the original page layout, but "
+        "source_evidence must be copied exactly from SERVER SOURCE below so "
+        "the backend can verify every accepted fact. Some document header "
+        "lines may be repeated between chunks; do not turn headers into "
+        "flights.\n\nSERVER SOURCE:\n" + source_chunk)
+    user_content = []
+    if (isinstance(pdf_blob, (bytes, bytearray))
+            and bytes(pdf_blob).startswith(b"%PDF-")
+            and len(pdf_blob) <= 8 * 1024 * 1024):
+        user_content.append({
+            "type": "input_file",
+            "filename": "logbook.pdf",
+            "file_data": ("data:application/pdf;base64," + base64.b64encode(
+                bytes(pdf_blob)).decode("ascii")),
+            "detail": "high",
+        })
+    user_content.append({"type": "input_text", "text": user_text})
     body = {
         "model": model,
         "store": False,
@@ -590,10 +609,7 @@ def _logbook_ai_call_once(source_chunk, token):
         "max_output_tokens": LOGBOOK_AI_MAX_OUTPUT_TOKENS,
         "input": [
             {"role": "system", "content": LOGBOOK_AI_SYSTEM},
-            {"role": "user", "content": (
-                "Read this complete line-bounded logbook chunk independently. "
-                "Some document header lines may be repeated between chunks; "
-                "do not turn headers into flights.\n\n" + source_chunk)},
+            {"role": "user", "content": user_content},
         ],
         "text": {"format": {
             "type": "json_schema",
@@ -757,6 +773,12 @@ def _try_openai_logbook(path, token):
     source, error = _logbook_ai_source_text(path)
     if error:
         return None, error
+    try:
+        with open(path, "rb") as handle:
+            candidate_blob = handle.read()
+        pdf_blob = candidate_blob if candidate_blob.startswith(b"%PDF-") else None
+    except OSError as exc:
+        return None, f"source_read_{type(exc).__name__}"
     chunks = _logbook_ai_chunks(source)
     if not chunks:
         return None, "source_requires_too_many_chunks"
@@ -776,12 +798,14 @@ def _try_openai_logbook(path, token):
     combined, model = [], LOGBOOK_AI_MODEL_DEFAULT
     try:
         for chunk in chunks:
-            first, model = _logbook_ai_call_once(chunk, token)
+            first, model = _logbook_ai_call_once(
+                chunk, token, pdf_blob=pdf_blob)
             first_clean, first_dropped = _logbook_ai_validate_items(first, source)
             if first_dropped:
                 return _semantic_failure("source_evidence_rejected", model)
             if read_count == 2:
-                second, _ = _logbook_ai_call_once(chunk, token)
+                second, _ = _logbook_ai_call_once(
+                    chunk, token, pdf_blob=pdf_blob)
                 second_clean, second_dropped = _logbook_ai_validate_items(
                     second, source)
                 if second_dropped:

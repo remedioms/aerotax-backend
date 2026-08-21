@@ -218,6 +218,29 @@ def test_openai_sol_xhigh_requires_two_identical_structured_reads(monkeypatch):
         assert response_format['schema']['additionalProperties'] is False
 
 
+def test_openai_sol_receives_original_pdf_with_high_visual_detail(monkeypatch):
+    calls = []
+    pdf = b'%PDF-1.4\nsynthetic-roster-layout'
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-test-openai-not-real')
+    _mock_post(monkeypatch, _openai_answer(GOOD_ITEMS), calls)
+
+    assert backend._roster_ai_fallback_ics(
+        UNKNOWN_TEXT, 'AT-TEST-OPENAI-PDF', 'unsupported_pdf_format',
+        pdf_data=pdf)
+    assert len(calls) == 2
+    for call in calls:
+        user_content = call['body']['input'][1]['content']
+        file_item = user_content[0]
+        assert file_item['type'] == 'input_file'
+        assert file_item['filename'] == 'roster.pdf'
+        assert file_item['detail'] == 'high'
+        prefix = 'data:application/pdf;base64,'
+        assert file_item['file_data'].startswith(prefix)
+        assert base64.b64decode(file_item['file_data'][len(prefix):]) == pdf
+        assert user_content[1]['type'] == 'input_text'
+        assert 'SERVER-TEXT:' in user_content[1]['text']
+
+
 def test_active_roster_format_uses_one_sol_read_then_defers_db_promotion(
         monkeypatch):
     calls = []

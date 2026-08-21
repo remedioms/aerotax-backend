@@ -62294,8 +62294,16 @@ def _roster_ai_openai_response_text(payload):
     return ''.join(chunks)
 
 
-def _roster_ai_call_openai_once(text):
-    """Ein unabhängiger, schema-strikter Sol-Leselauf via Responses API."""
+def _roster_ai_call_openai_once(text, pdf_data=None):
+    """Ein unabhängiger, schema-strikter Sol-Leselauf via Responses API.
+
+    Bei PDF-Uploads bekommt Sol neben der serverseitigen Textrepräsentation
+    auch das Original als ``input_file``. Dadurch bleiben Spaltengeometrie,
+    kleine Schrift und als Einzelglyphen extrahierte Tabellenzeilen sichtbar.
+    Die Ausgabe muss trotzdem weiterhin gegen den separat übergebenen Text
+    bestehen; das Seitenbild darf also beim Verstehen helfen, aber niemals den
+    deterministischen Quellbeleg ersetzen.
+    """
     key = (os.getenv('OPENAI_API_KEY') or '').strip()
     model = ((os.getenv('AEROX_ROSTER_OPENAI_MODEL') or '').strip()
              or _ROSTER_OPENAI_DEFAULT_MODEL)
@@ -62304,6 +62312,28 @@ def _roster_ai_call_openai_once(text):
     if not key:
         return None, model
     import requests as _requests
+    user_text = (
+        'Lies diesen Dienstplan unabhängig, vollständig und in '
+        'Quellreihenfolge. Das PDF zeigt dir das Seitenlayout; für '
+        '`source_evidence` darfst du ausschließlich eine kürzeste '
+        'unveränderte Zeile aus dem Abschnitt SERVER-TEXT kopieren, die Tag, '
+        'Aktivität und alle zurückgegebenen Zeiten/Flugfakten belegt. Gib nur '
+        'die belegten Roh-Fakten im verlangten Schema zurück.\n\n'
+        'SERVER-TEXT:\n' + text)
+    user_content = []
+    if (isinstance(pdf_data, (bytes, bytearray))
+            and bytes(pdf_data).startswith(b'%PDF-')
+            and len(pdf_data) <= 8 * 1024 * 1024):
+        user_content.append({
+            'type': 'input_file',
+            'filename': 'roster.pdf',
+            'file_data': ('data:application/pdf;base64,'
+                          + base64.b64encode(bytes(pdf_data)).decode('ascii')),
+            # Dienstpläne haben kleine, dichte Tabellen. GPT-5.6 nutzt bei
+            # auto bereits high; explizit bleibt der Produktionsvertrag klar.
+            'detail': 'high',
+        })
+    user_content.append({'type': 'input_text', 'text': user_text})
     body = {
         'model': model,
         # Dienstpläne sind private Nutzerdokumente. Das Modell bekommt sie nur
@@ -62313,13 +62343,7 @@ def _roster_ai_call_openai_once(text):
         'max_output_tokens': _ROSTER_AI_MAX_TOKENS,
         'input': [
             {'role': 'system', 'content': _ROSTER_AI_SYSTEM},
-            {'role': 'user', 'content': (
-                'Lies diesen Dienstplan unabhängig, vollständig und in '
-                'Quellreihenfolge. `source_evidence` muss die kürzeste '
-                'unveränderte Quellzeile sein, die Tag, Aktivität und alle '
-                'zurückgegebenen Zeiten/Flugfakten belegt. Gib nur die '
-                'belegten Roh-Fakten im verlangten Schema zurück.\n\n'
-                + text)},
+            {'role': 'user', 'content': user_content},
         ],
         'text': {'format': {
             'type': 'json_schema',
@@ -62338,10 +62362,10 @@ def _roster_ai_call_openai_once(text):
     return _roster_ai_parse_json(raw), model
 
 
-def _roster_ai_call_openai_double(text):
+def _roster_ai_call_openai_double(text, pdf_data=None):
     """Zwei frische Reads; der Caller validiert und vergleicht beide."""
-    first, model = _roster_ai_call_openai_once(text)
-    second, _ = _roster_ai_call_openai_once(text)
+    first, model = _roster_ai_call_openai_once(text, pdf_data=pdf_data)
+    second, _ = _roster_ai_call_openai_once(text, pdf_data=pdf_data)
     return [first, second], model
 
 
@@ -62643,7 +62667,8 @@ def _roster_ai_learn_store(token, capped_text, valid_items, model, src_sha):
     return bool(stored)
 
 
-def _roster_ai_fallback_ics(text, token, det_error, learning_result=None):
+def _roster_ai_fallback_ics(text, token, det_error, learning_result=None,
+                            pdf_data=None):
     """KI-Lesepfad für einen Upload, den kein Parser versteht.
 
     Liefert einen ICS-String oder None. Wirft NIE — jeder Fehlerpfad landet im
@@ -62696,9 +62721,11 @@ def _roster_ai_fallback_ics(text, token, det_error, learning_result=None):
     try:
         if openai_enabled:
             if read_count == 2:
-                readings, model = _roster_ai_call_openai_double(capped)
+                readings, model = _roster_ai_call_openai_double(
+                    capped, pdf_data=pdf_data)
             else:
-                items, model = _roster_ai_call_openai_once(capped)
+                items, model = _roster_ai_call_openai_once(
+                    capped, pdf_data=pdf_data)
                 readings = [items]
         else:
             items, model = _roster_ai_call_anthropic(capped)
@@ -63692,7 +63719,8 @@ def import_roster_pdf(token):
             if perr in ('unsupported_pdf_format', 'no_roster_days'):
                 learning_result = {}
                 ai_ics = _roster_ai_fallback_ics(
-                    text, token, perr, learning_result=learning_result)
+                    text, token, perr, learning_result=learning_result,
+                    pdf_data=data)
             if ai_ics:
                 standard_calendars.append(ai_ics)
                 ai_fallback_used = True

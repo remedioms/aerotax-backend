@@ -1,5 +1,6 @@
 """Fail-closed Sol fallback for a previously unknown flight-log layout."""
 
+import base64
 import json
 import os
 import sys
@@ -127,6 +128,33 @@ def test_unknown_text_logbook_is_read_twice_with_sol_xhigh(monkeypatch, tmp_path
         assert body["safety_identifier"].startswith("ax-logbook-")
         assert "AT-private-user" not in json.dumps(body)
         assert timeout == w.LOGBOOK_AI_TIMEOUT_SECONDS
+
+
+def test_logbook_sol_receives_original_pdf_with_high_visual_detail(monkeypatch):
+    calls = []
+    pdf = b"%PDF-1.4\nsynthetic-logbook-layout"
+
+    def fake_urlopen(request, timeout):
+        calls.append(json.loads(request.data))
+        return _Response([_item()])
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-test-key")
+    monkeypatch.setattr(w.urllib.request, "urlopen", fake_urlopen)
+
+    items, model = w._logbook_ai_call_once(
+        SOURCE, "AT-private-user", pdf_blob=pdf)
+
+    assert model == "gpt-5.6-sol" and len(items) == 1
+    user_content = calls[0]["input"][1]["content"]
+    file_item = user_content[0]
+    assert file_item["type"] == "input_file"
+    assert file_item["filename"] == "logbook.pdf"
+    assert file_item["detail"] == "high"
+    prefix = "data:application/pdf;base64,"
+    assert file_item["file_data"].startswith(prefix)
+    assert base64.b64decode(file_item["file_data"][len(prefix):]) == pdf
+    assert user_content[1]["type"] == "input_text"
+    assert "SERVER SOURCE:" in user_content[1]["text"]
 
 
 def test_active_learned_format_uses_one_read_and_defers_success_record(
