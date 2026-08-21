@@ -1207,6 +1207,13 @@ def test_duty_from_roster_day_klass_und_marker():
     assert duty_from_roster_day('REST', None) == 'free'
     # iCal-Summary-Token (family_watch hat kein klass-Feld).
     assert duty_from_roster_day(None, 'OFF DAY') == 'free'
+    # LH SCU storniert den Standby; selbst ein alter STBY-Klass darf nicht
+    # wieder Bereitschaft, Pickup oder Bereitschaftstext ausloesen.
+    assert duty_from_roster_day(None, 'SCU') == 'free'
+    assert duty_from_roster_day('STBY', 'Standby (SCU)') == 'free'
+    assert duty_from_roster_day('STBY', 'Off Day (SCU)') == 'free'
+    # SCU ist zugleich ein Flughafenkuerzel; echte Routen bleiben Dienst.
+    assert duty_from_roster_day(None, 'LH123 FRA-SCU') is None
     # Kein Signal → None (Flugtag/unbekannt — Resolver entscheidet über Legs).
     assert duty_from_roster_day('Z72', 'FLUG') is None
     assert duty_from_roster_day(None, None) is None

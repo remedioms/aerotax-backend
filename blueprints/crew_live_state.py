@@ -53,6 +53,8 @@ Details/Quellen: siehe Kommentarblock über den PRE_*-Konstanten.
 import datetime as _dt
 import re as _re
 
+from roster_markers import is_cancelled_standby_marker
+
 # ── Zustände (Kontrakt mit iOS) ──────────────────────────────────────────────
 STATE_HOME = 'home'            # kein Dienst / Feierabend an der Homebase
 STATE_STANDBY = 'standby'      # Bereitschaft ohne Legs
@@ -1730,6 +1732,11 @@ def duty_from_roster_day(klass=None, marker=None):
     behandelt (Smart-Pickup ausgelöst). Jetzt eigene Nicht-Commute-Kategorie."""
     marker_up = str(marker or '').upper()
     klass_up = str(klass or '').strip().upper()
+    # LH SCU = gestrichener Standby. Alte Snapshots koennen noch
+    # ``klass=STBY`` oder die Prosa ``Standby (SCU)`` tragen; der eindeutige
+    # Rohmarker muss deshalb VOR der abgeleiteten Standby-Klasse gewinnen.
+    if is_cancelled_standby_marker(marker_up):
+        return 'free'
     # 'STANDBY'/'STBY' ergänzt (2026-07-27): der FlightOps-Import mintet die
     # myTime-Prosa „Standby (SB60)" — die trägt KEIN 'SBY' als Substring
     # (S-T-A-N-D-B-Y) und fiel deshalb bis hierher durch. Ohne diesen Zweig

@@ -38,7 +38,20 @@ def test_standby_erkennung_im_summary():
     assert app._feed_summary_is_standby('LX 1076 ZRH-MUC') is False
     # 'SBY' nur als eigenes Token — nicht als Teil eines Worts.
     assert app._feed_summary_is_standby('PRESBYOPIE') is False
+    assert app._feed_summary_is_standby('SCU') is False
+    assert app._feed_summary_is_standby('Standby (SCU)') is False
+    assert app._feed_summary_is_standby('Off Day (SCU)') is False
     assert app._feed_summary_is_standby(None) is False
+
+
+def test_scu_schlaegt_alte_standby_kategorie_auch_im_roster_payload():
+    assert app._me_roster_briefing_klass('Standby (SCU)') == 'FREI'
+    assert app._me_roster_briefing_klass('LH 123: FRA-SCU', has_flight=True) is None
+    briefings, _ = app._ics_events_to_briefings([{
+        'summary': 'SCU', 'categories': ['STANDBY'],
+        'start': '2026-08-20', '_multiday_dates': ['2026-08-20'],
+    }])
+    assert briefings['2026-08-20']['ical_klass'] == 'frei'
 
 
 class _FakeTable:

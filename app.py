@@ -29,6 +29,7 @@ from parser_learning import (
     learning_read_count as _parser_learning_read_count,
     source_evidence_hash as _parser_learning_source_hash,
 )
+from roster_markers import is_cancelled_standby_marker
 import stripe
 import anthropic
 import pdfplumber
@@ -17634,6 +17635,12 @@ def _friend_day_is_vacation(day):
 
 def _friend_day_is_standby(day):
     text = _friend_day_text(day)
+    # Bei alten Tagen kann ``klass=STBY`` neben dem korrigierenden Rohmarker
+    # ``SCU`` stehen. Deshalb die Felder einzeln prüfen, bevor sie zu einem
+    # Suchtext verbunden werden und der alte Klass wieder gewinnen könnte.
+    if isinstance(day, dict) and any(is_cancelled_standby_marker(day.get(key))
+                                     for key in ('klass', 'marker', 'routing')):
+        return False
     tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', text))
     return ('STANDBY' in text or 'BEREITSCHAFT' in text or 'RESERVE' in text
             or bool(tokens & {'SBY', 'RSV'}))
@@ -22776,6 +22783,8 @@ def _feed_summary_is_standby(text):
     """Bereitschafts-Signal im iCal-Summary — gleiche Wortliste wie
     `_friend_day_is_standby` (dort auf tage_detail-Tagen)."""
     up = str(text or '').upper()
+    if is_cancelled_standby_marker(up):
+        return False
     tokens = set(re.split(r'[^A-Z0-9ÄÖÜ]+', up))
     return ('STANDBY' in up or 'BEREITSCHAFT' in up or 'RESERVE' in up
             or bool(tokens & {'SBY', 'RSV'}))
@@ -58153,6 +58162,10 @@ def _ics_events_to_briefings(events, existing=None):
         end_iso = (ev.get('end_iso') or '')[:25]
         categories = ev.get('categories') or []
         klass_from_cats = _ics_classify_from_categories(categories)
+        # Ein Feed kann SCU noch mit der alten Kategorie STANDBY liefern. Der
+        # eindeutige Rohmarker gewinnt und wird als frei persistiert.
+        if is_cancelled_standby_marker(summary):
+            klass_from_cats = 'frei'
         # Skip nur wenn ALLES leer.
         if not summary and not location and not start_iso:
             continue
@@ -84749,7 +84762,11 @@ def _me_roster_briefing_klass(summary, has_flight=False, has_time=False):
     and are rendered verbatim by the client instead of being guessed.
     """
     upper = str(summary or '').strip().upper()
-    if not upper or has_flight or _summary_has_ground_duty(upper):
+    if not upper:
+        return None
+    if is_cancelled_standby_marker(upper):
+        return 'FREI'
+    if has_flight or _summary_has_ground_duty(upper):
         return None
     if 'ABSENCE' in upper and re.search(r'\((?:K|KH|KK|KO|T)\)', upper):
         return 'Krank'

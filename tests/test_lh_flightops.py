@@ -4425,6 +4425,41 @@ def test_standby_groundevent_wird_nie_ein_flug_leg():
     assert 'LH 507: GRU-FRA' in ics
 
 
+def test_scu_storniert_standby_und_wird_freier_tag():
+    """Forum 21.08.2026: STANDBY/SCU ist ein gestrichener Standby.
+
+    Der Parser darf daraus weder Standby-Semantik noch den Flughafen SCU
+    (Santiago de Cuba) ableiten.
+    """
+    duty = {"rosterDays": [{
+        "day": "2026-08-20T00:00:00Z",
+        "events": [{"eventCategory": "STANDBY",
+                    "eventType": "GROUNDEVENT",
+                    "eventDetails": "SCU", "wholeDay": True,
+                    "startLocation": "MUC", "endLocation": "MUC",
+                    "startTime": None, "endTime": None}],
+    }]}
+
+    ics = fo.duty_events_to_ics(duty)
+    assert 'SUMMARY:Off Day (SCU)' in ics
+    assert 'Standby (SCU)' not in ics
+    assert 'MUC-SCU' not in ics and 'MUC - SCU' not in ics
+
+    import app as backend
+    events = backend._parse_ics_to_events(ics)
+    sectors = backend._build_ical_sectors(events)
+    briefings, _ = backend._ics_events_to_briefings(events)
+    assert not (sectors.get('2026-08-20') or [])
+    day = briefings['2026-08-20']
+    assert day['ical_summary'] == 'Off Day (SCU)'
+    assert not (day.get('legs') or [])
+    assert not (day.get('ground_events') or [])
+    stale = {'ical_summary': 'Standby (SCU)', 'ical_klass': 'standby',
+             'ical_sectors': []}
+    assert fo._fo_day_has_duty(stale) is False
+    assert fo._fo_day_is_standby(stale) is False
+
+
 def test_standby_tag_erzeugt_keinen_sektor_in_der_pipeline():
     """Durch die echte Import-Pipeline: der 15.02. hat KEINEN Flug-Sektor und
     KEIN Leg — nur Briefing/Layover/Standby-Marker. Der 16.02. behält seinen

@@ -35,6 +35,8 @@ import datetime as _dt
 
 from flask import Blueprint, jsonify, request, redirect
 
+from roster_markers import is_cancelled_standby_marker
+
 log = logging.getLogger('aerotax')
 lh_flightops_bp = Blueprint('lh_flightops_bp', __name__)
 
@@ -3349,11 +3351,17 @@ def duty_events_to_ics(resp, pickups=None, rot_legs=None, enrich=True):
                 # (SBA = Santa Barbara) und erfand daraus ein Leg FRA→SBA.
                 # Jetzt myTime-Prosa 'Standby (SBA)' — der Code bleibt 1:1
                 # sichtbar, aber als Dienstart etikettiert, nie als Ort.
-                _is_sb = (cat in ('standby', 'sby')
-                          or _du.startswith('SB') or _du.startswith('STBY'))
-                _word = 'Standby' if _is_sb else 'Reserve'
-                summary = f'{_word} ({det})' if det else (
-                    f'{_word} {frm}' if len(frm) == 3 else _word)
+                # SCU ist die Stornierung eines Standbys, kein Standby-Typ.
+                # Als Off-Day-Prosa greift die bestehende Frei-Klassifikation
+                # in Feed, Kalender, Crew-State und Smart-Pickup automatisch.
+                if is_cancelled_standby_marker(det):
+                    summary = 'Off Day (SCU)'
+                else:
+                    _is_sb = (cat in ('standby', 'sby')
+                              or _du.startswith('SB') or _du.startswith('STBY'))
+                    _word = 'Standby' if _is_sb else 'Reserve'
+                    summary = f'{_word} ({det})' if det else (
+                        f'{_word} {frm}' if len(frm) == 3 else _word)
             elif etype == 'hotel' or cat == 'hotel':
                 # myTime-Paritaet (Tim/KRK 2026-07-25): 'Layover [BRE]' + die
                 # IATA als LOCATION — NUR mit LOCATION setzt der Feed-Import
@@ -7329,6 +7337,8 @@ def _fo_day_has_duty(ev):
     secs = ev.get('ical_sectors')
     if isinstance(secs, list) and secs:
         return True                       # echte Legs = Dienst, fertig
+    if is_cancelled_standby_marker(ev.get('ical_summary')):
+        return False                      # SCU = gestrichener Standby
     klass = str(ev.get('ical_klass') or '').strip().lower()
     if klass in ('hotel_layover', 'standby'):
         return True                       # unterwegs bzw. Bereitschaft
@@ -7363,6 +7373,8 @@ def _fo_day_is_standby(ev):
         return False
     secs = ev.get('ical_sectors')
     if isinstance(secs, list) and secs:
+        return False
+    if is_cancelled_standby_marker(ev.get('ical_summary')):
         return False
     if str(ev.get('ical_klass') or '').strip().lower() == 'standby':
         return True

@@ -40,6 +40,9 @@ def test_private_roster_symbol_classifiers_are_narrow():
     assert A._friend_day_is_part_time({'klass': 'TZ'})
     assert A._friend_day_is_vacation({'marker': 'Urlaub'})
     assert A._friend_day_is_standby({'marker': 'SBY'})
+    assert not A._friend_day_is_standby({'marker': 'Standby (SCU)'})
+    assert not A._friend_day_is_standby(
+        {'klass': 'STBY', 'marker': 'Standby (SCU)'})
     assert not A._friend_day_is_training({'routing': 'FRA-SIN'})
 
 
