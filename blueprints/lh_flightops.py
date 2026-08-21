@@ -5162,6 +5162,11 @@ _CREW_CACHE_PRUNE_EVERY_S = 3600.0
 # Datums-Toleranz beim LESEN: Roster-Datum (LT) vs. LH-Flugdatum (Z) können
 # bei Red-Eyes um einen Tag auseinanderliegen.
 _CREW_CACHE_DATE_SLACK = (0, -1, 1)
+# Simulator-Sessions haben keine Flugnummer. Unter diesem reservierten Key
+# nutzt die SIM-Crew denselben privaten, RLS-geschuetzten Last-Good-Speicher
+# wie Flug-Crewlisten. Der Payload im jsonb-Feld `crew` ist fuer diesen Key
+# ein Objekt {members,session}; normale Flug-Keys bleiben unveraendert Listen.
+_SIM_CREW_CACHE_FLIGHT = '__SIMULATOR__'
 
 # (letzter Fehlversuch, Tabelle nutzbar?) — nach einem Fehler 5 min Ruhe,
 # damit ein fehlendes Table/PostgREST-404 nicht jeden Request bezahlt.
@@ -5355,6 +5360,43 @@ def _crew_cache_put(token, flight, date, crew):
     if _crew_cache_put_sb(token, flight, date, crew):
         return
     _crew_cache_put_profile(token, flight, date, crew)
+
+
+def _sim_crew_cache_get(token, date):
+    """Exakter Last-Good-Treffer fuer eine Simulator-Crew.
+
+    Anders als Flug-Crewlisten darf ein SIM nie mit dem Nachbartag bedient
+    werden: zwei Sessions an aufeinanderfolgenden Tagen sind fachlich nicht
+    austauschbar. `_crew_cache_get` darf wegen Red-Eyes ±1 Tag liefern; dieser
+    Wrapper verwirft deshalb jeden nicht exakt datierten Treffer.
+    """
+    wanted = str(date or '')[:10]
+    e = _crew_cache_get(token, _SIM_CREW_CACHE_FLIGHT, wanted)
+    if not e or str(e.get('date') or '')[:10] != wanted:
+        return None
+    payload = e.get('crew')
+    if isinstance(payload, dict):
+        members = payload.get('members')
+        session = payload.get('session')
+    else:
+        # Vorwaertskompatibler Notnagel, falls waehrend eines gestaffelten
+        # Deploys bereits eine reine Liste geschrieben worden sein sollte.
+        members, session = payload, {}
+    if not isinstance(members, list) or not members:
+        return None
+    return {'crew': members,
+            'session': session if isinstance(session, dict) else {},
+            'cached_at': e.get('cached_at'), 'date': wanted}
+
+
+def _sim_crew_cache_put(token, date, crew, session):
+    """Persistiert die rohe LH-SIM-Liste samt Session-Kopf als Last-Good."""
+    if not isinstance(crew, list) or not crew:
+        return
+    _crew_cache_put(token, _SIM_CREW_CACHE_FLIGHT, date, {
+        'members': crew,
+        'session': session if isinstance(session, dict) else {},
+    })
 
 
 # ── GETEILTER Cache über User-Grenzen hinweg ────────────────────────────────
@@ -5893,23 +5935,49 @@ def flightops_sim_crewlist(token):
     if not date:
         return jsonify({'ok': False, 'error': 'date_required'}), 400
 
+    def _cached():
+        e = _sim_crew_cache_get(token, date)
+        if not e:
+            return None
+        crew = e['crew']
+        try:
+            crew = _crew_reenrich(crew, flight=None, date=date)
+        except Exception as exc:
+            log.warning('[lh_flightops] cached sim-crew reenrich: %s',
+                        type(exc).__name__)
+        return jsonify({'ok': True, 'crew': crew,
+                        'session': e.get('session') or {},
+                        'cached': True, 'cached_at': e.get('cached_at')})
+
     _st, _acc = _access_state(token)
     if _st == 'pending':
-        return jsonify({'ok': False, 'error': 'token_refresh_pending'}), 503
+        return _cached() or (jsonify({'ok': False,
+                                      'error': 'token_refresh_pending'}), 503)
     if _st != 'ok':
-        return jsonify({'ok': False, 'error': 'not_connected'}), 401
+        return _cached() or (jsonify({'ok': False,
+                                      'error': 'not_connected'}), 401)
 
     p = _resolve_sim_link_params(token, date, interactive=True) or {}
     access = (p.get('accessCode') or '').strip()
     if not access:
-        return jsonify({'ok': False, 'error': 'no_sim_that_day'}), 404
+        return _cached() or (jsonify({'ok': False,
+                                      'error': 'no_sim_that_day'}), 404)
 
     resp = simulator_crewlist(token, forDate=p.get('forDate') or f'{date}Z',
                               accessCode=access, interactive=True)
     if resp is None:
-        return jsonify({'ok': False,
-                        'error': 'simulator_crewlist_unavailable'}), 502
-    crew = parse_simulator_crewlist(resp)
+        return _cached() or (jsonify({'ok': False,
+                                      'error': 'simulator_crewlist_unavailable'}), 502)
+    raw_crew = parse_simulator_crewlist(resp)
+    session = simulator_session_info(resp)
+    if not raw_crew:
+        # LH kann eine Liste vor dem SIM noch nicht oder danach nicht mehr
+        # liefern. Eine leere Live-Antwort darf die letzte gute Liste nicht
+        # verdraengen — gleiches Verhalten wie bei Flug-Crewlisten.
+        return _cached() or jsonify({'ok': True, 'crew': [],
+                                     'session': session})
+    _sim_crew_cache_put(token, date, raw_crew, session)
+    crew = raw_crew
     # AeroX-Verknüpfung wie bei der Flug-Crewliste: wer von den Kollegen ein
     # AeroX-Profil hat, wird über die Personalnummer gefunden (NUR über die PK
     # — Namens-Fuzzy ist bewusst raus, siehe Crew-Match-Regel).
@@ -5917,8 +5985,7 @@ def flightops_sim_crewlist(token):
         crew = _crew_reenrich(crew, flight=None, date=date)
     except Exception as e:
         log.warning('[lh_flightops] sim-crew reenrich: %s', type(e).__name__)
-    return jsonify({'ok': True, 'crew': crew,
-                    'session': simulator_session_info(resp)})
+    return jsonify({'ok': True, 'crew': crew, 'session': session})
 
 
 @lh_flightops_bp.route('/api/me/lh/flightops/sim-crewlist', methods=['POST'])

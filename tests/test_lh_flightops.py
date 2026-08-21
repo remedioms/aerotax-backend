@@ -4334,6 +4334,76 @@ def test_session_kopf_fuer_die_ueberschrift():
     assert fo.simulator_session_info([]) == {}
 
 
+def test_sim_crew_cache_speichert_liste_und_session_unter_reserviertem_key(
+        monkeypatch):
+    put = {}
+    monkeypatch.setattr(
+        fo, '_crew_cache_put',
+        lambda tok, flight, date, payload: put.update(
+            token=tok, flight=flight, date=date, payload=payload))
+    crew = [{'position': 'CPT', 'name': 'Muster', 'pk': '1', 'duty': 'PF'}]
+    session = {'simulator': '328', 'shift': '3'}
+
+    fo._sim_crew_cache_put('AT-U', '2026-07-07', crew, session)
+
+    assert put['flight'] == fo._SIM_CREW_CACHE_FLIGHT
+    assert put['date'] == '2026-07-07'
+    assert put['payload'] == {'members': crew, 'session': session}
+
+
+def test_sim_crew_cache_nimmt_nie_den_nachbartag(monkeypatch):
+    monkeypatch.setattr(fo, '_crew_cache_get', lambda *a: {
+        'date': '2026-07-08',
+        'crew': {'members': [{'name': 'Falscher Tag'}], 'session': {}},
+        'cached_at': 123.0,
+    })
+    assert fo._sim_crew_cache_get('AT-U', '2026-07-07') is None
+
+
+def test_sim_crew_endpoint_serviert_cache_auch_bei_lokal_verlorenem_grant(
+        monkeypatch):
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('disconnected', None))
+    monkeypatch.setattr(fo, '_sim_crew_cache_get', lambda tok, date: {
+        'date': date, 'crew': [{'name': 'Muster', 'position': 'CPT'}],
+        'session': {'simulator': '328'}, 'cached_at': 123.0,
+    })
+    monkeypatch.setattr(fo, '_crew_reenrich', lambda crew, **kw: crew)
+    import app as backend
+    r = backend.app.test_client().post(
+        '/api/lh/flightops/sim-crewlist/AT-U',
+        json={'date': '2026-07-07'},
+        headers={'Authorization': 'Bearer AT-U'})
+    d = r.get_json()
+    assert r.status_code == 200 and d['cached'] is True
+    assert d['crew'][0]['name'] == 'Muster'
+    assert d['session']['simulator'] == '328'
+
+
+def test_sim_crew_endpoint_persistiert_erfolgreiche_live_liste(monkeypatch):
+    _pass_auth_gate(monkeypatch)
+    monkeypatch.setattr(fo, '_access_state', lambda tok: ('ok', 'ACC'))
+    monkeypatch.setattr(fo, '_resolve_sim_link_params', lambda *a, **k: {
+        'forDate': '2026-07-07Z', 'accessCode': 'SIM-ACCESS'})
+    monkeypatch.setattr(fo, 'simulator_crewlist', lambda *a, **k: _SIM_RESP)
+    monkeypatch.setattr(fo, '_crew_reenrich', lambda crew, **kw: crew)
+    stored = {}
+    monkeypatch.setattr(
+        fo, '_sim_crew_cache_put',
+        lambda tok, date, crew, session: stored.update(
+            token=tok, date=date, crew=crew, session=session))
+    import app as backend
+    r = backend.app.test_client().post(
+        '/api/lh/flightops/sim-crewlist/AT-U',
+        json={'date': '2026-07-07'},
+        headers={'Authorization': 'Bearer AT-U'})
+
+    assert r.status_code == 200 and r.get_json()['ok'] is True
+    assert stored['token'] == 'AT-U' and stored['date'] == '2026-07-07'
+    assert len(stored['crew']) == 3
+    assert stored['session']['simulator'] == '328'
+
+
 def test_sim_referenz_wird_ueber_das_datum_gefunden_nicht_ueber_die_flugnummer():
     """Der Kern des Bugs: `_links_find` verlangt einen flightDesignator und
     findet die SIM-Referenz deshalb NIE — `_links_find_sim` findet sie."""
