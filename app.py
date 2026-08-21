@@ -61263,6 +61263,59 @@ def _roster_ics_excluding_date_span(calendar_text, start_date, end_date):
     return '\r\n'.join(output)
 
 
+def _roster_ics_covered_dates(calendar_text):
+    """Return the calendar days explicitly covered by synthetic PDF events.
+
+    A PDF upload is a partial roster source, not proof that every other month
+    was deleted.  The dates are therefore used as an upsert key: events on an
+    incoming day are replaced, while stored events on all other days survive.
+    The synthetic parsers emit unfolded DTSTART properties, so this helper can
+    stay deliberately small and cannot reinterpret timezone values.
+    """
+    dates = set()
+    for raw in (calendar_text or '').replace('\r\n', '\n').split('\n'):
+        match = re.match(r'^DTSTART(?:;[^:]*)?:(\d{8})', raw.rstrip('\r'))
+        if not match:
+            continue
+        value = match.group(1)
+        dates.add(f'{value[:4]}-{value[4:6]}-{value[6:8]}')
+    return dates
+
+
+def _roster_events_excluding_dates(events, covered_dates):
+    """Keep stored roster events whose covered days are absent from a PDF.
+
+    ``_multiday_dates`` wins when present; normalized start/start_iso values
+    cover the persisted synthetic-event shape.  A malformed event is retained
+    so a merge helper can never silently destroy data it cannot classify.
+    """
+    covered = {
+        str(value)[:10] for value in (covered_dates or set())
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(value)[:10])
+    }
+    if not covered:
+        return list(events or [])
+    kept = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            kept.append(event)
+            continue
+        event_dates = set()
+        for value in event.get('_multiday_dates') or []:
+            value = str(value)[:10]
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+                event_dates.add(value)
+        if not event_dates:
+            value = (str(event.get('start') or '')[:10]
+                     or str(event.get('start_iso') or '')[:10])
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+                event_dates.add(value)
+        if event_dates and not event_dates.isdisjoint(covered):
+            continue
+        kept.append(event)
+    return kept
+
+
 def _roster_ics_text(value):
     """RFC-5545 text escaping for stored-event archive reconstruction."""
     return (str(value or '').replace('\\', '\\\\').replace('\r', '')
@@ -63609,10 +63662,12 @@ def _pdf_informational_only_kind(text):
 def import_roster_pdf(token):
     """Roster-PDF-Upload for supported deterministic airline formats.
 
-    Repeated multipart ``pdf`` fields form one archive import. CAS revisions
-    are resolved day-by-day before the single calendar write. Optional
-    ``merge_existing=1`` preserves a verified active roster while historical
-    months are added around its covered date range.
+    Every PDF is a partial roster import: incoming covered days replace their
+    previous revision and all other stored months remain available. Repeated
+    multipart ``pdf`` fields form one archive import and CAS revisions are
+    resolved day-by-day before the single calendar write. Optional legacy
+    ``merge_existing=1`` gives a verified active roster priority while older
+    archive months are added around its covered date range.
     """
     files = request.files.getlist('pdf') or request.files.getlist('file')
     files = [upload for upload in files if upload is not None]
@@ -63866,16 +63921,16 @@ def import_roster_pdf(token):
         in ('1', 'true', 'yes')
     existing_events = []
     existing_bounds = (None, None)
+    try:
+        full = _profile_load(token) or {}
+        for source in ((full.get('profile') or {}), full):
+            feed = source.get('calendar_feed')
+            if isinstance(feed, dict) and isinstance(feed.get('events'), list):
+                existing_events = list(feed['events'])
+                break
+    except Exception:
+        existing_events = []
     if merge_existing:
-        try:
-            full = _profile_load(token) or {}
-            for source in ((full.get('profile') or {}), full):
-                feed = source.get('calendar_feed')
-                if isinstance(feed, dict) and isinstance(feed.get('events'), list):
-                    existing_events = list(feed['events'])
-                    break
-        except Exception:
-            existing_events = []
         existing_bounds = _archive_protected_date_bounds(
             token, existing_events)
         if existing_bounds[0] and existing_bounds[1]:
@@ -63894,7 +63949,7 @@ def import_roster_pdf(token):
                         <= existing_bounds[1])
             ]
 
-    calendars = list(standard_calendars)
+    incoming_calendars = list(standard_calendars)
     if cas_events:
         first_value = min(
             (event[1] for event in cas_events),
@@ -63902,9 +63957,19 @@ def import_roster_pdf(token):
         )
         first_day = (first_value.date()
                      if isinstance(first_value, datetime) else first_value)
-        calendars.append(_pdf_events_to_ics(
+        incoming_calendars.append(_pdf_events_to_ics(
             cas_events, first_day.year, first_day.month,
             prodid='AeroX Lufthansa CAS Roster PDF Import'))
+    incoming_ics = _roster_join_ics(incoming_calendars)
+    if not merge_existing:
+        # Default monthly-upload contract: only dates explicitly present in
+        # the new PDF are authoritative. This prevents a September preview
+        # from deleting August (and vice versa), while a corrected PDF still
+        # replaces the older revision of each day it actually contains.
+        existing_events = _roster_events_excluding_dates(
+            existing_events, _roster_ics_covered_dates(incoming_ics))
+
+    calendars = [incoming_ics]
     if existing_events:
         calendars.append(_stored_calendar_events_to_ics(existing_events))
     ics = _roster_join_ics(calendars)
@@ -63955,7 +64020,9 @@ def import_roster_pdf(token):
     # Interner Dispatch in die EINE Feed-Pipeline (wallreply-Muster) — kein
     # Fetch, volles Parse/Merge/Briefings/Reconcile/Sektoren-Verhalten.
     # `source` explizit — hier ist es WIRKLICH ein PDF (s. _DIRECT_ICS_SOURCES).
-    archive = len(files) > 1 or merge_existing
+    # A PDF is always a partial/archive source. It must never trigger the live
+    # feed reconcile that interprets all absent months as deletions.
+    archive = True
     with app.test_request_context(json={
             'ics_text': ics, 'source': 'pdf', 'archive': archive,
             'archive_preserve_from': existing_bounds[0],

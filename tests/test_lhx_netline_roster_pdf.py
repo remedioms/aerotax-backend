@@ -15,16 +15,16 @@ import app as backend
 from lhx_netline_roster_pdf import parse_lhx_netline_calendar
 
 
-def _synthetic_pdf():
+def _synthetic_pdf(period="01Nov25 - 03Nov25", rows=None):
     stream = io.BytesIO()
     pdf = canvas.Canvas(stream, pagesize=landscape(A4))
     pdf.setFont("Helvetica", 7)
     pdf.drawString(30, 575, "Individual duty plan")
     pdf.drawString(300, 575, "NetLine/Crew(LHX) printed by PRINTIDP")
-    pdf.drawString(30, 558, "Period: 01Nov25 - 03Nov25")
+    pdf.drawString(30, 558, f"Period: {period}")
 
     # Same coordinate contract as the three real NetLine schedule columns.
-    rows = (
+    rows = rows or (
         (28, "Sat01", "GC19", "MUC", "0800", "1600"),
         (295, "Sun02", "O", "MUC", None, None),
         (562, "Mon03", "CRM", "MUC", "0645", "1430"),
@@ -117,3 +117,66 @@ def test_roster_pdf_endpoint_dispatches_lhx_parser():
     stored = saved["profile"]["calendar_feed"]["events"]
     assert len(stored) == 3
     assert any(event.get("summary") == "GC19 · MUC" for event in stored)
+
+
+def test_sequential_month_uploads_keep_both_months():
+    """Uploading December after November must upsert, never replace November."""
+    november_pdf = _synthetic_pdf()
+    december_pdf = _synthetic_pdf(
+        period="01Dec25 - 03Dec25",
+        rows=(
+            (28, "Mon01", "GC20", "MUC", "0800", "1600"),
+            (295, "Tue02", "O", "MUC", None, None),
+            (562, "Wed03", "CRM", "MUC", "0645", "1430"),
+        ),
+    )
+    token = "AT-TEST-LHX-MONTH-MERGE-1"
+    valid = backend._TokenValidationResult(
+        backend._TokenValidationState.VALID, "month-merge@example.test")
+    state = {"full": {}, "briefings": {}}
+
+    def load_profile(_token):
+        return state["full"]
+
+    def save_profile(_token, profile, full_disk_payload=None):
+        state["full"] = dict(
+            full_disk_payload or {"profile": dict(profile or {})})
+        return True
+
+    def save_briefings(_token, values):
+        state["briefings"] = {
+            day: dict(value) for day, value in (values or {}).items()
+        }
+        return True
+
+    with patch.object(backend, "_validate_token", return_value=valid), \
+            patch.object(backend, "_BUG004_REQUIRE_TOKEN_BINDING", False), \
+            patch.object(backend, "_roster_pdf_upload_store", return_value=685), \
+            patch.object(backend, "_roster_pdf_upload_finish", return_value=True), \
+            patch.object(backend, "_profile_load", side_effect=load_profile), \
+            patch.object(backend, "_profile_load_from_disk", side_effect=load_profile), \
+            patch.object(backend, "_profile_save", side_effect=save_profile), \
+            patch.object(
+                backend, "_ical_briefings_load",
+                side_effect=lambda _token: state["briefings"]), \
+            patch.object(backend, "_ical_briefings_save", side_effect=save_briefings):
+        client = backend.app.test_client()
+        responses = []
+        for pdf_data, filename in (
+                (november_pdf, "november.pdf"),
+                (december_pdf, "december.pdf")):
+            responses.append(client.post(
+                f"/api/user/roster-pdf/{token}/import",
+                data={"airline": "Lufthansa City", "homebase": "MUC",
+                      "pdf": (io.BytesIO(pdf_data), filename)},
+                content_type="multipart/form-data"))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    feed = ((state["full"].get("profile") or {}).get("calendar_feed")
+            or state["full"].get("calendar_feed") or {})
+    events = feed.get("events") or []
+    assert len(events) == 6
+    assert {str(event.get("start"))[:7] for event in events} == {
+        "2025-11", "2025-12"}
+    assert {day[:7] for day in state["briefings"]} == {"2025-11", "2025-12"}
+    assert responses[1].get_json()["existing_events_preserved"] == 3
