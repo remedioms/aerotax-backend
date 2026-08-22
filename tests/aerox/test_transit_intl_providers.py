@@ -254,6 +254,126 @@ def test_google_merges_walks_and_reconstructs_times(client, monkeypatch):
     assert seen["body"]["destination"]["location"]["latLng"]["latitude"] == 41.79344
 
 
+def _reset_google_budget(appmod):
+    """Zähler + Cache sind modul-global → zwischen Tests zurücksetzen, sonst
+    verbraucht ein Test das Kontingent des nächsten."""
+    appmod._GOOGLE_TRANSIT_BUDGET["day"] = None
+    appmod._GOOGLE_TRANSIT_BUDGET["n"] = 0
+    for k in [k for k in appmod._AVIATION_CACHE if str(k).startswith("gtransit:")]:
+        appmod._AVIATION_CACHE.pop(k, None)
+
+
+def test_google_cache_prevents_second_paid_call(appmod, client, monkeypatch):
+    """Zweimal dieselbe Frage = EIN bezahlter Aufruf. Dieselbe Crew fährt jeden
+    Dienst denselben Weg — ohne Cache zahlt man denselben Weg mehrfach."""
+    import requests as _req
+
+    _reset_google_budget(appmod)
+    monkeypatch.delenv("RMV_ACCESS_ID", raising=False)
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "test-key")
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, headers=None, **kw):
+        if "routes.googleapis.com" not in url:
+            raise RuntimeError("down")
+        calls["n"] += 1
+        return _FakeResp(_FAKE_GOOGLE)
+
+    monkeypatch.setattr(_req, "post", fake_post)
+    monkeypatch.setattr(_req, "get",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("down")))
+
+    q = ("/api/ax/transit?from_lat=41.9010&from_lon=12.5015"
+         "&to_lat=41.8003&to_lon=12.2389&arrival=2026-08-23T08:00:00Z&debug=1")
+    first = client.get(q).get_json()
+    second = client.get(q).get_json()
+    assert first["found"] is True and second["found"] is True
+    assert first["debug"]["efa"]["google_cache"] == "miss"
+    assert second["debug"]["efa"]["google_cache"] == "hit"
+    assert calls["n"] == 1, "zweite identische Anfrage darf nichts kosten"
+
+
+def test_google_daily_cap_falls_back_silently(appmod, client, monkeypatch):
+    """Ist das Tageslimit erreicht, verhält sich der Endpoint wie VOR der
+    Google-Stufe: ehrliches found=False, damit die App die Apple-ETA zeigt.
+    Der teure Fall ist ein RMV-Ausfall, bei dem alle DE-Anfragen hierher kippen."""
+    import requests as _req
+
+    _reset_google_budget(appmod)
+    monkeypatch.delenv("RMV_ACCESS_ID", raising=False)
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "test-key")
+    monkeypatch.setenv("AEROX_GOOGLE_TRANSIT_DAILY_CAP", "1")
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, headers=None, **kw):
+        if "routes.googleapis.com" not in url:
+            raise RuntimeError("down")
+        calls["n"] += 1
+        return _FakeResp(_FAKE_GOOGLE)
+
+    monkeypatch.setattr(_req, "post", fake_post)
+    monkeypatch.setattr(_req, "get",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("down")))
+
+    base = ("/api/ax/transit?from_lat=41.9010&from_lon=12.5015"
+            "&to_lat=41.8003&to_lon=12.2389&debug=1&arrival=2026-08-23T08:%02d:00Z")
+    assert client.get(base % 0).get_json()["found"] is True
+    blocked = client.get(base % 30).get_json()          # andere Zeit → kein Cache
+    assert blocked["found"] is False
+    assert blocked["debug"]["efa"]["google_cache"] == "daily_cap"
+    assert calls["n"] == 1, "über dem Limit darf kein Aufruf mehr rausgehen"
+
+
+def test_unparseable_times_are_dropped_not_shown(client, monkeypatch):
+    """Ein unparsebarer Zeit-String eines Providers darf NICHT als `leave_at`
+    durchgereicht werden — die App würde „kaputt" als Abfahrtszeit anzeigen.
+    Ein Fehler darf nicht wie ein Wert aussehen (gefunden 2026-08-22)."""
+    import copy
+
+    import requests as _req
+
+    monkeypatch.delenv("RMV_ACCESS_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
+    broken = copy.deepcopy(_FAKE_CH)
+    broken["connections"][0]["sections"][1]["departure"]["departure"] = "kaputt"
+
+    monkeypatch.setattr(_req, "get",
+                        lambda url, **kw: (_FakeResp(broken) if "opendata.ch" in url
+                                           else (_ for _ in ()).throw(RuntimeError("down"))))
+    monkeypatch.setattr(_req, "post",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("down")))
+
+    d = client.get("/api/ax/transit?from_lat=47.3669&from_lon=8.5453"
+                   "&to_lat=47.4581&to_lon=8.5555"
+                   "&arrival=2026-08-23T08:00:00Z&debug=1").get_json()
+    assert d["found"] is False and d.get("leave_at") is None
+    prov = [p for p in d["debug"]["providers"] if p["name"] == "ch_opendata"][0]
+    assert prov["dropped_bad_times"] == 1
+
+
+def test_reversed_times_are_dropped(client, monkeypatch):
+    """Ankunft VOR Abfahrt ist kaputt, egal welcher Provider das liefert."""
+    import copy
+
+    import requests as _req
+
+    monkeypatch.delenv("RMV_ACCESS_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
+    broken = copy.deepcopy(_FAKE_CH)
+    broken["connections"][0]["sections"][1]["arrival"]["arrival"] = "2026-08-23T08:00:00+0200"
+
+    monkeypatch.setattr(_req, "get",
+                        lambda url, **kw: (_FakeResp(broken) if "opendata.ch" in url
+                                           else (_ for _ in ()).throw(RuntimeError("down"))))
+    monkeypatch.setattr(_req, "post",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("down")))
+
+    d = client.get("/api/ax/transit?from_lat=47.3669&from_lon=8.5453"
+                   "&to_lat=47.4581&to_lon=8.5555"
+                   "&arrival=2026-08-23T08:00:00Z").get_json()
+    assert d["found"] is False
+
+
 def test_german_sources_win_over_austria_bbox(client, monkeypatch):
     """Passau liegt in der rechteckigen AT-Bbox, ist aber Deutschland: die
     deutsche Quelle muss ZUERST gefragt werden, sonst bekommt Südost-Bayern

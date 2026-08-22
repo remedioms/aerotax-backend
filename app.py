@@ -36130,6 +36130,44 @@ _AIRPORT_RAIL_SNAP = [
 _AIRPORT_RAIL_SNAP_KM = 3.0
 
 
+# ── Google-Routes-Kostenbremse (2026-08-22) ─────────────────────────────────
+# Google ist die einzige BEZAHLTE Stufe der Transit-Kette. Der teure Fall ist
+# nicht das Ausland (dort fragt ohnehin kaum jemand), sondern ein AUSFALL der
+# deutschen Quellen: fällt RMV für ein paar Stunden aus, kippt schlagartig
+# JEDE deutsche Anfrage auf Google. Genau das ist am 2026-08-22 im Test
+# passiert (ConnectTimeout www.rmv.de → Frankfurt lief über Google).
+#
+# Das Tageslimit ist so gewählt, dass die Rechnung rechnerisch NIE entsteht:
+# Google gibt 10.000 Aufrufe/Monat gratis. Auf Hetzner laufen 3 gunicorn-Worker,
+# und der Zähler ist PRO WORKER (kein geteilter Speicher) → 100 × 3 × 31 Tage
+# = 9.300 < 10.000. Wer mehr will, setzt AEROX_GOOGLE_TRANSIT_DAILY_CAP und
+# weiß dann, dass es Geld kostet. Limit erreicht = Provider fällt aus = die App
+# zeigt die Apple-ETA, also exakt das Verhalten von vor der Google-Stufe.
+_GOOGLE_TRANSIT_BUDGET = {'day': None, 'n': 0}
+_GOOGLE_TRANSIT_BUDGET_LOCK = _req_threading.Lock()
+
+
+def _google_transit_budget_take():
+    """Ein Google-Kontingent verbrauchen. True = darf abfragen, False = Limit
+    erreicht. Zählt pro UTC-Tag und setzt sich beim Tageswechsel selbst zurück."""
+    try:
+        cap = int(os.environ.get('AEROX_GOOGLE_TRANSIT_DAILY_CAP', '100'))
+    except Exception:
+        cap = 100
+    if cap <= 0:
+        return False
+    from datetime import datetime as _dt, timezone as _tz
+    today = _dt.now(_tz.utc).strftime('%Y%m%d')
+    with _GOOGLE_TRANSIT_BUDGET_LOCK:
+        if _GOOGLE_TRANSIT_BUDGET['day'] != today:
+            _GOOGLE_TRANSIT_BUDGET['day'] = today
+            _GOOGLE_TRANSIT_BUDGET['n'] = 0
+        if _GOOGLE_TRANSIT_BUDGET['n'] >= cap:
+            return False
+        _GOOGLE_TRANSIT_BUDGET['n'] += 1
+        return True
+
+
 def _snap_to_airport_rail(lat, lon):
     """Liegt (lat,lon) < _AIRPORT_RAIL_SNAP_KM an einem bekannten Flughafen-Bahnhof,
     gib (snap_lat, snap_lon, label) der nächsten Station zurück, sonst None.
@@ -50443,8 +50481,25 @@ def ax_transit():
             providers.append(('ch_opendata', lambda: _norm_ch_opendata(
                 _get_json('https://transport.opendata.ch/v1/connections', ch_params, 12))))
         # Google GANZ zuletzt: kostet Geld, alle Gratis-Quellen hatten ihre Chance.
-        if google_body is not None:
-            providers.append(('google', lambda: _norm_google_routes(_post_json(
+        def _google_fetch():
+            """Cache-davor, Tageslimit-dahinter. Dieselbe Crew fährt jeden Dienst
+            denselben Weg zur selben Uhrzeit → identischer Body → Cache-Treffer
+            kostet nichts. Der Key ist der VOLLSTÄNDIGE Body (inkl. sekunden-
+            genauer Zielzeit): bei arrive-by wäre ein auf 5 Minuten gerundeter
+            Key gefährlich, weil die Antwort dann für eine ANDERE Zielzeit gälte
+            und die Crew zu spät käme. Sparsamkeit endet vor der Pünktlichkeit."""
+            import hashlib as _hl
+            ck = 'gtransit:' + _hl.sha256(
+                json.dumps(google_body, sort_keys=True).encode()).hexdigest()[:32]
+            hit = _aviation_cache_get(ck, 600)
+            if hit is not None:
+                efa_dbg['google_cache'] = 'hit'
+                return hit
+            if not _google_transit_budget_take():
+                efa_dbg['google_cache'] = 'daily_cap'
+                raise RuntimeError('google daily cap reached')
+            efa_dbg['google_cache'] = 'miss'
+            data = _post_json(
                 'https://routes.googleapis.com/directions/v2:computeRoutes',
                 google_body, 12,
                 headers={**UA, 'Content-Type': 'application/json',
@@ -50455,7 +50510,55 @@ def ax_transit():
                              'routes.legs.steps.staticDuration',
                              'routes.legs.steps.startLocation',
                              'routes.legs.steps.polyline.encodedPolyline',
-                             'routes.legs.steps.transitDetails'))}))))
+                             'routes.legs.steps.transitDetails'))})
+            _aviation_cache_set(ck, data, 600)
+            return data
+
+        if google_body is not None:
+            providers.append(('google', lambda: _norm_google_routes(_google_fetch())))
+
+        def _parse_iso_utc(s):
+            """ISO-String → UTC-aware datetime, sonst None. Naive Werte werden als
+            UTC gelesen (gleiche Konvention wie `_parse` weiter unten, das die
+            Auswahl-Logik benutzt)."""
+            try:
+                from datetime import timezone as _tz
+                dt = datetime.fromisoformat((s or '').replace('Z', '+00:00'))
+                return dt.replace(tzinfo=_tz.utc) if dt.tzinfo is None else dt.astimezone(_tz.utc)
+            except Exception:
+                return None
+
+        def _journey_times_ok(legs):
+            """Hat eine Verbindung eine BRAUCHBARE Zeitachse? Prüft nur die zwei
+            Werte, an denen die App wirklich hängt: die Losgeh-Zeit (`dep` des
+            ersten Legs → `leave_at`) und die Ankunft (`arr` des letzten Legs).
+
+            Gefunden 2026-08-22 beim Härtetest der neuen Ausland-Stufen: ein
+            unparsebarer Zeit-String eines Providers wanderte ungeprüft bis in
+            `leave_at` durch — die App hätte „kaputt" als Abfahrtszeit angezeigt.
+            Ein Fehler darf nicht wie ein Wert aussehen. Gilt bewusst für ALLE
+            Provider, nicht nur die neuen: liefert irgendeine Quelle Müll, ist die
+            ehrliche Antwort `found=False` (→ App fällt auf Apple zurück).
+            Rückwärts laufende Zeiten (Ankunft VOR Abfahrt) fliegen ebenfalls raus.
+
+            Geprüft wird JEDES gesetzte Zeitfeld, nicht nur Anfang und Ende: ein
+            kaputter Wert MITTEN in der Kette taucht sonst als „S5 ab kaputt" im
+            Fahrplan-Sheet auf, während `leave_at` harmlos aussieht. Fehlende
+            (None) Felder sind dagegen erlaubt — nicht jeder Provider liefert
+            Gleis, Echtzeit und Planzeit."""
+            try:
+                if not legs:
+                    return False
+                for leg in legs:
+                    for key in ('dep', 'arr', 'dep_planned', 'arr_planned'):
+                        v = leg.get(key)
+                        if v is not None and _parse_iso_utc(v) is None:
+                            return False
+                a = _parse_iso_utc(legs[0].get('dep'))
+                b = _parse_iso_utc(legs[-1].get('arr'))
+                return bool(a and b and b >= a)
+            except Exception:
+                return False
 
         dbg = {'providers': [], 'efa': efa_dbg}
         journeys = None
@@ -50464,6 +50567,10 @@ def ax_transit():
             p = {'name': name}
             try:
                 js = fn() or []
+                _raw_n = len(js)
+                js = [ls for ls in js if _journey_times_ok(ls)]
+                if len(js) != _raw_n:
+                    p['dropped_bad_times'] = _raw_n - len(js)
                 p['n'] = len(js)
                 dbg['providers'].append(p)
                 if js:

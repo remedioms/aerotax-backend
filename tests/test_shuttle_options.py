@@ -275,6 +275,28 @@ def test_endpoint_liefert_fluege(appmod, client, monkeypatch):
     assert j['from'] == 'LIS' and j['flights'][0]['flight'] == 'LH1167'
 
 
+def test_endpoint_reicht_condor_direktflug_ungefiltert_durch(appmod, client,
+                                                             monkeypatch):
+    """Shuttle ist eine Streckensuche, kein LH-Airline-Filter.
+
+    Die LH-Route-Antwort kann Fremdcarrier enthalten; insbesondere darf eine
+    DE-Verbindung für Condor-Crew nicht zwischen Provider und App verschwinden.
+    """
+    monkeypatch.setattr(appmod, '_validate_token_exists', lambda t: True)
+    monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
+    monkeypatch.setattr(
+        lh, 'route_flights',
+        lambda frm, to, d, caller=None: ([
+            {'flight': 'LH2', 'dep': 'FRA', 'arr': 'HAM'},
+            {'flight': 'DE4181', 'dep': 'FRA', 'arr': 'HAM'},
+        ], True))
+    r = client.get('/api/ax/shuttle-options/AT-CONDOR?from=FRA&to=HAM'
+                   '&date=2026-08-22')
+    j = r.get_json()
+    assert r.status_code == 200 and j['ok'] and j['answered']
+    assert [f['flight'] for f in j['flights']] == ['LH2', 'DE4181']
+
+
 def test_endpoint_luecke_ist_kein_leeres_ergebnis(appmod, client, monkeypatch):
     monkeypatch.setattr(appmod, '_validate_token_exists', lambda t: True)
     monkeypatch.setattr(lh, 'lh_open_configured', lambda: True)
