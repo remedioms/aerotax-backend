@@ -36138,11 +36138,15 @@ _AIRPORT_RAIL_SNAP_KM = 3.0
 # passiert (ConnectTimeout www.rmv.de → Frankfurt lief über Google).
 #
 # Das Tageslimit ist so gewählt, dass die Rechnung rechnerisch NIE entsteht:
-# Google gibt 10.000 Aufrufe/Monat gratis. Auf Hetzner laufen 3 gunicorn-Worker,
-# und der Zähler ist PRO WORKER (kein geteilter Speicher) → 100 × 3 × 31 Tage
-# = 9.300 < 10.000. Wer mehr will, setzt AEROX_GOOGLE_TRANSIT_DAILY_CAP und
-# weiß dann, dass es Geld kostet. Limit erreicht = Provider fällt aus = die App
-# zeigt die Apple-ETA, also exakt das Verhalten von vor der Google-Stufe.
+# Google gibt 10.000 Aufrufe/Monat gratis. Der Zähler ist PRO WORKER (kein
+# geteilter Speicher), also zählt die WORKER-ZAHL mit: Hetzner startet in
+# /opt/aerox/compose.yaml `--workers 4` → 75 × 4 × 31 Tage = 9.300 < 10.000.
+# ACHTUNG beim Ändern der Worker-Zahl: der Kommentar im Dockerfile nennt 3,
+# die compose.yaml auf dem Host gewinnt (2026-08-22 nachgesehen — mit 3
+# gerechnet wären es 12.400 Aufrufe und damit eine echte Rechnung gewesen).
+# Wer mehr will, setzt AEROX_GOOGLE_TRANSIT_DAILY_CAP und weiß dann, dass es
+# Geld kostet. Limit erreicht = Provider fällt aus = die App zeigt die
+# Apple-ETA, also exakt das Verhalten von vor der Google-Stufe.
 _GOOGLE_TRANSIT_BUDGET = {'day': None, 'n': 0}
 _GOOGLE_TRANSIT_BUDGET_LOCK = _req_threading.Lock()
 
@@ -36151,9 +36155,9 @@ def _google_transit_budget_take():
     """Ein Google-Kontingent verbrauchen. True = darf abfragen, False = Limit
     erreicht. Zählt pro UTC-Tag und setzt sich beim Tageswechsel selbst zurück."""
     try:
-        cap = int(os.environ.get('AEROX_GOOGLE_TRANSIT_DAILY_CAP', '100'))
+        cap = int(os.environ.get('AEROX_GOOGLE_TRANSIT_DAILY_CAP', '75'))
     except Exception:
-        cap = 100
+        cap = 75
     if cap <= 0:
         return False
     from datetime import datetime as _dt, timezone as _tz
