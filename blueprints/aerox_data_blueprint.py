@@ -1717,7 +1717,9 @@ def lh_quota_snapshot(hours=6):
     produktiv laufen 3 Backend-Worker (:8080) + 1 Poll-Worker (:8081) + der
     Pfad des MQTT-Daemons — die Container teilen KEIN Volume, ein datei-
     basierter Zähler kann das also nicht sehen. Die LH-Quota gilt aber PRO KEY
-    (1.000/h + 5/s). Die Zähler stehen daher in `ax_api_budget` (atomarer RPC).
+    und mit unterschiedlichen Grenzen: Open API 1.000/h, FlightOps 20.000/h
+    plus 20/s (schriftlich von LH bestaetigt). Die Zähler stehen daher in
+    `ax_api_budget` (atomarer RPC).
 
     Schlüssel-Schema (Spalte heißt historisch `month`, hält beliebige Keys) —
     die STUNDE steht vor dem Aufrufer, damit die Abfrage ein index-nutzbares
@@ -1750,9 +1752,16 @@ def lh_quota_snapshot(hours=6):
     now = _t.time()
     stamps = [_t.strftime('%Y%m%d%H', _t.gmtime(now - i * 3600))
               for i in range(hours)]
-    out = {'quota_per_key_per_hour': 1000, 'hours': [], 'note': (
+    out = {
+        # Legacy-Feld fuer bestehende Diagnose-Clients: bezeichnet weiterhin
+        # die Open-API-Quote. Neue Clients muessen die explizite Map benutzen.
+        'quota_per_key_per_hour': 1000,
+        'quota_per_hour': {'lhopen': 1000, 'lhfo': 20000},
+        'rate_per_second': {'lhfo': 20},
+        'hours': [], 'note': (
         'lhopen = LH Open API Key, lhfo = LH FlightOps Key (getrennte Keys, '
-        'getrenntes Kontingent). lhopen_denied = Calls, die der EIGENE '
+        'getrennte Kontingente: 1.000/h bzw. 20.000/h + 20/s). '
+        'lhopen_denied = Calls, die der EIGENE '
         'Prozess-Throttle abgewiesen hat (gewollt = lhopen + lhopen_denied). '
         'Zaehler prozessuebergreifend via ax_api_budget, bis zu 30 s Nachlauf.')}
     sb = _sb()

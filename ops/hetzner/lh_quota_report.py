@@ -4,8 +4,11 @@
 #
 # WARUM: `lh_open_api._HOUR_BUDGET`/`_hour_count` zaehlen PRO PROZESS (3
 # Backend-Worker :8080 + 1 Poll-Worker :8081 + MQTT-Pfad, kein gemeinsames
-# Volume) — die LH-Quota gilt aber PRO KEY (1.000/h + 5/s). Erst der
-# gemeinsame Zaehler in `ax_api_budget` zeigt, was der Key wirklich sieht.
+# Volume) — die LH-Quota gilt aber PRO KEY. Die beiden Keys haben
+# UNTERSCHIEDLICHE Grenzen: Open API 1.000/h, FlightOps 20.000/h (plus
+# 20/s; schriftlich von LH bestaetigt und im FlightOps-Gate dokumentiert).
+# Erst der gemeinsame Zaehler in `ax_api_budget` zeigt, was der jeweilige Key
+# wirklich sieht.
 import time
 
 try:
@@ -15,7 +18,7 @@ except Exception as e:                                    # noqa: BLE001
     raise SystemExit(0)
 
 HOURS = 24
-QUOTA = 1000
+QUOTA = {'lhopen': 1000, 'lhfo': 20000}
 
 snap = lh_quota_snapshot(HOURS)
 rows = snap.get('hours') or []
@@ -33,20 +36,25 @@ for r in rows:
         tot[fam] += n
         if n > peak[fam][0]:
             peak[fam] = (n, st)
-        if n >= QUOTA:
+        # Nur wirklich an LH gesendete Requests haben ein Provider-Limit.
+        # `denied` und `skip` sind interne Diagnosefamilien; insbesondere ein
+        # hoher Skip-Wert ist gut und darf niemals einen Quotenalarm ausloesen.
+        if fam in QUOTA and n >= QUOTA[fam]:
             over.append((st, fam, n))
         for c, v in (blk.get('callers') or {}).items():
             callers[fam][c] = callers[fam].get(c, 0) + int(v or 0)
 
-worst = max(peak['lhopen'][0], peak['lhfo'][0])
-flag = '⚠️ ' if (over or worst > QUOTA * 0.8 or tot['lhopen_denied']) else ''
-print('%sAeroX LH-Quota 24 h — Open %d (+%d abgewiesen) / FlightOps %d '
-      '(Peak %d/h)' % (flag, tot['lhopen'], tot['lhopen_denied'],
-                       tot['lhfo'], worst))
+near_limit = any(peak[f][0] > QUOTA[f] * 0.8 for f in QUOTA)
+flag = '⚠️ ' if (over or near_limit or tot['lhopen_denied']) else ''
+print('%sAeroX LH-Quota 24 h — Open %d (+%d abgewiesen; Peak %d/%d/h) '
+      '/ FlightOps %d (Peak %d/%d/h)' % (
+          flag, tot['lhopen'], tot['lhopen_denied'], peak['lhopen'][0],
+          QUOTA['lhopen'], tot['lhfo'], peak['lhfo'][0], QUOTA['lhfo']))
 print('')
-print('Stand %s UTC · Kontingent %d Calls/h PRO KEY (Open API und FlightOps'
-      ' sind GETRENNTE Keys).' % (time.strftime('%Y-%m-%d %H:%M', time.gmtime()),
-                                  QUOTA))
+print('Stand %s UTC · GETRENNTE Keys und Grenzen: Open API %d Calls/h; '
+      'FlightOps %d Calls/h + 20/s.' % (
+          time.strftime('%Y-%m-%d %H:%M', time.gmtime()),
+          QUOTA['lhopen'], QUOTA['lhfo']))
 print('')
 print('WICHTIG: „abgewiesen" = Calls, die der EIGENE Prozess-Throttle')
 print('(_HOUR_BUDGET=220 pro Prozess) gestoppt hat. Gewollt = gesendet +')
@@ -75,7 +83,7 @@ for fam, label in (('lhopen', 'LH Open API (gesendet)'),
     print('')
 
 if over:
-    print('UEBER DEM KONTINGENT:')
+    print('UEBER DEM PROVIDER-KONTINGENT:')
     for st, fam, n in over:
         print('  %s UTC  %s  %d' % (st, fam, n))
     print('')
