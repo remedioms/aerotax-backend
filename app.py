@@ -36112,6 +36112,20 @@ _AIRPORT_RAIL_SNAP = [
     # Besucherpark-Koordinate als Ziel — der nächste Snap ist damit diese Station
     # (Terminal-Ziele anderer Nutzer snappen weiter aufs Terminal, nearest wins).
     (48.35213, 11.76419, 'München Flughafen Besucherpark'),       # MUC FOC — OSM-verifiziert
+    # AUSLAND (2026-08-22, freie Homebases): exakt dieselbe Vorfeld-Falle. Ohne
+    # Snap liefert Google für JFK/MAD GAR KEINE Route und für FCO eine
+    # 155-Minuten-Bus-Kette statt 38 Minuten Zug (live gemessen). Alle Koordinaten
+    # aus OSM/Overpass (`railway=station` im Flughafen-Umkreis) — die Regel
+    # „keine geratenen Koordinaten" gilt unverändert.
+    (41.79344, 12.25187, 'Roma Fiumicino Aeroporto'),             # FCO — OSM-verifiziert
+    (45.62715, 8.71125, 'Malpensa Aeroporto T1'),                 # MXP T1 — OSM-verifiziert
+    (45.65064, 8.72194, 'Malpensa Aeroporto T2'),                 # MXP T2 — OSM-verifiziert
+    (47.45010, 8.56190, 'Zürich Flughafen'),                      # ZRH — OSM-verifiziert
+    (46.23133, 6.11027, 'Genève-Aéroport'),                       # GVA — OSM-verifiziert
+    (48.12023, 16.56427, 'Flughafen Wien'),                       # VIE — OSM-verifiziert
+    # BSL/EuroAirport bekommt BEWUSST keinen Eintrag: der Flughafen hat keinen
+    # Bahnanschluss (Overpass findet im Umkreis nur Saint-Louis) — Bus/Tram ab
+    # Terminal IST dort die richtige Route.
 ]
 _AIRPORT_RAIL_SNAP_KM = 3.0
 
@@ -49833,6 +49847,187 @@ def ax_transit():
                     out.append(legs)
             return out
 
+        def _ch_iso(s):
+            """transport.opendata.ch liefert `2026-08-23T09:05:00+0200` — der
+            Offset OHNE Doppelpunkt. `fromisoformat` verträgt das erst ab 3.11
+            und die Downstream-Vergleiche parsen selbst → hier einmalig auf
+            `+02:00` normalisieren. None/Müll bleibt None."""
+            s = (s or '').strip()
+            if not s:
+                return None
+            if len(s) >= 5 and s[-5] in '+-' and s[-3] != ':':
+                s = s[:-2] + ':' + s[-2:]
+            return s
+
+        def _norm_ch_opendata(data):
+            """transport.opendata.ch `/v1/connections` → normalisierte Leg-Listen,
+            GLEICHE Form wie _norm_efa/_norm_rmv_mgate. Gratis, kein Key, arrive-by
+            nativ über `isArrivalTime=1`. Live verifiziert 2026-08-22 (Zürich
+            Bellevue → ZRH). `sections[]`: mit `journey` = Fahrt, mit `walk`
+            (journey None) = Fußweg. Linienname = category+number (S5, T15, B31);
+            `journey.name` ist oft nur die Zugnummer und taugt nicht als Anzeige.
+            Koordinaten: `station.coordinate` mit x=LAT, y=LON (nicht vertauschen)."""
+            out = []
+            for con in (data or {}).get('connections') or []:
+                legs = []
+                for sec in con.get('sections') or []:
+                    jny = sec.get('journey') or {}
+                    is_walk = not jny
+                    dep = sec.get('departure') or {}
+                    arr = sec.get('arrival') or {}
+                    o_st = dep.get('station') or {}
+                    d_st = arr.get('station') or {}
+                    crd = o_st.get('coordinate') or {}
+                    cat = (jny.get('category') or '').strip()
+                    num = str(jny.get('number') or '').strip()
+                    name = (f'{cat}{num}'.strip() or (jny.get('name') or '').strip()) or None
+                    # CH-Fernverkehr: IC/ICE/EC/TGV/RJ/NJ/EN. IR/RE/S/T/B = Nahverkehr
+                    # (InterRegio ist in der Schweiz Verbund-Nahverkehr, kein Fern).
+                    is_fern = (cat.upper() in ('IC', 'ICE', 'EC', 'TGV', 'RJ', 'RJX',
+                                               'NJ', 'EN', 'ICN')) or _leg_is_fern(name)
+                    dep_plan = _ch_iso(dep.get('departure'))
+                    arr_plan = _ch_iso(arr.get('arrival'))
+                    # `delay` ist die Echtzeit-Abweichung in MINUTEN (nicht der
+                    # Echtzeit-Zeitpunkt) → Echtzeit selbst ausrechnen.
+                    dly = dep.get('delay')
+                    dep_rt = None
+                    if isinstance(dly, (int, float)) and dep_plan:
+                        try:
+                            dep_rt = (datetime.fromisoformat(dep_plan)
+                                      + timedelta(minutes=int(dly))).isoformat()
+                        except Exception:
+                            dep_rt = None
+                    legs.append({
+                        'mode': 'walk' if is_walk else 'transit',
+                        'line': None if is_walk else name,
+                        'product': 'walk' if is_walk else (cat or 'transit'),
+                        'fern': is_fern,
+                        'from': o_st.get('name'), 'to': d_st.get('name'),
+                        'from_lat': crd.get('x'), 'from_lon': crd.get('y'),
+                        'dep': dep_rt or dep_plan,
+                        'arr': arr_plan,
+                        'dep_planned': dep_plan,
+                        'arr_planned': arr_plan,
+                        'delay_min': (int(dly) if (not is_walk and
+                                                   isinstance(dly, (int, float))) else None),
+                        'platform': (None if is_walk else
+                                     (str(dep.get('platform')).strip() or None)
+                                     if dep.get('platform') not in (None, '') else None),
+                    })
+                if legs:
+                    out.append(legs)
+            return out
+
+        def _norm_google_routes(data):
+            """Google Routes API `computeRoutes` (travelMode TRANSIT) →
+            normalisierte Leg-Listen, GLEICHE Form wie die anderen Provider.
+            LETZTE Stufe der Kette — greift nur, wo keine Verbund-Quelle existiert
+            (Italien, Übersee). Live verifiziert 2026-08-22 (Rom → FCO 38 min,
+            London → LHR Piccadilly, Bangkok → BKK).
+
+            ZWEI Eigenheiten, die den Normalizer bestimmen:
+            (1) Google zerlegt Fußwege in viele winzige WALK-Steps → aufeinander
+                folgende WALKs werden zu EINEM Fuß-Leg addiert, sonst zeigt die
+                Karte „Fuß › Fuß › Fuß".
+            (2) WALK-Steps haben KEINE absoluten Zeiten, nur `staticDuration`.
+                Die Zeiten werden aus den benachbarten Transit-Steps rekonstruiert
+                (Fuß VOR einer Fahrt endet zu deren Abfahrt, Fuß DANACH beginnt zu
+                deren Ankunft). Eine Route ganz ohne Transit-Step hat keinen Anker
+                → wird verworfen (dafür ist Apple da, nicht dieser Provider)."""
+            def _secs(v):
+                try:
+                    return int(float(str(v or '0s').rstrip('s')))
+                except Exception:
+                    return 0
+
+            out = []
+            for route in (data or {}).get('routes') or []:
+                # Schritt 1: Steps einsammeln, WALK-Ketten verschmelzen.
+                items = []   # {'walk':True,'sec':int} | {'walk':False,'td':…,'poly':…}
+                for leg in route.get('legs') or []:
+                    for st in leg.get('steps') or []:
+                        td = st.get('transitDetails')
+                        if td:
+                            items.append({'walk': False, 'td': td, 'step': st})
+                        else:
+                            sec = _secs(st.get('staticDuration'))
+                            if items and items[-1]['walk']:
+                                items[-1]['sec'] += sec
+                            else:
+                                items.append({'walk': True, 'sec': sec, 'step': st})
+                if not any(not it['walk'] for it in items):
+                    continue      # kein Transit-Anker → keine ehrliche Zeitachse
+
+                # Schritt 2: Zeiten der Transit-Steps als Anker, Fußwege andocken.
+                legs = []
+                for idx, it in enumerate(items):
+                    if not it['walk']:
+                        td = it['td']
+                        sd = td.get('stopDetails') or {}
+                        li = td.get('transitLine') or {}
+                        veh = ((li.get('vehicle') or {}).get('type') or '').upper()
+                        name = (li.get('nameShort') or li.get('name') or '').strip() or None
+                        dep_t = sd.get('departureTime')
+                        arr_t = sd.get('arrivalTime')
+                        dep_st = (sd.get('departureStop') or {}).get('name')
+                        arr_st = (sd.get('arrivalStop') or {}).get('name')
+                        loc = (it['step'].get('startLocation') or {}).get('latLng') or {}
+                        _leg = {
+                            'mode': 'transit', 'line': name,
+                            'product': veh.lower() or 'transit',
+                            'fern': veh in ('HIGH_SPEED_TRAIN', 'LONG_DISTANCE_TRAIN',
+                                            'INTERCITY_BUS') or _leg_is_fern(name),
+                            'from': dep_st, 'to': arr_st,
+                            'from_lat': loc.get('latitude'), 'from_lon': loc.get('longitude'),
+                            'dep': dep_t, 'arr': arr_t,
+                            'dep_planned': dep_t, 'arr_planned': arr_t,
+                            # Google liefert im TRANSIT-Modus Fahrplanzeiten, keine
+                            # Echtzeit-Abweichung → ehrlich None statt einer erfundenen 0.
+                            'delay_min': None,
+                            'platform': None,
+                        }
+                        try:
+                            _enc = ((it['step'].get('polyline') or {})
+                                    .get('encodedPolyline'))
+                            # Googles encodedPolyline = dasselbe Format wie HAFAS
+                            # `crdEncYX` (lat/lon-Order, Präzision 1e5).
+                            _pp = _thin_path(_dec_hafas_poly(_enc)) if _enc else None
+                            if _pp:
+                                _leg['path'] = _pp
+                        except Exception:
+                            pass
+                        legs.append(_leg)
+                    else:
+                        # Fußweg: Anker ist die NÄCHSTE Fahrt (davor) bzw. die
+                        # VORHERIGE (danach). Beides fehlt nie gleichzeitig, weil
+                        # oben mindestens ein Transit-Step garantiert ist.
+                        nxt = next((x for x in items[idx + 1:] if not x['walk']), None)
+                        prv = next((x for x in reversed(items[:idx]) if not x['walk']), None)
+                        w_dep = w_arr = None
+                        try:
+                            if nxt:
+                                _a = (nxt['td'].get('stopDetails') or {}).get('departureTime')
+                                _ad = datetime.fromisoformat((_a or '').replace('Z', '+00:00'))
+                                w_arr, w_dep = _a, (_ad - timedelta(seconds=it['sec'])).isoformat()
+                            elif prv:
+                                _d = (prv['td'].get('stopDetails') or {}).get('arrivalTime')
+                                _dd = datetime.fromisoformat((_d or '').replace('Z', '+00:00'))
+                                w_dep, w_arr = _d, (_dd + timedelta(seconds=it['sec'])).isoformat()
+                        except Exception:
+                            w_dep = w_arr = None
+                        loc = (it['step'].get('startLocation') or {}).get('latLng') or {}
+                        legs.append({
+                            'mode': 'walk', 'line': None, 'product': 'walk', 'fern': False,
+                            'from': None, 'to': None,
+                            'from_lat': loc.get('latitude'), 'from_lon': loc.get('longitude'),
+                            'dep': w_dep, 'arr': w_arr,
+                            'dep_planned': w_dep, 'arr_planned': w_arr,
+                            'delay_min': None, 'platform': None,
+                        })
+                if legs:
+                    out.append(legs)
+            return out
+
         prod = 'true'
         fern = 'true' if want_fern else 'false'
         # FLUGHAFEN-BAHNHOF-SNAP, richtungsabhängig. Der Snap existiert, weil das
@@ -50095,6 +50290,125 @@ def ax_transit():
                 rmv_mgate_body = None
                 efa_dbg['rmv_mgate_build_err'] = f'{type(me).__name__}: {str(me)[:140]}'
 
+        # ── ÖSTERREICH: ÖBB-HAFAS-mgate (KEIN Key) ──────────────────────────
+        # Technisch identisch zum RMV-mgate oben, nur andere AID/ext/client (AID
+        # öffentlich dokumentiert in public-transport/transport-apis,
+        # data/at/oebb-hafas-mgate.json) → derselbe Normalizer.
+        # RECHERCHE 2026-08-22: RMVs HAFAS antwortet auf ÖSTERREICHISCHE
+        # Startkoordinaten mit HTTP 400 (Zürich/Basel/Salzburg/Innsbruck/
+        # Straßburg alle gemessen) — ganz Österreich fiel bisher auf die
+        # Apple-ETA OHNE Legs zurück. Live verifiziert: Wien Stephansplatz → VIE
+        # = U1 › U2 › Bus VAB 2; Salzburg Zentrum → SZG = O-Bus 1.
+        # Produkt-Bitmaske ÖBB: 1 RJ/ICE + 2 IC/EC + 4 IC/EC + 8 D/EN = Fern
+        # → Nahverkehr-only = 4095-15 = 4080.
+        in_austria = (46.3 <= flat <= 49.1) and (9.5 <= flon <= 17.2)
+        oebb_body = None
+        efa_dbg['in_austria'] = in_austria
+        if in_austria:
+            try:
+                from zoneinfo import ZoneInfo as _ZA
+                _tza = _ZA('Europe/Vienna')
+                if anchor_s:
+                    _aa = datetime.fromisoformat(anchor_s.replace('Z', '+00:00'))
+                    _aa = _aa.astimezone(_tza) if _aa.tzinfo else _aa.replace(tzinfo=_tza)
+                else:
+                    _aa = datetime.now(_tza)
+                _alat, _alon = tlat, tlon
+                if not depart_mode:
+                    _asnap = _snap_to_airport_rail(tlat, tlon)
+                    if _asnap:
+                        _alat, _alon = _asnap[0], _asnap[1]
+                        efa_dbg['airport_rail_snap'] = _asnap[2]
+                oebb_body = {
+                    'ver': '1.88', 'lang': 'deu', 'ext': 'VAO.11',
+                    'auth': {'type': 'AID', 'aid': '5vHavmuWPWIfetEe'},
+                    'client': {'id': 'OEBB', 'type': 'WEB', 'name': 'webapp',
+                               'l': 'vs_webapp', 'v': 21804},
+                    'svcReqL': [{'meth': 'TripSearch', 'req': {
+                        'depLocL': [{'lid': f'A=2@O=Zuhause@X={int(round(_o_lon * 1e6))}@Y={int(round(_o_lat * 1e6))}@'}],
+                        'arrLocL': [{'lid': f'A=2@O=Flughafen@X={int(round(_alon * 1e6))}@Y={int(round(_alat * 1e6))}@'}],
+                        'outDate': _aa.strftime('%Y%m%d'), 'outTime': _aa.strftime('%H%M%S'),
+                        'outFrwd': True if depart_mode else (not bool(arrival_s)),
+                        'numF': 5, 'getPolyline': True, 'getPasslist': False,
+                        'jnyFltrL': [{'type': 'PROD', 'mode': 'INC',
+                                      'value': 4095 if want_fern else 4080}],
+                    }}],
+                }
+            except Exception as ae:
+                oebb_body = None
+                efa_dbg['oebb_build_err'] = f'{type(ae).__name__}: {str(ae)[:140]}'
+
+        # ── SCHWEIZ: transport.opendata.ch (KEIN Key, 1.000 Anfragen/Tag) ────
+        # Offizielle Fahrplan-API auf SBB-Daten; arrive-by nativ per
+        # `isArrivalTime=1`. Live verifiziert 2026-08-22 (Zürich Bellevue → ZRH,
+        # Fuß › Tram › Fuß). Zeiten werden in LOKALER Zeit (Europe/Zurich)
+        # gefragt, genau wie bei EFA.
+        in_swiss = (45.8 <= flat <= 47.9) and (5.9 <= flon <= 10.6)
+        ch_params = None
+        efa_dbg['in_swiss'] = in_swiss
+        if in_swiss:
+            try:
+                from zoneinfo import ZoneInfo as _ZC
+                _tzc = _ZC('Europe/Zurich')
+                if anchor_s:
+                    _ac = datetime.fromisoformat(anchor_s.replace('Z', '+00:00'))
+                    _ac = _ac.astimezone(_tzc) if _ac.tzinfo else _ac.replace(tzinfo=_tzc)
+                else:
+                    _ac = datetime.now(_tzc)
+                _clat, _clon = tlat, tlon
+                if not depart_mode:
+                    _csnap = _snap_to_airport_rail(tlat, tlon)
+                    if _csnap:
+                        _clat, _clon = _csnap[0], _csnap[1]
+                        efa_dbg['airport_rail_snap'] = _csnap[2]
+                ch_params = {
+                    'from': f'{_o_lat},{_o_lon}', 'to': f'{_clat},{_clon}',
+                    'date': _ac.strftime('%Y-%m-%d'), 'time': _ac.strftime('%H:%M'),
+                    'isArrivalTime': 0 if depart_mode else (1 if arrival_s else 0),
+                    'limit': 5,
+                }
+            except Exception as ce:
+                ch_params = None
+                efa_dbg['ch_build_err'] = f'{type(ce).__name__}: {str(ce)[:140]}'
+
+        # ── LETZTE STUFE: Google Routes API (weltweit, KOSTENPFLICHTIG) ──────
+        # Greift nur, wenn KEINE Verbund-Quelle etwas geliefert hat — also für
+        # Italien (hat keine landesweite Gratis-Quelle) und Übersee. Ohne
+        # `GOOGLE_MAPS_API_KEY` bleibt alles exakt wie vorher (App → Apple-ETA).
+        # Der Flughafen-Bahnhof-Snap ist hier PFLICHT, nicht Kosmetik: auf die
+        # Terminal-Koordinate antwortet Google für JFK/MAD mit GAR KEINER Route
+        # und für FCO mit 155 statt 38 Minuten (live gemessen 2026-08-22).
+        gkey = os.environ.get('GOOGLE_MAPS_API_KEY', '').strip()
+        google_body = None
+        efa_dbg['google_key'] = bool(gkey)
+        if gkey:
+            try:
+                _glat, _glon = tlat, tlon
+                if not depart_mode:
+                    _gsnap = _snap_to_airport_rail(tlat, tlon)
+                    if _gsnap:
+                        _glat, _glon = _gsnap[0], _gsnap[1]
+                        efa_dbg['airport_rail_snap'] = _gsnap[2]
+                _gt = datetime.fromisoformat(anchor_s.replace('Z', '+00:00')) if anchor_s else None
+                google_body = {
+                    'origin': {'location': {'latLng': {'latitude': _o_lat,
+                                                       'longitude': _o_lon}}},
+                    'destination': {'location': {'latLng': {'latitude': _glat,
+                                                            'longitude': _glon}}},
+                    'travelMode': 'TRANSIT',
+                    'languageCode': 'de-DE',
+                    'computeAlternativeRoutes': True,
+                }
+                if _gt:
+                    from datetime import timezone as _tzutc
+                    if _gt.tzinfo is None:
+                        _gt = _gt.replace(tzinfo=_tzutc.utc)
+                    _gts = _gt.astimezone(_tzutc.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    google_body['departureTime' if depart_mode else 'arrivalTime'] = _gts
+            except Exception as ge:
+                google_body = None
+                efa_dbg['google_build_err'] = f'{type(ge).__name__}: {str(ge)[:140]}'
+
         # SCHLANKE Kette (User: „besser einfach RMV nutzen"): RMV deckt als
         # bundesweite DELFI-HAFAS GANZ DE ab → wird primäre Quelle. MVV-EFA bleibt
         # als verifiziertes München-Sicherheitsnetz davor (falls RMV mal lokale
@@ -50115,6 +50429,33 @@ def ax_transit():
         if rmv_mgate_body is not None:
             providers.append(('rmv_mgate', lambda: _norm_rmv_mgate(
                 _post_json('https://www.rmv.de/auskunft/bin/jp/mgate.exe', rmv_mgate_body, 12))))
+        # Ausland NACH den deutschen Quellen — bewusst, obwohl es „falsch herum"
+        # aussieht: die AT-/CH-Bboxen sind Rechtecke und überlappen zwangsläufig
+        # Südost-Bayern bzw. den Hochrhein (Salzburg/Innsbruck/Basel liegen
+        # direkt an der Grenze, ein Rechteck trennt das nicht). Stünden sie
+        # vorne, bekäme Passau oder Lindau eine ÖBB-Auskunft statt der besseren
+        # deutschen. Andersherum kostet es im Ausland nur den schnellen RMV-400
+        # (gemessen 2026-08-22: sofortige Antwort, kein Timeout).
+        if oebb_body is not None:
+            providers.append(('oebb', lambda: _norm_rmv_mgate(
+                _post_json('https://fahrplan.oebb.at/gate', oebb_body, 12))))
+        if ch_params is not None:
+            providers.append(('ch_opendata', lambda: _norm_ch_opendata(
+                _get_json('https://transport.opendata.ch/v1/connections', ch_params, 12))))
+        # Google GANZ zuletzt: kostet Geld, alle Gratis-Quellen hatten ihre Chance.
+        if google_body is not None:
+            providers.append(('google', lambda: _norm_google_routes(_post_json(
+                'https://routes.googleapis.com/directions/v2:computeRoutes',
+                google_body, 12,
+                headers={**UA, 'Content-Type': 'application/json',
+                         'X-Goog-Api-Key': gkey,
+                         'X-Goog-FieldMask': ','.join((
+                             'routes.duration',
+                             'routes.legs.steps.travelMode',
+                             'routes.legs.steps.staticDuration',
+                             'routes.legs.steps.startLocation',
+                             'routes.legs.steps.polyline.encodedPolyline',
+                             'routes.legs.steps.transitDetails'))}))))
 
         dbg = {'providers': [], 'efa': efa_dbg}
         journeys = None

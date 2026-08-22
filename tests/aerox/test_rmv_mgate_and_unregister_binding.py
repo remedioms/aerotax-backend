@@ -157,8 +157,13 @@ def test_transit_frankfurt_uses_rmv_mgate_and_normalizes_legs(client, monkeypatc
 
 
 def test_transit_region_gate_munich_does_not_call_rmv_mgate(client, monkeypatch):
-    """München liegt außerhalb der Rhein-Main-Bbox → kein mgate-POST.
-    (MVV-EFA-GET schlägt hier absichtlich fehl → ehrliches found=False.)"""
+    """München liegt außerhalb der Rhein-Main-Bbox → kein mgate-POST AN RMV.
+    (MVV-EFA-GET schlägt hier absichtlich fehl → ehrliches found=False.)
+
+    2026-08-22: Seit der Österreich-Stufe darf hier ein POST an
+    `fahrplan.oebb.at` stehen — Münchens Koordinate liegt in der (rechteckigen)
+    AT-Bbox, und ÖBB ist die letzte Gratis-Stufe, bevor es auf Apple zurückfällt.
+    Geprüft wird deshalb die ZIEL-URL, nicht mehr die reine POST-Anzahl."""
     import requests as _req
 
     monkeypatch.delenv("RMV_ACCESS_ID", raising=False)
@@ -166,6 +171,9 @@ def test_transit_region_gate_munich_does_not_call_rmv_mgate(client, monkeypatch)
 
     def fake_post(url, json=None, timeout=None, headers=None, **kw):
         posts.append(url)
+        if "rmv.de" not in url:
+            # Ausland-Stufen sind hier nicht Gegenstand des Tests → down.
+            raise RuntimeError("provider down (test)")
         return _FakeResp(_FAKE_MGATE)
 
     def fake_get(url, params=None, timeout=None, headers=None, **kw):
@@ -179,7 +187,8 @@ def test_transit_region_gate_munich_does_not_call_rmv_mgate(client, monkeypatch)
     assert r.status_code == 200
     d = r.get_json()
     assert d["ok"] is True and d["found"] is False
-    assert posts == [], "RMV mgate must not be called outside Rhein-Main bbox"
+    assert not any("rmv.de" in u for u in posts), \
+        "RMV mgate must not be called outside Rhein-Main bbox"
 
 
 def test_transit_mgate_kernel_error_is_graceful(client, monkeypatch):
